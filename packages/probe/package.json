@@ -1,0 +1,10 @@
+{
+  "name": "@helm/probe",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@helm/engine-claude-code": "*",
+    "@helm/protocol": "*"
+  }
+}

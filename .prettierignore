@@ -1,0 +1,14 @@
+node_modules
+dist
+.scratch
+package-lock.json
+**/test/fixtures/**
+
+# 文档与原型 HTML/CSS 是手写「真值」，不交给 prettier 重排（避免无关 diff）
+*.md
+**/*.md
+*.html
+prototype/
+docs/
+briefs/
+src-tauri/

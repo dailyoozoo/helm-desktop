@@ -1,0 +1,124 @@
+/* Helm 设计 token —— 唯一真值，从 prototype/assets/app.css 的 :root 抽取。
+   全局用 var(--…) 引用，不复制色值；改 token 改这里。 */
+:root {
+  /* surfaces — clean light, faint cool tint */
+  --bg: oklch(98.4% 0.0025 265);
+  --surface: oklch(100% 0 0);
+  --surface-2: oklch(96.7% 0.004 265);
+  --hover: oklch(94.4% 0.006 265);
+  --raised: oklch(100% 0 0);
+
+  /* hairlines & lines — dark ink on light */
+  --border: color-mix(in oklch, oklch(45% 0.03 265) 15%, transparent);
+  --border-2: color-mix(in oklch, oklch(45% 0.03 265) 26%, transparent);
+  --line: color-mix(in oklch, oklch(45% 0.03 265) 9%, transparent);
+
+  /* text — cool dark ink */
+  --fg: oklch(24% 0.014 265);
+  --fg-2: oklch(40% 0.013 265);
+  --fg-3: oklch(52% 0.012 265);
+  /* 63% → 58%：提示级文字对比度不足 WCAG AA（≈3.1:1），压深一档（变更-12） */
+  --fg-4: oklch(58% 0.011 265);
+
+  /* accent — electric indigo, action color only (tuned for white text on white bg) */
+  --accent: oklch(55% 0.2 264);
+  --accent-hi: oklch(49% 0.21 264);
+  --accent-soft: color-mix(in oklch, oklch(55% 0.2 264) 11%, transparent);
+  --accent-line: color-mix(in oklch, oklch(55% 0.2 264) 38%, transparent);
+  --on-accent: oklch(99% 0 0);
+
+  /* status — readable as text on light tints */
+  --success: oklch(53% 0.14 156);
+  --warn: oklch(58% 0.13 65);
+  --danger: oklch(55% 0.21 25);
+  --success-soft: color-mix(in oklch, oklch(53% 0.14 156) 12%, transparent);
+  --warn-soft: color-mix(in oklch, oklch(58% 0.13 65) 14%, transparent);
+  --danger-soft: color-mix(in oklch, oklch(55% 0.21 25) 11%, transparent);
+
+  /* diff */
+  --add-bg: color-mix(in oklch, oklch(53% 0.14 156) 11%, transparent);
+  --del-bg: color-mix(in oklch, oklch(55% 0.21 25) 9%, transparent);
+  --add-fg: oklch(45% 0.13 156);
+  --del-fg: oklch(49% 0.19 25);
+
+  /* terminal — intentionally dark in a light app (IDE convention); theme-independent */
+  --term-bg: oklch(20.5% 0.014 265);
+  --term-fg: oklch(91% 0.008 265);
+  --term-dim: oklch(66% 0.012 265);
+  --term-accent: oklch(78% 0.13 264);
+  --term-ok: oklch(80% 0.15 156);
+  --term-line: color-mix(in oklch, white 10%, transparent);
+
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', system-ui, sans-serif;
+  --font-mono:
+    'JetBrains Mono', 'SF Mono', 'Cascadia Code', ui-monospace, 'Segoe UI Mono', Menlo, Consolas,
+    monospace;
+
+  --r-xs: 5px;
+  --r-sm: 7px;
+  --r: 10px;
+  --r-lg: 14px;
+  --r-xl: 20px;
+
+  --rail-w: 56px;
+  --side-w: 282px;
+  --ctx-w: 330px;
+  --titlebar-h: 40px;
+
+  --shadow-pop: 0 14px 40px -12px rgba(22, 24, 46, 0.2), 0 3px 10px -3px rgba(22, 24, 46, 0.1);
+  --shadow-sm: 0 1px 2px rgba(22, 24, 46, 0.1), 0 0 0 1px rgba(22, 24, 46, 0.035);
+}
+
+:root[data-theme='dark'] {
+  --bg: oklch(20% 0.012 265);
+  --surface: oklch(24% 0.013 265);
+  --surface-2: oklch(28% 0.014 265);
+  --hover: oklch(32% 0.015 265);
+  --raised: oklch(25% 0.014 265);
+
+  --border: color-mix(in oklch, white 13%, transparent);
+  --border-2: color-mix(in oklch, white 22%, transparent);
+  --line: color-mix(in oklch, white 9%, transparent);
+
+  --fg: oklch(94% 0.006 265);
+  --fg-2: oklch(82% 0.007 265);
+  --fg-3: oklch(66% 0.008 265);
+  --fg-4: oklch(52% 0.009 265);
+
+  --accent-soft: color-mix(in oklch, var(--accent) 18%, transparent);
+  --accent-line: color-mix(in oklch, var(--accent) 46%, transparent);
+
+  --shadow-pop: 0 18px 48px -18px rgba(0, 0, 0, 0.62), 0 3px 14px -4px rgba(0, 0, 0, 0.42);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.38), 0 0 0 1px rgba(255, 255, 255, 0.035);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root[data-theme='system'] {
+    --bg: oklch(20% 0.012 265);
+    --surface: oklch(24% 0.013 265);
+    --surface-2: oklch(28% 0.014 265);
+    --hover: oklch(32% 0.015 265);
+    --raised: oklch(25% 0.014 265);
+
+    --border: color-mix(in oklch, white 13%, transparent);
+    --border-2: color-mix(in oklch, white 22%, transparent);
+    --line: color-mix(in oklch, white 9%, transparent);
+
+    --fg: oklch(94% 0.006 265);
+    --fg-2: oklch(82% 0.007 265);
+    --fg-3: oklch(66% 0.008 265);
+    --fg-4: oklch(52% 0.009 265);
+
+    --accent-soft: color-mix(in oklch, var(--accent) 18%, transparent);
+    --accent-line: color-mix(in oklch, var(--accent) 46%, transparent);
+
+    --shadow-pop: 0 18px 48px -18px rgba(0, 0, 0, 0.62), 0 3px 14px -4px rgba(0, 0, 0, 0.42);
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.38), 0 0 0 1px rgba(255, 255, 255, 0.035);
+  }
+}
+
+:root[data-density='compact'] {
+  --side-w: 258px;
+  --ctx-w: 306px;
+  --titlebar-h: 38px;
+}

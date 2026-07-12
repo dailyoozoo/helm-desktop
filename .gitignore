@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.scratch/
+*.log
+.DS_Store
+.helm-public-repo
+
+# Rust / Tauri 构建产物
+src-tauri/target/
+src-tauri/target-*/
+src-tauri/gen/
