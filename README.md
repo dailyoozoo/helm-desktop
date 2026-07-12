@@ -29,7 +29,7 @@ Helm 不重新实现 Agent，而是负责启动和管理本地 CLI、解析流�
 前置要求：
 
 - Node.js 18+
-- Rust 1.77+
+- Rust 1.85+
 - Claude Code CLI 或 Codex CLI（至少安装一个）
 
 安装依赖并启动开发模式：
