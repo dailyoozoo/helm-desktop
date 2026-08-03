@@ -23,7 +23,9 @@ fn app_settings_use_defaults_when_missing() {
     let settings = load_app_settings_from_store(&store).unwrap();
 
     assert_eq!(settings.engines.default_engine, "claude-code");
-    assert!(settings.general.confirm_before_command);
+    assert!(settings.general.pricing_auto_update);
+    assert_eq!(settings.general.pricing_unknown_policy, "warn");
+    assert_eq!(settings.general.pricing_max_age_days, 30);
 }
 
 #[test]
@@ -34,8 +36,12 @@ fn app_settings_round_trip_through_sqlite_setting_table() {
     settings.general.workspace_name = "真实设置工作区".to_string();
     settings.general.default_directory = "D:\\work\\helm".to_string();
     settings.engines.default_engine = "codex".to_string();
-    settings.permissions.run_commands = "deny".to_string();
     settings.appearance.theme = "dark".to_string();
+    settings.general.pricing_feed_urls = vec![
+        "https://oss.example.cn/helm/pricing-catalog.json".to_string(),
+        "https://cos.example.cn/helm/pricing-catalog.json".to_string(),
+    ];
+    settings.general.pricing_unknown_policy = "block".to_string();
 
     save_app_settings_to_store(&store, settings.clone()).unwrap();
 
@@ -43,8 +49,9 @@ fn app_settings_round_trip_through_sqlite_setting_table() {
     assert_eq!(loaded.general.workspace_name, "真实设置工作区");
     assert_eq!(loaded.general.default_directory, "D:\\work\\helm");
     assert_eq!(loaded.engines.default_engine, "codex");
-    assert_eq!(loaded.permissions.run_commands, "deny");
     assert_eq!(loaded.appearance.theme, "dark");
+    assert_eq!(loaded.general.pricing_feed_urls.len(), 2);
+    assert_eq!(loaded.general.pricing_unknown_policy, "block");
 
     let conn = rusqlite::Connection::open(path).unwrap();
     let raw: String = conn

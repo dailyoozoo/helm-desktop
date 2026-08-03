@@ -1,16 +1,28 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Icon, type IconName } from '../shell/icons';
 import { showResultToast } from '../components/toast';
+import { ConfirmDialog } from '../components/ConfirmDialog';
 import { useDialogBehavior } from '../components/useDialogBehavior';
+import type { ReasoningEffort } from '@helm/protocol';
+import { useReasoningEffortCapability } from '../engine/useReasoningEffortCapability';
+import { normalizeReasoningEffort, reasoningEffortLabel } from '../reasoning';
 import {
   deleteProviderConfig,
   detectCliLogin,
   getEquivalentEnv,
+  listModelPriceOverrides,
+  getProviderPricingPreference,
   getProviderConfig,
+  loginCliAccount,
+  logoutCliAccount,
   readEngineConfigFile,
   revealProviderSecret,
   saveBindingConfig,
   saveModelConfig,
+  saveProviderModelSelection,
+  saveModelPriceOverride,
+  deleteModelPriceOverride,
+  saveProviderPricingPreference,
   saveProviderConfig,
   syncProviderModels,
   testEngineConfig,
@@ -22,28 +34,42 @@ import {
   type ConnectionResult,
   type EngineConfig,
   type EngineConfigFile,
+  type ModelConfig,
+  type ProviderPricingPreference,
   type ProviderAuthMethod,
   type ProviderConfig,
   type ProviderProtocol,
 } from './api';
 import {
   AUTH_METHOD_LABELS,
+  bindingForEngine,
   PROVIDER_TEMPLATES,
   applicableEngineLabels,
+  canBindProvider,
   compatibleProvidersForEngine,
   createProviderDraft,
   envPairsToText,
+  failureCategoryLabel,
   lastTestText,
   lastTestTimeText,
+  loginStateLabel,
+  matchingSubscriptionProvider,
   modelCatalog,
   modelCatalogForProvider,
   modelsForProvider,
   normalizeBindingDraft,
   priceSourceText,
   providerDeleteConfirmation,
+  providerDeleteBlockedReason,
+  providerCapabilities,
+  providerCanDelete,
+  providerFailureCategory,
   providerModelEmptyState,
+  providerSetupCopy,
   protocolLabel,
+  reachabilityStatus,
   readinessText,
+  subscriptionLoginWarning,
   type ProviderTemplateId,
 } from './providerViewModel';
 import './providers.css';
@@ -104,10 +130,6 @@ function errorMessage(err: unknown, fallback: string) {
   return fallback;
 }
 
-function bindingForEngine(config: AppConfig, engineId: string) {
-  return config.bindings.find((binding) => binding.engineId === engineId);
-}
-
 export function ProvidersPage() {
   const [tab, setTab] = useState<Tab>('bindings');
   const [config, setConfig] = useState<AppConfig>(emptyConfig);
@@ -153,7 +175,7 @@ export function ProvidersPage() {
           <div>
             <div className="page__title">服务商与模型</div>
             <div className="page__sub">
-              配置 API 服务商、管理各自的模型目录，并为每个 CLI 引擎绑定生效的服务商与模型。
+              使用 Claude / ChatGPT 订阅，或配置 API 服务商，并为每个 CLI 引擎绑定生效模型。
             </div>
           </div>
           <button className="btn btn--primary" onClick={() => setAddProviderOpen(true)}>
@@ -211,16 +233,20 @@ export function ProvidersPage() {
         </div>
         {addProviderOpen ? (
           <AddProviderModal
+            providers={config.providers}
             onClose={() => setAddProviderOpen(false)}
-            onCreate={(templateId) => {
-              const provider = createProviderDraft(templateId);
-              void saveProviderConfig(provider)
+            onCreate={(provider, apiKey) => {
+              void saveProviderConfig(provider, apiKey)
                 .then((next) => {
                   setConfig(next);
                   setActiveProviderId(provider.id);
                   setTab('providers');
                   setAddProviderOpen(false);
-                  notify('已创建服务商草稿，下一步填写密钥并测试可达性');
+                  notify(
+                    provider.kind === 'subscription'
+                      ? '订阅接入已创建，请检测或登录账号后选择模型'
+                      : '服务商已创建，下一步测试可达性并同步模型',
+                  );
                 })
                 .catch((err: unknown) => notify(errorMessage(err, '创建服务商失败')));
             }}
@@ -234,13 +260,28 @@ export function ProvidersPage() {
 function AddProviderModal({
   onClose,
   onCreate,
+  providers,
 }: {
   onClose: () => void;
-  onCreate: (templateId: ProviderTemplateId) => void;
+  onCreate: (provider: ProviderConfig, apiKey?: string) => void;
+  providers: ProviderConfig[];
 }) {
   const dialogRef = useDialogBehavior(onClose);
   const [selected, setSelected] = useState<ProviderTemplateId>(PROVIDER_TEMPLATES[0].id);
+  const [name, setName] = useState(PROVIDER_TEMPLATES[0].name);
+  const [baseUrl, setBaseUrl] = useState(PROVIDER_TEMPLATES[0].baseUrl);
+  const [apiKey, setApiKey] = useState('');
   const template = PROVIDER_TEMPLATES.find((item) => item.id === selected) ?? PROVIDER_TEMPLATES[0];
+  const needsApiKey = template.authMethod === 'apikey';
+  const existingSubscription =
+    template.kind === 'subscription'
+      ? matchingSubscriptionProvider(providers, template.protocol)
+      : undefined;
+  const readyToCreate =
+    Boolean(name.trim()) &&
+    !existingSubscription &&
+    (template.kind === 'subscription' || Boolean(baseUrl.trim())) &&
+    (!needsApiKey || Boolean(apiKey.trim()));
 
   return (
     <div
@@ -261,7 +302,12 @@ function AddProviderModal({
               <button
                 key={item.id}
                 className={'provider-template' + (selected === item.id ? ' is-active' : '')}
-                onClick={() => setSelected(item.id)}
+                onClick={() => {
+                  setSelected(item.id);
+                  setName(item.name);
+                  setBaseUrl(item.baseUrl);
+                  setApiKey('');
+                }}
                 type="button"
               >
                 <span className="provider-template__ic">
@@ -274,12 +320,42 @@ function AddProviderModal({
               </button>
             ))}
           </div>
+          <label className="field">
+            <span>显示名称</span>
+            <input
+              className="input"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+            />
+          </label>
+          {template.kind !== 'subscription' ? (
+            <label className="field">
+              <span>Base URL</span>
+              <input
+                className="input mono"
+                value={baseUrl}
+                onChange={(event) => setBaseUrl(event.target.value)}
+              />
+            </label>
+          ) : null}
+          {needsApiKey ? (
+            <label className="field">
+              <span>API 密钥</span>
+              <input
+                className="input mono"
+                type="password"
+                value={apiKey}
+                onChange={(event) => setApiKey(event.target.value)}
+                placeholder="保存到系统钥匙串"
+              />
+            </label>
+          ) : null}
           <div className="providers-next-box">
             <b>创建后下一步</b>
             <span>
-              {template.authMethod === 'local'
-                ? '确认基础 URL 后测试可达性，再同步模型目录。'
-                : '填写基础 URL 和 API 密钥，保存后测试可达性，再同步模型目录。'}
+              {existingSubscription
+                ? `同协议订阅「${existingSubscription.name}」已存在，请关闭弹窗后直接复用。`
+                : providerSetupCopy(template).nextStep}
             </span>
           </div>
         </div>
@@ -287,8 +363,23 @@ function AddProviderModal({
           <button className="btn btn--subtle" onClick={onClose} type="button">
             取消
           </button>
-          <button className="btn btn--primary" onClick={() => onCreate(selected)} type="button">
-            创建草稿
+          <button
+            className="btn btn--primary"
+            disabled={!readyToCreate}
+            onClick={() => {
+              const provider = createProviderDraft(selected);
+              onCreate(
+                {
+                  ...provider,
+                  name: name.trim(),
+                  baseUrl: template.kind === 'subscription' ? '' : baseUrl.trim(),
+                },
+                apiKey.trim() || undefined,
+              );
+            }}
+            type="button"
+          >
+            保存并继续
           </button>
         </div>
       </div>
@@ -304,55 +395,9 @@ function EmptyProvidersPrompt() {
       </span>
       <div>
         <h2>还没有服务商</h2>
-        <p>先添加一个服务商，填写接口规范、认证方式、基础 URL 和 API 密钥。</p>
+        <p>添加 Claude / ChatGPT 订阅，或接入一个 API 服务商、本地模型服务。</p>
       </div>
     </section>
-  );
-}
-
-function ConfirmDialog({
-  title,
-  body,
-  confirmLabel,
-  danger,
-  onCancel,
-  onConfirm,
-}: {
-  title: string;
-  body: string;
-  confirmLabel: string;
-  danger?: boolean;
-  onCancel: () => void;
-  onConfirm: () => void;
-}) {
-  const dialogRef = useDialogBehavior(onCancel);
-  return (
-    <div
-      className="pv-modal-overlay open"
-      role="dialog"
-      aria-modal="true"
-      aria-label={title}
-      onClick={(event) => event.target === event.currentTarget && onCancel()}
-    >
-      <div className="pv-modal card providers-confirm-modal" ref={dialogRef} tabIndex={-1}>
-        <div className="pv-modal__hd">
-          {title}
-          <small>{body}</small>
-        </div>
-        <div className="pv-modal__ft">
-          <button className="btn btn--subtle" onClick={onCancel} type="button">
-            取消
-          </button>
-          <button
-            className={danger ? 'btn btn--danger' : 'btn btn--primary'}
-            onClick={onConfirm}
-            type="button"
-          >
-            {confirmLabel}
-          </button>
-        </div>
-      </div>
-    </div>
   );
 }
 
@@ -407,7 +452,7 @@ function EngineBindingCard({
   onEdit: () => void;
   onNotice: (message: string | null) => void;
 }) {
-  const binding = bindingForEngine(config, engine.id);
+  const binding = bindingForEngine(config, engine);
   const provider = config.providers.find((item) => item.id === binding?.providerId);
   const [envText, setEnvText] = useState('');
   const [configFile, setConfigFile] = useState<EngineConfigFile | null>(null);
@@ -592,23 +637,45 @@ function BindingModal({
   onConfig: (config: AppConfig) => void;
   onNotice: (message: string | null) => void;
 }) {
-  const dialogRef = useDialogBehavior(onClose);
   const providers = compatibleProvidersForEngine(config, engine.id);
-  const current = bindingForEngine(config, engine.id);
+  const current = bindingForEngine(config, engine);
   const initialProviderId = current?.providerId ?? providers[0]?.id ?? '';
   const initialBinding = normalizeBindingDraft(config, {
     engineId: engine.id,
     providerId: initialProviderId,
     primaryModel: current?.primaryModel ?? '',
     fastModel: current?.fastModel ?? null,
+    reasoningEffort: current?.reasoningEffort ?? 'auto',
   });
   const [providerId, setProviderId] = useState(initialBinding.providerId);
   const models = modelsForProvider(config, providerId);
   const [primaryModel, setPrimaryModel] = useState(initialBinding.primaryModel);
   const [fastModel, setFastModel] = useState(initialBinding.fastModel ?? '');
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>(
+    initialBinding.reasoningEffort ?? 'auto',
+  );
   const [envText, setEnvText] = useState('');
   const [testingProvider, setTestingProvider] = useState(false);
+  const [syncingSubscriptionModels, setSyncingSubscriptionModels] = useState(false);
+  const [subscriptionModelsRefreshed, setSubscriptionModelsRefreshed] = useState(false);
   const selectedProvider = config.providers.find((provider) => provider.id === providerId);
+  const selectedProviderId = selectedProvider?.id;
+  const selectedProviderKind = selectedProvider?.kind;
+  const {
+    capability: reasoningCapability,
+    loading: reasoningLoading,
+    error: reasoningError,
+  } = useReasoningEffortCapability(engine.id, primaryModel, providerId);
+  const [selectedLogin, setSelectedLogin] = useState<CliLoginState | null>(null);
+  const cancelBindingChange = useCallback(() => {
+    if (subscriptionModelsRefreshed) {
+      onNotice('已取消绑定更改；账号模型刷新结果仍已保存，当前生效绑定没有改变');
+    }
+    onClose();
+  }, [onClose, onNotice, subscriptionModelsRefreshed]);
+  const dialogRef = useDialogBehavior(cancelBindingChange);
+  const loginWarning =
+    selectedProvider?.kind === 'subscription' ? subscriptionLoginWarning(selectedLogin) : null;
 
   useEffect(() => {
     const normalized = normalizeBindingDraft(config, {
@@ -616,6 +683,7 @@ function BindingModal({
       providerId,
       primaryModel,
       fastModel: fastModel || null,
+      reasoningEffort,
     });
     if (normalized.primaryModel !== primaryModel) {
       setPrimaryModel(normalized.primaryModel);
@@ -623,7 +691,17 @@ function BindingModal({
     if ((normalized.fastModel ?? '') !== fastModel) {
       setFastModel(normalized.fastModel ?? '');
     }
-  }, [config, engine.id, fastModel, primaryModel, providerId]);
+  }, [config, engine.id, fastModel, primaryModel, providerId, reasoningEffort]);
+
+  useEffect(() => {
+    if (reasoningLoading) return;
+    if (reasoningCapability) {
+      const normalized = normalizeReasoningEffort(reasoningCapability, reasoningEffort);
+      if (normalized !== reasoningEffort) setReasoningEffort(normalized);
+    } else if (reasoningError && reasoningEffort !== 'auto') {
+      setReasoningEffort('auto');
+    }
+  }, [reasoningCapability, reasoningEffort, reasoningError, reasoningLoading]);
 
   useEffect(() => {
     let live = true;
@@ -636,6 +714,7 @@ function BindingModal({
       providerId,
       primaryModel,
       fastModel: fastModel || null,
+      reasoningEffort,
     };
     getEquivalentEnv(binding)
       .then((pairs) => {
@@ -647,7 +726,51 @@ function BindingModal({
     return () => {
       live = false;
     };
-  }, [engine.id, fastModel, primaryModel, providerId]);
+  }, [engine.id, fastModel, primaryModel, providerId, reasoningEffort]);
+
+  useEffect(() => {
+    let live = true;
+    if (selectedProviderKind !== 'subscription') {
+      setSelectedLogin(null);
+      return;
+    }
+    setSelectedLogin(null);
+    detectCliLogin(engine.id)
+      .then(async (state) => {
+        if (live) setSelectedLogin(state);
+        if (
+          live &&
+          state.state === 'ok' &&
+          state.authMethod === 'subscription' &&
+          selectedProviderId
+        ) {
+          setSyncingSubscriptionModels(true);
+          try {
+            const next = await syncProviderModels(selectedProviderId);
+            if (live) {
+              onConfig(next);
+              setSubscriptionModelsRefreshed(true);
+            }
+          } catch (err: unknown) {
+            if (live) onNotice(errorMessage(err, '读取订阅账号模型失败'));
+          } finally {
+            if (live) setSyncingSubscriptionModels(false);
+          }
+        }
+      })
+      .catch((err: unknown) => {
+        if (live) {
+          setSelectedLogin({
+            state: 'unknown',
+            authMethod: 'unknown',
+            detail: errorMessage(err, '检测登录态失败'),
+          });
+        }
+      });
+    return () => {
+      live = false;
+    };
+  }, [engine.id, onConfig, onNotice, selectedProviderId, selectedProviderKind]);
 
   return (
     <div
@@ -655,7 +778,7 @@ function BindingModal({
       role="dialog"
       aria-modal="true"
       aria-label={`更改 ${engine.name} 绑定`}
-      onClick={(event) => event.target === event.currentTarget && onClose()}
+      onClick={(event) => event.target === event.currentTarget && cancelBindingChange()}
     >
       <div className="pv-modal card" ref={dialogRef} tabIndex={-1}>
         <div className="pv-modal__hd">
@@ -675,6 +798,7 @@ function BindingModal({
                   providerId: nextProviderId,
                   primaryModel,
                   fastModel: fastModel || null,
+                  reasoningEffort,
                 });
                 setProviderId(nextProviderId);
                 setPrimaryModel(normalized.primaryModel);
@@ -683,7 +807,8 @@ function BindingModal({
             >
               {providers.map((provider) => (
                 <option key={provider.id} value={provider.id}>
-                  {provider.name} - {protocolLabel(provider.protocol)}
+                  {provider.name} - {protocolLabel(provider.protocol)} ·{' '}
+                  {modelsForProvider(config, provider.id).length} 个模型
                 </option>
               ))}
             </select>
@@ -691,30 +816,62 @@ function BindingModal({
           {selectedProvider ? (
             <div className="reachability-box">
               <div>
-                <b>{lastTestText(selectedProvider)}</b>
-                <small>可达性 · {lastTestTimeText(selectedProvider)}</small>
+                <b>
+                  {selectedProvider.kind === 'subscription'
+                    ? loginStateLabel(selectedLogin)
+                    : lastTestText(selectedProvider)}
+                </b>
+                <small>
+                  {selectedProvider.kind === 'subscription'
+                    ? (selectedLogin?.detail ?? '正在检测 Helm 独立订阅登录状态')
+                    : `可达性 · ${lastTestTimeText(selectedProvider)}`}
+                </small>
               </div>
               <button
                 className="btn btn--subtle btn--sm"
-                disabled={testingProvider}
+                disabled={testingProvider || syncingSubscriptionModels}
                 onClick={() => {
                   setTestingProvider(true);
-                  void testProviderConfig(selectedProvider.id)
-                    .then((result) => {
-                      onNotice(result.ok ? null : result.message);
-                      return getProviderConfig();
-                    })
-                    .then(onConfig)
+                  const action =
+                    selectedProvider.kind === 'subscription'
+                      ? detectCliLogin(engine.id).then(async (state) => {
+                          setSelectedLogin(state);
+                          if (state.state !== 'ok' || state.authMethod !== 'subscription') {
+                            onNotice(state.detail);
+                            return;
+                          }
+                          setSyncingSubscriptionModels(true);
+                          try {
+                            onConfig(await syncProviderModels(selectedProvider.id));
+                            setSubscriptionModelsRefreshed(true);
+                            onNotice('账号模型已保存；请选择模型并保存绑定后才会切换生效服务商');
+                          } finally {
+                            setSyncingSubscriptionModels(false);
+                          }
+                        })
+                      : testProviderConfig(selectedProvider.id).then((result) => {
+                          onNotice(result.ok ? null : result.message);
+                          return getProviderConfig().then(onConfig);
+                        });
+                  void action
                     .catch((err: unknown) => onNotice(errorMessage(err, '测试可达性失败')))
                     .finally(() => setTestingProvider(false));
                 }}
               >
                 <Icon name="refresh" className={testingProvider ? 'spin' : undefined} />
-                测试可达性
+                {selectedProvider.kind === 'subscription'
+                  ? syncingSubscriptionModels
+                    ? '读取账号模型…'
+                    : '检测并刷新模型'
+                  : '测试可达性'}
               </button>
             </div>
           ) : null}
-          {selectedProvider && selectedProvider.lastTest?.result !== 'ok' ? (
+          {loginWarning ? (
+            <div className="providers-warning">{loginWarning}</div>
+          ) : selectedProvider &&
+            selectedProvider.kind !== 'subscription' &&
+            selectedProvider.lastTest?.result !== 'ok' ? (
             <div className="providers-warning">
               {selectedProvider.lastTest
                 ? '上次可达性测试失败，保存后建议先验证。'
@@ -731,7 +888,9 @@ function BindingModal({
               >
                 {models.map((model) => (
                   <option key={`${model.providerId}:${model.id}`} value={model.id}>
-                    {model.id}
+                    {model.displayName && model.displayName !== model.id
+                      ? `${model.displayName} · ${model.id}`
+                      : model.id}
                   </option>
                 ))}
               </select>
@@ -745,42 +904,79 @@ function BindingModal({
               >
                 {models.map((model) => (
                   <option key={`${model.providerId}:${model.id}`} value={model.id}>
-                    {model.id}
+                    {model.displayName && model.displayName !== model.id
+                      ? `${model.displayName} · ${model.id}`
+                      : model.id}
                   </option>
                 ))}
               </select>
+            </label>
+            <label className="field">
+              <span>新会话默认推理强度</span>
+              <select
+                className="select"
+                value={reasoningEffort}
+                disabled={reasoningLoading}
+                onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}
+              >
+                {(reasoningCapability?.options ?? ['auto']).map((effort) => (
+                  <option key={effort} value={effort}>
+                    {reasoningEffortLabel(effort)}
+                    {effort !== 'auto' && effort === reasoningCapability?.defaultEffort
+                      ? '（模型默认）'
+                      : ''}
+                  </option>
+                ))}
+              </select>
+              <small>
+                {reasoningLoading
+                  ? '正在读取 CLI 模型能力…'
+                  : reasoningError
+                    ? '未能确认可调档位，将使用模型默认值'
+                    : '仅影响主模型；快速模型继续使用自身默认值'}
+              </small>
             </label>
           </div>
           <pre className="env">{envText}</pre>
         </div>
         <div className="pv-modal__ft">
-          <button className="btn btn--subtle" onClick={onClose}>
+          <button className="btn btn--subtle" onClick={cancelBindingChange}>
             取消
           </button>
           <button
             className="btn btn--primary"
-            disabled={!providerId || !primaryModel}
+            disabled={
+              !selectedProvider ||
+              !providerId ||
+              !primaryModel ||
+              reasoningLoading ||
+              !canBindProvider(selectedProvider, selectedLogin, models.length)
+            }
             onClick={() => {
               const binding = normalizeBindingDraft(config, {
                 engineId: engine.id,
                 providerId,
                 primaryModel,
                 fastModel: fastModel || null,
+                reasoningEffort,
               });
               void saveBindingConfig(binding)
                 .then((next) => {
                   onConfig(next);
                   onNotice(
-                    selectedProvider?.lastTest?.result === 'ok'
-                      ? `${engine.name} 的绑定已保存`
-                      : `${engine.name} 的绑定已保存；建议先测试可达性`,
+                    selectedProvider?.kind === 'subscription'
+                      ? `${engine.name} 的订阅绑定已保存`
+                      : selectedProvider?.lastTest?.result === 'ok'
+                        ? `${engine.name} 的绑定已保存`
+                        : `${engine.name} 的绑定已保存；建议先测试可达性`,
                   );
                   onClose();
                 })
                 .catch((err: unknown) => onNotice(errorMessage(err, '保存绑定失败')));
             }}
           >
-            保存绑定
+            <Icon name="check" />
+            保存并启用绑定
           </button>
         </div>
       </div>
@@ -810,6 +1006,9 @@ function ProvidersPanel({
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<ConnectionResult | undefined>();
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [modelDrafts, setModelDrafts] = useState(() =>
+    modelCatalogForProvider(config, activeProvider.id),
+  );
 
   useEffect(() => {
     setDraft(activeProvider);
@@ -819,9 +1018,14 @@ function ProvidersPanel({
     setTestResult(undefined);
   }, [activeProvider]);
 
+  useEffect(() => {
+    setModelDrafts(modelCatalogForProvider(config, activeProvider.id));
+  }, [activeProvider.id, config]);
+
   const keyValue = apiKey || (!editingKey && draft.keyRef ? '••••••••••••••••••••' : '');
-  const providerModels = modelCatalogForProvider(config, draft.id);
+  const providerModels = modelDrafts;
   const usableEngines = applicableEngineLabels(draft.protocol);
+  const capabilities = providerCapabilities(draft);
   const markSecretMissing = () => {
     setDraft({ ...draft, keyRef: null });
     setApiKey('');
@@ -839,7 +1043,15 @@ function ProvidersPanel({
     void saveProviderConfig(draft, apiKey)
       .then((next) => {
         onConfig(next);
-        onNotice('服务商配置已保存');
+        return saveProviderModelSelection(
+          draft.id,
+          modelDrafts.filter((model) => model.enabled).map((model) => model.id),
+        );
+      })
+      .then((next) => {
+        onConfig(next);
+        setModelDrafts(modelCatalogForProvider(next, draft.id));
+        onNotice('服务商与启用模型已保存；当前引擎绑定未改变');
         setApiKey('');
         setShowKey(false);
         setEditingKey(false);
@@ -882,33 +1094,65 @@ function ProvidersPanel({
       })
       .finally(() => setTesting(false));
   };
+  const repairProviderFailure = () => {
+    const category = providerFailureCategory(draft);
+    if (category === 'auth') {
+      setShowKey(true);
+      setEditingKey(true);
+      requestAnimationFrame(() =>
+        document.querySelector<HTMLInputElement>('[data-provider-field="api-key"]')?.focus(),
+      );
+      return;
+    }
+    if (category === 'network') {
+      document.querySelector<HTMLInputElement>('[data-provider-field="base-url"]')?.focus();
+      return;
+    }
+    testProvider();
+  };
   const providerModelCount = config.models.filter((model) => model.providerId === draft.id).length;
   const providerBindingCount = config.bindings.filter(
     (binding) => binding.providerId === draft.id,
   ).length;
+  const deleteBlockedReason = providerDeleteBlockedReason(providerBindingCount);
   const deleteCopy = providerDeleteConfirmation(draft, providerModelCount, providerBindingCount);
 
   return (
     <div className="providers-split">
       <div className="provider-list">
-        {config.providers.map((provider) => (
-          <button
-            key={provider.id}
-            className={'provider-item' + (provider.id === activeProvider.id ? ' is-active' : '')}
-            onClick={() => onSelect(provider.id)}
-          >
-            <span className="provider-item__ic">
-              <Icon name={providerIcon(provider.id)} />
-            </span>
-            <span className="provider-item__m">
-              <b>{provider.name}</b>
-              <small>
-                {protocolLabel(provider.protocol)} · {readinessText(provider)}
-              </small>
-            </span>
-            <span className={'dot ' + (provider.ready ? 'dot--on' : 'dot--off')} />
-          </button>
-        ))}
+        {config.providers.map((provider) => {
+          const rStatus = reachabilityStatus(provider);
+          return (
+            <button
+              key={provider.id}
+              className={'provider-item' + (provider.id === activeProvider.id ? ' is-active' : '')}
+              onClick={() => onSelect(provider.id)}
+            >
+              <span className="provider-item__ic">
+                <Icon name={providerIcon(provider.id)} />
+              </span>
+              <span className="provider-item__m">
+                <b>{provider.name}</b>
+                <small>
+                  {protocolLabel(provider.protocol)} · {readinessText(provider)}
+                </small>
+              </span>
+              <span
+                className={
+                  'dot ' +
+                  (rStatus === 'reachable'
+                    ? 'dot--on'
+                    : rStatus === 'unreachable'
+                      ? 'dot--fail'
+                      : 'dot--off')
+                }
+                title={
+                  rStatus === 'reachable' ? '可达' : rStatus === 'unreachable' ? '不可达' : '未测试'
+                }
+              />
+            </button>
+          );
+        })}
       </div>
 
       <section className="provider-detail card card--pad">
@@ -921,7 +1165,11 @@ function ProvidersPanel({
               {draft.name}
               <span className="pill pill--proto">{protocolLabel(draft.protocol)}</span>
             </h2>
-            <div className="muted">密钥仅写入操作系统钥匙串，配置文件只保存 keyRef。</div>
+            <div className="muted">
+              {draft.kind === 'subscription'
+                ? '订阅凭证由 Helm 独立 CLI Profile 管理，不影响其他终端工具。'
+                : '密钥仅写入操作系统钥匙串，配置文件只保存 keyRef。'}
+            </div>
           </div>
           <span className={'pill ' + (draft.ready ? 'pill--success' : '')}>
             {readinessText(draft)}
@@ -937,51 +1185,67 @@ function ProvidersPanel({
               onChange={(event) => setDraft({ ...draft, name: event.target.value })}
             />
           </label>
-          <label className="field">
-            <span>接口规范</span>
-            <select
-              className="select"
-              value={draft.protocol}
-              onChange={(event) =>
-                setDraft({ ...draft, protocol: event.target.value as ProviderProtocol })
-              }
-            >
-              {PROTOCOLS.map((protocol) => (
-                <option key={protocol} value={protocol}>
-                  {protocolLabel(protocol)}
-                </option>
-              ))}
-            </select>
-            <div className="hint">
-              决定哪些引擎能使用它 · 当前可用于：
-              {usableEngines.length ? usableEngines.join('、') : '暂无兼容引擎'}
+          {draft.kind === 'subscription' ? (
+            <div className="field pv-account-source">
+              <span>接入方式</span>
+              <b>{draft.protocol === 'anthropic' ? 'Claude 官方订阅' : 'ChatGPT 官方订阅'}</b>
+              <div className="hint">
+                固定用于：{usableEngines.length ? usableEngines.join('、') : '暂无兼容引擎'}；
+                官方地址和认证方式不可在这里修改。
+              </div>
             </div>
-          </label>
-          <label className="field">
-            <span>认证方式</span>
-            <select
-              className="select"
-              value={draft.authMethod}
-              onChange={(event) =>
-                setDraft({ ...draft, authMethod: event.target.value as ProviderAuthMethod })
-              }
-            >
-              {AUTH_METHODS.map((method) => (
-                <option key={method} value={method}>
-                  {AUTH_METHOD_LABELS[method]}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="field">
-            <span>基础 URL</span>
-            <input
-              className="input mono"
-              value={draft.baseUrl}
-              disabled={draft.authMethod === 'cloud'}
-              onChange={(event) => setDraft({ ...draft, baseUrl: event.target.value })}
-            />
-          </label>
+          ) : (
+            <>
+              <label className="field">
+                <span>接口规范</span>
+                <select
+                  className="select"
+                  value={draft.protocol}
+                  onChange={(event) =>
+                    setDraft({ ...draft, protocol: event.target.value as ProviderProtocol })
+                  }
+                >
+                  {PROTOCOLS.map((protocol) => (
+                    <option key={protocol} value={protocol}>
+                      {protocolLabel(protocol)}
+                    </option>
+                  ))}
+                </select>
+                <div className="hint">
+                  决定哪些引擎能使用它 · 当前可用于：
+                  {usableEngines.length ? usableEngines.join('、') : '暂无兼容引擎'}
+                </div>
+              </label>
+              <label className="field">
+                <span>认证方式</span>
+                <select
+                  className="select"
+                  value={draft.authMethod}
+                  onChange={(event) =>
+                    setDraft({ ...draft, authMethod: event.target.value as ProviderAuthMethod })
+                  }
+                >
+                  {AUTH_METHODS.filter((method) => method !== 'oauth').map((method) => (
+                    <option key={method} value={method}>
+                      {AUTH_METHOD_LABELS[method]}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {capabilities.showBaseUrl ? (
+                <label className="field">
+                  <span>基础 URL</span>
+                  <input
+                    data-provider-field="base-url"
+                    className="input mono"
+                    value={draft.baseUrl}
+                    disabled={draft.authMethod === 'cloud'}
+                    onChange={(event) => setDraft({ ...draft, baseUrl: event.target.value })}
+                  />
+                </label>
+              ) : null}
+            </>
+          )}
         </div>
         <AuthFields
           draft={draft}
@@ -994,48 +1258,92 @@ function ProvidersPanel({
           onShowKey={setShowKey}
           onEditingKey={setEditingKey}
           onSecretMissing={markSecretMissing}
+          onConfig={onConfig}
           onNotice={onNotice}
         />
-        <div className="stat-3">
-          <div className="ministat">
-            <b>{readinessText(draft)}</b>
-            <small>配置状态</small>
+        {draft.kind !== 'subscription' ? (
+          <div className="stat-3">
+            <div className="ministat">
+              <b>{readinessText(draft)}</b>
+              <small>配置状态</small>
+            </div>
+            <div className="ministat">
+              <b>{lastTestText(draft)}</b>
+              <small>上次测试</small>
+            </div>
+            <div className="ministat">
+              <b>{lastTestTimeText(draft)}</b>
+              <small>测试时间</small>
+            </div>
           </div>
-          <div className="ministat">
-            <b>{lastTestText(draft)}</b>
-            <small>上次测试</small>
-          </div>
-          <div className="ministat">
-            <b>{lastTestTimeText(draft)}</b>
-            <small>测试时间</small>
-          </div>
-        </div>
+        ) : null}
+        {draft.kind !== 'subscription'
+          ? (() => {
+              const failCat = providerFailureCategory(draft);
+              if (!failCat) return null;
+              return (
+                <div className="failure-category-bar">
+                  <span className={'failure-tag failure-tag--' + failCat}>
+                    {failureCategoryLabel(failCat)}
+                  </span>
+                  <span className="failure-category-bar__text">
+                    {failCat === 'network' && '无法连接到服务商，请检查网络和基础 URL。'}
+                    {failCat === 'auth' && '认证失败，请检查 API 密钥是否正确。'}
+                    {failCat === 'timeout' && '连接超时，请检查网络状况或服务商状态。'}
+                    {failCat === 'unknown' && '未知错误，请查看详情后尝试修复。'}
+                  </span>
+                  <button
+                    className="btn btn--subtle btn--sm"
+                    onClick={repairProviderFailure}
+                    disabled={testing}
+                    type="button"
+                  >
+                    <Icon name="refresh" className={testing ? 'spin' : undefined} />
+                    去修复
+                  </button>
+                </div>
+              );
+            })()
+          : null}
         <ProviderModelCatalog
           config={config}
           provider={draft}
           models={providerModels}
           onConfig={onConfig}
+          onModelsChange={setModelDrafts}
           onNotice={onNotice}
           onRequestSave={saveProvider}
           onRequestTest={testProvider}
         />
-        <div className="hint">{resultLabel(testResult) ?? '测试可达性会调用真实服务商接口。'}</div>
+        <div className="hint">
+          {draft.kind === 'subscription'
+            ? '订阅模式只验证 Helm 独立 CLI Profile，不调用 Provider HTTP 接口。'
+            : (resultLabel(testResult) ?? '测试可达性会调用真实服务商接口。')}
+        </div>
         <div className="provider-actions">
           <button
             className="btn btn--danger"
-            disabled={config.providers.length <= 1}
-            onClick={() => setConfirmDelete(true)}
+            onClick={() => {
+              if (!providerCanDelete(providerBindingCount)) {
+                onNotice(deleteBlockedReason);
+                return;
+              }
+              setConfirmDelete(true);
+            }}
+            title={deleteBlockedReason ?? undefined}
           >
             移除服务商
           </button>
           <span className="grow" />
-          <button className="btn btn--subtle" disabled={testing} onClick={testProvider}>
-            <Icon name="refresh" className={testing ? 'spin' : undefined} />
-            测试可达性
-          </button>
+          {capabilities.canTestHttp ? (
+            <button className="btn btn--subtle" disabled={testing} onClick={testProvider}>
+              <Icon name="refresh" className={testing ? 'spin' : undefined} />
+              测试可达性
+            </button>
+          ) : null}
           <button className="btn btn--primary" onClick={saveProvider}>
             <Icon name="check" />
-            保存更改
+            保存服务商与模型
           </button>
         </div>
         {confirmDelete ? (
@@ -1069,6 +1377,7 @@ function ProviderModelCatalog({
   provider,
   models,
   onConfig,
+  onModelsChange,
   onNotice,
   onRequestSave,
   onRequestTest,
@@ -1077,18 +1386,34 @@ function ProviderModelCatalog({
   provider: ProviderConfig;
   models: ReturnType<typeof modelCatalogForProvider>;
   onConfig: (config: AppConfig) => void;
+  onModelsChange: (models: ModelConfig[]) => void;
   onNotice: (message: string | null) => void;
   onRequestSave: () => void;
   onRequestTest: () => void;
 }) {
   const [syncing, setSyncing] = useState(false);
+  const [editingPrice, setEditingPrice] = useState<ModelConfig | null>(null);
+  const [preference, setPreference] = useState<ProviderPricingPreference | null>(null);
+  const [savingPreference, setSavingPreference] = useState(false);
   const emptyState = providerModelEmptyState(provider);
+  const capabilities = providerCapabilities(provider);
+  useEffect(() => {
+    let active = true;
+    getProviderPricingPreference(provider.id)
+      .then((value) => active && setPreference(value))
+      .catch(() => active && setPreference(null));
+    return () => {
+      active = false;
+    };
+  }, [provider.id]);
   const syncModels = () => {
     setSyncing(true);
     void syncProviderModels(provider.id)
       .then((next) => {
         onConfig(next);
-        const count = next.models.filter((model) => model.providerId === provider.id).length;
+        const refreshed = modelCatalogForProvider(next, provider.id);
+        onModelsChange(refreshed);
+        const count = refreshed.length;
         onNotice(`模型列表已同步：${count} 个`);
       })
       .catch((err: unknown) => onNotice(errorMessage(err, '同步模型列表失败')))
@@ -1112,15 +1437,79 @@ function ProviderModelCatalog({
         <b>
           模型目录 <span className="faint">（{models.length}）</span>
         </b>
-        <button
-          className="btn btn--subtle btn--sm"
-          disabled={syncing}
-          onClick={syncModels}
-          type="button"
-        >
-          <Icon name="refresh" className={syncing ? 'spin' : undefined} /> 同步模型列表
-        </button>
+        {capabilities.canSyncModels ? (
+          <button
+            className="btn btn--subtle btn--sm"
+            disabled={syncing}
+            onClick={syncModels}
+            type="button"
+          >
+            <Icon name="refresh" className={syncing ? 'spin' : undefined} />
+            {provider.kind === 'subscription' ? '刷新账号模型' : '同步模型列表'}
+          </button>
+        ) : null}
       </div>
+      {provider.kind !== 'subscription' && preference ? (
+        <div className="provider-pricing-policy">
+          <div className="grow">
+            <b>价格策略</b>
+            <small>官方目录只作为估算；手动覆盖始终按服务商 + 模型隔离。</small>
+          </div>
+          <select
+            className="select"
+            value={preference.mode}
+            onChange={(event) =>
+              setPreference({
+                ...preference,
+                mode: event.target.value as ProviderPricingPreference['mode'],
+              })
+            }
+          >
+            <option value="auto">自动：手动 → 服务商 → 官方参考</option>
+            <option value="official-reference">只用官方参考</option>
+            <option value="provider">只用服务商价格</option>
+            <option value="manual">只用手动价格</option>
+            <option value="disabled">不计算价格</option>
+          </select>
+          <label className="provider-pricing-multiplier">
+            倍率
+            <input
+              className="input mono"
+              type="number"
+              min="0.01"
+              max="100"
+              step="0.01"
+              value={preference.multiplierBasisPoints / 10000}
+              onChange={(event) =>
+                setPreference({
+                  ...preference,
+                  multiplierBasisPoints: Math.max(
+                    1,
+                    Math.round(Number(event.target.value || '1') * 10000),
+                  ),
+                })
+              }
+            />
+          </label>
+          <button
+            className="btn btn--subtle btn--sm"
+            disabled={savingPreference}
+            onClick={() => {
+              setSavingPreference(true);
+              void saveProviderPricingPreference(preference)
+                .then(async () => {
+                  onConfig(await getProviderConfig());
+                  onNotice('价格策略已保存');
+                })
+                .catch((error: unknown) => onNotice(errorMessage(error, '保存价格策略失败')))
+                .finally(() => setSavingPreference(false));
+            }}
+            type="button"
+          >
+            保存策略
+          </button>
+        </div>
+      ) : null}
       {models.length ? (
         <div className="provider-model-list">
           {models.map((model) => (
@@ -1132,20 +1521,40 @@ function ProviderModelCatalog({
                 </small>
               </div>
               <span className="model-price">
-                <span className="mono">
-                  {priceText(model.inputPricePerMtok)} / {priceText(model.outputPricePerMtok)}
-                </span>
-                <small>{priceSourceText(model)}</small>
+                {provider.kind === 'subscription' ? (
+                  <>
+                    <span>订阅内</span>
+                    <small>当前账号可用</small>
+                  </>
+                ) : (
+                  <>
+                    <span className="mono">
+                      {priceText(model.inputPricePerMtok)} / {priceText(model.outputPricePerMtok)}
+                    </span>
+                    <small>{priceSourceText(model)}</small>
+                  </>
+                )}
               </span>
+              {provider.kind !== 'subscription' ? (
+                <button
+                  className="btn btn--subtle btn--sm"
+                  onClick={() => setEditingPrice(model)}
+                  type="button"
+                >
+                  定价
+                </button>
+              ) : null}
               <label className="switch">
                 <input
                   type="checkbox"
                   checked={model.enabled}
-                  onChange={() => {
-                    void saveModelConfig({ ...model, enabled: !model.enabled })
-                      .then(onConfig)
-                      .catch((err: unknown) => onNotice(errorMessage(err, '保存模型启用状态失败')));
-                  }}
+                  onChange={() =>
+                    onModelsChange(
+                      models.map((item) =>
+                        item.id === model.id ? { ...item, enabled: !item.enabled } : item,
+                      ),
+                    )
+                  }
                 />
                 <i />
               </label>
@@ -1172,41 +1581,247 @@ function ProviderModelCatalog({
           </button>
         </div>
       )}
+      {editingPrice ? (
+        <ModelPriceModal
+          model={editingPrice}
+          onClose={() => setEditingPrice(null)}
+          onSaved={async (message) => {
+            onConfig(await getProviderConfig());
+            onNotice(message);
+            setEditingPrice(null);
+          }}
+        />
+      ) : null}
     </section>
   );
 }
 
+function ModelPriceModal({
+  model,
+  onClose,
+  onSaved,
+}: {
+  model: ModelConfig;
+  onClose: () => void;
+  onSaved: (message: string) => Promise<void>;
+}) {
+  const dialogRef = useDialogBehavior(onClose);
+  const [input, setInput] = useState(model.inputPricePerMtok || 0);
+  const [cachedInput, setCachedInput] = useState(0);
+  const [cacheWrite, setCacheWrite] = useState(0);
+  const [output, setOutput] = useState(model.outputPricePerMtok || 0);
+  const [saving, setSaving] = useState(false);
+  const [loadingOverride, setLoadingOverride] = useState(true);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    listModelPriceOverrides()
+      .then((overrides) => {
+        if (!active) return;
+        const existing = overrides.find(
+          (item) => item.providerId === model.providerId && item.modelId === model.id,
+        );
+        const band = existing?.tiers.standard?.bands[0];
+        if (band) {
+          setInput(band.input);
+          setCachedInput(band.cachedInput ?? 0);
+          setCacheWrite(band.cacheWrite ?? 0);
+          setOutput(band.output);
+        }
+      })
+      .catch((err: unknown) => {
+        if (active) setSaveError(errorMessage(err, '读取手动价格失败'));
+      })
+      .finally(() => {
+        if (active) setLoadingOverride(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [model.id, model.providerId]);
+
+  const save = () => {
+    if (
+      [input, cachedInput, cacheWrite, output].some((value) => value < 0 || !Number.isFinite(value))
+    ) {
+      setSaveError('价格必须是大于或等于 0 的有效数字');
+      return;
+    }
+    setSaveError(null);
+    setSaving(true);
+    void saveModelPriceOverride({
+      providerId: model.providerId,
+      modelId: model.id,
+      currency: 'USD',
+      updatedAt: 0,
+      tiers: {
+        standard: {
+          bands: [
+            {
+              input,
+              ...(cachedInput > 0 ? { cachedInput } : {}),
+              ...(cacheWrite > 0 ? { cacheWrite } : {}),
+              output,
+            },
+          ],
+        },
+      },
+    })
+      .then(() => onSaved('手动价格已保存'))
+      .catch((err: unknown) => setSaveError(errorMessage(err, '保存手动价格失败')))
+      .finally(() => setSaving(false));
+  };
+
+  return (
+    <div
+      className="pv-modal-overlay open"
+      role="dialog"
+      aria-modal="true"
+      aria-label={`配置 ${model.id} 价格`}
+      onClick={(event) => event.target === event.currentTarget && onClose()}
+    >
+      <div className="pv-modal card provider-price-modal" ref={dialogRef} tabIndex={-1}>
+        <div className="pv-modal__hd">
+          配置模型价格
+          <small>{model.id} · 美元 / 百万 token；手动价格只作用于当前服务商。</small>
+        </div>
+        <div className="pv-modal__bd provider-price-grid">
+          {[
+            ['输入', input, setInput],
+            ['缓存读取', cachedInput, setCachedInput],
+            ['缓存写入', cacheWrite, setCacheWrite],
+            ['输出', output, setOutput],
+          ].map(([label, value, setter]) => (
+            <label className="field" key={label as string}>
+              <span>{label as string}</span>
+              <input
+                className="input mono"
+                type="number"
+                min="0"
+                step="0.001"
+                value={value as number}
+                onChange={(event) =>
+                  (setter as React.Dispatch<React.SetStateAction<number>>)(
+                    Number(event.target.value || '0'),
+                  )
+                }
+              />
+            </label>
+          ))}
+          {saveError ? (
+            <div className="provider-price-error" role="alert">
+              {saveError}
+            </div>
+          ) : null}
+        </div>
+        <div className="pv-modal__ft">
+          <button
+            className="btn btn--subtle"
+            disabled={saving || loadingOverride}
+            onClick={() => {
+              setSaving(true);
+              void deleteModelPriceOverride(model.providerId, model.id)
+                .then(() => onSaved('已恢复自动价格'))
+                .catch((err: unknown) => setSaveError(errorMessage(err, '恢复自动价格失败')))
+                .finally(() => setSaving(false));
+            }}
+            type="button"
+          >
+            恢复自动
+          </button>
+          <span className="grow" />
+          <button className="btn btn--subtle" onClick={onClose} type="button">
+            取消
+          </button>
+          <button
+            className="btn btn--primary"
+            disabled={saving || loadingOverride}
+            onClick={save}
+            type="button"
+          >
+            {loadingOverride ? '读取中…' : '保存价格'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /** 订阅登录一等公民（P3-1）：展示协议对应 CLI 的登录态，并给出登录指引 */
-function SubscriptionLoginCard({ protocol }: { protocol: ProviderProtocol }) {
+function SubscriptionLoginCard({
+  protocol,
+  providerId,
+  onConfig,
+  onNotice,
+}: {
+  protocol: ProviderProtocol;
+  providerId: string;
+  onConfig: (config: AppConfig) => void;
+  onNotice: (message: string | null) => void;
+}) {
   const engine = protocol === 'anthropic' ? 'claude-code' : 'codex';
-  const loginCommand = protocol === 'anthropic' ? 'claude' : 'codex login';
   const [login, setLogin] = useState<CliLoginState | null>(null);
   const [detecting, setDetecting] = useState(false);
+  const [accountAction, setAccountAction] = useState<'login' | 'logout' | null>(null);
+
+  const syncAccountModels = useCallback(
+    async (state: CliLoginState) => {
+      if (state.state !== 'ok' || state.authMethod !== 'subscription') return;
+      try {
+        const next = await syncProviderModels(providerId);
+        onConfig(next);
+        const count = next.models.filter((model) => model.providerId === providerId).length;
+        onNotice(`订阅账号已验证，可用模型已刷新：${count} 个`);
+      } catch (err: unknown) {
+        onNotice(errorMessage(err, '读取订阅账号模型失败'));
+      }
+    },
+    [onConfig, onNotice, providerId],
+  );
 
   const detect = useCallback(async () => {
     setDetecting(true);
     try {
-      setLogin(await detectCliLogin(engine));
+      const state = await detectCliLogin(engine);
+      setLogin(state);
+      await syncAccountModels(state);
     } catch {
       // 浏览器预览无后端；桌面端极少失败，保持「未检测」态可重试
       setLogin(null);
     } finally {
       setDetecting(false);
     }
-  }, [engine]);
+  }, [engine, syncAccountModels]);
 
   useEffect(() => {
     void detect();
   }, [detect]);
 
-  const stateLabel =
-    login?.state === 'ok' ? '已登录' : login?.state === 'missing' ? '未登录' : '无法判断';
+  const stateLabel = loginStateLabel(login);
   const stateClass =
-    login?.state === 'ok'
+    login?.state === 'ok' && login.authMethod === 'subscription'
       ? 'pv-login-pill pv-login-pill--ok'
-      : login?.state === 'missing'
+      : login?.state === 'missing' || login?.state === 'expired'
         ? 'pv-login-pill pv-login-pill--missing'
         : 'pv-login-pill';
+  const runAccountAction = async (action: 'login' | 'logout') => {
+    setAccountAction(action);
+    try {
+      const state =
+        action === 'login' ? await loginCliAccount(engine) : await logoutCliAccount(engine);
+      setLogin(state);
+      if (action === 'login') await syncAccountModels(state);
+    } catch (err: unknown) {
+      setLogin({
+        state: 'unknown',
+        authMethod: 'unknown',
+        detail: errorMessage(err, action === 'login' ? '账号登录失败' : '退出登录失败'),
+      });
+    } finally {
+      setAccountAction(null);
+    }
+  };
 
   return (
     <div className="authcard">
@@ -1218,24 +1833,51 @@ function SubscriptionLoginCard({ protocol }: { protocol: ProviderProtocol }) {
           订阅登录 <span className={stateClass}>{login ? stateLabel : '检测中…'}</span>
         </b>
         <small>
-          会话将复用本机 CLI 的登录态（Claude Pro/Max、ChatGPT 订阅），Helm 不保存凭证。
+          会话使用 Helm 独立 CLI Profile，不修改其他终端工具的登录态。
           {login ? ` ${login.detail}` : ''}
-          {login?.state === 'missing' ? (
-            <>
-              {' '}
-              在终端运行 <code>{loginCommand}</code> 完成登录后重新检测。
-            </>
-          ) : null}
+          {login?.accountLabel ? ` · ${login.accountLabel}` : ''}
+          {login?.plan ? ` · ${login.plan}` : ''}
         </small>
       </div>
-      <button
-        className="btn btn--subtle btn--sm"
-        type="button"
-        disabled={detecting}
-        onClick={() => void detect()}
-      >
-        <Icon name="refresh" /> {detecting ? '检测中…' : '检测登录态'}
-      </button>
+      <div className="pv-account-actions">
+        {login?.state === 'ok' ? (
+          <>
+            <button
+              className="btn btn--subtle btn--sm"
+              type="button"
+              disabled={accountAction !== null}
+              onClick={() => void runAccountAction('login')}
+            >
+              {accountAction === 'login' ? '等待授权…' : '重新登录'}
+            </button>
+            <button
+              className="btn btn--subtle btn--sm"
+              type="button"
+              disabled={accountAction !== null}
+              onClick={() => void runAccountAction('logout')}
+            >
+              {accountAction === 'logout' ? '正在退出…' : '退出'}
+            </button>
+          </>
+        ) : (
+          <button
+            className="btn btn--primary btn--sm"
+            type="button"
+            disabled={accountAction !== null}
+            onClick={() => void runAccountAction('login')}
+          >
+            {accountAction === 'login' ? '等待浏览器授权…' : '登录账号'}
+          </button>
+        )}
+        <button
+          className="btn btn--subtle btn--sm"
+          type="button"
+          disabled={detecting || accountAction !== null}
+          onClick={() => void detect()}
+        >
+          <Icon name="refresh" /> {detecting ? '检测中…' : '重新检测'}
+        </button>
+      </div>
     </div>
   );
 }
@@ -1251,6 +1893,7 @@ function AuthFields({
   onShowKey,
   onEditingKey,
   onSecretMissing,
+  onConfig,
   onNotice,
 }: {
   draft: ProviderConfig;
@@ -1263,10 +1906,18 @@ function AuthFields({
   onShowKey: (value: boolean) => void;
   onEditingKey: (value: boolean) => void;
   onSecretMissing: () => void;
+  onConfig: (config: AppConfig) => void;
   onNotice: (message: string | null) => void;
 }) {
   if (draft.authMethod === 'oauth') {
-    return <SubscriptionLoginCard protocol={draft.protocol} />;
+    return (
+      <SubscriptionLoginCard
+        protocol={draft.protocol}
+        providerId={draft.id}
+        onConfig={onConfig}
+        onNotice={onNotice}
+      />
+    );
   }
   if (draft.authMethod === 'cloud') {
     return (
@@ -1299,6 +1950,7 @@ function AuthFields({
       <label>API 密钥</label>
       <div className="keyfield">
         <input
+          data-provider-field="api-key"
           className="input mono"
           type={showKey ? 'text' : 'password'}
           value={keyValue}
@@ -1417,6 +2069,8 @@ function ModelsPanel({
               <th>接口规范</th>
               <th>输入</th>
               <th>输出</th>
+              <th>上下文窗口</th>
+              <th>能力</th>
               <th className="models-enabled-cell">启用</th>
             </tr>
           </thead>
@@ -1440,6 +2094,18 @@ function ModelsPanel({
                     <span className="model-price">
                       <span className="mono">{priceText(model.outputPricePerMtok)}</span>
                       <small>{priceSourceText(model)}</small>
+                    </span>
+                  </td>
+                  <td>
+                    <span className="faint">
+                      {model.contextWindow ? `${(model.contextWindow / 1000).toFixed(0)}k` : '暂无'}
+                    </span>
+                  </td>
+                  <td>
+                    <span className="faint">
+                      {model.capabilities && model.capabilities.length > 0
+                        ? model.capabilities.join(', ')
+                        : '暂无'}
                     </span>
                   </td>
                   <td className="models-enabled-cell">

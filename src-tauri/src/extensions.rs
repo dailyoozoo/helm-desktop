@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// 技能元信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,12 +29,13 @@ pub enum SkillScope {
     Project,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SkillSource {
     Builtin,
     Market,
     Custom,
+    Plugin,
 }
 
 /// MCP 服务器配置
@@ -190,6 +192,16 @@ fn claude_settings_path() -> Result<PathBuf, String> {
     Ok(claude_dir()?.join("settings.json"))
 }
 
+fn claude_mcp_config_path() -> Result<PathBuf, String> {
+    if let Ok(config_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+        let config_dir = config_dir.trim();
+        if !config_dir.is_empty() {
+            return Ok(PathBuf::from(config_dir).join(".claude.json"));
+        }
+    }
+    Ok(home_dir()?.join(".claude.json"))
+}
+
 fn codex_config_path() -> Result<PathBuf, String> {
     Ok(home_dir()?.join(".codex").join("config.toml"))
 }
@@ -218,6 +230,118 @@ fn project_claude_dir(project_dir: &str) -> Result<PathBuf, String> {
     }
     Ok(PathBuf::from(trimmed).join(".claude"))
 }
+/// Claude Code marketplace plugin 安装目录
+fn claude_plugins_marketplaces_dir() -> Result<PathBuf, String> {
+    Ok(claude_dir()?.join("plugins").join("marketplaces"))
+}
+
+/// 扫描 Claude Code marketplace plugin 里的 skills。
+///
+/// 目录结构：~/.claude/plugins/marketplaces/<plugin>/skills/<skill>/SKILL.md
+/// 产出 ID 格式：plugin:<plugin>:<skill>（如 plugin:caveman:caveman）
+/// Trigger 格式：/<plugin>:<skill>（如 /caveman:caveman）
+/// Plugin skill 在 Helm 中只读展示，不支持通过 .helm-disabled 启停。
+pub fn list_plugin_skills_from_marketplaces() -> Result<Vec<Skill>, String> {
+    list_plugin_skills_from_dir(&claude_plugins_marketplaces_dir()?)
+}
+
+/// 从指定目录扫描 marketplace plugin skills（测试可注入目录）。
+pub fn list_plugin_skills_from_dir(marketplaces_dir: &Path) -> Result<Vec<Skill>, String> {
+    if !marketplaces_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut skills = Vec::new();
+    let entries = std::fs::read_dir(marketplaces_dir)
+        .map_err(|e| format!("读取 Claude 插件市场目录失败: {}", e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("读取插件目录项失败: {}", e))?;
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let plugin_name = entry.file_name().to_string_lossy().to_string();
+        if plugin_name.starts_with('.') {
+            continue;
+        }
+        let plugin_path = entry.path();
+        scan_skills_in_plugin_dir(&plugin_path, &plugin_name, &mut skills)?;
+    }
+    skills.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(skills)
+}
+
+/// 递归扫描插件目录下的 skills/ 子目录，发现 SKILL.md 文件。
+fn scan_skills_in_plugin_dir(
+    dir: &Path,
+    plugin_name: &str,
+    skills: &mut Vec<Skill>,
+) -> Result<(), String> {
+    let skills_dir = dir.join("skills");
+    if skills_dir.exists() {
+        read_skills_from_dir_with_prefix(&skills_dir, plugin_name, skills)?;
+    }
+    // 某些插件（如 claude-plugins-official）有嵌套的 plugins/<name>/skills/
+    let plugins_dir = dir.join("plugins");
+    if plugins_dir.exists() {
+        let entries = std::fs::read_dir(&plugins_dir)
+            .map_err(|e| format!("读取嵌套插件目录失败: {}", e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("读取嵌套插件目录项失败: {}", e))?;
+            if entry.path().is_dir() {
+                scan_skills_in_plugin_dir(&entry.path(), plugin_name, skills)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 从目录读取 skill，用 plugin_name 作为命名空间前缀。
+fn read_skills_from_dir_with_prefix(
+    dir: &Path,
+    plugin_name: &str,
+    skills: &mut Vec<Skill>,
+) -> Result<(), String> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("读取技能目录失败: {}", e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("读取目录项失败: {}", e))?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let skill_id = entry.file_name().to_string_lossy().to_string();
+        if skill_id.is_empty() || skill_id.starts_with('.') {
+            continue;
+        }
+        let skill_md = path.join("SKILL.md");
+        let readme_md = path.join("README.md");
+        let meta_file = if skill_md.exists() {
+            skill_md
+        } else if readme_md.exists() {
+            readme_md
+        } else {
+            continue;
+        };
+        let content = std::fs::read_to_string(&meta_file).unwrap_or_default();
+        let name = extract_title(&content).unwrap_or_else(|| skill_id.clone());
+        let description = extract_description(&content);
+        let namespaced_id = format!("{plugin_name}:{skill_id}");
+        let trigger = format!("/{namespaced_id}");
+        skills.push(Skill {
+            trigger,
+            id: format!("plugin:{namespaced_id}"),
+            name,
+            description,
+            scope: SkillScope::Global,
+            source: SkillSource::Plugin,
+            enabled: true,
+            path: path.to_string_lossy().to_string(),
+            engine: "claude-code".to_string(),
+        });
+    }
+    Ok(())
+}
 
 /// MCP 连接状态持久化文件（Helm 自有，不进引擎配置）
 fn mcp_status_path() -> Result<PathBuf, String> {
@@ -229,6 +353,99 @@ fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+fn shared_config_write_guard() -> Result<MutexGuard<'static, ()>, String> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "CLI 共享配置写锁中毒".to_string())
+}
+
+fn write_shared_config_atomically(path: &Path, content: &[u8]) -> Result<(), String> {
+    write_shared_config_atomically_with(path, content, |_| Ok(()))
+}
+
+fn write_shared_config_atomically_with<F>(
+    path: &Path,
+    content: &[u8],
+    before_replace: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&Path) -> Result<(), String>,
+{
+    let parent = path
+        .parent()
+        .ok_or_else(|| "CLI 共享配置缺少父目录".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {e}"))?;
+    let temporary = parent.join(format!(
+        ".helm-config-{}-{}.tmp",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let result = (|| -> Result<(), String> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|e| format!("创建配置临时文件失败: {e}"))?;
+        file.write_all(content)
+            .map_err(|e| format!("写入配置临时文件失败: {e}"))?;
+        file.flush()
+            .map_err(|e| format!("刷新配置临时文件失败: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("同步配置临时文件失败: {e}"))?;
+        before_replace(&temporary)?;
+        replace_shared_config(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(windows)]
+fn replace_shared_config(source: &Path, destination: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(format!(
+            "原子替换 CLI 共享配置失败: {}",
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_shared_config(source: &Path, destination: &Path) -> Result<(), String> {
+    std::fs::rename(source, destination).map_err(|e| format!("原子替换 CLI 共享配置失败: {e}"))?;
+    if let Some(parent) = destination.parent() {
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| format!("同步 CLI 共享配置目录失败: {e}"))?;
+    }
+    Ok(())
 }
 
 fn read_settings(path: &Path) -> Result<serde_json::Value, String> {
@@ -246,12 +463,20 @@ fn read_settings(path: &Path) -> Result<serde_json::Value, String> {
 }
 
 fn write_settings(path: &Path, settings: &serde_json::Value) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {}", e))?;
-    }
     let content = serde_json::to_string_pretty(settings)
         .map_err(|e| format!("序列化 settings.json 失败: {}", e))?;
-    std::fs::write(path, content).map_err(|e| format!("写入 settings.json 失败: {}", e))
+    write_shared_config_atomically(path, content.as_bytes())
+        .map_err(|e| format!("写入 settings.json 失败: {e}"))
+}
+
+fn update_settings<F>(path: &Path, update: F) -> Result<(), String>
+where
+    F: FnOnce(&mut serde_json::Value) -> Result<(), String>,
+{
+    let _guard = shared_config_write_guard()?;
+    let mut settings = read_settings(path)?;
+    update(&mut settings)?;
+    write_settings(path, &settings)
 }
 
 fn read_toml_config(path: &Path) -> Result<toml::Value, String> {
@@ -269,12 +494,20 @@ fn read_toml_config(path: &Path) -> Result<toml::Value, String> {
 }
 
 fn write_toml_config(path: &Path, config: &toml::Value) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {}", e))?;
-    }
     let content =
         toml::to_string_pretty(config).map_err(|e| format!("序列化 config.toml 失败: {}", e))?;
-    std::fs::write(path, content).map_err(|e| format!("写入 config.toml 失败: {}", e))
+    write_shared_config_atomically(path, content.as_bytes())
+        .map_err(|e| format!("写入 config.toml 失败: {e}"))
+}
+
+fn update_toml_config<F>(path: &Path, update: F) -> Result<(), String>
+where
+    F: FnOnce(&mut toml::Value) -> Result<(), String>,
+{
+    let _guard = shared_config_write_guard()?;
+    let mut config = read_toml_config(path)?;
+    update(&mut config)?;
+    write_toml_config(path, &config)
 }
 
 fn toml_table_mut<'a>(
@@ -449,6 +682,11 @@ pub fn list_skills(
             skills.push(skill);
         }
     }
+    // 合并 Claude Code marketplace plugin 里的 skills
+    match list_plugin_skills_from_marketplaces() {
+        Ok(plugin_skills) => skills.extend(plugin_skills),
+        Err(e) => eprintln!("读取插件市场技能失败（忽略）: {e}"),
+    }
     skills.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(skills)
 }
@@ -553,6 +791,7 @@ fn migrate_legacy_disabled_skills(skills_dir: &Path, settings_path: &Path) -> Re
     if !settings_path.exists() {
         return Ok(());
     }
+    let _guard = shared_config_write_guard()?;
     let mut settings = read_settings(settings_path)?;
     let Some(ids) = settings.get("skillsDisabled").and_then(|v| v.as_array()) else {
         return Ok(());
@@ -672,7 +911,8 @@ pub fn toggle_skill_in_dir(skills_dir: &Path, skill_id: &str, enabled: bool) -> 
 
 /// 列出 MCP 服务器配置（合并 ~/.helm/mcp-status.json 里的最近连接状态）
 pub fn list_mcp_servers() -> Result<Vec<McpServer>, String> {
-    let mut servers = list_mcp_servers_from_settings_path(&claude_settings_path()?)?;
+    migrate_legacy_claude_mcp_config()?;
+    let mut servers = list_mcp_servers_from_settings_path(&claude_mcp_config_path()?)?;
     for server in list_mcp_servers_from_codex_config_path(&codex_config_path()?)? {
         if !servers.iter().any(|existing| existing.name == server.name) {
             servers.push(server);
@@ -721,6 +961,7 @@ pub fn record_mcp_status_to_path(
     server_name: &str,
     result: &Result<Vec<McpTool>, String>,
 ) -> Result<(), String> {
+    let _guard = shared_config_write_guard()?;
     // 状态文件损坏时按空表重建，不阻塞测试连接主流程
     let mut status_map = read_mcp_status(path).unwrap_or_default();
     let entry = match result {
@@ -738,12 +979,10 @@ pub fn record_mcp_status_to_path(
         },
     };
     status_map.insert(server_name.to_string(), entry);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("创建状态目录失败: {}", e))?;
-    }
     let content = serde_json::to_string_pretty(&status_map)
         .map_err(|e| format!("序列化 MCP 状态失败: {}", e))?;
-    std::fs::write(path, content).map_err(|e| format!("写入 MCP 状态失败: {}", e))
+    write_shared_config_atomically(path, content.as_bytes())
+        .map_err(|e| format!("写入 MCP 状态失败: {e}"))
 }
 
 pub fn record_mcp_status(server_name: &str, result: &Result<Vec<McpTool>, String>) {
@@ -756,12 +995,15 @@ pub fn forget_mcp_status(server_name: &str) {
     let Ok(path) = mcp_status_path() else {
         return;
     };
+    let Ok(_guard) = shared_config_write_guard() else {
+        return;
+    };
     let Ok(mut status_map) = read_mcp_status(&path) else {
         return;
     };
     if status_map.remove(server_name).is_some() {
         if let Ok(content) = serde_json::to_string_pretty(&status_map) {
-            let _ = std::fs::write(&path, content);
+            let _ = write_shared_config_atomically(&path, content.as_bytes());
         }
     }
 }
@@ -836,8 +1078,55 @@ fn mcp_remote_url_error(transport: McpTransport) -> String {
 }
 
 pub fn save_mcp_server(server: McpServer) -> Result<(), String> {
-    save_mcp_server_to_settings_path(&claude_settings_path()?, server.clone())?;
+    migrate_legacy_claude_mcp_config()?;
+    save_mcp_server_to_settings_path(&claude_mcp_config_path()?, server.clone())?;
     save_mcp_server_to_codex_config_path(&codex_config_path()?, server)
+}
+
+fn migrate_legacy_claude_mcp_config() -> Result<(), String> {
+    let legacy_path = claude_settings_path()?;
+    let target_path = claude_mcp_config_path()?;
+    migrate_legacy_claude_mcp_config_at(&legacy_path, &target_path)
+}
+
+fn migrate_legacy_claude_mcp_config_at(
+    legacy_path: &Path,
+    target_path: &Path,
+) -> Result<(), String> {
+    if legacy_path == target_path || !legacy_path.exists() {
+        return Ok(());
+    }
+
+    let _guard = shared_config_write_guard()?;
+    let mut legacy = read_settings(&legacy_path)?;
+    let Some(legacy_servers) = legacy
+        .get("mcpServers")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+    else {
+        return Ok(());
+    };
+    if legacy_servers.is_empty() {
+        return Ok(());
+    }
+
+    let mut target = read_settings(&target_path)?;
+    let target_servers = object_mut(&mut target, "mcpServers")?;
+    for (name, config) in legacy_servers {
+        target_servers.entry(name).or_insert(config);
+    }
+    let target_content = serde_json::to_string_pretty(&target)
+        .map_err(|e| format!("序列化 Claude MCP 配置失败: {e}"))?;
+    write_shared_config_atomically(&target_path, target_content.as_bytes())
+        .map_err(|e| format!("迁移 Claude MCP 配置失败: {e}"))?;
+
+    if let Some(object) = legacy.as_object_mut() {
+        object.remove("mcpServers");
+    }
+    let legacy_content = serde_json::to_string_pretty(&legacy)
+        .map_err(|e| format!("序列化 Claude settings 失败: {e}"))?;
+    write_shared_config_atomically(&legacy_path, legacy_content.as_bytes())
+        .map_err(|e| format!("清理旧 Claude MCP 配置失败: {e}"))
 }
 
 pub fn save_mcp_server_to_settings_path(path: &Path, server: McpServer) -> Result<(), String> {
@@ -848,8 +1137,7 @@ pub fn save_mcp_server_to_settings_path(path: &Path, server: McpServer) -> Resul
         return Err(mcp_remote_url_error(server.transport));
     }
 
-    let mut settings = read_settings(path)?;
-    let mcp_servers = object_mut(&mut settings, "mcpServers")?;
+    let name = server.name.trim().to_string();
     let config = match server.transport {
         McpTransport::Stdio => serde_json::json!({
             "command": server.command.trim(),
@@ -865,24 +1153,28 @@ pub fn save_mcp_server_to_settings_path(path: &Path, server: McpServer) -> Resul
             "url": server.command.trim()
         }),
     };
-    mcp_servers.insert(server.name.trim().to_string(), config);
-    write_settings(path, &settings)
+    update_settings(path, move |settings| {
+        object_mut(settings, "mcpServers")?.insert(name, config);
+        Ok(())
+    })
 }
 
 pub fn delete_mcp_server(name: &str) -> Result<(), String> {
-    delete_mcp_server_from_settings_path(&claude_settings_path()?, name)?;
+    migrate_legacy_claude_mcp_config()?;
+    delete_mcp_server_from_settings_path(&claude_mcp_config_path()?, name)?;
     delete_mcp_server_from_codex_config_path(&codex_config_path()?, name)
 }
 
 pub fn delete_mcp_server_from_settings_path(path: &Path, name: &str) -> Result<(), String> {
-    let mut settings = read_settings(path)?;
-    if let Some(mcp_servers) = settings
-        .get_mut("mcpServers")
-        .and_then(|v| v.as_object_mut())
-    {
-        mcp_servers.remove(name);
-    }
-    write_settings(path, &settings)
+    update_settings(path, |settings| {
+        if let Some(mcp_servers) = settings
+            .get_mut("mcpServers")
+            .and_then(|v| v.as_object_mut())
+        {
+            mcp_servers.remove(name);
+        }
+        Ok(())
+    })
 }
 
 pub fn list_mcp_servers_from_codex_config_path(path: &Path) -> Result<Vec<McpServer>, String> {
@@ -954,8 +1246,7 @@ pub fn save_mcp_server_to_codex_config_path(path: &Path, server: McpServer) -> R
         return Err(mcp_remote_url_error(server.transport));
     }
 
-    let mut config = read_toml_config(path)?;
-    let mcp_servers = toml_table_mut(&mut config, "mcp_servers")?;
+    let name = server.name.trim().to_string();
     let mut server_table = toml::map::Map::new();
     match server.transport {
         McpTransport::Stdio => {
@@ -985,22 +1276,22 @@ pub fn save_mcp_server_to_codex_config_path(path: &Path, server: McpServer) -> R
             );
         }
     }
-    mcp_servers.insert(
-        server.name.trim().to_string(),
-        toml::Value::Table(server_table),
-    );
-    write_toml_config(path, &config)
+    update_toml_config(path, move |config| {
+        toml_table_mut(config, "mcp_servers")?.insert(name, toml::Value::Table(server_table));
+        Ok(())
+    })
 }
 
 pub fn delete_mcp_server_from_codex_config_path(path: &Path, name: &str) -> Result<(), String> {
-    let mut config = read_toml_config(path)?;
-    if let Some(mcp_servers) = config
-        .get_mut("mcp_servers")
-        .and_then(toml::Value::as_table_mut)
-    {
-        mcp_servers.remove(name);
-    }
-    write_toml_config(path, &config)
+    update_toml_config(path, |config| {
+        if let Some(mcp_servers) = config
+            .get_mut("mcp_servers")
+            .and_then(toml::Value::as_table_mut)
+        {
+            mcp_servers.remove(name);
+        }
+        Ok(())
+    })
 }
 
 pub fn list_subagents(project_dir: Option<String>) -> Result<Vec<Subagent>, String> {
@@ -1104,6 +1395,7 @@ pub fn save_subagent_to_dir(dir: &Path, subagent: Subagent) -> Result<(), String
         return Err("子代理系统提示不能为空".to_string());
     }
 
+    let _guard = shared_config_write_guard()?;
     std::fs::create_dir_all(dir).map_err(|e| format!("创建子代理目录失败: {}", e))?;
     let content = markdown_with_frontmatter(
         &[
@@ -1116,8 +1408,8 @@ pub fn save_subagent_to_dir(dir: &Path, subagent: Subagent) -> Result<(), String
         ],
         &subagent.prompt,
     );
-    std::fs::write(dir.join(format!("{id}.md")), content)
-        .map_err(|e| format!("写入子代理失败: {}", e))
+    write_shared_config_atomically(&dir.join(format!("{id}.md")), content.as_bytes())
+        .map_err(|e| format!("写入子代理失败: {e}"))
 }
 
 pub fn delete_subagent(id: &str, project_dir: Option<String>) -> Result<(), String> {
@@ -1134,6 +1426,7 @@ pub fn delete_subagent(id: &str, project_dir: Option<String>) -> Result<(), Stri
 
 pub fn delete_subagent_from_dir(dir: &Path, id: &str) -> Result<(), String> {
     let id = safe_file_stem(id)?;
+    let _guard = shared_config_write_guard()?;
     let path = dir.join(format!("{id}.md"));
     if path.exists() {
         std::fs::remove_file(path).map_err(|e| format!("删除子代理失败: {}", e))?;
@@ -1514,6 +1807,7 @@ pub fn save_slash_command_to_dir(dir: &Path, command: SlashCommand) -> Result<()
         return Err("斜杠命令模板不能为空".to_string());
     }
 
+    let _guard = shared_config_write_guard()?;
     let disabled_dir = dir.join(".helm-disabled");
     std::fs::create_dir_all(dir).map_err(|e| format!("创建斜杠命令目录失败: {}", e))?;
     std::fs::create_dir_all(&disabled_dir).map_err(|e| format!("创建禁用命令目录失败: {}", e))?;
@@ -1543,15 +1837,19 @@ pub fn save_slash_command_to_dir(dir: &Path, command: SlashCommand) -> Result<()
     let content = markdown_with_frontmatter(&meta, &command.body);
 
     if command.enabled {
+        write_shared_config_atomically(&enabled_path, content.as_bytes())
+            .map_err(|e| format!("写入斜杠命令失败: {e}"))?;
         if disabled_path.exists() {
             std::fs::remove_file(&disabled_path).map_err(|e| format!("移除禁用命令失败: {}", e))?;
         }
-        std::fs::write(enabled_path, content).map_err(|e| format!("写入斜杠命令失败: {}", e))
+        Ok(())
     } else {
+        write_shared_config_atomically(&disabled_path, content.as_bytes())
+            .map_err(|e| format!("写入禁用斜杠命令失败: {e}"))?;
         if enabled_path.exists() {
             std::fs::remove_file(&enabled_path).map_err(|e| format!("移除启用命令失败: {}", e))?;
         }
-        std::fs::write(disabled_path, content).map_err(|e| format!("写入禁用斜杠命令失败: {}", e))
+        Ok(())
     }
 }
 
@@ -1573,6 +1871,7 @@ pub fn delete_slash_command_from_dir(dir: &Path, id: &str) -> Result<(), String>
         return Err("引擎原生/内置命令为只读，无法删除".to_string());
     }
     let id = safe_file_stem(id)?;
+    let _guard = shared_config_write_guard()?;
     for path in [
         dir.join(format!("{id}.md")),
         dir.join(".helm-disabled").join(format!("{id}.md")),
@@ -1717,28 +2016,23 @@ pub fn save_hook_to_settings_path(path: &Path, mut hook: Hook) -> Result<(), Str
         hook.description = hook.command.clone();
     }
 
-    let mut settings = read_settings(path)?;
-    let previous = hook_metadata_by_id(&settings, &hook.id);
-    for old in previous {
-        remove_real_hook(&mut settings, &old.event, &old.match_pattern, &old.command)?;
-    }
-    remove_real_hook(
-        &mut settings,
-        &hook.event,
-        &hook.match_pattern,
-        &hook.command,
-    )?;
-    remove_hook_metadata(&mut settings, "helmHooks", &hook.id)?;
-    remove_hook_metadata(&mut settings, "helmDisabledHooks", &hook.id)?;
+    update_settings(path, move |settings| {
+        let previous = hook_metadata_by_id(settings, &hook.id);
+        for old in previous {
+            remove_real_hook(settings, &old.event, &old.match_pattern, &old.command)?;
+        }
+        remove_real_hook(settings, &hook.event, &hook.match_pattern, &hook.command)?;
+        remove_hook_metadata(settings, "helmHooks", &hook.id)?;
+        remove_hook_metadata(settings, "helmDisabledHooks", &hook.id)?;
 
-    if hook.enabled {
-        add_hook_metadata(&mut settings, "helmHooks", &hook)?;
-        add_real_hook(&mut settings, &hook)?;
-    } else {
-        add_hook_metadata(&mut settings, "helmDisabledHooks", &hook)?;
-    }
-
-    write_settings(path, &settings)
+        if hook.enabled {
+            add_hook_metadata(settings, "helmHooks", &hook)?;
+            add_real_hook(settings, &hook)?;
+        } else {
+            add_hook_metadata(settings, "helmDisabledHooks", &hook)?;
+        }
+        Ok(())
+    })
 }
 
 pub fn delete_hook(id: &str, project_dir: Option<String>) -> Result<(), String> {
@@ -1756,14 +2050,15 @@ pub fn delete_hook(id: &str, project_dir: Option<String>) -> Result<(), String> 
 
 pub fn delete_hook_from_settings_path(path: &Path, id: &str) -> Result<(), String> {
     let id = safe_file_stem(id)?;
-    let mut settings = read_settings(path)?;
-    let previous = hook_metadata_by_id(&settings, &id);
-    for old in previous {
-        remove_real_hook(&mut settings, &old.event, &old.match_pattern, &old.command)?;
-    }
-    remove_hook_metadata(&mut settings, "helmHooks", &id)?;
-    remove_hook_metadata(&mut settings, "helmDisabledHooks", &id)?;
-    write_settings(path, &settings)
+    update_settings(path, move |settings| {
+        let previous = hook_metadata_by_id(settings, &id);
+        for old in previous {
+            remove_real_hook(settings, &old.event, &old.match_pattern, &old.command)?;
+        }
+        remove_hook_metadata(settings, "helmHooks", &id)?;
+        remove_hook_metadata(settings, "helmDisabledHooks", &id)?;
+        Ok(())
+    })
 }
 
 fn hook_event_from_str(event: &str) -> Option<HookEvent> {
@@ -2507,12 +2802,82 @@ pub async fn market_install_skill(
     })?;
 
     let skill_dir = skills_dir.join(&dir_name);
+    let _guard = shared_config_write_guard()?;
     std::fs::create_dir_all(&skill_dir).map_err(|e| format!("创建技能目录失败: {}", e))?;
-    std::fs::write(skill_dir.join("SKILL.md"), content)
-        .map_err(|e| format!("写入 SKILL.md 失败: {}", e))?;
-    std::fs::write(
-        skill_dir.join(".helm-market.json"),
-        market_marker_json(source, skill_id),
-    )
-    .map_err(|e| format!("写入市场标记失败: {}", e))
+    write_shared_config_atomically(&skill_dir.join("SKILL.md"), content.as_bytes())
+        .map_err(|e| format!("写入 SKILL.md 失败: {e}"))?;
+    let marker = market_marker_json(source, skill_id);
+    write_shared_config_atomically(&skill_dir.join(".helm-market.json"), marker.as_bytes())
+        .map_err(|e| format!("写入市场标记失败: {e}"))
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::{migrate_legacy_claude_mcp_config_at, write_shared_config_atomically_with};
+
+    #[test]
+    fn failure_before_replace_keeps_last_successful_file_and_cleans_temporary_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "helm-extension-atomic-failure-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("settings.json");
+        std::fs::write(&path, b"last-successful").unwrap();
+
+        let error = write_shared_config_atomically_with(&path, b"partial-new-value", |_| {
+            Err("injected failure".to_string())
+        })
+        .unwrap_err();
+
+        assert_eq!(error, "injected failure");
+        assert_eq!(std::fs::read(&path).unwrap(), b"last-successful");
+        let leftovers = std::fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".helm-config-")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn legacy_claude_mcp_entries_migrate_to_real_cli_config_without_overwriting_target() {
+        let directory = std::env::temp_dir().join(format!(
+            "helm-extension-mcp-migration-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let legacy_path = directory.join("settings.json");
+        let target_path = directory.join(".claude.json");
+        std::fs::write(
+            &legacy_path,
+            r#"{"theme":"dark","mcpServers":{"legacy":{"command":"legacy"},"shared":{"command":"old"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &target_path,
+            r#"{"mcpServers":{"shared":{"command":"new"}}}"#,
+        )
+        .unwrap();
+
+        migrate_legacy_claude_mcp_config_at(&legacy_path, &target_path).unwrap();
+
+        let legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&legacy_path).unwrap()).unwrap();
+        let target: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&target_path).unwrap()).unwrap();
+        assert_eq!(legacy["theme"], "dark");
+        assert!(legacy.get("mcpServers").is_none());
+        assert_eq!(target["mcpServers"]["legacy"]["command"], "legacy");
+        assert_eq!(target["mcpServers"]["shared"]["command"], "new");
+        let _ = std::fs::remove_dir_all(directory);
+    }
 }

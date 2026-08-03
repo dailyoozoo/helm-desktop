@@ -16,6 +16,15 @@ export interface WorkspaceEngineOption {
   models: ModelConfig[];
 }
 
+export function sameWorkspacePath(left: string, right: string): boolean {
+  const normalize = (value: string) => {
+    let normalized = value.replace(/\\/g, '/').replace(/^\/\/\?\//, '');
+    if (/^unc\//i.test(normalized)) normalized = `//${normalized.slice(4)}`;
+    return normalized.replace(/\/+$/, '').toLocaleLowerCase();
+  };
+  return normalize(left) === normalize(right);
+}
+
 export function workspaceEngineOptions(config: AppConfig): WorkspaceEngineOption[] {
   return config.engines.map((engine) => {
     const binding = config.bindings.find((item) => item.engineId === engine.id);

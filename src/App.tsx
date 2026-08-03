@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { Titlebar } from './shell/Titlebar';
 import { Rail, type PageId } from './shell/Rail';
@@ -20,6 +20,7 @@ import {
   shouldIgnoreNavigationShortcut,
 } from './settings/shortcuts';
 import { DEFAULT_SETTINGS, type AppSettings } from './settings/types';
+import { LatestSerialSaver, type SaveState } from './settings/latestSerialSaver';
 
 const ProvidersPage = lazy(() =>
   import('./providers/ProvidersPage').then((module) => ({ default: module.ProvidersPage })),
@@ -60,6 +61,15 @@ export function App() {
   const [toggleContextRequest, setToggleContextRequest] = useState(0);
   const [cycleEngineRequest, setCycleEngineRequest] = useState(0);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const [settingsSaveState, setSettingsSaveState] = useState<SaveState>('idle');
+  const settingsSaverRef = useRef<LatestSerialSaver<AppSettings> | null>(null);
+  if (!settingsSaverRef.current) {
+    settingsSaverRef.current = new LatestSerialSaver(saveSettings, 400, setSettingsSaveState, () =>
+      showToast('设置保存失败，修改可能在重启后丢失，请重试', 'error'),
+    );
+  }
+  // Git 信息（批次 E）：标题栏显示「项目目录名 › 分支名」
+  const [gitInfo, setGitInfo] = useState<{ projectName?: string; branchName?: string }>({});
 
   useEffect(() => {
     let active = true;
@@ -84,14 +94,31 @@ export function App() {
     };
   }, []);
 
+  useEffect(
+    () => () => {
+      void settingsSaverRef.current?.flush().catch(() => undefined);
+    },
+    [],
+  );
+
   // 深层组件（错误卡/发送前置校验）的跨页跳转通道
   useEffect(() => {
     const onNavigate = (event: Event) => {
+      const openSessionId = (event as CustomEvent<{ sessionId?: string }>).detail?.sessionId;
+      if (event.type === 'helm:open-session' && openSessionId) {
+        setPage('workspace');
+        setPendingSessionId(openSessionId);
+        return;
+      }
       const page = (event as CustomEvent<{ page?: string }>).detail?.page;
       if (page) setPage(page as PageId);
     };
     window.addEventListener('helm:navigate', onNavigate);
-    return () => window.removeEventListener('helm:navigate', onNavigate);
+    window.addEventListener('helm:open-session', onNavigate);
+    return () => {
+      window.removeEventListener('helm:navigate', onNavigate);
+      window.removeEventListener('helm:open-session', onNavigate);
+    };
   }, []);
 
   // 系统托盘菜单（P3-2）的跨页跳转：Rust 侧 emit("helm-navigate", "<page>")
@@ -121,11 +148,14 @@ export function App() {
   const persistSettings = (updater: (prev: AppSettings) => AppSettings) => {
     setSettings((prev) => {
       const next = updater(prev);
-      saveSettings(next).catch(() =>
-        showToast('设置保存失败，修改可能在重启后丢失，请重试', 'error'),
-      );
+      settingsSaverRef.current?.schedule(next);
       return next;
     });
+  };
+
+  const updateSettingsFromPage = (next: AppSettings) => {
+    setSettings(next);
+    settingsSaverRef.current?.schedule(next);
   };
 
   const runShortcutAction = (action: AppShortcutAction) => {
@@ -208,6 +238,8 @@ export function App() {
       <Titlebar
         title={TITLES[page]}
         workspaceName={workspaceIdentity.name}
+        projectName={gitInfo.projectName}
+        branchName={gitInfo.branchName}
         onOpenCommandPalette={() => setPaletteOpen(true)}
       />
       <CommandPaletteView
@@ -219,6 +251,10 @@ export function App() {
         <Rail
           active={page}
           onSelect={setPage}
+          onNewSession={() => {
+            setPage('workspace');
+            setNewSessionRequest((value) => value + 1);
+          }}
           workspaceName={workspaceIdentity.name}
           workspaceAvatar={workspaceIdentity.avatar}
         />
@@ -256,6 +292,7 @@ export function App() {
                 cycleEngineRequest={cycleEngineRequest}
                 pendingSessionId={pendingSessionId}
                 onClearPendingSessionId={() => setPendingSessionId(null)}
+                onGitInfoChange={setGitInfo}
               />
             ) : null}
             {page === 'providers' ? <ProvidersPage /> : null}
@@ -282,7 +319,8 @@ export function App() {
               <main className="main">
                 <SettingsPage
                   initialSettings={settings}
-                  onSettingsChange={setSettings}
+                  onSettingsChange={updateSettingsFromPage}
+                  externalSaveState={settingsSaveState}
                   onNavigate={setPage}
                 />
               </main>

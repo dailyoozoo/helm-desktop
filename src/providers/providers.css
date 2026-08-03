@@ -7,24 +7,14 @@
 }
 
 .providers-wrap {
-  max-width: 1080px;
+  max-width: 1100px;
   margin: 0 auto;
-  padding: 4px 36px 56px;
-}
-
-.providers-notice {
-  margin-bottom: 14px;
-  padding: 10px 12px;
-  border: 1px solid var(--accent-line);
-  border-radius: var(--r-sm);
-  background: var(--accent-soft);
-  color: var(--fg-2);
-  font-size: 13px;
+  padding: 4px 36px 64px;
 }
 
 .providers-warning {
   padding: 9px 10px;
-  border: 1px solid var(--warn-line);
+  border: 1px solid color-mix(in oklch, var(--warn) 38%, transparent);
   border-radius: var(--r-sm);
   background: var(--warn-soft);
   color: var(--fg-2);
@@ -421,6 +411,70 @@
   line-height: 1.2;
 }
 
+.provider-pricing-policy {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-2);
+}
+
+.provider-pricing-policy small {
+  display: block;
+  color: var(--fg-3);
+  margin-top: 2px;
+}
+
+.provider-pricing-policy .select {
+  max-width: 260px;
+}
+
+.provider-pricing-multiplier {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--fg-2);
+  font-size: 12px;
+}
+
+.provider-pricing-multiplier .input {
+  width: 74px;
+}
+
+.provider-price-modal {
+  width: min(560px, calc(100vw - 32px));
+}
+
+.provider-price-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.provider-price-error {
+  grid-column: 1 / -1;
+  color: var(--danger);
+  font-size: 12px;
+}
+
+@media (max-width: 760px) {
+  .provider-pricing-policy {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .provider-pricing-policy .select {
+    max-width: none;
+  }
+
+  .provider-price-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 .filterbar {
   display: flex;
   align-items: center;
@@ -602,8 +656,8 @@
 
 .env {
   margin-top: 10px;
-  background: var(--term-bg, #0c1118);
-  color: var(--term-fg, #d6deeb);
+  background: var(--term-bg);
+  color: var(--term-fg);
   border-radius: 9px;
   padding: 12px 14px;
   font-family: var(--font-mono);
@@ -718,7 +772,7 @@
   max-width: calc(100vw - 40px);
   overflow: hidden;
   border-radius: 16px;
-  box-shadow: var(--shadow-lg, 0 24px 60px rgba(0, 0, 0, 0.22));
+  box-shadow: var(--shadow-pop);
 }
 
 .pv-modal__hd {
@@ -770,6 +824,22 @@
 }
 
 /* 订阅登录态 pill（P3-1） */
+.pv-account-source {
+  justify-content: center;
+  min-height: 76px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface-2);
+}
+
+.pv-account-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
 .pv-login-pill {
   display: inline-block;
   margin-left: 6px;

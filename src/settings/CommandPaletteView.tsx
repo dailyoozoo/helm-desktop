@@ -1,17 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { AppConfig } from '../providers/api';
 import { getProviderConfig } from '../providers/api';
-import { listSessions } from '../sessions/api';
+import { listFolders, listSessions } from '../sessions/api';
 import { Icon } from '../shell/icons';
-import {
-  filterCommandPaletteCommands,
-  filterProviders,
-  paletteCommands,
-  providerToCommand,
-  sessionToCommand,
-  type CommandPaletteCommand,
-} from './commandPalette';
-import { filterSessions } from '../sessions/sessionViewModel';
+import { useDialogBehavior } from '../components/useDialogBehavior';
+import { commandPaletteResults, type CommandPaletteCommand } from './commandPalette';
 
 export function CommandPaletteView({
   open,
@@ -25,8 +18,11 @@ export function CommandPaletteView({
   const [query, setQuery] = useState('');
   const [active, setActive] = useState(0);
   const [sessions, setSessions] = useState<Awaited<ReturnType<typeof listSessions>>>([]);
+  const [folders, setFolders] = useState<Awaited<ReturnType<typeof listFolders>>>([]);
   const [providers, setProviders] = useState<AppConfig['providers']>([]);
   const inputRef = useRef<HTMLInputElement>(null);
+  const activeItemRef = useRef<HTMLButtonElement>(null);
+  const dialogRef = useDialogBehavior(onClose, open);
 
   useEffect(() => {
     if (!open) return;
@@ -46,6 +42,13 @@ export function CommandPaletteView({
         // 豁免提示：面板要保持轻量，会话源失败只降级为"搜不到会话"，静态命令仍可用
         if (active) setSessions([]);
       });
+    listFolders()
+      .then((next) => {
+        if (active) setFolders(next);
+      })
+      .catch(() => {
+        if (active) setFolders([]);
+      });
     getProviderConfig()
       .then((next) => {
         if (active) setProviders(next.providers);
@@ -60,19 +63,17 @@ export function CommandPaletteView({
   }, [open]);
 
   const commands = useMemo(() => {
-    const trimmed = query.trim();
-    const staticCommands = filterCommandPaletteCommands(paletteCommands, query);
-    if (!trimmed) return staticCommands;
-    const sessionCommands = filterSessions(sessions, { query, engine: 'all', status: 'all' }).map(
-      sessionToCommand,
-    );
-    const providerCommands = filterProviders(providers, query).map(providerToCommand);
-    return [...staticCommands, ...sessionCommands, ...providerCommands];
-  }, [query, sessions, providers]);
+    return commandPaletteResults(query, sessions, providers, folders);
+  }, [query, sessions, providers, folders]);
 
   useEffect(() => {
     setActive(0);
   }, [query, commands.length]);
+
+  useEffect(() => {
+    if (!open) return;
+    activeItemRef.current?.scrollIntoView({ block: 'nearest' });
+  }, [active, open, commands.length]);
 
   const run = (command: CommandPaletteCommand | undefined) => {
     if (!command) return;
@@ -114,9 +115,19 @@ export function CommandPaletteView({
         if (event.target === event.currentTarget) onClose();
       }}
     >
-      <div className="palette" role="dialog" aria-modal="true" aria-label="命令面板">
+      <div
+        ref={dialogRef}
+        className="palette"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="command-palette-title"
+        tabIndex={-1}
+      >
         <div className="palette__in">
           <Icon name="search" />
+          <span id="command-palette-title" className="sr-only">
+            命令面板
+          </span>
           <input
             ref={inputRef}
             type="text"
@@ -137,6 +148,7 @@ export function CommandPaletteView({
               <div key={command.id}>
                 {showGroup ? <div className="palette__group">{command.group}</div> : null}
                 <button
+                  ref={index === active ? activeItemRef : undefined}
                   className={'palette__item' + (index === active ? ' is-active' : '')}
                   onMouseEnter={() => setActive(index)}
                   onClick={() => run(command)}

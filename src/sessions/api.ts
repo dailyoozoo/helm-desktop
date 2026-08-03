@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { Diff } from '@helm/protocol';
-import type { SessionSummary } from './sessionTypes';
+import type { SessionFolder, SessionSummary } from './sessionTypes';
 
 export interface SessionMessage {
   role: 'user' | 'assistant';
@@ -8,6 +8,21 @@ export interface SessionMessage {
   ts: number;
   /** 是否被检查点回溯（P2-5）：重开会话时保留淡化视觉 */
   reverted?: boolean;
+  /** schema v17：与逐 Turn 权限审计稳定关联。 */
+  turnId?: string | null;
+  attachments?: string[];
+}
+
+export interface SessionContextRecord {
+  id: string;
+  kind: 'file' | 'directory';
+  sourcePath: string;
+  canonicalPath: string;
+  displayName: string;
+  status: 'ready' | 'missing' | 'blocked';
+  statusDetail?: string | null;
+  createdAt: number;
+  updatedAt: number;
 }
 
 export interface SessionToolCall {
@@ -19,12 +34,24 @@ export interface SessionToolCall {
   diff?: Diff | null;
   /** 毫秒时间戳（变更-10）：历史恢复按时间线穿插排序用 */
   ts: number;
+  endedAt?: number | null;
+  turnId?: string | null;
+  outcome?: import('@helm/protocol').ToolOutcomeKind | null;
+  started?: boolean | null;
+  hasOutput?: boolean | null;
+  retryable?: boolean | null;
+  denialSource?: import('@helm/protocol').ToolDenialSource | null;
+  nativeDenialCode?: string | null;
 }
 
 export interface SessionCheckpoint {
   id: string;
   label: string;
   ts: number;
+  turnId?: string | null;
+  restorable?: boolean;
+  fileCount?: number;
+  reason?: string | null;
 }
 
 /** 审批请求持久化记录（变更-07）：pending 的悬空审批在重开会话时重建审批卡 */
@@ -32,8 +59,32 @@ export interface SessionApproval {
   id: string;
   action: string;
   detail: string;
-  status: 'pending' | 'resolved' | 'expired';
+  status: 'pending' | 'applying' | 'resolved' | 'failed' | 'expired';
   ts: number;
+  decision?: 'allow' | 'turn' | 'session' | 'project' | 'always' | 'deny' | null;
+  ruleId?: string | null;
+  error?: string | null;
+  resolvedAt?: number | null;
+  persistentLabel?: string | null;
+  matcherSummary?: string | null;
+  turnId?: string | null;
+}
+
+export interface SessionTurn {
+  id: string;
+  epoch: number;
+  mode: 'build' | 'plan' | 'ask';
+  permissionProfile: 'standard' | 'auto' | 'full_access';
+  status: 'running' | 'waiting_approval' | 'stalled' | 'succeeded' | 'failed' | 'interrupted';
+  startedAt: number;
+  endedAt?: number | null;
+  terminalReason?: string | null;
+  providerDisplayName?: string | null;
+  requestedModelId?: string | null;
+  routedModelId?: string | null;
+  requestedReasoningEffort?: string | null;
+  routedReasoningEffort?: string | null;
+  resolutionSource?: string | null;
 }
 
 export interface SessionDetail extends SessionSummary {
@@ -41,10 +92,73 @@ export interface SessionDetail extends SessionSummary {
   toolCalls: SessionToolCall[];
   checkpoints: SessionCheckpoint[];
   approvals: SessionApproval[];
+  /** schema v17：逐轮权限审计；旧导入数据可为空。 */
+  turns?: SessionTurn[];
+  sessionContext?: SessionContextRecord[];
+  fork?: SessionForkSummary | null;
+}
+
+export interface SessionForkSummary {
+  id: string;
+  handoffId: string;
+  sourceSessionId?: string | null;
+  sourceTitleSnapshot: string;
+  sourceEngine: string;
+  targetEngine: string;
+  boundaryTurnId: string;
+  boundaryTurnEpoch: number;
+  createdAt: number;
+}
+
+export interface BackgroundOperation {
+  id: string;
+  kind: string;
+  sourceSessionId?: string | null;
+  inputDigest: string;
+  input?: unknown;
+  idempotencyKey: string;
+  status: 'committed' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'delivery_unknown';
+  result?: unknown;
+  errorCode?: string | null;
+  createdAt: number;
+  startedAt?: number | null;
+  cancelRequestedAt?: number | null;
+  endedAt?: number | null;
+}
+
+export function startSessionFork(
+  sourceSessionId: string,
+  targetEngine: string,
+): Promise<BackgroundOperation> {
+  return invoke<BackgroundOperation>('start_session_fork', { sourceSessionId, targetEngine });
 }
 
 export function listSessions(): Promise<SessionSummary[]> {
   return invoke<SessionSummary[]>('list_sessions');
+}
+
+export function listFolders(): Promise<SessionFolder[]> {
+  return invoke<SessionFolder[]>('list_folders');
+}
+
+export function createFolder(name: string): Promise<SessionFolder> {
+  return invoke<SessionFolder>('create_folder', { name });
+}
+
+export function renameFolder(folderId: string, name: string): Promise<void> {
+  return invoke<void>('rename_folder', { folderId, name });
+}
+
+export function deleteFolder(folderId: string): Promise<void> {
+  return invoke<void>('delete_folder', { folderId });
+}
+
+export function setSessionFolder(sessionId: string, folderId: string): Promise<void> {
+  return invoke<void>('set_session_folder', { sessionId, folderId });
+}
+
+export function setFolderCollapsed(folderId: string, collapsed: boolean): Promise<void> {
+  return invoke<void>('set_folder_collapsed', { folderId, collapsed });
 }
 
 export function getActiveSession(): Promise<SessionDetail | null> {
@@ -53,6 +167,33 @@ export function getActiveSession(): Promise<SessionDetail | null> {
 
 export function getSessionHistory(sessionId: string): Promise<SessionDetail> {
   return invoke<SessionDetail>('get_session_history', { sessionId });
+}
+
+export function getBackgroundOperation(operationId: string): Promise<BackgroundOperation | null> {
+  return invoke<BackgroundOperation | null>('get_background_operation', { operationId });
+}
+
+export function cancelBackgroundOperation(operationId: string): Promise<boolean> {
+  return invoke<boolean>('cancel_background_operation', { operationId });
+}
+
+export function retryBackgroundOperation(operationId: string): Promise<void> {
+  return invoke<void>('retry_background_operation', { operationId });
+}
+
+export function listSessionContexts(sessionId: string): Promise<SessionContextRecord[]> {
+  return invoke<SessionContextRecord[]>('list_session_contexts', { sessionId });
+}
+
+export function addSessionContext(
+  sessionId: string,
+  sourcePath: string,
+): Promise<SessionContextRecord> {
+  return invoke<SessionContextRecord>('add_session_context', { sessionId, sourcePath });
+}
+
+export function removeSessionContext(sessionId: string, contextId: string): Promise<void> {
+  return invoke<void>('remove_session_context', { sessionId, contextId });
 }
 
 export function resumeSession(sessionId: string): Promise<string> {
@@ -71,21 +212,4 @@ export function renameSession(sessionId: string, title: string): Promise<void> {
 
 export function setSessionPinned(sessionId: string, pinned: boolean): Promise<void> {
   return invoke<void>('set_session_pinned', { sessionId, pinned });
-}
-
-// —— worktree 隔离（P3-3） ——
-
-export interface WorktreeInfo {
-  path: string;
-  branch: string;
-  /** setup 脚本输出尾部；失败时以 [setup 脚本失败] 开头 */
-  setupOutput: string;
-}
-
-export function createSessionWorktree(baseCwd: string, name: string): Promise<WorktreeInfo> {
-  return invoke<WorktreeInfo>('create_session_worktree', { baseCwd, name });
-}
-
-export function removeSessionWorktree(baseCwd: string, worktreePath: string): Promise<void> {
-  return invoke<void>('remove_session_worktree', { baseCwd, worktreePath });
 }

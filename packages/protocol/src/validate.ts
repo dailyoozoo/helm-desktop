@@ -31,7 +31,19 @@ function isTurnStage(x: unknown): x is TurnStage {
     x === 'responding' ||
     x === 'finalizing' ||
     x === 'waiting_approval' ||
-    x === 'retrying'
+    x === 'retrying' ||
+    x === 'stalled'
+  );
+}
+
+function isDecision(x: unknown): boolean {
+  return (
+    x === 'allow' ||
+    x === 'turn' ||
+    x === 'session' ||
+    x === 'project' ||
+    x === 'always' ||
+    x === 'deny'
   );
 }
 
@@ -47,7 +59,16 @@ export function isAgentEvent(x: unknown): x is AgentEvent {
   switch (x.type) {
     case 'session_started':
       return (
-        strNonEmpty('sessionId') && isEngineId(x.engine) && str('model') && str('cwd') && num('ts')
+        strNonEmpty('sessionId') &&
+        isEngineId(x.engine) &&
+        str('model') &&
+        str('cwd') &&
+        num('ts') &&
+        (x.capabilities === undefined ||
+          (isRecord(x.capabilities) &&
+            ['available', 'unavailable', 'unknown'].includes(String(x.capabilities.webSearch)) &&
+            ['available', 'unavailable', 'unknown'].includes(String(x.capabilities.webFetch)) &&
+            typeof x.capabilities.approvalContractVersion === 'string'))
       );
     case 'message_delta':
       return strNonEmpty('sessionId') && x.role === 'assistant' && str('text');
@@ -85,7 +106,20 @@ export function isAgentEvent(x: unknown): x is AgentEvent {
         (x.status === 'success' || x.status === 'error')
       );
     case 'approval_request':
-      return strNonEmpty('sessionId') && strNonEmpty('id') && str('action') && str('detail');
+      return (
+        strNonEmpty('sessionId') &&
+        strNonEmpty('id') &&
+        str('action') &&
+        str('detail') &&
+        Array.isArray(x.availableDecisions) &&
+        x.availableDecisions.length >= 2 &&
+        new Set(x.availableDecisions).size === x.availableDecisions.length &&
+        x.availableDecisions.every(isDecision) &&
+        x.availableDecisions.includes('allow') &&
+        x.availableDecisions.includes('deny') &&
+        (!('persistentLabel' in x) || str('persistentLabel')) &&
+        (!('matcherSummary' in x) || str('matcherSummary'))
+      );
     case 'plan_update':
       return strNonEmpty('sessionId') && Array.isArray(x.steps) && x.steps.every(isPlanStep);
     case 'checkpoint':
@@ -94,8 +128,17 @@ export function isAgentEvent(x: unknown): x is AgentEvent {
       return (
         strNonEmpty('sessionId') &&
         num('inputTokens') &&
+        (!('cachedInputTokens' in x) || num('cachedInputTokens')) &&
+        (!('cacheWriteInputTokens' in x) || num('cacheWriteInputTokens')) &&
         num('outputTokens') &&
         num('costUsd') &&
+        (!('serviceTier' in x) || strNonEmpty('serviceTier')) &&
+        (!('contextWindow' in x) || num('contextWindow'))
+      );
+    case 'context_usage':
+      return (
+        str('sessionId') &&
+        num('contextTokens') &&
         (!('contextWindow' in x) || num('contextWindow'))
       );
     case 'turn_complete':
@@ -104,7 +147,11 @@ export function isAgentEvent(x: unknown): x is AgentEvent {
         (x.stopReason === 'end' || x.stopReason === 'interrupted' || x.stopReason === 'error')
       );
     case 'error':
-      return str('message') && typeof x.recoverable === 'boolean';
+      return (
+        str('message') &&
+        typeof x.recoverable === 'boolean' &&
+        (!('kind' in x) || strNonEmpty('kind'))
+      );
     default:
       return false;
   }

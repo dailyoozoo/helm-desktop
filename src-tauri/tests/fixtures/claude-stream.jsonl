@@ -1,0 +1,6 @@
+{"type":"system","subtype":"init","cwd":"C:\\workspace","session_id":"fixture-stream","model":"claude-test","permissionMode":"default"}
+{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-test","usage":{"input_tokens":2,"output_tokens":0}}},"session_id":"fixture-stream"}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"checking"}},"session_id":"fixture-stream"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tool-fixture-1","name":"Read","input":{"file_path":"C:\\workspace\\README.md"}}]},"session_id":"fixture-stream"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-fixture-1","content":"ok"}]},"session_id":"fixture-stream"}
+{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"fixture-stream","usage":{"input_tokens":2,"output_tokens":3},"modelUsage":{"claude-test":{"inputTokens":2,"outputTokens":3,"contextWindow":200000}}}

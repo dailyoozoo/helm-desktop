@@ -1,15 +1,13 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Icon } from '../shell/icons';
 import type { SessionState } from '../engine/useSession';
-import type { EngineId } from '@helm/protocol';
 import type { WorkspaceEngineOption } from './workspaceViewModel';
-import type { SessionSummary } from '../sessions/sessionTypes';
+import type { SessionFolder, SessionSummary } from '../sessions/sessionTypes';
 import {
   engineLabel as sessionEngineLabel,
+  costText,
   filterSessions,
-  groupSessionsByTime,
   relativeTimeText,
-  tokenText,
 } from '../sessions/sessionViewModel';
 
 interface SessionMenuState {
@@ -19,20 +17,44 @@ interface SessionMenuState {
   pinned: boolean;
 }
 
+export function sessionProjectName(cwd: string): string {
+  const normalized = cwd.replace(/[\\/]+$/, '');
+  return normalized.split(/[\\/]/).filter(Boolean).pop() || cwd || '未设置项目';
+}
+
+export function sidebarFolderEntries(
+  folders: SessionFolder[],
+  sessions: SessionSummary[],
+  visibleSessions: SessionSummary[],
+  query: string,
+): Array<{ folder: SessionFolder; items: SessionSummary[] }> {
+  const normalizedQuery = query.trim().toLowerCase();
+  return folders.flatMap((folder) => {
+    const folderMatches = Boolean(
+      normalizedQuery && folder.name.toLowerCase().includes(normalizedQuery),
+    );
+    const source = folderMatches ? sessions : visibleSessions;
+    const items = source.filter((session) => (session.folderId ?? 'folder-default') === folder.id);
+    return !normalizedQuery || folderMatches || items.length ? [{ folder, items }] : [];
+  });
+}
+
 export function SessionSidebar({
   state,
-  engineOptions,
   activeOption,
   sessions,
+  folders,
   sessionError,
   resumingId,
   runningIds,
   approvalIds = [],
-  worktreeEnabled,
-  creatingWorktree,
   onNew,
-  onNewWorktree,
-  onSelectEngine,
+  onCreateFolder,
+  onToggleFolder,
+  onMoveSession,
+  onCreateFolderForSession,
+  onRenameFolder,
+  onDeleteFolder,
   onOpenSession,
   onRenameSession,
   onDeleteSession,
@@ -40,20 +62,22 @@ export function SessionSidebar({
   isSessionActive,
 }: {
   state: SessionState;
-  engineOptions: WorkspaceEngineOption[];
   activeOption?: WorkspaceEngineOption;
   sessions: SessionSummary[];
+  folders: SessionFolder[];
   sessionError: string | null;
   resumingId: string | null;
   /** 仍有存活后端句柄的会话（并行运行中，P3-3） */
   runningIds: string[];
   /** 有待处理审批的会话（变更-12：黄色徽标） */
   approvalIds?: string[];
-  worktreeEnabled: boolean;
-  creatingWorktree: boolean;
-  onNew: () => void;
-  onNewWorktree: () => void;
-  onSelectEngine: (engine: EngineId) => void;
+  onNew: (folderId?: string) => void;
+  onCreateFolder: () => void;
+  onToggleFolder: (folder: SessionFolder) => void;
+  onMoveSession: (session: SessionSummary, folderId: string) => void;
+  onCreateFolderForSession: (session: SessionSummary) => void;
+  onRenameFolder: (folder: SessionFolder) => void;
+  onDeleteFolder: (folder: SessionFolder) => void;
   onOpenSession: (sessionId: string) => void;
   onRenameSession?: (session: SessionSummary) => void;
   onDeleteSession?: (session: SessionSummary) => void;
@@ -62,6 +86,7 @@ export function SessionSidebar({
 }) {
   const [query, setQuery] = useState('');
   const [menu, setMenu] = useState<SessionMenuState | null>(null);
+  const [folderMenuId, setFolderMenuId] = useState<string | null>(null);
   const started = state.sessionId !== null || state.items.length > 0;
   const currentSessionInHistory = sessions.some(isSessionActive);
   const engineLabel =
@@ -72,14 +97,19 @@ export function SessionSidebar({
     () => filterSessions(sessions, { query, engine: 'all', status: 'all' }),
     [query, sessions],
   );
-  const groups = useMemo(() => groupSessionsByTime(visibleSessions), [visibleSessions]);
+  const folderEntries = useMemo(() => {
+    return sidebarFolderEntries(folders, sessions, visibleSessions, query);
+  }, [folders, query, sessions, visibleSessions]);
 
   // 右键菜单：点击任意处 / Esc 关闭
   useEffect(() => {
-    if (!menu) return;
-    const close = () => setMenu(null);
+    if (!menu && !folderMenuId) return;
+    const close = () => {
+      setMenu(null);
+      setFolderMenuId(null);
+    };
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setMenu(null);
+      if (event.key === 'Escape') close();
     };
     window.addEventListener('click', close);
     window.addEventListener('contextmenu', close);
@@ -89,9 +119,24 @@ export function SessionSidebar({
       window.removeEventListener('contextmenu', close);
       window.removeEventListener('keydown', onKey);
     };
-  }, [menu]);
+  }, [folderMenuId, menu]);
 
   const menuSession = menu ? sessions.find((session) => session.id === menu.sessionId) : undefined;
+
+  // hover kebab（B1-5）：与右键共用同一个会话菜单，锚定在 kebab 左下角（原型 r.left / r.bottom+4）
+  const openKebabMenu = (session: SessionSummary, anchor: Element) => {
+    const rect = anchor.getBoundingClientRect();
+    setMenu((current) =>
+      current?.sessionId === session.id
+        ? null
+        : {
+            sessionId: session.id,
+            x: rect.left,
+            y: rect.bottom + 4,
+            pinned: Boolean(session.pinned),
+          },
+    );
+  };
 
   const renderItem = (session: SessionSummary) => (
     <button
@@ -121,8 +166,9 @@ export function SessionSidebar({
       <div className="sitem__sub">
         <Icon name={session.engine === 'codex' ? 'cpu' : 'zap'} style={{ width: 13, height: 13 }} />
         <span>{sessionEngineLabel(session.engine)}</span>
+        <span title={session.cwd}>{sessionProjectName(session.cwd)}</span>
         {session.model ? <span className="mono">{session.model}</span> : null}
-        <span className="mono">{tokenText(session.inputTokens + session.outputTokens)}</span>
+        <span className="mono">{costText(session.costUsd)}</span>
         {resumingId === session.id ? <span>恢复中</span> : null}
         {approvalIds.includes(session.id) ? (
           <span className="ws-approval-chip">待审批</span>
@@ -130,68 +176,45 @@ export function SessionSidebar({
           <span className="ws-run-chip">运行中</span>
         ) : null}
       </div>
+      <span
+        className="btn-icon sm sitem__kebab"
+        role="button"
+        tabIndex={0}
+        title="会话操作"
+        aria-label={`会话操作：${session.title}`}
+        aria-haspopup="menu"
+        onClick={(event) => {
+          event.stopPropagation();
+          openKebabMenu(session, event.currentTarget);
+        }}
+        onKeyDown={(event) => {
+          if (event.key !== 'Enter' && event.key !== ' ') return;
+          event.preventDefault();
+          event.stopPropagation();
+          openKebabMenu(session, event.currentTarget);
+        }}
+      >
+        <Icon name="more" />
+      </span>
     </button>
   );
 
   return (
     <aside className="sbar">
       <div className="sbar__head">
-        <div className="menu-wrap" style={{ display: 'block' }}>
-          <button
-            className="btn btn--primary"
-            style={{ width: '100%' }}
-            onClick={onNew}
-            type="button"
-          >
-            <Icon name="plus" /> 新建会话
-          </button>
-          <div className="menu ws-menu ws-menu--wide">
-            <div className="menu__label">选择引擎开始新会话</div>
-            {engineOptions.map((option) => (
-              <button
-                key={option.engine.id}
-                className="menu__item"
-                onClick={() => {
-                  onSelectEngine(option.engine.id);
-                  onNew();
-                }}
-                type="button"
-              >
-                <Icon name={option.engine.id === 'codex' ? 'cpu' : 'zap'} />
-                <span className="ws-menu__text">
-                  {option.engine.name}
-                  <small>
-                    {option.provider?.name ?? '未绑定服务商'} ·{' '}
-                    {option.binding?.primaryModel ?? '未设置模型'}
-                  </small>
-                </span>
-              </button>
-            ))}
-            {engineOptions.length === 0 && <div className="ws-menu__empty">还没有可用引擎</div>}
-            {worktreeEnabled ? (
-              <>
-                <div className="menu__label">并行会话</div>
-                <button
-                  className="menu__item"
-                  disabled={creatingWorktree}
-                  onClick={onNewWorktree}
-                  type="button"
-                >
-                  <Icon name="gitbranch" />
-                  <span className="ws-menu__text">
-                    {creatingWorktree ? '正在创建 worktree…' : '在 Git worktree 中新建'}
-                    <small>隔离目录并行跑，不影响当前工作区（当前会话继续后台运行）</small>
-                  </span>
-                </button>
-              </>
-            ) : null}
-          </div>
-        </div>
+        <button
+          className="btn btn--primary"
+          style={{ width: '100%' }}
+          onClick={() => onNew()}
+          type="button"
+        >
+          <Icon name="plus" /> 新建会话
+        </button>
         <div className="search">
           <Icon name="search" />
           <input
             type="text"
-            placeholder="搜索会话…"
+            placeholder="搜索会话、项目或文件夹…"
             value={query}
             onChange={(event) => setQuery(event.target.value)}
           />
@@ -212,22 +235,98 @@ export function SessionSidebar({
               <span>
                 {engineLabel} · {providerLabel}
               </span>
+              <span title={state.cwd}>{sessionProjectName(state.cwd)}</span>
               {state.model && <span className="mono">{state.model}</span>}
             </div>
           </button>
         ) : null}
-        {sessions.length ? (
-          groups.map((group) => (
-            <div key={group.label}>
-              <div className="sgroup__label">{group.label}</div>
-              {group.sessions.map(renderItem)}
-            </div>
-          ))
+        {folderEntries.length ? (
+          folderEntries.map(({ folder, items }) => {
+            const collapsed = folder.collapsed && !query.trim();
+            return (
+              <section className="ws-folder" key={folder.id}>
+                <div
+                  className="ws-folder__head"
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    setFolderMenuId(folder.id);
+                  }}
+                >
+                  <button
+                    className="ws-folder__toggle"
+                    type="button"
+                    aria-expanded={!collapsed}
+                    title={folder.cwd ?? folder.name}
+                    onClick={() => onToggleFolder(folder)}
+                  >
+                    <Icon name={collapsed ? 'right' : 'down'} />
+                    <Icon name="folder" />
+                    <span>{folder.name}</span>
+                    <small>{items.length}</small>
+                  </button>
+                  <button
+                    className="btn-icon sm ws-folder__action"
+                    type="button"
+                    title={`在${folder.name}中新建会话`}
+                    aria-label={`在${folder.name}中新建会话`}
+                    onClick={() => onNew(folder.id)}
+                  >
+                    <Icon name="plus" />
+                  </button>
+                  <div className="menu-wrap ws-folder__action">
+                    <button
+                      className="btn-icon sm"
+                      type="button"
+                      aria-label={`管理文件夹 ${folder.name}`}
+                      onClick={() =>
+                        setFolderMenuId((current) => (current === folder.id ? null : folder.id))
+                      }
+                    >
+                      <Icon name="more" />
+                    </button>
+                    <div
+                      className={
+                        'menu ws-folder-menu' + (folderMenuId === folder.id ? ' open' : '')
+                      }
+                    >
+                      <button type="button" onClick={() => onRenameFolder(folder)}>
+                        <Icon name="edit" />
+                        重命名
+                      </button>
+                      {!folder.locked ? (
+                        <button
+                          className="is-danger"
+                          type="button"
+                          onClick={() => onDeleteFolder(folder)}
+                        >
+                          <Icon name="x" />
+                          删除文件夹
+                        </button>
+                      ) : null}
+                    </div>
+                  </div>
+                </div>
+                {!collapsed ? (
+                  items.length ? (
+                    items.map(renderItem)
+                  ) : (
+                    <div className="ws-folder__empty">暂无会话</div>
+                  )
+                ) : null}
+              </section>
+            );
+          })
         ) : !started ? (
           <div className="sbar-empty">还没有会话。在右侧输入框发送一条消息即可开始。</div>
         ) : null}
-        {sessions.length > 0 && visibleSessions.length === 0 ? (
+        {sessions.length > 0 && folderEntries.length === 0 ? (
           <div className="sbar-empty">没有匹配的会话</div>
+        ) : null}
+        {!query.trim() ? (
+          <button className="ws-folder-create" type="button" onClick={onCreateFolder}>
+            <Icon name="plus" /> 新建文件夹
+          </button>
         ) : null}
       </div>
       {menu && menuSession ? (
@@ -247,6 +346,35 @@ export function SessionSidebar({
             }}
           >
             <Icon name="flag" /> {menu.pinned ? '取消置顶' : '置顶'}
+          </button>
+          <div className="menu__sep" />
+          <div className="menu__label">移动到文件夹</div>
+          {folders
+            .filter((folder) => folder.id !== menuSession.folderId)
+            .map((folder) => (
+              <button
+                key={folder.id}
+                type="button"
+                className="menu__item"
+                role="menuitem"
+                onClick={() => {
+                  setMenu(null);
+                  onMoveSession(menuSession, folder.id);
+                }}
+              >
+                <Icon name="folder" /> {folder.name}
+              </button>
+            ))}
+          <button
+            type="button"
+            className="menu__item"
+            role="menuitem"
+            onClick={() => {
+              setMenu(null);
+              onCreateFolderForSession(menuSession);
+            }}
+          >
+            <Icon name="folderopen" /> 新建文件夹并移入…
           </button>
           <button
             type="button"

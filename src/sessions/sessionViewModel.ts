@@ -23,6 +23,7 @@ const STATUS_LABELS: Record<SessionStatus, string> = {
   active: '活跃',
   idle: '空闲',
   done: '已完成',
+  waiting_approval: '等待审批',
 };
 
 export function filterSessions(
@@ -104,24 +105,6 @@ export function sessionTimeGroup(session: SessionSummary, nowMs = Date.now()): S
   if (updated >= startOfToday - 86_400) return '昨天';
   if (updated >= startOfToday - 6 * 86_400) return '本周';
   return '更早';
-}
-
-/** 把（已排序的）会话列表切成分组保持原顺序 */
-export function groupSessionsByTime(
-  sessions: SessionSummary[],
-  nowMs = Date.now(),
-): Array<{ label: SessionTimeGroup; sessions: SessionSummary[] }> {
-  const groups: Array<{ label: SessionTimeGroup; sessions: SessionSummary[] }> = [];
-  for (const session of sessions) {
-    const label = sessionTimeGroup(session, nowMs);
-    const last = groups[groups.length - 1];
-    if (last && last.label === label) {
-      last.sessions.push(session);
-    } else {
-      groups.push({ label, sessions: [session] });
-    }
-  }
-  return groups;
 }
 
 function sortValue(session: SessionSummary, key: SessionSortKey): number {

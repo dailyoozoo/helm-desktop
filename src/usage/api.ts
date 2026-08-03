@@ -8,6 +8,16 @@ export interface UsageStats {
   output_tokens: number;
   request_count: number;
   session_count: number;
+  actual_cost: number;
+  estimated_cost: number;
+  subscription_count: number;
+  unknown_count: number;
+  legacy_cost: number;
+  legacy_count: number;
+  previous_total_cost: number;
+  previous_total_tokens: number;
+  previous_request_count: number;
+  previous_session_count: number;
 }
 
 export interface ModelUsage {
@@ -83,8 +93,4 @@ export async function setBudget(
     alertAt80,
     stopAt100,
   });
-}
-
-export async function checkBudget(): Promise<boolean> {
-  return invoke<boolean>('check_budget');
 }

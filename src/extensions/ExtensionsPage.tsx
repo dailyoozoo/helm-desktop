@@ -2,7 +2,10 @@ import { useEffect, useState } from 'react';
 import { Icon } from '../shell/icons';
 import { showResultToast } from '../components/toast';
 import { EmptyState } from '../components/EmptyState';
-import { useDialogBehavior } from '../components/useDialogBehavior';
+import { Chip } from '../components/Chip';
+import { ConfirmDialog } from '../components/ConfirmDialog';
+import { Dialog } from '../components/Dialog';
+import { applyExtensionLoadResult } from './extensionLoadState';
 import { loadSettings, selectDirectory } from '../settings/api';
 import { getProviderConfig } from '../providers/api';
 import { modelCatalog } from '../providers/providerViewModel';
@@ -189,11 +192,11 @@ export function ExtensionsPage() {
         listHooks(dir),
       ]);
     const failures: string[] = [];
-    applyResult(skillsResult, setSkills, '技能', failures);
-    applyResult(mcpResult, setMcpServers, 'MCP 服务器', failures);
-    applyResult(subagentResult, setSubagents, '子代理', failures);
-    applyResult(commandResult, setSlashCommands, '斜杠命令', failures);
-    applyResult(hookResult, setHooks, '钩子', failures);
+    applyExtensionLoadResult(skillsResult, setSkills, '技能', failures);
+    applyExtensionLoadResult(mcpResult, setMcpServers, 'MCP 服务器', failures);
+    applyExtensionLoadResult(subagentResult, setSubagents, '子代理', failures);
+    applyExtensionLoadResult(commandResult, setSlashCommands, '斜杠命令', failures);
+    applyExtensionLoadResult(hookResult, setHooks, '钩子', failures);
     setLoadErrors(failures);
     setLoading(false);
   }
@@ -413,42 +416,41 @@ export function ExtensionsPage() {
   }
 
   const enabledSkillsCount = skills.filter((s) => s.enabled).length;
+  // MCP 工具数（B1-6）：只聚合本次会话真实测试过连接的 server；一个都没测过时显示「暂无」，
+  // 测过后如实显示数字（0 也显示 0），不用持久化的旧 toolCount 伪造聚合值
+  const testedMcpServerCount = Object.keys(mcpTools).length;
   const mcpToolCount = Object.values(mcpTools).reduce((sum, tools) => sum + tools.length, 0);
   const enabledCommandCount = slashCommands.filter((command) => command.enabled).length;
   const enabledHookCount = hooks.filter((hook) => hook.enabled).length;
 
+  async function chooseProjectDirectory() {
+    const next = await selectDirectory();
+    if (next) setProjectDir(next);
+  }
+
   return (
     <div className="page scroll">
-      <div className="page__head">
+      <div className="page__head extensions-head">
         <div>
           <div className="page__title">扩展中心</div>
           <div className="page__sub">
-            统一管理驱动 Agent 的技能、MCP 服务器、子代理、斜杠命令与钩子。MCP
-            斜杠命令与技能按当前引擎的原生机制生效；子代理与钩子仅对 Claude Code 生效。
-          </div>
-          <div className="row gap-sm" style={{ marginTop: 8, alignItems: 'center' }}>
-            <span className="faint" style={{ fontSize: 12 }}>
-              项目级作用域：
-            </span>
-            <span className="mono" style={{ fontSize: 12 }}>
-              {projectDir || '未设置（仅显示全局扩展）'}
-            </span>
-            <button
-              className="btn btn--subtle btn--sm"
-              onClick={() => {
-                void (async () => {
-                  const next = await selectDirectory();
-                  if (next) setProjectDir(next);
-                })();
-              }}
-            >
-              选择项目目录
-            </button>
+            统一管理驱动 Agent 的技能、MCP 服务器、子代理、斜杠命令与钩子——按各引擎的原生机制生效。
           </div>
         </div>
-        <button className="btn btn--primary" onClick={() => setMarketOpen(true)}>
-          <Icon name="store" /> 浏览市场
-        </button>
+        <div className="row gap-sm extensions-head-actions">
+          <button
+            className="btn btn--subtle extensions-project-picker"
+            onClick={() => void chooseProjectDirectory()}
+            title={projectDir || '未设置项目目录'}
+          >
+            <span>项目目录：</span>
+            <span className="mono extensions-project-path">{projectDir || '仅显示全局扩展'}</span>
+            <Icon name="down" />
+          </button>
+          <button className="btn btn--primary" onClick={() => setMarketOpen(true)}>
+            <Icon name="store" /> 浏览市场
+          </button>
+        </div>
       </div>
 
       <div className="etabs tabbar">
@@ -482,18 +484,29 @@ export function ExtensionsPage() {
             </button>
           </div>
         ) : null}
-        <div className="xsum">
-          <SummaryItem icon="sparkles" value={enabledSkillsCount} label="启用技能" />
-          <SummaryItem icon="plug" value={mcpToolCount || '—'} label="MCP 工具（已连接）" />
-          <SummaryItem icon="bot" value={subagents.length} label="子代理" />
-          <SummaryItem
-            icon="code"
-            value={`${enabledCommandCount} / ${enabledHookCount}`}
-            label="命令 / 钩子"
-          />
-        </div>
+        {!loading ? (
+          <div className="xsum">
+            <SummaryItem icon="sparkles" value={enabledSkillsCount} label="启用技能" />
+            <SummaryItem
+              icon="plug"
+              value={testedMcpServerCount > 0 ? mcpToolCount : '暂无'}
+              label="MCP 工具（已连接）"
+            />
+            <SummaryItem icon="bot" value={subagents.length} label="子代理" />
+            <SummaryItem
+              icon="code"
+              value={`${enabledCommandCount} / ${enabledHookCount}`}
+              label="命令 / 钩子"
+            />
+          </div>
+        ) : null}
 
-        {tab === 'skills' && (
+        {loading ? (
+          <div className="empty" aria-live="polite">
+            正在读取扩展配置…
+          </div>
+        ) : null}
+        {!loading && tab === 'skills' && (
           <SkillsTab
             skills={skills}
             loading={loading}
@@ -501,7 +514,7 @@ export function ExtensionsPage() {
             onBrowseMarket={() => setMarketOpen(true)}
           />
         )}
-        {tab === 'mcp' && (
+        {!loading && tab === 'mcp' && (
           <McpTab
             servers={mcpServers}
             tools={mcpTools}
@@ -513,18 +526,16 @@ export function ExtensionsPage() {
             onTested={() => void reloadMcpServers()}
           />
         )}
-        {tab === 'subagents' && (
+        {!loading && tab === 'subagents' && (
           <SubagentsTab
             subagents={subagents}
-            onAdd={() =>
-              setSubagentDraft({ ...EMPTY_SUBAGENT, model: modelOptions[0] ?? 'claude-sonnet-4.6' })
-            }
+            onAdd={() => setSubagentDraft({ ...EMPTY_SUBAGENT, model: modelOptions[0] ?? '' })}
             onEdit={(subagent) => setSubagentDraft(subagentToDraft(subagent))}
             onDelete={handleDeleteSubagent}
             onToggleAuto={handleToggleSubagentAuto}
           />
         )}
-        {tab === 'commands' && (
+        {!loading && tab === 'commands' && (
           <CommandsTab
             commands={slashCommands}
             onAdd={() => setCommandDraft({ ...EMPTY_COMMAND })}
@@ -533,7 +544,7 @@ export function ExtensionsPage() {
             onToggle={handleToggleCommand}
           />
         )}
-        {tab === 'hooks' && (
+        {!loading && tab === 'hooks' && (
           <HooksTab
             hooks={hooks}
             onAdd={() => setHookDraft({ ...EMPTY_HOOK })}
@@ -547,6 +558,7 @@ export function ExtensionsPage() {
       {marketOpen && (
         <MarketplaceDialog
           projectDir={projectDir}
+          modelOptions={modelOptions}
           onInstalled={() => {
             void refreshAll();
           }}
@@ -612,27 +624,15 @@ export function ExtensionsPage() {
       )}
       {pendingConfirm ? (
         <ConfirmDialog
-          confirm={pendingConfirm}
-          onClose={() => setPendingConfirm(null)}
-          onDone={() => setPendingConfirm(null)}
+          title={pendingConfirm.title}
+          body={pendingConfirm.body}
+          confirmLabel={pendingConfirm.confirmLabel}
+          onCancel={() => setPendingConfirm(null)}
+          onConfirm={() => pendingConfirm.onConfirm().finally(() => setPendingConfirm(null))}
         />
       ) : null}
     </div>
   );
-}
-
-function applyResult<T>(
-  result: PromiseSettledResult<T>,
-  setter: (value: T) => void,
-  label: string,
-  failures: string[],
-) {
-  if (result.status === 'fulfilled') {
-    setter(result.value);
-  } else {
-    console.error(`加载${label}失败:`, result.reason);
-    failures.push(label);
-  }
 }
 
 function TabButton({
@@ -698,8 +698,8 @@ function SkillsTab({
   return (
     <section>
       <p className="faint" style={{ fontSize: 12.5, margin: '-2px 0 14px' }}>
-        <span className="pill">仅 Claude Code</span>{' '}
-        技能是按需加载的提示词能力包，来自用户/项目目录的 skills 文件夹或市场安装。
+        技能是按需加载的提示词能力包，来自用户/项目目录的 skills 文件夹或市场安装。Claude Code
+        技能在会话中以 /技能名 触发，可在此启停；Codex 技能以 $技能名 触发，暂不支持在 Helm 中启停。
       </p>
       <div className="toolbar">
         <SearchBox placeholder="搜索技能…" value={search} onChange={setSearch} />
@@ -748,6 +748,11 @@ function SkillsTab({
                 <Switch
                   checked={skill.enabled}
                   disabled={skill.engine === 'codex'}
+                  title={
+                    skill.engine === 'codex'
+                      ? 'Codex 技能由 Codex CLI 原生加载，暂不支持在 Helm 中启停'
+                      : undefined
+                  }
                   onChange={(enabled) => onToggle(skill.id, enabled)}
                 />
               </div>
@@ -762,7 +767,9 @@ function SkillsTab({
                     ? '内置'
                     : skill.source === 'market'
                       ? '市场'
-                      : '自定义'}
+                      : skill.source === 'plugin'
+                        ? '插件'
+                        : '自定义'}
                 </span>
               </div>
             </div>
@@ -1268,6 +1275,7 @@ function HooksTab({
 
 function MarketplaceDialog({
   projectDir,
+  modelOptions,
   onInstalled,
   onNotify,
   onClose,
@@ -1277,6 +1285,7 @@ function MarketplaceDialog({
   onUseHook,
 }: {
   projectDir: string;
+  modelOptions: string[];
   onInstalled: () => void;
   onNotify: (message: string) => void;
   onClose: () => void;
@@ -1367,7 +1376,7 @@ function MarketplaceDialog({
           ...EMPTY_SUBAGENT,
           id: 'security-reviewer',
           name: '安全审查',
-          model: 'claude-opus-4.7',
+          model: modelOptions[0] ?? '',
           role: '审查改动中的注入、鉴权与密钥泄露风险。',
           tools: 'Read,Grep,Glob',
           prompt: '你是安全审查代理，聚焦 OWASP Top 10。按严重程度列出风险、证据与修复建议。',
@@ -1919,74 +1928,6 @@ function HookDialog({
   );
 }
 
-function ConfirmDialog({
-  confirm,
-  onClose,
-  onDone,
-}: {
-  confirm: PendingConfirm;
-  onClose: () => void;
-  onDone: () => void;
-}) {
-  const [busy, setBusy] = useState(false);
-  return (
-    <Dialog
-      title={confirm.title}
-      onClose={busy ? () => undefined : onClose}
-      footer={
-        <>
-          <button className="btn btn--ghost" onClick={onClose} disabled={busy}>
-            取消
-          </button>
-          <button
-            className="btn btn--danger"
-            disabled={busy}
-            onClick={() => {
-              setBusy(true);
-              void confirm.onConfirm().finally(() => {
-                setBusy(false);
-                onDone();
-              });
-            }}
-          >
-            {busy ? '处理中...' : confirm.confirmLabel}
-          </button>
-        </>
-      }
-    >
-      <p className="modal-copy">{confirm.body}</p>
-    </Dialog>
-  );
-}
-
-function Dialog({
-  title,
-  children,
-  footer,
-  onClose,
-}: {
-  title: string;
-  children: React.ReactNode;
-  footer?: React.ReactNode;
-  onClose: () => void;
-}) {
-  const dialogRef = useDialogBehavior(onClose);
-  return (
-    <div className="modal-overlay" role="dialog" aria-modal="true" aria-label={title}>
-      <div className="modal-panel" ref={dialogRef} tabIndex={-1}>
-        <div className="modal-panel__head">
-          <b>{title}</b>
-          <button className="btn-icon sm" onClick={onClose} aria-label="关闭">
-            <Icon name="x" />
-          </button>
-        </div>
-        <div className="modal-panel__body">{children}</div>
-        {footer ? <div className="modal-panel__foot">{footer}</div> : null}
-      </div>
-    </div>
-  );
-}
-
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label className="field">
@@ -2017,33 +1958,19 @@ function SearchBox({
   );
 }
 
-function Chip({
-  active,
-  onClick,
-  children,
-}: {
-  active: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <button className={'chip' + (active ? ' is-active' : '')} onClick={onClick}>
-      {children}
-    </button>
-  );
-}
-
 function Switch({
   checked,
   disabled = false,
+  title,
   onChange,
 }: {
   checked: boolean;
   disabled?: boolean;
+  title?: string;
   onChange: (checked: boolean) => void;
 }) {
   return (
-    <label className="switch">
+    <label className="switch" title={title}>
       <input
         type="checkbox"
         checked={checked}

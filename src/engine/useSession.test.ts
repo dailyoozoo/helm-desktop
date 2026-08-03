@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AgentEvent, AgentEventEnvelope } from '@helm/protocol';
 import {
   applyEnvelopeToLiveRegistry,
+  classifyClientErrorKind,
   itemsFromHistory,
   liveSessionHandle,
   liveSessionActivity,
@@ -12,10 +13,52 @@ import {
   resetSessionState,
   reduceSessionAction,
   reduceSessionEvent,
+  submitApprovalTransaction,
   shouldConsumeAgentEvent,
   subscribeLiveSessions,
   type SessionState,
 } from './useSession';
+
+describe('Tauri 命令错误分类', () => {
+  it('把会话创建阶段的无效工作目录识别为 cwd_invalid', () => {
+    expect(
+      classifyClientErrorKind(
+        '工作目录不存在：D:\\missing。请重新选择一个有效目录（系统找不到指定的路径）',
+      ),
+    ).toBe('cwd_invalid');
+    expect(
+      classifyClientErrorKind(
+        '工作目录不存在或不是文件夹：D:\\work\\file.txt。请重新选择一个有效目录',
+      ),
+    ).toBe('cwd_invalid');
+  });
+
+  it('识别模型不可用错误', () => {
+    expect(
+      classifyClientErrorKind(
+        "There's an issue with the selected model. It may not exist or you may not have access to it.",
+      ),
+    ).toBe('model_unavailable');
+  });
+
+  it('把 Codex 受保护工具面拒绝渲染为版本不兼容，而不是裸错误码', () => {
+    for (const code of [
+      'codex_probe_tool_surface_unmanaged',
+      'codex_probe_tool_surface_incomplete',
+      'codex_probe_tool_surface_timed_out',
+      'codex_probe_tool_surface_unavailable',
+      'codex_probe_tool_surface_unrecognized',
+    ]) {
+      expect(classifyClientErrorKind(`[${code}] codex 0.144.1 probe rejected`)).toBe(
+        'version_incompatible',
+      );
+    }
+  });
+
+  it('不把未知命令错误误判为 Codex 版本问题', () => {
+    expect(classifyClientErrorKind('未知后端错误')).toBeUndefined();
+  });
+});
 
 function sessionState(overrides: Partial<SessionState> = {}): SessionState {
   return {
@@ -82,6 +125,21 @@ describe('shouldConsumeAgentEvent（historyId 路由，变更-06）', () => {
         envelope('h-1', { type: 'error', message: '任意错误', recoverable: false }),
       ),
     ).toBe(false);
+  });
+});
+
+describe('逐 Turn 模型证据', () => {
+  it('keeps the requested preference separate from the Runtime-observed model', () => {
+    const next = reduceSessionEvent(sessionState({ model: 'requested-model' }), {
+      type: 'session_started',
+      sessionId: 'native-1',
+      engine: 'claude-code',
+      model: 'routed-model',
+      cwd: 'D:\\work\\demo',
+      ts: 1,
+    });
+    expect(next.model).toBe('requested-model');
+    expect(next.runtimeModel).toBe('routed-model');
   });
 });
 
@@ -172,6 +230,7 @@ describe('并行会话注册表（变更-06）', () => {
         id: 'approval-1',
         action: 'Bash',
         detail: 'npm test',
+        availableDecisions: ['allow', 'deny'],
       }),
     );
     expect(liveSessionActivity('h-1')).toMatchObject({ stage: 'waiting_approval' });
@@ -262,6 +321,7 @@ describe('并行会话注册表（变更-06）', () => {
         id: 'approval-1',
         action: 'Bash',
         detail: 'npm test',
+        availableDecisions: ['allow', 'deny'],
       }),
     );
     expect(notifications).toBe(2);
@@ -448,6 +508,38 @@ describe('reduceSessionEvent plan_update', () => {
       contextWindow: 2000,
     });
   });
+
+  it('累加计费 token，但替换最近一次上下文占用', () => {
+    let next = reduceSessionEvent(baseState(), {
+      type: 'token_usage',
+      sessionId: 'cli-current',
+      inputTokens: 100,
+      cachedInputTokens: 70,
+      cacheWriteInputTokens: 20,
+      outputTokens: 10,
+      costUsd: 0.01,
+    });
+    next = reduceSessionEvent(next, {
+      type: 'context_usage',
+      sessionId: 'cli-current',
+      contextTokens: 80,
+      contextWindow: 200,
+    });
+    next = reduceSessionEvent(next, {
+      type: 'context_usage',
+      sessionId: 'cli-current',
+      contextTokens: 120,
+      contextWindow: 200,
+    });
+    expect(next.cost).toMatchObject({
+      inputTokens: 100,
+      cachedInputTokens: 70,
+      cacheWriteInputTokens: 20,
+      outputTokens: 10,
+      contextTokens: 120,
+      contextWindow: 200,
+    });
+  });
 });
 
 describe('轮次活动追踪', () => {
@@ -562,6 +654,7 @@ describe('轮次活动追踪', () => {
       id: 'approval-1',
       action: 'Bash',
       detail: 'npm test',
+      availableDecisions: ['allow', 'deny'],
     });
 
     expect(responding.turnActivity).toEqual({ stage: 'responding', since: 6_000 });
@@ -582,11 +675,74 @@ describe('轮次活动追踪', () => {
       id: 'approval-1',
       action: 'Bash',
       detail: 'npm test',
+      availableDecisions: ['allow', 'deny'],
     });
 
     expect(waiting.openThinkingId).toBeNull();
     expect(waiting.items.find((item) => item.kind === 'thinking')).toMatchObject({ done: true });
     expect(waiting.turnActivity).toMatchObject({ stage: 'waiting_approval' });
+  });
+
+  it('updates a replayed approval request in place instead of appending a duplicate card', () => {
+    const first = reduceSessionEvent(sessionState(), {
+      type: 'approval_request',
+      sessionId: 'cli-current',
+      id: 'approval-1',
+      action: 'Bash',
+      detail: 'ls',
+      availableDecisions: ['allow', 'deny'],
+    });
+
+    const replayed = reduceSessionEvent(first, {
+      type: 'approval_request',
+      sessionId: 'cli-current',
+      id: 'approval-1',
+      action: 'Bash',
+      detail: 'ls -la',
+      availableDecisions: ['allow', 'deny'],
+    });
+
+    expect(replayed.items.filter((item) => item.kind === 'approval')).toEqual([
+      {
+        kind: 'approval',
+        id: 'approval-1',
+        action: 'Bash',
+        detail: 'ls -la',
+        status: 'pending',
+        availableDecisions: ['allow', 'deny'],
+        persistentLabel: undefined,
+        matcherSummary: undefined,
+      },
+    ]);
+  });
+
+  it('keeps a terminal approval terminal when its request event is replayed', () => {
+    const resolved = sessionState({
+      items: [
+        {
+          kind: 'approval',
+          id: 'approval-1',
+          action: 'Bash',
+          detail: 'ls',
+          status: 'resolved',
+          availableDecisions: [],
+        },
+      ],
+    });
+
+    const replayed = reduceSessionEvent(resolved, {
+      type: 'approval_request',
+      sessionId: 'cli-current',
+      id: 'approval-1',
+      action: 'Bash',
+      detail: 'ls',
+      availableDecisions: ['allow', 'deny'],
+    });
+
+    expect(replayed.items.find((item) => item.kind === 'approval')).toMatchObject({
+      id: 'approval-1',
+      status: 'resolved',
+    });
   });
 
   it('clears activity on turn completion and fatal errors', () => {
@@ -606,7 +762,7 @@ describe('轮次活动追踪', () => {
     expect(failed).toMatchObject({ turnActivity: null, turnStartedAt: null });
   });
 
-  it('keeps the current activity on recoverable errors', () => {
+  it('ends the current turn on recoverable session errors', () => {
     const current = { stage: 'retrying' as const, since: 9_000, retryAttempt: 2 };
     const next = reduceSessionEvent(sessionState({ turnActivity: current }), {
       type: 'error',
@@ -615,13 +771,13 @@ describe('轮次活动追踪', () => {
       recoverable: true,
     });
 
-    expect(next.turnActivity).toEqual(current);
-    expect(next.turnStartedAt).toBe(1);
+    expect(next.status).toBe('idle');
+    expect(next.turnActivity).toBeNull();
+    expect(next.turnStartedAt).toBeNull();
   });
 
   it.each([
     { type: 'select_engine' as const, engine: 'codex' as const, model: 'gpt-5' },
-    { type: 'select_model' as const, model: 'claude-opus-4.1' },
     {
       type: 'resume_handle' as const,
       handleId: 'handle-2',
@@ -629,9 +785,36 @@ describe('轮次活动追踪', () => {
       working: true,
     },
   ])('$type clears activity inherited from another thread', (action) => {
-    const next = reduceSessionAction(sessionState(), action);
+    const next = reduceSessionAction(
+      {
+        ...sessionState(),
+        items: [{ kind: 'assistant', id: 'old', text: '旧消息' }],
+        cost: { inputTokens: 2, outputTokens: 3, costUsd: 0.01 },
+      },
+      action,
+    );
     expect(next.turnActivity).toBeNull();
     expect(next.turnStartedAt).toBeNull();
+    if (action.type === 'resume_handle') return;
+    expect(next.items).toEqual([]);
+    expect(next.cost).toEqual({ inputTokens: 0, outputTokens: 0, costUsd: 0 });
+  });
+
+  it('keeps the current Session and history when changing the next-turn model preference', () => {
+    const current = {
+      ...sessionState(),
+      handleId: 'handle-1',
+      historyId: 'history-1',
+      items: [{ kind: 'assistant' as const, id: 'old', text: '旧消息' }],
+    };
+    const next = reduceSessionAction(current, {
+      type: 'select_model',
+      model: 'claude-opus-4.1',
+    });
+    expect(next.handleId).toBe('handle-1');
+    expect(next.historyId).toBe('history-1');
+    expect(next.items).toEqual(current.items);
+    expect(next.model).toBe('claude-opus-4.1');
   });
 });
 
@@ -687,7 +870,7 @@ describe('itemsFromHistory', () => {
       outputTokens: 0,
       costUsd: 0,
       messages: [
-        { role: 'user', text: '改一下配置', ts: 1000 },
+        { role: 'user', text: '改一下配置', ts: 1000, turnId: 'turn-1' },
         { role: 'assistant', text: '先看文件', ts: 2000 },
         { role: 'assistant', text: '改完了', ts: 5000 },
       ],
@@ -697,6 +880,17 @@ describe('itemsFromHistory', () => {
       ],
       checkpoints: [{ id: 'c-1', label: '改动前：config.ts', ts: 3500 }],
       approvals: [],
+      turns: [
+        {
+          id: 'turn-1',
+          epoch: 1,
+          mode: 'build',
+          permissionProfile: 'auto',
+          status: 'succeeded',
+          startedAt: 1100,
+          endedAt: 5100,
+        },
+      ],
     });
 
     expect(items.map((it) => it.kind)).toEqual([
@@ -707,6 +901,68 @@ describe('itemsFromHistory', () => {
       'tool', // 4000 Edit
       'assistant', // 5000
     ]);
+    expect(items[0]).toMatchObject({
+      kind: 'user',
+      mode: 'build',
+      permissionProfile: 'auto',
+    });
+    expect(items[1]).toMatchObject({ kind: 'assistant', turnId: 'turn-1' });
+    expect(items[5]).toMatchObject({ kind: 'assistant', turnId: 'turn-1' });
+  });
+
+  it('只在唯一已结束 Turn 的时间区间内恢复旧 assistant 归属', () => {
+    const items = itemsFromHistory({
+      id: 'legacy-turn-links',
+      cliSessionId: null,
+      title: '旧历史',
+      engine: 'claude-code',
+      model: 'claude-sonnet-4.6',
+      cwd: 'D:\\work\\demo',
+      status: 'done',
+      createdAt: 1,
+      updatedAt: 2,
+      messageCount: 3,
+      inputTokens: 0,
+      outputTokens: 0,
+      costUsd: 0,
+      messages: [
+        { role: 'assistant', text: '第一轮完成', ts: 1900 },
+        { role: 'assistant', text: '区间外旧消息', ts: 2500 },
+        { role: 'assistant', text: '第二轮完成', ts: 3900 },
+      ],
+      toolCalls: [],
+      checkpoints: [],
+      approvals: [],
+      turns: [
+        {
+          id: 'turn-1',
+          epoch: 1,
+          mode: 'build',
+          permissionProfile: 'standard',
+          status: 'succeeded',
+          startedAt: 1000,
+          endedAt: 2000,
+        },
+        {
+          id: 'turn-2',
+          epoch: 2,
+          mode: 'build',
+          permissionProfile: 'standard',
+          status: 'failed',
+          startedAt: 3000,
+          endedAt: 4000,
+        },
+      ],
+    });
+
+    expect(items[0]).toMatchObject({ kind: 'assistant', turnId: 'turn-1' });
+    expect(items[1]).toMatchObject({ kind: 'assistant' });
+    expect(items[1]).not.toHaveProperty('turnId');
+    expect(items[2]).toMatchObject({
+      kind: 'assistant',
+      turnId: 'turn-2',
+      turnStatus: 'failed',
+    });
   });
 
   it('restores tool calls with diff from session history', () => {
@@ -760,14 +1016,24 @@ describe('itemsFromHistory', () => {
       id: 'appr-1',
       action: 'Bash',
       detail: 'pnpm test',
-      resolved: false,
+      status: 'pending',
+      error: undefined,
+      availableDecisions: ['allow', 'deny'],
+      decision: undefined,
+      persistentLabel: undefined,
+      matcherSummary: undefined,
     });
     expect(items).toContainEqual({
       kind: 'approval',
       id: 'appr-2',
       action: 'Write',
       detail: 'x.txt',
-      resolved: true,
+      status: 'resolved',
+      error: undefined,
+      availableDecisions: [],
+      decision: undefined,
+      persistentLabel: undefined,
+      matcherSummary: undefined,
     });
 
     expect(items).toContainEqual({
@@ -777,6 +1043,7 @@ describe('itemsFromHistory', () => {
       input: { file_path: 'demo.ts' },
       status: 'success',
       output: 'Updated',
+      startedAt: 2,
       diff: {
         path: 'demo.ts',
         hunks: [
@@ -797,6 +1064,59 @@ describe('itemsFromHistory', () => {
       label: '改动前：demo.ts',
       ts: 1_717_171_703_000,
       restored: false,
+      restorable: false,
+      fileCount: 0,
+      reason: undefined,
     });
+  });
+});
+
+describe('submitApprovalTransaction', () => {
+  it('stays applying until the backend confirms the decision', async () => {
+    const actions: Array<{ type: string }> = [];
+    let confirm!: () => void;
+    const backend = new Promise<void>((resolve) => {
+      confirm = resolve;
+    });
+
+    const pending = submitApprovalTransaction({
+      approvalId: 'approval-1',
+      decision: 'always',
+      respond: () => backend,
+      dispatch: (action) => actions.push(action),
+      onResolved: vi.fn(),
+      onFailed: vi.fn(),
+    });
+
+    expect(actions).toEqual([{ type: 'approval_applying', approvalId: 'approval-1' }]);
+    confirm();
+    await pending;
+    expect(actions).toEqual([
+      { type: 'approval_applying', approvalId: 'approval-1' },
+      { type: 'approval_resolved', approvalId: 'approval-1', decision: 'always' },
+    ]);
+  });
+
+  it('marks a backend failure retryable and exposes the error', async () => {
+    const actions: Array<{ type: string; error?: string }> = [];
+    const onFailed = vi.fn();
+
+    await submitApprovalTransaction({
+      approvalId: 'approval-1',
+      decision: 'allow',
+      respond: async () => {
+        throw new Error('审批恢复失败');
+      },
+      dispatch: (action) => actions.push(action),
+      onResolved: vi.fn(),
+      onFailed,
+    });
+
+    expect(actions.at(-1)).toEqual({
+      type: 'approval_failed',
+      approvalId: 'approval-1',
+      error: '审批恢复失败',
+    });
+    expect(onFailed).toHaveBeenCalledWith('审批恢复失败');
   });
 });

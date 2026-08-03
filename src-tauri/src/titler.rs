@@ -1,18 +1,30 @@
-//! fast model 自动起标题 + 会话摘要（P3-5）。
+//! fast model 自动起标题 + 会话摘要（BackgroundOperation）。
 //!
-//! 首轮 TurnComplete 后，用会话绑定的服务商与 fast model 真实调用一次补全接口，
-//! 生成 ≤16 字标题与一句话摘要，写入 `session.title` / `session.summary`。
+//! 首轮 TurnComplete 后，用当前 Engine Binding 的 fast model（缺失回落 primary）经
+//! ModelOnlyOperationPolicy + 真实 CLI Adapter 生成标题与摘要。
 //!
 //! 披露与开关（隐私要求：默认外发必须显式披露 + 可关）：
 //! - 设置 `general.autoTitleSessions` 可关闭（默认开）；
-//! - 内容只发给用户自己绑定、已在计费的服务商，不发第三方；
-//! - 订阅登录（无 Key）服务商 Helm 不持有凭证，自动跳过，标题保持首条消息截断。
+//! - 内容只发给当前 Engine Binding 的服务商；
+//! - API/订阅共用真实 CLI 路径，不保留 direct HTTP 旁路。
 
-use crate::providers::{
-    provider_completion_endpoint, AuthMethod, KeyringSecretStore, Protocol, ProviderStore,
+use crate::adapter::agent_environment_from_settings;
+use crate::budget::TurnBudgetSnapshot;
+use crate::capability_registry::EngineCapabilityRegistry;
+use crate::commands::{
+    ensure_binding_runtime_ready, resolve_engine_capability_snapshot, resolve_routed_effort,
+    subscription_profile_for_binding,
 };
+use crate::operations::{
+    BackgroundOperation, ModelOnlyOperationPolicy, NewBackgroundOperation, OperationExecutionSpec,
+};
+use crate::providers::{BindingConfig, KeyringSecretStore, ProviderStore};
+use crate::reasoning::ReasoningEffort;
+use crate::runtime_registry::RuntimeRegistry;
 use crate::sessions::SessionHistoryStore;
-use crate::settings::load_app_settings_from_store;
+use crate::settings::{load_app_settings_from_store, AppSettings};
+use crate::subscription_profiles::SubscriptionProfileStore;
+use crate::turn_start::{build_runtime_route, digest_json};
 use tauri::{AppHandle, Emitter, Manager};
 
 const MAX_SNIPPET_CHARS: usize = 600;
@@ -59,49 +71,311 @@ async fn generate_title(app: &AppHandle, history_session_id: &str) -> Result<(),
     let provider_store = app
         .try_state::<ProviderStore<KeyringSecretStore>>()
         .ok_or("服务商存储未初始化")?;
-    let config = provider_store.load()?;
-    let provider_id = history_store.session_provider_id(history_session_id)?;
-    let provider = config
-        .providers
-        .iter()
-        .find(|provider| provider.id == provider_id)
-        .ok_or_else(|| format!("会话服务商不存在：{provider_id}"))?;
-    // 订阅登录（无 Key）：Helm 不持有凭证，无法代表用户调 API——跳过而不是硬错
-    let has_key = provider
-        .key_ref
-        .as_deref()
-        .is_some_and(|key_ref| !key_ref.trim().is_empty());
-    if !has_key {
-        return Err("服务商未存密钥（订阅登录模式），跳过自动起标题".to_string());
-    }
-    if !matches!(provider.auth_method, AuthMethod::ApiKey | AuthMethod::OAuth) {
-        return Err("云凭证/本地服务商暂不支持自动起标题".to_string());
-    }
-    let api_key = provider_store.provider_secret(&provider.id)?;
-
-    // fast model 优先，没配就用主模型
-    let model = config
-        .bindings
-        .iter()
-        .find(|binding| binding.provider_id == provider.id)
-        .and_then(|binding| binding.fast_model.clone().filter(|model| !model.is_empty()))
-        .unwrap_or_else(|| detail.summary.model.clone());
-
     let prompt = title_prompt(&user_text, &assistant_text);
-    let raw = request_completion(
-        &provider.protocol,
-        &provider.base_url,
-        &api_key,
-        &model,
-        &prompt,
-    )
-    .await?;
-    let (title, summary) = parse_title_summary(&raw, &user_text);
-
-    history_store.set_session_title_and_summary(history_session_id, &title, &summary)?;
+    let profiles = app
+        .try_state::<SubscriptionProfileStore>()
+        .ok_or("订阅 Profile 存储未初始化")?;
+    let capabilities = app
+        .try_state::<EngineCapabilityRegistry>()
+        .ok_or("Engine Capability Registry 未初始化")?;
+    let runtime_registry = app
+        .try_state::<RuntimeRegistry>()
+        .ok_or("RuntimeRegistry 未初始化")?;
+    let engine_id = match detail.summary.engine {
+        crate::protocol::EngineId::ClaudeCode => "claude-code",
+        crate::protocol::EngineId::Codex => "codex",
+    };
+    let mut committed = None;
+    for _ in 0..3 {
+        let candidate = provider_store.route_candidate()?;
+        let binding = candidate
+            .config
+            .bindings
+            .iter()
+            .find(|binding| binding.engine_id == engine_id)
+            .cloned()
+            .ok_or_else(|| format!("引擎还没有配置生效绑定：{engine_id}"))?;
+        let model = binding
+            .fast_model
+            .as_deref()
+            .filter(|model| !model.trim().is_empty())
+            .unwrap_or(&binding.primary_model)
+            .to_string();
+        let launch_binding = BindingConfig {
+            primary_model: model.clone(),
+            assistant_model_id: None,
+            ..binding.clone()
+        };
+        ensure_binding_runtime_ready(&profiles, &candidate.config, &launch_binding).await?;
+        let mut env = provider_store.launch_env_for_config(&candidate.config, &launch_binding)?;
+        let subscription_home =
+            subscription_profile_for_binding(&profiles, &candidate.config, &launch_binding)?;
+        if subscription_home.is_some() {
+            profiles.append_launch_env(&mut env, engine_id)?;
+        }
+        append_operation_environment(&mut env, &settings);
+        let bin = candidate
+            .config
+            .engine_bin(engine_id)
+            .filter(|bin| !bin.is_empty())
+            .unwrap_or(if engine_id == "codex" {
+                "codex"
+            } else {
+                "claude"
+            })
+            .to_string();
+        let pricing_profile = candidate
+            .config
+            .models
+            .iter()
+            .find(|item| item.provider_id == binding.provider_id && item.id == model)
+            .map(|item| provider_store.model_pricing_profile(&candidate.config, item))
+            .transpose()?
+            .flatten();
+        let requested_effort = binding.reasoning_effort.unwrap_or(ReasoningEffort::Auto);
+        let route = build_runtime_route(
+            &candidate.config,
+            &launch_binding,
+            &model,
+            &bin,
+            &env,
+            requested_effort,
+            pricing_profile,
+        )?;
+        let capability = resolve_engine_capability_snapshot(
+            &capabilities,
+            &route,
+            &bin,
+            &env,
+            subscription_home,
+        )
+        .await?;
+        let routed_effort = resolve_routed_effort(&capability, requested_effort);
+        let created_at = crate::util::now_millis();
+        let operation_id = format!("operation-{:032x}", rand::random::<u128>());
+        let spec = OperationExecutionSpec::from_binding_route(
+            operation_id.clone(),
+            "auto_title",
+            format!("binding:{}", binding.engine_id),
+            binding.revision,
+            &route,
+            &capability,
+            requested_effort,
+            routed_effort,
+            created_at,
+        )?;
+        let policy = ModelOnlyOperationPolicy::freeze_from_capability(&capability, created_at);
+        let new_operation = NewBackgroundOperation {
+            operation: BackgroundOperation {
+                id: operation_id,
+                kind: "auto_title".to_string(),
+                source_session_id: Some(history_session_id.to_string()),
+                input_digest: digest_json(&prompt)?,
+                input: None,
+                idempotency_key: format!("auto_title:{history_session_id}:v1"),
+                status: "committed".to_string(),
+                result: None,
+                error_code: None,
+                created_at,
+                started_at: None,
+                cancel_requested_at: None,
+                ended_at: None,
+            },
+            spec,
+            policy,
+            budget: TurnBudgetSnapshot::standard(created_at),
+        };
+        match provider_store.commit_route_if_unchanged(&candidate.config_digest, |_| {
+            history_store.create_background_operation(&new_operation)
+        })? {
+            Some((operation, false)) => return existing_operation_result(&operation),
+            Some((_operation, true)) => {
+                committed = Some((new_operation, capability, bin, env));
+                break;
+            }
+            None => continue,
+        }
+    }
+    let (operation, capability, bin, env) = committed.ok_or_else(|| {
+        "Provider 配置连续变化，OperationStart 有界重算未能收敛，请重试".to_string()
+    })?;
+    if let Err(error) =
+        ModelOnlyOperationPolicy::from_capability(&capability, operation.operation.created_at)
+    {
+        history_store.fail_committed_background_operation(&operation.operation.id, &error)?;
+        return Err(error);
+    }
+    let (attempt_no, output) = runtime_registry
+        .run_model_only_operation(
+            &operation.spec,
+            &operation.policy,
+            &operation.budget,
+            &bin,
+            &env,
+            &prompt,
+        )
+        .await?;
+    let (title, summary) = parse_title_summary(&output.text, &user_text);
+    let result = serde_json::json!({"title": title, "summary": summary});
+    history_store.complete_model_only_operation(
+        &operation.operation.id,
+        attempt_no,
+        &output,
+        &result,
+    )?;
     // 通知前端刷新会话列表（侧栏标题即时更新）
     let _ = app.emit("helm-sessions-changed", history_session_id);
     Ok(())
+}
+
+pub async fn retry_background_operation(app: &AppHandle, operation_id: &str) -> Result<(), String> {
+    let history_store = app
+        .try_state::<SessionHistoryStore>()
+        .ok_or("历史存储未初始化")?;
+    let execution = history_store
+        .load_background_operation_execution(operation_id)?
+        .ok_or_else(|| format!("找不到 BackgroundOperation：{operation_id}"))?;
+    if execution.operation.kind != "auto_title" || execution.spec.purpose != "auto_title" {
+        return Err("当前 BackgroundOperation 类型不支持手工重试".to_string());
+    }
+    if !matches!(
+        execution.operation.status.as_str(),
+        "failed" | "cancelled" | "delivery_unknown"
+    ) {
+        return Err("BackgroundOperation 当前状态不允许手工重试".to_string());
+    }
+    let history_session_id = execution
+        .operation
+        .source_session_id
+        .as_deref()
+        .ok_or("auto_title Operation 缺少源 Session")?;
+    let detail = history_store.get_session(history_session_id)?;
+    let user_text = detail
+        .messages
+        .iter()
+        .find(|message| matches!(message.role, crate::protocol::Role::User))
+        .map(|message| message.text.clone())
+        .ok_or("源 Session 没有用户消息")?;
+    let assistant_text = detail
+        .messages
+        .iter()
+        .find(|message| matches!(message.role, crate::protocol::Role::Assistant))
+        .map(|message| message.text.clone())
+        .ok_or("源 Session 没有助手回复")?;
+    let prompt = title_prompt(&user_text, &assistant_text);
+    if digest_json(&prompt)? != execution.operation.input_digest {
+        return Err("[operation_input_digest_mismatch] 无法从源 Session 重建冻结输入".into());
+    }
+
+    let settings = load_app_settings_from_store(&history_store)?;
+    let provider_store = app
+        .try_state::<ProviderStore<KeyringSecretStore>>()
+        .ok_or("服务商存储未初始化")?;
+    let profiles = app
+        .try_state::<SubscriptionProfileStore>()
+        .ok_or("订阅 Profile 存储未初始化")?;
+    let capabilities = app
+        .try_state::<EngineCapabilityRegistry>()
+        .ok_or("Engine Capability Registry 未初始化")?;
+    let runtime_registry = app
+        .try_state::<RuntimeRegistry>()
+        .ok_or("RuntimeRegistry 未初始化")?;
+    let candidate = provider_store.route_candidate()?;
+    let current_binding = candidate
+        .config
+        .bindings
+        .iter()
+        .find(|binding| binding.engine_id == execution.spec.engine_id)
+        .cloned()
+        .ok_or_else(|| format!("引擎还没有配置生效绑定：{}", execution.spec.engine_id))?;
+    let launch_binding = BindingConfig {
+        provider_id: execution.spec.provider_id.clone(),
+        primary_model: execution.spec.routed_model_id.clone(),
+        fast_model: Some(execution.spec.routed_model_id.clone()),
+        assistant_model_id: None,
+        reasoning_effort: Some(execution.spec.routed_reasoning_effort),
+        revision: execution.spec.binding_revision,
+        ..current_binding
+    };
+    ensure_binding_runtime_ready(&profiles, &candidate.config, &launch_binding).await?;
+    let mut env = provider_store.launch_env_for_config(&candidate.config, &launch_binding)?;
+    let subscription_home =
+        subscription_profile_for_binding(&profiles, &candidate.config, &launch_binding)?;
+    if subscription_home.is_some() {
+        profiles.append_launch_env(&mut env, &execution.spec.engine_id)?;
+    }
+    append_operation_environment(&mut env, &settings);
+    let bin = candidate
+        .config
+        .engine_bin(&execution.spec.engine_id)
+        .filter(|bin| !bin.is_empty())
+        .unwrap_or(if execution.spec.engine_id == "codex" {
+            "codex"
+        } else {
+            "claude"
+        })
+        .to_string();
+    let route = build_runtime_route(
+        &candidate.config,
+        &launch_binding,
+        &execution.spec.routed_model_id,
+        &bin,
+        &env,
+        execution.spec.routed_reasoning_effort,
+        execution.spec.pricing_basis_snapshot.profile.clone(),
+    )?;
+    if route.engine_id != execution.spec.engine_id
+        || route.provider_id != execution.spec.provider_id
+        || route.model_id != execution.spec.routed_model_id
+        || route.engine_profile_digest != execution.spec.engine_profile_digest
+        || route.provider_launch_profile_ref != execution.spec.provider_launch_profile_ref
+        || route.provider_launch_profile_digest != execution.spec.provider_launch_profile_digest
+        || route.launch_config_digest != execution.spec.launch_config_digest
+    {
+        return Err(
+            "[operation_frozen_launch_unavailable] 当前配置无法复现冻结的 Operation spec".into(),
+        );
+    }
+    let capability =
+        resolve_engine_capability_snapshot(&capabilities, &route, &bin, &env, subscription_home)
+            .await?;
+    ModelOnlyOperationPolicy::from_capability(&capability, crate::util::now_millis())?;
+    let transitioned = provider_store
+        .commit_route_if_unchanged(&candidate.config_digest, |_| {
+            history_store.prepare_background_operation_retry(operation_id)
+        })?;
+    if transitioned.is_none() {
+        return Err("Provider 配置在重试复核期间发生变化，请重新重试".to_string());
+    }
+    let (attempt_no, output) = runtime_registry
+        .run_model_only_operation(
+            &execution.spec,
+            &execution.policy,
+            &execution.budget,
+            &bin,
+            &env,
+            &prompt,
+        )
+        .await?;
+    let (title, summary) = parse_title_summary(&output.text, &user_text);
+    let result = serde_json::json!({"title": title, "summary": summary});
+    history_store.complete_model_only_operation(operation_id, attempt_no, &output, &result)?;
+    let _ = app.emit("helm-sessions-changed", history_session_id);
+    Ok(())
+}
+
+fn append_operation_environment(env: &mut Vec<(String, String)>, settings: &AppSettings) {
+    env.extend(agent_environment_from_settings(settings));
+}
+
+fn existing_operation_result(operation: &BackgroundOperation) -> Result<(), String> {
+    match operation.status.as_str() {
+        "succeeded" | "running" | "committed" => Ok(()),
+        _ => Err(operation
+            .error_code
+            .clone()
+            .unwrap_or_else(|| format!("自动标题任务状态：{}", operation.status))),
+    }
 }
 
 /// 构造起标题的 prompt（截断首轮内容，避免长对话浪费 token）
@@ -146,78 +420,6 @@ pub fn parse_title_summary(raw: &str, fallback_user_text: &str) -> (String, Stri
         truncate_chars(summary_line, 80)
     };
     (title, summary)
-}
-
-async fn request_completion(
-    protocol: &Protocol,
-    base_url: &str,
-    api_key: &str,
-    model: &str,
-    prompt: &str,
-) -> Result<String, String> {
-    let endpoint = provider_completion_endpoint(protocol, base_url);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败：{e}"))?;
-
-    match protocol {
-        Protocol::Anthropic => {
-            let body = serde_json::json!({
-                "model": model,
-                "max_tokens": 120,
-                "messages": [{ "role": "user", "content": prompt }],
-            });
-            let response = client
-                .post(endpoint)
-                .header("x-api-key", api_key)
-                .header("anthropic-version", "2023-06-01")
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| format!("请求失败：{e}"))?;
-            let status = response.status();
-            if !status.is_success() {
-                return Err(format!("HTTP {}", status.as_u16()));
-            }
-            let payload: serde_json::Value = response
-                .json()
-                .await
-                .map_err(|e| format!("解析响应失败：{e}"))?;
-            payload["content"][0]["text"]
-                .as_str()
-                .map(|text| text.to_string())
-                .ok_or_else(|| "响应缺少 content[0].text".to_string())
-        }
-        Protocol::OpenAiResponses | Protocol::OpenAiChat => {
-            let body = serde_json::json!({
-                "model": model,
-                "max_tokens": 120,
-                "messages": [{ "role": "user", "content": prompt }],
-            });
-            let response = client
-                .post(endpoint)
-                .bearer_auth(api_key)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| format!("请求失败：{e}"))?;
-            let status = response.status();
-            if !status.is_success() {
-                return Err(format!("HTTP {}", status.as_u16()));
-            }
-            let payload: serde_json::Value = response
-                .json()
-                .await
-                .map_err(|e| format!("解析响应失败：{e}"))?;
-            payload["choices"][0]["message"]["content"]
-                .as_str()
-                .map(|text| text.to_string())
-                .ok_or_else(|| "响应缺少 choices[0].message.content".to_string())
-        }
-        Protocol::Bedrock | Protocol::Vertex => Err("该协议暂不支持自动起标题".to_string()),
-    }
 }
 
 #[cfg(test)]

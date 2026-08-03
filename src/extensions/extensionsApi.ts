@@ -5,7 +5,7 @@ export interface Skill {
   name: string;
   description: string;
   scope: 'global' | 'project';
-  source: 'builtin' | 'market' | 'custom';
+  source: 'builtin' | 'market' | 'custom' | 'plugin';
   enabled: boolean;
   path: string;
   engine: 'claude-code' | 'codex';

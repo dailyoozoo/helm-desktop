@@ -47,12 +47,26 @@ function workingRows(markup: string): string[] {
 }
 
 describe('Thread activity rendering', () => {
+  it('hides the raw Codex tool-surface code behind the version-incompatible guidance', () => {
+    const state = reduceSessionEvent(activeState('thinking'), {
+      type: 'error',
+      message: '[codex_probe_tool_surface_unrecognized] codex 0.144.1 probe rejected',
+      recoverable: false,
+      kind: 'version_incompatible',
+    });
+    const markup = renderThread(state);
+
+    expect(markup).toContain('CLI 版本不兼容');
+    expect(markup).toContain('Codex 可切到计划/询问模式');
+    expect(markup).not.toContain('codex_probe_tool_surface_unrecognized');
+  });
+
   it.each(['thinking', 'tool'] as const)(
-    'renders exactly one ActivityRow and no generic spinner during active %s',
+    'does not duplicate ActivityRow when an entity already describes active %s',
     (kind) => {
       const markup = renderThread(activeState(kind));
 
-      expect(workingRows(markup)).toHaveLength(1);
+      expect(workingRows(markup)).toHaveLength(0);
       expect(markup).not.toContain('Helm 正在思考');
     },
   );
@@ -64,6 +78,7 @@ describe('Thread activity rendering', () => {
       id: 'approval-1',
       action: 'Bash',
       detail: 'npm test',
+      availableDecisions: ['allow', 'deny'],
     });
     const markup = renderThread(waiting);
 
@@ -73,6 +88,7 @@ describe('Thread activity rendering', () => {
 
   it('keeps elapsed time outside the polite live region', () => {
     const state = activeState('tool');
+    state.items = [];
     state.turnActivity = {
       stage: 'using_tool',
       since: Date.now() - 9_000,
@@ -94,5 +110,35 @@ describe('Thread activity rendering', () => {
     expect(markup).toContain('aria-expanded="true"');
     expect(controlId).toBeTruthy();
     expect(markup).toContain(`id="${controlId}"`);
+  });
+
+  it('最终答复流式输出期间保持同 Turn 过程容器展开', () => {
+    const state = activeState('thinking');
+    state.items = [
+      { kind: 'thinking', id: 'thinking-1', text: '分析', done: true, turnId: 'turn-1' },
+      { kind: 'assistant', id: 'assistant-1', text: '正在输出', turnId: 'turn-1' },
+    ];
+    state.openAssistantId = 'assistant-1';
+    state.openThinkingId = null;
+
+    const markup = renderThread(state);
+    expect(markup).toContain('turn-process__box');
+    expect(markup).toContain('aria-expanded="true"');
+  });
+
+  it('阶段正文已完成但 Turn 仍运行时保持过程容器展开', () => {
+    const state = activeState('thinking');
+    state.items = [
+      { kind: 'user', id: 'user-1', text: '继续', mode: 'build' },
+      { kind: 'thinking', id: 'thinking-1', text: '分析', done: true, turnId: 'turn-1' },
+      { kind: 'assistant', id: 'assistant-1', text: '阶段结论', turnId: 'turn-1' },
+    ];
+    state.openAssistantId = null;
+    state.openThinkingId = null;
+
+    const markup = renderThread(state);
+    expect(markup).toContain('turn-process__box');
+    expect(markup).toContain('aria-expanded="true"');
+    expect(markup).not.toContain('>已完成</span>');
   });
 });

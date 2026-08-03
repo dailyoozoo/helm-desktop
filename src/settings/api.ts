@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { AppSettings, UpdateStatus } from './types';
+import type { PermissionRule } from './permissionRules';
 
 export async function loadSettings(): Promise<AppSettings> {
   return invoke('load_app_settings');
@@ -61,14 +62,58 @@ export async function selectDirectory(): Promise<string | null> {
   return invoke('select_directory');
 }
 
-// —— 跨会话「始终允许」清单（P2-4） ——
+// —— 结构化权限规则（Permission Kernel Phase 1） ——
 
-export async function getAlwaysAllowTools(): Promise<string[]> {
-  return invoke('get_always_allow_tools');
+export async function getPermissionRules(): Promise<PermissionRule[]> {
+  return invoke('get_permission_rules');
 }
 
-export async function removeAlwaysAllowTool(tool: string): Promise<string[]> {
-  return invoke('remove_always_allow_tool', { tool });
+export interface CreateDenyRuleInput {
+  engine: 'claude-code' | 'codex' | null;
+  capability:
+    | 'file_read'
+    | 'directory_list'
+    | 'file_write'
+    | 'process_exec'
+    | 'network_request'
+    | 'mcp_invoke';
+  operation: string | null;
+  resourcePattern: string | null;
+  projectRoot: string | null;
+}
+
+export async function createPermissionDenyRule(
+  input: CreateDenyRuleInput,
+): Promise<PermissionRule[]> {
+  return invoke('create_permission_deny_rule', { input });
+}
+
+export interface PermissionRuleRemovalResult {
+  rules: PermissionRule[];
+  revocationTooLateCount: number;
+}
+
+export async function removePermissionRule(ruleId: string): Promise<PermissionRuleRemovalResult> {
+  return invoke('remove_permission_rule', { ruleId });
+}
+
+export interface PermissionAuditSummary {
+  recordCount: number;
+  oldestAt: number | null;
+  newestAt: number | null;
+  retentionDays: number;
+}
+
+export async function getPermissionAuditSummary(): Promise<PermissionAuditSummary> {
+  return invoke('get_permission_audit_summary');
+}
+
+export async function exportPermissionAudit(includeResources: boolean): Promise<string | null> {
+  return invoke('export_permission_audit', { includeResources });
+}
+
+export async function clearPermissionAudit(): Promise<PermissionAuditSummary> {
+  return invoke('clear_permission_audit');
 }
 
 // —— 冷启动就绪度（首启向导与发送前置校验共用） ——

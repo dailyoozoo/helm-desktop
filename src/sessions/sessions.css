@@ -41,6 +41,52 @@
   margin-bottom: 14px;
 }
 
+.sessions-folder-filters {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: nowrap;
+  max-width: 100%;
+  overflow-x: auto;
+  margin: -6px 0 12px;
+  padding-bottom: 2px;
+  scrollbar-width: thin;
+}
+.sessions-folder-filters .sessions-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+}
+.sessions-folder-filters svg {
+  width: 12px;
+  height: 12px;
+  color: var(--accent-hi);
+}
+.sessions-title-meta {
+  display: flex !important;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.sessions-title-meta > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sessions-title-meta > span:first-child {
+  color: var(--accent-hi);
+  flex: none;
+}
+.sessions-title-meta svg {
+  width: 12px;
+  height: 12px;
+}
+
 .sessions-search {
   width: 300px;
 }
@@ -69,9 +115,18 @@
 }
 
 .sessions-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   margin-bottom: 12px;
   color: var(--danger);
   font-size: 13px;
+}
+
+.sessions-row-error {
+  color: var(--danger) !important;
+  white-space: normal;
 }
 
 .sessions-table-card {
@@ -118,6 +173,56 @@
 
 .sessions-action {
   text-align: right;
+}
+
+.sessions-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.sessions-menu-wrap {
+  position: relative;
+}
+
+.sessions-row-menu {
+  top: calc(100% + 4px);
+  right: 0;
+  left: auto;
+  min-width: 140px;
+  opacity: 1;
+  transform: none;
+  pointer-events: auto;
+  z-index: 20;
+}
+
+.sessions-row-menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: var(--r-xs);
+  background: transparent;
+  color: var(--fg-2);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.sessions-row-menu button:hover {
+  background: var(--hover);
+}
+
+.sessions-row-menu button.is-danger {
+  color: var(--danger);
+}
+
+.sessions-row-menu svg {
+  width: 14px;
+  height: 14px;
 }
 
 .sessions-pill {

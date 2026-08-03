@@ -66,6 +66,9 @@ export function activityPresentationParts(
         ? `连接异常，正在重试（${activity.retryAttempt}）…`
         : '连接异常，正在重试…';
       break;
+    case 'stalled':
+      text = '长时间没有新活动，可继续等待或停止';
+      break;
   }
 
   const elapsedSeconds = Math.floor(Math.max(0, now - activity.since) / 1_000);
@@ -73,12 +76,6 @@ export function activityPresentationParts(
     label: text,
     elapsedText: elapsedSeconds >= 8 ? `（已用时 ${elapsedSeconds} 秒）` : null,
   };
-}
-
-export function activityPresentation(state: SessionState, now = Date.now()): string | null {
-  const presentation = activityPresentationParts(state, now);
-  if (!presentation) return null;
-  return `${presentation.label}${presentation.elapsedText ?? ''}`;
 }
 
 export function thinkingOpenAfterItemUpdate(

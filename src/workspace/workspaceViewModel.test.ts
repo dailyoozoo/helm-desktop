@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { AppConfig } from '../providers/api';
 import {
   defaultModelForEngine,
+  sameWorkspacePath,
   workspaceEngineOptions,
   workspaceSessionIsActive,
 } from './workspaceViewModel';
@@ -13,6 +14,7 @@ const config: AppConfig = {
     {
       id: 'anthropic',
       name: 'Anthropic',
+      kind: 'api',
       baseUrl: 'https://api.anthropic.com',
       keyRef: null,
       ready: true,
@@ -23,6 +25,7 @@ const config: AppConfig = {
     {
       id: 'openai',
       name: 'OpenAI',
+      kind: 'api',
       baseUrl: 'https://api.openai.com/v1',
       keyRef: null,
       ready: true,
@@ -102,6 +105,15 @@ describe('workspace view model', () => {
   it('returns the bound model as the default model per engine', () => {
     expect(defaultModelForEngine(config, 'claude-code')).toBe('claude-sonnet-4.6');
     expect(defaultModelForEngine(config, 'codex')).toBe('gpt-5-codex');
+  });
+
+  it('matches Windows workspace paths across separators, case, and extended prefixes', () => {
+    expect(sameWorkspacePath('D:\\Work\\Helm\\', 'd:/work/helm')).toBe(true);
+    expect(sameWorkspacePath('\\\\?\\D:\\Work\\Helm', 'd:/work/helm')).toBe(true);
+    expect(sameWorkspacePath('\\\\?\\UNC\\server\\share\\Helm', '\\\\server\\share\\helm')).toBe(
+      true,
+    );
+    expect(sameWorkspacePath('D:\\Work\\Helm', 'D:\\Work\\Other')).toBe(false);
   });
 
   it('matches workspace sessions by local handle id or attached cli session id', () => {

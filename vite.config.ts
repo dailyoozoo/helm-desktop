@@ -7,6 +7,12 @@ import react from '@vitejs/plugin-react';
 export default defineConfig({
   plugins: [react()],
   clearScreen: false,
+  build: {
+    // 生产包只收录正式入口；visual-audit.html 与其 fixture 仅供本地审计脚本使用。
+    rollupOptions: {
+      input: fileURLToPath(new URL('./index.html', import.meta.url)),
+    },
+  },
   server: {
     port: 1420,
     strictPort: true,

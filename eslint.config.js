@@ -9,7 +9,9 @@ export default tseslint.config(
     ignores: [
       '**/node_modules/**',
       '**/dist/**',
+      '.cargo-target-*/**',
       '.scratch/**',
+      'tmp/**',
       '**/test/fixtures/**',
       'prototype/**',
       'src-tauri/**',

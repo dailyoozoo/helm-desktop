@@ -1,4 +1,5 @@
 use helm_lib::extensions::{
+    list_plugin_skills_from_dir,
     delete_hook_from_settings_path, delete_mcp_server_from_codex_config_path,
     delete_mcp_server_from_settings_path, delete_slash_command_from_dir, delete_subagent_from_dir,
     list_hooks_from_settings_path, list_mcp_servers_from_codex_config_path,
@@ -11,6 +12,7 @@ use helm_lib::extensions::{
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
@@ -692,6 +694,122 @@ fn mcp_status_record_round_trips_and_survives_reload() {
 }
 
 #[test]
+fn concurrent_mcp_writes_preserve_all_successful_claude_and_codex_entries() {
+    let claude_path = temp_settings_path("concurrent-mcp-claude");
+    let codex_path = temp_dir("concurrent-mcp-codex").join("config.toml");
+    let mut workers = Vec::new();
+    for index in 0..12 {
+        let claude_path = claude_path.clone();
+        let codex_path = codex_path.clone();
+        workers.push(std::thread::spawn(move || {
+            let server = McpServer {
+                name: format!("server-{index}"),
+                command: format!("mcp-{index}"),
+                args: vec!["--stdio".to_string()],
+                env: HashMap::new(),
+                transport: McpTransport::Stdio,
+                enabled: true,
+                status: McpStatus::Disconnected,
+                last_tested_at: None,
+                tool_count: None,
+                last_error: None,
+            };
+            save_mcp_server_to_settings_path(&claude_path, server.clone()).unwrap();
+            save_mcp_server_to_codex_config_path(&codex_path, server).unwrap();
+        }));
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+
+    let claude = list_mcp_servers_from_settings_path(&claude_path).unwrap();
+    let codex = list_mcp_servers_from_codex_config_path(&codex_path).unwrap();
+    assert_eq!(claude.len(), 12);
+    assert_eq!(codex.len(), 12);
+    for index in 0..12 {
+        let name = format!("server-{index}");
+        assert!(claude.iter().any(|server| server.name == name));
+        assert!(codex.iter().any(|server| server.name == name));
+    }
+}
+
+#[test]
+#[ignore = "requires installed claude and codex CLIs"]
+fn real_clis_parse_isolated_configs_written_by_helm() {
+    let root = temp_dir("real-cli-config-smoke");
+    let claude_dir = root.join(".claude");
+    let codex_home = root.join(".codex");
+    fs::create_dir_all(&claude_dir).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let claude_path = claude_dir.join(".claude.json");
+    let codex_path = codex_home.join("config.toml");
+    let server = McpServer {
+        name: "helm-real-smoke".to_string(),
+        command: "node".to_string(),
+        args: vec!["-e".to_string(), "process.exit(0)".to_string()],
+        env: HashMap::new(),
+        transport: McpTransport::Stdio,
+        enabled: true,
+        status: McpStatus::Disconnected,
+        last_tested_at: None,
+        tool_count: None,
+        last_error: None,
+    };
+    save_mcp_server_to_settings_path(&claude_path, server.clone()).unwrap();
+    save_mcp_server_to_codex_config_path(&codex_path, server).unwrap();
+
+    let claude_bin = if cfg!(windows) {
+        "claude.cmd"
+    } else {
+        "claude"
+    };
+    let claude = Command::new(claude_bin)
+        .args(["mcp", "list"])
+        .env("HOME", &root)
+        .env("USERPROFILE", &root)
+        .env("CLAUDE_CONFIG_DIR", &claude_dir)
+        .current_dir(&root)
+        .output()
+        .expect("failed to start the real Claude CLI");
+    let claude_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&claude.stdout),
+        String::from_utf8_lossy(&claude.stderr)
+    );
+    assert!(
+        claude.status.success(),
+        "Claude CLI rejected the generated settings:\n{claude_output}"
+    );
+    assert!(
+        claude_output.contains("helm-real-smoke"),
+        "Claude CLI did not load the generated MCP entry:\n{claude_output}"
+    );
+
+    let codex_bin = if cfg!(windows) { "codex.cmd" } else { "codex" };
+    let codex = Command::new(codex_bin)
+        .args(["mcp", "list", "--json"])
+        .env("HOME", &root)
+        .env("USERPROFILE", &root)
+        .env("CODEX_HOME", &codex_home)
+        .current_dir(&root)
+        .output()
+        .expect("failed to start the real Codex CLI");
+    let codex_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&codex.stdout),
+        String::from_utf8_lossy(&codex.stderr)
+    );
+    assert!(
+        codex.status.success(),
+        "Codex CLI rejected the generated config:\n{codex_output}"
+    );
+    assert!(
+        codex_output.contains("helm-real-smoke"),
+        "Codex CLI did not load the generated MCP entry:\n{codex_output}"
+    );
+}
+
+#[test]
 fn hook_all_nine_events_round_trip_settings_json() {
     let settings_path = temp_settings_path("hooks-nine");
     let events = [
@@ -902,4 +1020,101 @@ fn changing_command_scope_to_project_moves_file_out_of_global_dir() {
     );
     let raw = fs::read_to_string(project_commands.join("deploy.md")).unwrap();
     assert!(raw.contains("项目模板 v2"));
+}
+
+#[test]
+fn plugin_skills_discovered_from_marketplace_directory() {
+    let dir = temp_dir("plugin-skills");
+    let marketplaces = dir.join("marketplaces");
+
+    // 插件 caveman：skills/caveman/SKILL.md
+    let caveman_skill = marketplaces.join("caveman").join("skills").join("caveman");
+    fs::create_dir_all(&caveman_skill).unwrap();
+    fs::write(
+        caveman_skill.join("SKILL.md"),
+        "# Caveman Mode\n\nUltra-compressed communication.",
+    )
+    .unwrap();
+
+    // 插件 caveman：skills/caveman-commit/SKILL.md
+    let commit_skill = marketplaces.join("caveman").join("skills").join("caveman-commit");
+    fs::create_dir_all(&commit_skill).unwrap();
+    fs::write(
+        commit_skill.join("SKILL.md"),
+        "# Caveman Commit\n\nCommit like caveman.",
+    )
+    .unwrap();
+
+    // 带点号的目录应跳过
+    let hidden = marketplaces.join(".hidden-plugin").join("skills").join("test");
+    fs::create_dir_all(&hidden).unwrap();
+    fs::write(hidden.join("SKILL.md"), "# Hidden").unwrap();
+
+    // 没有 SKILL.md 的子目录应跳过
+    let no_skill = marketplaces.join("empty-plugin").join("skills").join("noskill");
+    fs::create_dir_all(&no_skill).unwrap();
+
+    let skills = list_plugin_skills_from_dir(&marketplaces).unwrap();
+
+    // 应发现 2 个 skill（caveman:caveman 和 caveman:caveman-commit）
+    assert_eq!(skills.len(), 2);
+
+    let ids: Vec<&str> = skills.iter().map(|s| s.id.as_str()).collect();
+    assert!(ids.contains(&"plugin:caveman:caveman"), "应包含 plugin:caveman:caveman，实际: {ids:?}");
+    assert!(ids.contains(&"plugin:caveman:caveman-commit"), "应包含 plugin:caveman:caveman-commit，实际: {ids:?}");
+
+    // 验证 trigger 格式
+    let caveman = skills.iter().find(|s| s.id == "plugin:caveman:caveman").unwrap();
+    assert_eq!(caveman.trigger, "/caveman:caveman");
+    assert_eq!(caveman.engine, "claude-code");
+    assert_eq!(caveman.source, helm_lib::extensions::SkillSource::Plugin);
+    assert!(caveman.enabled);
+    assert_eq!(caveman.scope, SkillScope::Global);
+
+    // 验证隐藏插件和空 skill 目录被跳过
+    assert!(!ids.iter().any(|id| id.contains("hidden")));
+    assert!(!ids.iter().any(|id| id.contains("noskill")));
+}
+
+#[test]
+fn plugin_skills_with_nested_plugins_directory() {
+    let dir = temp_dir("plugin-nested");
+    let marketplaces = dir.join("marketplaces");
+
+    // claude-plugins-official 风格：plugins/<name>/skills/<skill>/SKILL.md
+    let nested_skill = marketplaces
+        .join("official")
+        .join("plugins")
+        .join("frontend-design")
+        .join("skills")
+        .join("frontend-design");
+    fs::create_dir_all(&nested_skill).unwrap();
+    fs::write(
+        nested_skill.join("SKILL.md"),
+        "# Frontend Design\n\nDesign skills.",
+    )
+    .unwrap();
+
+    let skills = list_plugin_skills_from_dir(&marketplaces).unwrap();
+
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0].id, "plugin:official:frontend-design");
+    assert_eq!(skills[0].trigger, "/official:frontend-design");
+}
+
+#[test]
+fn plugin_skills_empty_directory_returns_empty() {
+    let dir = temp_dir("plugin-empty");
+    let marketplaces = dir.join("marketplaces");
+    fs::create_dir_all(&marketplaces).unwrap();
+
+    let skills = list_plugin_skills_from_dir(&marketplaces).unwrap();
+    assert!(skills.is_empty());
+}
+
+#[test]
+fn plugin_skills_nonexistent_directory_returns_empty() {
+    let dir = temp_dir("plugin-nonexistent");
+    let skills = list_plugin_skills_from_dir(&dir.join("nonexistent")).unwrap();
+    assert!(skills.is_empty());
 }

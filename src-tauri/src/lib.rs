@@ -1,46 +1,110 @@
 //! Helm 桌面后端入口（Tauri 2）。组装应用：注册会话存储与命令、加载配置启动。
 
 pub mod adapter;
+pub mod budget;
+pub mod capability_registry;
+pub mod claude_capabilities;
+pub mod claude_permission_hook;
+pub mod codex_app_server;
+pub mod codex_capabilities;
 pub mod commands;
 pub mod extensions;
+pub mod git;
+pub mod handoff;
 pub mod installer;
+pub mod operations;
 pub mod parse;
+pub mod permission_kernel;
+pub mod permission_service;
+pub mod permissions;
+pub mod pricing;
 pub mod protocol;
 pub mod providers;
+pub mod reasoning;
+mod redaction;
+pub mod runtime_registry;
+pub mod sandbox_ceiling;
+pub mod session_actor;
+pub mod session_context;
 pub mod sessions;
 pub mod settings;
 pub mod snapshots;
+pub mod subscription_profiles;
 pub mod titler;
 pub mod tray;
+pub mod turn_start;
+pub mod turn_supervisor;
 pub mod updater;
-pub mod worktree;
+pub mod util;
+pub mod workspace_execution;
 
+#[cfg(test)]
+mod tests {
+    use crate::permission_service::PermissionService;
+    use crate::sessions::SessionHistoryStore;
+
+    #[tokio::test]
+    async fn permission_service_starts_and_reports_running() {
+        let database = std::env::temp_dir().join(format!(
+            "helm-permission-backends-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = SessionHistoryStore::new(database.clone());
+
+        let service = PermissionService::start(store).await.unwrap();
+
+        assert_ne!(service.addr().port(), 0);
+
+        service.shutdown().await;
+        let _ = std::fs::remove_file(database);
+    }
+}
+
+use capability_registry::EngineCapabilityRegistry;
 use commands::{
-    approval_response, check_budget, close_session, create_session, delete_hook, delete_mcp_server,
-    delete_provider_config, delete_session, delete_slash_command, delete_subagent,
-    get_active_session, get_always_allow_tools, get_budget, get_daily_usage, get_equivalent_env,
-    get_provider_config, get_session_history, get_top_sessions, get_usage_by_model,
-    get_usage_by_provider, get_usage_stats, interrupt, list_hooks, list_mcp_servers, list_sessions,
-    list_skills, list_slash_commands, list_subagents, market_install_skill, market_search_skills,
-    read_engine_config_file, remove_always_allow_tool, rename_session, restore_checkpoint,
-    resume_session, reveal_provider_secret, save_binding_config, save_engine_config, save_hook,
-    save_mcp_server, save_model_config, save_pasted_image, save_provider_config,
-    save_slash_command, save_subagent, search_workspace_files, send_message, set_budget,
-    set_provider_defaults, set_session_mcp_disabled, set_session_pinned,
-    sync_provider_models_config, test_engine_config, test_mcp_connection, test_provider_config,
-    toggle_skill, undo_revert, write_engine_config_file, SessionStore,
+    add_session_context, approval_response, cancel_background_operation, clear_permission_audit,
+    close_session, create_folder, create_permission_deny_rule, create_session, delete_folder,
+    delete_hook, delete_mcp_server, delete_provider_config, delete_session, delete_slash_command,
+    delete_subagent, export_permission_audit, get_active_session, get_background_operation,
+    get_budget, get_daily_usage, get_equivalent_env, get_permission_audit_summary,
+    get_permission_rules, get_provider_config, get_reasoning_effort_capability,
+    get_session_history, get_top_sessions, get_turn_snapshot, get_usage_by_model,
+    get_usage_by_provider, get_usage_stats, interrupt, list_folders, list_hooks, list_mcp_servers,
+    list_session_contexts, list_sessions, list_skills, list_slash_commands, list_subagents,
+    market_install_skill, market_search_skills, read_engine_config_file, remove_permission_rule,
+    remove_session_context, rename_folder, rename_session, restore_checkpoint, resume_session,
+    retry_background_operation, reveal_provider_secret, save_binding_config, save_engine_config,
+    save_hook, save_mcp_server, save_model_config, save_pasted_image, save_provider_config,
+    save_provider_model_selection, save_slash_command, save_subagent, search_workspace_files,
+    send_message, set_budget, set_folder_collapsed, set_session_folder, set_session_mcp_disabled,
+    set_session_permission_profile, set_session_pinned, set_session_turn_preference,
+    start_session_fork, sync_provider_models_config, test_engine_config, test_mcp_connection,
+    test_provider_config, toggle_skill, undo_revert, write_engine_config_file, SessionStore,
 };
 use installer::install_cli_engine;
+use permission_service::PermissionService;
+use pricing::PricingCatalogStore;
+use pricing::{
+    delete_model_price_override, get_pricing_catalog_status, get_provider_pricing_preference,
+    import_pricing_catalog, list_model_price_overrides, refresh_pricing_catalog,
+    save_model_price_override, save_provider_pricing_preference,
+};
 use providers::{KeyringSecretStore, ProviderStore};
+use runtime_registry::RuntimeRegistry;
 use sessions::SessionHistoryStore;
 use settings::{
     detect_cli_engine, detect_cli_login, export_app_settings, get_readiness_report,
     get_update_status, import_app_settings, load_app_settings, load_app_settings_from_store,
-    save_app_settings, select_directory,
+    login_cli_account, logout_cli_account, save_app_settings, select_directory,
 };
+use subscription_profiles::SubscriptionProfileStore;
 use tauri::Manager;
+use turn_supervisor::TurnSupervisor;
 use updater::{check_for_update, install_update};
-use worktree::{create_session_worktree, remove_session_worktree};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -59,13 +123,57 @@ pub fn run() {
                 config_dir.join("providers.json"),
                 KeyringSecretStore,
             ));
-            app.manage(SessionHistoryStore::new(config_dir.join("sessions.sqlite")));
+            app.manage(SubscriptionProfileStore::new(config_dir.clone()));
+            let pricing_store = PricingCatalogStore::new(config_dir.clone());
+            app.manage(pricing_store.clone());
+            let history_store = SessionHistoryStore::new(config_dir.join("sessions.sqlite"));
+            app.manage(EngineCapabilityRegistry::new(history_store.clone()));
+            let permission_service =
+                tauri::async_runtime::block_on(PermissionService::start(history_store.clone()))
+                    .map_err(|error| format!("初始化权限服务失败：{error}"))?;
+            let recovery = history_store
+                .reconcile_stream_recovery()
+                .map_err(|error| format!("Stream Supervisor 启动恢复失败：{error}"))?;
+            if recovery != Default::default() {
+                eprintln!("[helm] Stream Supervisor 启动恢复：{recovery:?}");
+            }
+            let operation_recovery = history_store
+                .reconcile_background_operations()
+                .map_err(|error| format!("BackgroundOperation 启动恢复失败：{error}"))?;
+            if operation_recovery > 0 {
+                eprintln!(
+                    "[helm] BackgroundOperation 启动恢复：{} 个不确定 Attempt 已收口为 delivery_unknown",
+                    operation_recovery
+                );
+            }
+            let turn_supervisor =
+                TurnSupervisor::with_app(history_store.clone(), app.handle().clone());
+            let runtime_registry =
+                RuntimeRegistry::with_supervisor(history_store.clone(), turn_supervisor.clone())
+                    .map_err(|error| format!("初始化 RuntimeRegistry 失败：{error}"))?;
+            if !runtime_registry.recovery_inputs().is_empty() {
+                eprintln!(
+                    "[helm] 检测到 {} 个未收口 TurnAttempt，已加载为 27F 恢复输入",
+                    runtime_registry.recovery_inputs().len()
+                );
+            }
+            app.manage(turn_supervisor);
+            app.manage(runtime_registry);
+            app.manage(history_store);
+            app.manage(permission_service);
             // 启动归位（变更-12）：应用刚启动不可能有运行中的轮次，
             // 把强杀/崩溃留下的 active 尸体会话归位为 idle
             if let Some(history) = app.try_state::<SessionHistoryStore>() {
                 if let Err(err) = history.normalize_stale_active_sessions() {
                     eprintln!("[helm] 启动归位会话状态失败：{err}");
                 }
+            }
+            if let Some(history) = app.try_state::<SessionHistoryStore>() {
+                pricing::spawn_background_refresh(
+                    app.handle().clone(),
+                    pricing_store,
+                    history.inner().clone(),
+                );
             }
             // 用量托盘（P3-2）：常驻托盘失败不阻断主窗口启动，只留诊断日志
             if let Err(err) = tray::setup(app) {
@@ -74,8 +182,15 @@ pub fn run() {
             Ok(())
         })
         .manage(SessionStore::default())
+        .manage(workspace_execution::WorkspaceExecutionCoordinator::default())
         .invoke_handler(tauri::generate_handler![
             create_session,
+            list_folders,
+            create_folder,
+            rename_folder,
+            delete_folder,
+            set_session_folder,
+            set_folder_collapsed,
             close_session,
             delete_session,
             rename_session,
@@ -83,15 +198,29 @@ pub fn run() {
             list_sessions,
             get_active_session,
             get_session_history,
+            list_session_contexts,
+            add_session_context,
+            remove_session_context,
             resume_session,
             send_message,
+            set_session_permission_profile,
+            set_session_turn_preference,
             approval_response,
             set_session_mcp_disabled,
             search_workspace_files,
             save_pasted_image,
-            get_always_allow_tools,
-            remove_always_allow_tool,
+            get_permission_rules,
+            create_permission_deny_rule,
+            remove_permission_rule,
+            get_permission_audit_summary,
+            clear_permission_audit,
+            export_permission_audit,
             interrupt,
+            get_background_operation,
+            start_session_fork,
+            cancel_background_operation,
+            retry_background_operation,
+            get_turn_snapshot,
             restore_checkpoint,
             undo_revert,
             get_provider_config,
@@ -100,14 +229,15 @@ pub fn run() {
             delete_provider_config,
             save_engine_config,
             save_model_config,
+            save_provider_model_selection,
             save_binding_config,
             get_equivalent_env,
             read_engine_config_file,
             write_engine_config_file,
-            set_provider_defaults,
             test_provider_config,
             sync_provider_models_config,
             test_engine_config,
+            get_reasoning_effort_capability,
             get_usage_stats,
             get_usage_by_model,
             get_usage_by_provider,
@@ -115,7 +245,6 @@ pub fn run() {
             get_top_sessions,
             get_budget,
             set_budget,
-            check_budget,
             list_skills,
             toggle_skill,
             list_mcp_servers,
@@ -140,13 +269,24 @@ pub fn run() {
             get_update_status,
             check_for_update,
             install_update,
+            get_pricing_catalog_status,
+            refresh_pricing_catalog,
+            import_pricing_catalog,
+            list_model_price_overrides,
+            save_model_price_override,
+            delete_model_price_override,
+            get_provider_pricing_preference,
+            save_provider_pricing_preference,
             detect_cli_engine,
             detect_cli_login,
+            login_cli_account,
+            logout_cli_account,
             install_cli_engine,
             get_readiness_report,
-            create_session_worktree,
-            remove_session_worktree,
-            select_directory
+            select_directory,
+            git::get_git_branch,
+            git::get_git_status,
+            git::get_git_staged
         ])
         .on_window_event(|window, event| {
             // 关闭行为（变更-12）：closeToTray 开启 → 隐藏到托盘（后台会话继续跑）；
@@ -191,12 +331,21 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("Helm 启动失败")
-        .run(|_app, event| {
+        .run(|app, event| {
             // 退出前同步杀掉所有仍在运行的 CLI 进程树，避免 Windows 上留下孤儿 node 进程。
             if matches!(
                 event,
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
             ) {
+                tauri::async_runtime::block_on(async {
+                    if let Some(registry) = app.try_state::<RuntimeRegistry>() {
+                        registry.shutdown_all().await;
+                    }
+                    if let Some(service) = app.try_state::<PermissionService>() {
+                        service.shutdown().await;
+                    }
+                });
+                // Registry 是正常回收路径；PID 表只保留为同步兜底，处理 Runtime 已失联的进程树。
                 adapter::kill_all_running_processes();
             }
         });

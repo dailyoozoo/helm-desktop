@@ -21,7 +21,12 @@ export interface WorkspaceActivity {
   itemsLength: number;
 }
 
-export type WorkspaceApprovalMode = 'manual' | 'direct';
+export function pricingFeedUrlsFromDraft(draft: string): string[] {
+  return draft
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
 
 export function sessionDefaultsFromSettings(settings: AppSettings): SessionDefaults {
   return {
@@ -30,10 +35,15 @@ export function sessionDefaultsFromSettings(settings: AppSettings): SessionDefau
   };
 }
 
-/** 新会话默认模式（变更-04 §0.3）：设置存量值 plan → 计划；auto/ask（旧「写入询问」）→ 构建。
- *  每轮实际生效的是发送框当前选中的模式，这里只决定新会话的初始选中。 */
-export function defaultTurnModeFromSettings(settings: AppSettings): TurnMode {
+/**
+ * 两个引擎使用同一新会话默认模式。每轮实际生效的仍是 Composer 当前选择。
+ */
+export function defaultTurnModeForEngine(settings: AppSettings, _engine: EngineId): TurnMode {
   return settings.engines.claudeCode.permissionMode === 'plan' ? 'plan' : 'build';
+}
+
+export function defaultTurnModeFromSettings(settings: AppSettings): TurnMode {
+  return defaultTurnModeForEngine(settings, settings.engines.defaultEngine);
 }
 
 export function workspaceIdentityFromSettings(settings: AppSettings): WorkspaceIdentity {
@@ -42,48 +52,6 @@ export function workspaceIdentityFromSettings(settings: AppSettings): WorkspaceI
   return {
     name,
     avatar: first.toLocaleUpperCase(),
-  };
-}
-
-export function approvalModeFromSettings(settings: AppSettings): WorkspaceApprovalMode {
-  if (settings.general.confirmBeforeCommand) return 'manual';
-  return settings.permissions.runCommands === 'allow' ? 'direct' : 'manual';
-}
-
-export function toggleApprovalSettings(settings: AppSettings): AppSettings {
-  const direct = approvalModeFromSettings(settings) === 'direct';
-  return {
-    ...settings,
-    general: {
-      ...settings.general,
-      confirmBeforeCommand: direct,
-    },
-    permissions: {
-      ...settings.permissions,
-      runCommands: direct ? 'ask' : 'allow',
-    },
-  };
-}
-
-export function addCommandAllowlistPattern(
-  permissions: AppSettings['permissions'],
-  pattern: string,
-): AppSettings['permissions'] {
-  const next = pattern.trim();
-  if (!next || permissions.commandAllowlist.includes(next)) return permissions;
-  return {
-    ...permissions,
-    commandAllowlist: [...permissions.commandAllowlist, next],
-  };
-}
-
-export function removeCommandAllowlistPattern(
-  permissions: AppSettings['permissions'],
-  pattern: string,
-): AppSettings['permissions'] {
-  return {
-    ...permissions,
-    commandAllowlist: permissions.commandAllowlist.filter((item) => item !== pattern),
   };
 }
 

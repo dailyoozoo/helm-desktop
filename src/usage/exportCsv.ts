@@ -39,6 +39,12 @@ export function buildUsageCsv(input: UsageCsvInput): string {
 
   lines.push(row(['统计项', '值']));
   lines.push(row(['总花费 USD', stats ? money(stats.total_cost) : money(0)]));
+  lines.push(row(['实际花费 USD', stats ? money(stats.actual_cost) : money(0)]));
+  lines.push(row(['估算花费 USD', stats ? money(stats.estimated_cost) : money(0)]));
+  lines.push(row(['历史未分类花费 USD', stats ? money(stats.legacy_cost) : money(0)]));
+  lines.push(row(['历史未分类请求数', stats?.legacy_count ?? 0]));
+  lines.push(row(['订阅内请求数', stats?.subscription_count ?? 0]));
+  lines.push(row(['无价格数据请求数', stats?.unknown_count ?? 0]));
   lines.push(row(['总 token', stats?.total_tokens ?? 0]));
   lines.push(row(['输入 token', stats?.input_tokens ?? 0]));
   lines.push(row(['输出 token', stats?.output_tokens ?? 0]));

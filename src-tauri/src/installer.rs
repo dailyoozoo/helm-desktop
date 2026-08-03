@@ -192,6 +192,26 @@ mod tests {
     }
 
     #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn process_tree_timeout_helper() {
+        let Some(pid_file) = std::env::var_os("HELM_INSTALLER_TIMEOUT_PID_FILE") else {
+            return;
+        };
+        let mut child = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ])
+            .spawn()
+            .unwrap();
+        std::fs::write(pid_file, child.id().to_string()).unwrap();
+        let _ = child.wait();
+    }
+
+    #[cfg(windows)]
     #[tokio::test]
     async fn timeout_terminates_spawned_process_tree() {
         let pid_file = std::env::temp_dir().join(format!(
@@ -202,15 +222,15 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let escaped_pid_file = pid_file.to_string_lossy().replace('\'', "''");
-        let script = format!(
-            "$child = Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 30' -PassThru; Set-Content -LiteralPath '{}' -Value $child.Id; Start-Sleep -Seconds 30",
-            escaped_pid_file
-        );
-        let mut cmd = Command::new("powershell");
-        cmd.args(["-NoProfile", "-Command", &script]);
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--ignored",
+            "--exact",
+            "installer::tests::process_tree_timeout_helper",
+        ])
+        .env("HELM_INSTALLER_TIMEOUT_PID_FILE", &pid_file);
 
-        let error = command_output_with_tree_timeout(cmd, Duration::from_millis(1500), "测试命令")
+        let error = command_output_with_tree_timeout(cmd, Duration::from_secs(15), "测试命令")
             .await
             .expect_err("命令应超时");
         assert!(error.contains("超时"));

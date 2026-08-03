@@ -1,5 +1,5 @@
 import type { ProviderConfig } from '../providers/api';
-import type { SessionSummary } from '../sessions/sessionTypes';
+import type { SessionFolder, SessionSummary } from '../sessions/sessionTypes';
 import type { PageId } from '../shell/Rail';
 import type { IconName } from '../shell/icons';
 import type { AppShortcutAction } from './shortcuts';
@@ -54,7 +54,7 @@ export const paletteCommands: CommandPaletteCommand[] = [
     group: '导航',
     title: '扩展中心',
     icon: 'puzzle',
-    hint: 'G X',
+    hint: 'G E',
     page: 'extensions',
   },
   {
@@ -156,17 +156,20 @@ export const paletteCommands: CommandPaletteCommand[] = [
   },
 ];
 
-export function sessionToCommand(session: SessionSummary): CommandPaletteCommand {
+export function sessionToCommand(
+  session: SessionSummary,
+  folderName?: string,
+): CommandPaletteCommand {
   return {
     id: `session:${session.id}`,
     type: 'session',
     group: '会话',
     title: session.title || '未命名会话',
     icon: 'history',
-    hint: session.model,
+    hint: folderName ? `${folderName} · ${session.model}` : session.model,
     page: 'workspace',
     sessionId: session.id,
-    searchText: `${session.title} ${session.cwd} ${session.model}`,
+    searchText: `${session.title} ${session.cwd} ${session.model} ${folderName ?? ''}`,
   };
 }
 
@@ -201,6 +204,31 @@ export function filterProviders(providers: ProviderConfig[], query: string): Pro
   const q = normalize(query);
   if (!q) return providers;
   return providers.filter((provider) => normalize(provider.name).includes(q));
+}
+
+export function commandPaletteResults(
+  query: string,
+  sessions: SessionSummary[],
+  providers: ProviderConfig[],
+  folders: SessionFolder[] = [],
+): CommandPaletteCommand[] {
+  const folderNames = new Map(folders.map((folder) => [folder.id, folder.name]));
+  const toCommand = (session: SessionSummary) =>
+    sessionToCommand(session, folderNames.get(session.folderId ?? 'folder-default'));
+  const trimmed = query.trim();
+  const staticCommands = filterCommandPaletteCommands(paletteCommands, query);
+  if (!trimmed) {
+    const recent = [...sessions]
+      .sort((left, right) => right.updatedAt - left.updatedAt)
+      .slice(0, 3)
+      .map((session) => ({ ...toCommand(session), group: '最近会话' }));
+    return [...recent, ...staticCommands];
+  }
+  const sessionCommands = sessions
+    .map(toCommand)
+    .filter((command) => filterCommandPaletteCommands([command], query).length > 0);
+  const providerCommands = filterProviders(providers, query).map(providerToCommand);
+  return [...staticCommands, ...sessionCommands, ...providerCommands];
 }
 
 function normalize(value: string): string {

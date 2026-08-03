@@ -1,19 +1,25 @@
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_SETTINGS } from './types';
 import {
-  addCommandAllowlistPattern,
-  approvalModeFromSettings,
+  defaultTurnModeForEngine,
   defaultTurnModeFromSettings,
   engineConfigWithDetection,
-  removeCommandAllowlistPattern,
+  pricingFeedUrlsFromDraft,
   sessionDefaultsFromSettings,
   shouldReopenLastSession,
-  toggleApprovalSettings,
   updateStatusSummary,
   workspaceIdentityFromSettings,
 } from './settingsViewModel';
 
 describe('settings view model', () => {
+  it('normalizes pricing feed drafts only when the editor commits the multiline value', () => {
+    expect(
+      pricingFeedUrlsFromDraft(
+        ' https://mirror-a.example/catalog.json\n\nhttps://mirror-b.example/catalog.json  ',
+      ),
+    ).toEqual(['https://mirror-a.example/catalog.json', 'https://mirror-b.example/catalog.json']);
+  });
+
   it('turns settings into defaults for a new workspace session', () => {
     const defaults = sessionDefaultsFromSettings({
       ...DEFAULT_SETTINGS,
@@ -33,8 +39,8 @@ describe('settings view model', () => {
     });
   });
 
-  it('maps the stored permissionMode to the default turn mode for new sessions', () => {
-    // 变更-04 §0.3：plan → 计划；auto 与旧「写入询问」ask 都回落构建
+  it('maps the stored permissionMode and engine to the default turn mode for new sessions', () => {
+    // 两个引擎使用同一用户默认值，不再由旧 evidence 强制 Codex 进入计划模式。
     const withMode = (permissionMode: 'auto' | 'ask' | 'plan') => ({
       ...DEFAULT_SETTINGS,
       engines: {
@@ -45,6 +51,13 @@ describe('settings view model', () => {
     expect(defaultTurnModeFromSettings(withMode('plan'))).toBe('plan');
     expect(defaultTurnModeFromSettings(withMode('auto'))).toBe('build');
     expect(defaultTurnModeFromSettings(withMode('ask'))).toBe('build');
+    expect(defaultTurnModeForEngine(withMode('auto'), 'codex')).toBe('build');
+    expect(
+      defaultTurnModeFromSettings({
+        ...withMode('auto'),
+        engines: { ...withMode('auto').engines, defaultEngine: 'codex' },
+      }),
+    ).toBe('build');
   });
 
   it('turns CLI detection results into the engine config used at launch time', () => {
@@ -68,47 +81,6 @@ describe('settings view model', () => {
       status: 'ready',
       version: 'codex 1.2.3',
     });
-  });
-
-  it('derives the workspace approval toggle from persisted command policy', () => {
-    expect(approvalModeFromSettings(DEFAULT_SETTINGS)).toBe('manual');
-    expect(
-      approvalModeFromSettings({
-        ...DEFAULT_SETTINGS,
-        general: { ...DEFAULT_SETTINGS.general, confirmBeforeCommand: false },
-        permissions: { ...DEFAULT_SETTINGS.permissions, runCommands: 'allow' },
-      }),
-    ).toBe('direct');
-  });
-
-  it('toggles the approval shortcut into the settings consumed by the CLI policy', () => {
-    expect(toggleApprovalSettings(DEFAULT_SETTINGS).general.confirmBeforeCommand).toBe(false);
-    expect(toggleApprovalSettings(DEFAULT_SETTINGS).permissions.runCommands).toBe('allow');
-
-    const direct = {
-      ...DEFAULT_SETTINGS,
-      general: { ...DEFAULT_SETTINGS.general, confirmBeforeCommand: false },
-      permissions: { ...DEFAULT_SETTINGS.permissions, runCommands: 'allow' as const },
-    };
-    expect(toggleApprovalSettings(direct).general.confirmBeforeCommand).toBe(true);
-    expect(toggleApprovalSettings(direct).permissions.runCommands).toBe('ask');
-  });
-
-  it('keeps command allowlist edits reversible and duplicate-free', () => {
-    const permissions = {
-      ...DEFAULT_SETTINGS.permissions,
-      commandAllowlist: ['git status', 'pnpm test *'],
-    };
-
-    expect(addCommandAllowlistPattern(permissions, ' git status ')).toBe(permissions);
-    expect(addCommandAllowlistPattern(permissions, 'cargo test').commandAllowlist).toEqual([
-      'git status',
-      'pnpm test *',
-      'cargo test',
-    ]);
-    expect(removeCommandAllowlistPattern(permissions, 'git status').commandAllowlist).toEqual([
-      'pnpm test *',
-    ]);
   });
 
   it('only reopens the last session on an empty workspace when the setting is enabled', () => {

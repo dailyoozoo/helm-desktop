@@ -37,6 +37,18 @@ pub enum TurnStage {
     Finalizing,
     WaitingApproval,
     Retrying,
+    Stalled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecisionOption {
+    Allow,
+    Turn,
+    Session,
+    Project,
+    Always,
+    Deny,
 }
 
 /// 轮次结束原因，对应 `turn_complete.stopReason`。
@@ -61,6 +73,25 @@ pub enum CallStatus {
 pub enum ToolStatus {
     Success,
     Error,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOutcomeKind {
+    ToolSucceeded,
+    AutoReviewUnavailable,
+    AutoReviewParseError,
+    AutoReviewBlocked,
+    RuntimeDenied,
+    ToolFailed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolDenialSource {
+    AutoReviewer,
+    Runtime,
+    Tool,
 }
 
 /// 计划条目状态。
@@ -107,6 +138,38 @@ pub struct Diff {
     pub hunks: Vec<DiffHunk>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeCapabilityAvailability {
+    Available,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeCapabilitySnapshot {
+    pub web_search: RuntimeCapabilityAvailability,
+    pub web_fetch: RuntimeCapabilityAvailability,
+    pub approval_contract_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_snapshot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_review_strategy: Option<String>,
+}
+
+impl RuntimeCapabilitySnapshot {
+    pub fn unknown() -> Self {
+        Self {
+            web_search: RuntimeCapabilityAvailability::Unknown,
+            web_fetch: RuntimeCapabilityAvailability::Unknown,
+            approval_contract_version: "unknown".to_string(),
+            capability_snapshot_id: None,
+            auto_review_strategy: Some("unknown".to_string()),
+        }
+    }
+}
+
 /// 归一化的「后端 → UI」事件，对应 TS `AgentEvent`。
 ///
 /// internally tagged：序列化为 `{ "type": "message_delta", "sessionId": "...", ... }`。
@@ -121,6 +184,8 @@ pub enum AgentEvent {
         model: String,
         cwd: String,
         ts: i64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        capabilities: Option<RuntimeCapabilitySnapshot>,
     },
     #[serde(rename_all = "camelCase")]
     MessageDelta {
@@ -171,6 +236,18 @@ pub enum AgentEvent {
         output: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         diff: Option<Diff>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<ToolOutcomeKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        has_output: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retryable: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        denial_source: Option<ToolDenialSource>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_denial_code: Option<String>,
     },
     #[serde(rename_all = "camelCase")]
     ApprovalRequest {
@@ -180,6 +257,11 @@ pub enum AgentEvent {
         detail: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         input: Option<Value>,
+        available_decisions: Vec<ApprovalDecisionOption>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        persistent_label: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        matcher_summary: Option<String>,
     },
     #[serde(rename_all = "camelCase")]
     PlanUpdate {
@@ -192,13 +274,32 @@ pub enum AgentEvent {
         id: String,
         label: String,
         ts: i64,
+        restorable: bool,
+        file_count: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     #[serde(rename_all = "camelCase")]
     TokenUsage {
         session_id: String,
+        /// Engine 报告的总输入 token；若 cached_input_tokens 存在，成本计算会从中扣除缓存读取部分。
         input_tokens: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cached_input_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_write_input_tokens: Option<u64>,
         output_tokens: u64,
         cost_usd: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        service_tier: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context_window: Option<u64>,
+    },
+    #[serde(rename_all = "camelCase")]
+    ContextUsage {
+        session_id: String,
+        /// 最近一次模型调用的真实输入规模；替换式更新，禁止跨调用累加。
+        context_tokens: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         context_window: Option<u64>,
     },

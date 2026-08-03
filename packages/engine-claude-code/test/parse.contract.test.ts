@@ -58,6 +58,11 @@ describe.each(FIXTURES)('真实输出契约：%s', (fixture) => {
       expect(first.engine).toBe('claude-code');
       expect(first.model.length).toBeGreaterThan(0);
       expect(first.cwd.length).toBeGreaterThan(0);
+      expect(first.capabilities).toEqual({
+        webSearch: 'available',
+        webFetch: 'available',
+        approvalContractVersion: 'claude-hook-bridge-v1',
+      });
     }
   });
 
@@ -76,6 +81,14 @@ describe.each(FIXTURES)('真实输出契约：%s', (fixture) => {
       expect(usage.outputTokens).toBeGreaterThanOrEqual(0);
       expect(usage.costUsd).toBeGreaterThanOrEqual(0);
       expect(usage.contextWindow).toBeGreaterThan(0);
+    }
+  });
+
+  it('含逐调用 context_usage，且不使用轮末累计值冒充', () => {
+    const samples = events.filter((event) => event.type === 'context_usage');
+    expect(samples.length).toBeGreaterThan(0);
+    for (const sample of samples) {
+      expect(sample.contextTokens).toBeGreaterThan(0);
     }
   });
 
@@ -119,6 +132,27 @@ describe('真实输出契约：含工具调用的回合 (claude-stream.jsonl)', 
 });
 
 describe('Slice 2 协议：diff 与审批', () => {
+  it('拒绝没有后端 decision 白名单的审批事件', () => {
+    expect(
+      isAgentEvent({
+        type: 'approval_request',
+        sessionId: 's1',
+        id: 'a1',
+        action: 'Bash',
+        detail: 'npm test',
+      }),
+    ).toBe(false);
+    expect(
+      isAgentEvent({
+        type: 'approval_request',
+        sessionId: 's1',
+        id: 'a1',
+        action: 'Bash',
+        detail: 'npm test',
+        availableDecisions: ['allow', 'deny'],
+      }),
+    ).toBe(true);
+  });
   it('从 Write/Edit 的 tool_result diff 内容块解析 Diff', () => {
     const events = parseClaudeLine(
       JSON.stringify({
@@ -211,6 +245,33 @@ describe('Slice 2 协议：diff 与审批', () => {
 });
 
 describe('解析器健壮性', () => {
+  it('把 Claude 模型不可用提示归一为错误，不保存成 Assistant 回复', () => {
+    const events = parseClaudeLine(
+      JSON.stringify({
+        type: 'assistant',
+        session_id: 's1',
+        message: {
+          content: [
+            {
+              type: 'text',
+              text: "There's an issue with the selected model (missing-model). It may not exist or you may not have access to it. Run --model to pick a different model.",
+            },
+          ],
+        },
+      }),
+    );
+
+    expect(events).toEqual([
+      {
+        type: 'error',
+        sessionId: 's1',
+        message: expect.stringContaining('selected model'),
+        recoverable: false,
+        kind: 'model_unavailable',
+      },
+    ]);
+  });
+
   it('空行 / 空白 / 非 JSON / 残缺 JSON 都返回空数组', () => {
     expect(parseClaudeLine('')).toEqual([]);
     expect(parseClaudeLine('   ')).toEqual([]);

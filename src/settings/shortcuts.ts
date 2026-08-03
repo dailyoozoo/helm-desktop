@@ -82,6 +82,24 @@ export function shortcutLabel(shortcut: string): string[] {
     .filter(Boolean);
 }
 
+export function shortcutFromKeyboardEvent(event: ShortcutEvent): string | null {
+  if (['Control', 'Shift', 'Alt', 'Meta'].includes(event.key)) return null;
+  const key =
+    event.key === ' '
+      ? 'Space'
+      : event.key.length === 1
+        ? event.key.toUpperCase()
+        : event.key === 'Esc'
+          ? 'Escape'
+          : event.key;
+  const parts: string[] = [];
+  if (event.ctrlKey || event.metaKey) parts.push('Ctrl');
+  if (event.altKey) parts.push('Alt');
+  if (event.shiftKey) parts.push('Shift');
+  parts.push(key);
+  return parts.join('+');
+}
+
 export function matchesAppShortcut(
   event: ShortcutEvent,
   action: AppShortcutAction,
@@ -93,15 +111,6 @@ export function matchesAppShortcut(
 
 function normalizedPrefix(shortcuts: AppSettings['shortcuts']): string {
   return shortcuts.navigationPrefix.trim().toLowerCase();
-}
-
-export function reduceNavigationShortcut(
-  prefix: NavigationPrefix,
-  event: ShortcutEvent,
-  shortcuts: AppSettings['shortcuts'] = DEFAULT_SETTINGS.shortcuts,
-) {
-  const next = reduceAppShortcut(prefix, event, shortcuts);
-  return { page: next.page, prefix: next.prefix };
 }
 
 export function reduceAppShortcut(

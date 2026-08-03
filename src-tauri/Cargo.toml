@@ -22,16 +22,36 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 regex = "1"
+sha2 = "0.10"
+minisign-verify = "0.2.5"
+base64 = "0.22"
+rand = "0.9"
 keyring = { version = "3", features = ["windows-native"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tokio = { version = "1", features = [
   "macros",
   "rt-multi-thread",
   "process",
-  "io-util",
+    "io-util",
+    "fs",
+  "net",
   "sync",
   "time",
 ] }
+tokio-tungstenite = "0.28"
+futures-util = "0.3"
 dirs = "6.0.0"
 tauri-plugin-window-state = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Security_Isolation",
+  "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }

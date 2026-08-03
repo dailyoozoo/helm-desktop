@@ -1,0 +1,164 @@
+{
+  "schemaVersion": 1,
+  "catalogVersion": "2026.07.17.1",
+  "sequence": 2026071701,
+  "publishedAt": "2026-07-17T00:00:00Z",
+  "models": [
+    {
+      "vendor": "openai",
+      "modelId": "gpt-5.6-sol",
+      "aliases": ["gpt-5.6"],
+      "currency": "USD",
+      "unit": "per-million-tokens",
+      "sourceUrl": "https://developers.openai.com/api/docs/pricing#latest-models",
+      "observedAt": "2026-07-17T00:00:00Z",
+      "tiers": {
+        "standard": { "bands": [
+          { "maxInputTokens": 272000, "input": 5.0, "cachedInput": 0.5, "cacheWrite": 6.25, "output": 30.0 },
+          { "minInputTokens": 272001, "input": 10.0, "cachedInput": 1.0, "cacheWrite": 12.5, "output": 45.0 }
+        ]},
+        "batch": { "bands": [
+          { "maxInputTokens": 272000, "input": 2.5, "cachedInput": 0.25, "cacheWrite": 3.125, "output": 15.0 },
+          { "minInputTokens": 272001, "input": 5.0, "cachedInput": 0.5, "cacheWrite": 6.25, "output": 22.5 }
+        ]},
+        "flex": { "bands": [
+          { "maxInputTokens": 272000, "input": 2.5, "cachedInput": 0.25, "cacheWrite": 3.125, "output": 15.0 },
+          { "minInputTokens": 272001, "input": 5.0, "cachedInput": 0.5, "cacheWrite": 6.25, "output": 22.5 }
+        ]},
+        "priority": { "bands": [
+          { "maxInputTokens": 272000, "input": 10.0, "cachedInput": 1.0, "cacheWrite": 12.5, "output": 60.0 },
+          { "minInputTokens": 272001, "input": 20.0, "cachedInput": 2.0, "cacheWrite": 25.0, "output": 90.0 }
+        ]}
+      }
+    },
+    {
+      "vendor": "openai",
+      "modelId": "gpt-5.6-terra",
+      "currency": "USD",
+      "unit": "per-million-tokens",
+      "sourceUrl": "https://developers.openai.com/api/docs/pricing#latest-models",
+      "observedAt": "2026-07-17T00:00:00Z",
+      "tiers": {
+        "standard": { "bands": [
+          { "maxInputTokens": 272000, "input": 2.5, "cachedInput": 0.25, "cacheWrite": 3.125, "output": 15.0 },
+          { "minInputTokens": 272001, "input": 5.0, "cachedInput": 0.5, "cacheWrite": 6.25, "output": 22.5 }
+        ]},
+        "batch": { "bands": [
+          { "maxInputTokens": 272000, "input": 1.25, "cachedInput": 0.125, "cacheWrite": 1.5625, "output": 7.5 },
+          { "minInputTokens": 272001, "input": 2.5, "cachedInput": 0.25, "cacheWrite": 3.125, "output": 11.25 }
+        ]},
+        "flex": { "bands": [
+          { "maxInputTokens": 272000, "input": 1.25, "cachedInput": 0.125, "cacheWrite": 1.5625, "output": 7.5 },
+          { "minInputTokens": 272001, "input": 2.5, "cachedInput": 0.25, "cacheWrite": 3.125, "output": 11.25 }
+        ]},
+        "priority": { "bands": [
+          { "maxInputTokens": 272000, "input": 5.0, "cachedInput": 0.5, "cacheWrite": 6.25, "output": 30.0 },
+          { "minInputTokens": 272001, "input": 10.0, "cachedInput": 1.0, "cacheWrite": 12.5, "output": 45.0 }
+        ]}
+      }
+    },
+    {
+      "vendor": "openai",
+      "modelId": "gpt-5.6-luna",
+      "currency": "USD",
+      "unit": "per-million-tokens",
+      "sourceUrl": "https://developers.openai.com/api/docs/pricing#latest-models",
+      "observedAt": "2026-07-17T00:00:00Z",
+      "tiers": {
+        "standard": { "bands": [
+          { "maxInputTokens": 272000, "input": 1.0, "cachedInput": 0.1, "cacheWrite": 1.25, "output": 6.0 },
+          { "minInputTokens": 272001, "input": 2.0, "cachedInput": 0.2, "cacheWrite": 2.5, "output": 9.0 }
+        ]},
+        "batch": { "bands": [
+          { "maxInputTokens": 272000, "input": 0.5, "cachedInput": 0.05, "cacheWrite": 0.625, "output": 3.0 },
+          { "minInputTokens": 272001, "input": 1.0, "cachedInput": 0.1, "cacheWrite": 1.25, "output": 4.5 }
+        ]},
+        "flex": { "bands": [
+          { "maxInputTokens": 272000, "input": 0.5, "cachedInput": 0.05, "cacheWrite": 0.625, "output": 3.0 },
+          { "minInputTokens": 272001, "input": 1.0, "cachedInput": 0.1, "cacheWrite": 1.25, "output": 4.5 }
+        ]},
+        "priority": { "bands": [
+          { "maxInputTokens": 272000, "input": 2.0, "cachedInput": 0.2, "cacheWrite": 2.5, "output": 12.0 },
+          { "minInputTokens": 272001, "input": 4.0, "cachedInput": 0.4, "cacheWrite": 5.0, "output": 18.0 }
+        ]}
+      }
+    },
+    {
+      "vendor": "openai", "modelId": "gpt-5.5", "currency": "USD", "unit": "per-million-tokens",
+      "sourceUrl": "https://developers.openai.com/api/docs/pricing#latest-models", "observedAt": "2026-07-17T00:00:00Z",
+      "tiers": { "standard": { "bands": [
+        { "maxInputTokens": 272000, "input": 5.0, "cachedInput": 0.5, "output": 30.0 },
+        { "minInputTokens": 272001, "input": 10.0, "cachedInput": 1.0, "output": 45.0 }
+      ]}}
+    },
+    {
+      "vendor": "openai", "modelId": "gpt-5.4", "currency": "USD", "unit": "per-million-tokens",
+      "sourceUrl": "https://developers.openai.com/api/docs/pricing#latest-models", "observedAt": "2026-07-17T00:00:00Z",
+      "tiers": { "standard": { "bands": [
+        { "maxInputTokens": 272000, "input": 2.5, "cachedInput": 0.25, "output": 15.0 },
+        { "minInputTokens": 272001, "input": 5.0, "cachedInput": 0.5, "output": 22.5 }
+      ]}}
+    },
+    {
+      "vendor": "openai", "modelId": "gpt-5.4-mini", "currency": "USD", "unit": "per-million-tokens",
+      "sourceUrl": "https://developers.openai.com/api/docs/pricing#latest-models", "observedAt": "2026-07-17T00:00:00Z",
+      "tiers": { "standard": { "bands": [{ "input": 0.75, "cachedInput": 0.075, "output": 4.5 }]}}
+    },
+    {
+      "vendor": "openai", "modelId": "gpt-5.3-codex", "currency": "USD", "unit": "per-million-tokens",
+      "sourceUrl": "https://developers.openai.com/api/docs/pricing", "observedAt": "2026-07-17T00:00:00Z",
+      "tiers": { "standard": { "bands": [{ "input": 1.25, "cachedInput": 0.125, "output": 10.0 }]}}
+    },
+    {
+      "vendor": "openai", "modelId": "gpt-5.3-codex-spark", "currency": "USD", "unit": "per-million-tokens",
+      "sourceUrl": "https://developers.openai.com/api/docs/pricing", "observedAt": "2026-07-17T00:00:00Z",
+      "tiers": { "standard": { "bands": [{ "input": 0.25, "cachedInput": 0.025, "output": 2.0 }]}}
+    },
+    {
+      "vendor": "openai", "modelId": "gpt-5-codex", "currency": "USD", "unit": "per-million-tokens",
+      "sourceUrl": "https://developers.openai.com/api/docs/pricing", "observedAt": "2026-07-17T00:00:00Z",
+      "tiers": { "standard": { "bands": [{ "input": 1.25, "cachedInput": 0.125, "output": 10.0 }]}}
+    },
+    {
+      "vendor": "openai", "modelId": "gpt-5-mini", "currency": "USD", "unit": "per-million-tokens",
+      "sourceUrl": "https://developers.openai.com/api/docs/pricing", "observedAt": "2026-07-17T00:00:00Z",
+      "tiers": { "standard": { "bands": [{ "input": 0.25, "cachedInput": 0.025, "output": 2.0 }]}}
+    },
+    {
+      "vendor": "anthropic", "modelId": "claude-opus-4-8", "currency": "USD", "unit": "per-million-tokens",
+      "sourceUrl": "https://docs.anthropic.com/en/docs/about-claude/pricing", "observedAt": "2026-07-17T00:00:00Z",
+      "tiers": { "standard": { "bands": [{ "input": 5.0, "output": 25.0 }]}}
+    },
+    {
+      "vendor": "anthropic", "modelId": "claude-opus-4-7", "currency": "USD", "unit": "per-million-tokens",
+      "sourceUrl": "https://docs.anthropic.com/en/docs/about-claude/pricing", "observedAt": "2026-07-17T00:00:00Z",
+      "tiers": { "standard": { "bands": [{ "input": 5.0, "output": 25.0 }]}}
+    },
+    {
+      "vendor": "anthropic", "modelId": "claude-opus-4-6", "currency": "USD", "unit": "per-million-tokens",
+      "sourceUrl": "https://docs.anthropic.com/en/docs/about-claude/pricing", "observedAt": "2026-07-17T00:00:00Z",
+      "tiers": { "standard": { "bands": [{ "input": 5.0, "output": 25.0 }]}}
+    },
+    {
+      "vendor": "anthropic", "modelId": "claude-opus-4-5-20251101", "currency": "USD", "unit": "per-million-tokens",
+      "sourceUrl": "https://docs.anthropic.com/en/docs/about-claude/pricing", "observedAt": "2026-07-17T00:00:00Z",
+      "tiers": { "standard": { "bands": [{ "input": 5.0, "output": 25.0 }]}}
+    },
+    {
+      "vendor": "anthropic", "modelId": "claude-sonnet-4-6", "currency": "USD", "unit": "per-million-tokens",
+      "sourceUrl": "https://docs.anthropic.com/en/docs/about-claude/pricing", "observedAt": "2026-07-17T00:00:00Z",
+      "tiers": { "standard": { "bands": [{ "input": 3.0, "output": 15.0 }]}}
+    },
+    {
+      "vendor": "anthropic", "modelId": "claude-haiku-4-5-20251001", "aliases": ["claude-haiku-4-5"],
+      "currency": "USD", "unit": "per-million-tokens",
+      "sourceUrl": "https://docs.anthropic.com/en/docs/about-claude/pricing", "observedAt": "2026-07-17T00:00:00Z",
+      "tiers": { "standard": { "bands": [{ "input": 0.8, "output": 4.0 }]}}
+    },
+    {
+      "vendor": "minimax", "modelId": "minimax-m3", "currency": "USD", "unit": "per-million-tokens",
+      "sourceUrl": "https://platform.minimax.io/docs/guides/pricing", "observedAt": "2026-07-17T00:00:00Z",
+      "tiers": { "standard": { "bands": [{ "input": 0.4, "output": 2.0 }]}}
+    }
+  ]
+}

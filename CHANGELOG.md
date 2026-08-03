@@ -12,14 +12,16 @@
 
 ### Changed
 
-- Codex 后续轮次复用原生 thread，并使用 `codex exec resume` 延续上下文。
+- Codex 后续轮次复用 Session-owned app-server 的原生 thread，并通过 `turn/start` 延续上下文。
 - 流式回复完成后再启用完整 Markdown 渲染，降低长回复期间的渲染开销。
 - 权限策略统一在设置页管理。
+- 普通 Codex 会话按真实 app-server 协议握手判断兼容性，不再要求用户维护精确 CLI 版本；保护模式继续严格验证。
 
 ### Fixed
 
 - 修复新会话多轮上下文、预算硬停、发送前持久化和 OAuth 状态误判问题。
 - 改进进程清理、钥匙串清理、审批恢复和工作区隔离的失败处理。
+- Codex 未完成命令/文件 item 现在以失败终态收口，不再误报成功；Windows 带空格 executable 的审批 matcher 保留完整路径。
 - 改进键盘可达性、响应式布局、错误状态和设置保存行为。
 
 ## [0.1.0] - 2026-07-09

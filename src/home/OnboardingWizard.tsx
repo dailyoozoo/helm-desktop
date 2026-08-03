@@ -2,6 +2,7 @@
 // 每一步都可跳过，整个向导可关闭——跳过后由工作区的发送前置校验兜底，闭环不依赖向导。
 import { useCallback, useEffect, useState } from 'react';
 import { showToast } from '../components/toast';
+import { useDialogBehavior } from '../components/useDialogBehavior';
 import { isTauriRuntime } from '../lib/env';
 import {
   getReadinessReport,
@@ -131,6 +132,7 @@ export function OnboardingWizard({
   const [step, setStep] = useState(0);
   const [readiness, setReadiness] = useState<ReadinessReport | null>(null);
   const [detecting, setDetecting] = useState(false);
+  const dialogRef = useDialogBehavior(() => onFinish());
 
   const refresh = useCallback(async () => {
     setDetecting(true);
@@ -182,8 +184,18 @@ export function OnboardingWizard({
     : [];
 
   return (
-    <div className="ob-overlay">
-      <div className="ob-panel">
+    <div
+      className="ob-overlay"
+      onMouseDown={(event) => event.target === event.currentTarget && onFinish()}
+    >
+      <div
+        ref={dialogRef}
+        className="ob-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-label="首启引导"
+        tabIndex={-1}
+      >
         <div className="ob-steps">
           {['欢迎', '引擎', '接入', '目录', '完成'].map((label, index) => (
             <span key={label} className={'ob-step' + (index === step ? ' is-active' : '')}>

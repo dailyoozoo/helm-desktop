@@ -11,7 +11,10 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { Icon } from '../shell/icons';
 import { showToast } from '../components/toast';
 import type { Skill, SlashCommand } from '../extensions/extensionsApi';
-import type { TurnMode } from '../engine/transport';
+import type { PermissionProfile, TurnMode } from '../engine/transport';
+import type { SessionState } from '../engine/useSession';
+import type { ReasoningEffort } from '@helm/protocol';
+import { reasoningEffortLabel } from '../reasoning';
 import { savePastedImage, searchWorkspaceFiles } from './workspaceApi';
 import {
   completeSlashCommand,
@@ -22,6 +25,8 @@ import {
   resolveEnterAction,
 } from './slashCommands';
 
+const useClientLayoutEffect = typeof window === 'undefined' ? useEffect : useLayoutEffect;
+
 function sourceLabel(source: SlashCommand['source']) {
   if (source === 'extension') return '扩展中心';
   if (source === 'engine-project') return '项目';
@@ -31,7 +36,7 @@ function sourceLabel(source: SlashCommand['source']) {
 
 /** 模式对应的输入框提示（变更-04 B.2：切了要有感觉） */
 const MODE_PLACEHOLDER: Record<TurnMode, string> = {
-  build: '让 Helm 构建或修改点什么…  ⏎ 发送 · / 命令 · @ 文件',
+  build: '让 Helm 构建或修改点什么…  Enter 发送 · / 命令 · @ 文件',
   plan: '描述要做的事，本轮只调研并产出实施计划，不会改动文件…',
   ask: '问点什么…（询问模式只读，不会修改文件）',
 };
@@ -41,34 +46,68 @@ interface QueuedMessage {
   attachments: string[];
 }
 
+export function settleQueuedMessage(
+  queue: QueuedMessage[],
+  delivered: QueuedMessage,
+  sent: boolean | void,
+): { queue: QueuedMessage[]; paused: boolean } {
+  if (sent === false) return { queue, paused: true };
+  return {
+    queue: queue[0] === delivered ? queue.slice(1) : queue.filter((item) => item !== delivered),
+    paused: false,
+  };
+}
+
 const HISTORY_LIMIT = 50;
 
 export function Composer({
   working,
   mode,
   engine,
+  model = '',
+  reasoningEffort = 'auto',
   cwd = '',
   slashCommands = [],
   skills = [],
   onModeChange,
+  permissionProfile = 'standard',
+  onPermissionProfileChange,
   onCommandAction,
   onSend,
   onStop,
+  cost,
+  onOpenContext,
 }: {
   working: boolean;
   /** 会话模式（变更-04）：状态在 Workspace，Composer 受控展示 */
   mode: TurnMode;
   engine?: string;
+  model?: string;
+  reasoningEffort?: ReasoningEffort;
   /** 工作目录（变更-12）：@文件引用在此目录下搜索 */
   cwd?: string;
   slashCommands?: SlashCommand[];
   skills?: Skill[];
   onModeChange: (mode: TurnMode) => void;
+  permissionProfile?: PermissionProfile;
+  onPermissionProfileChange?: (profile: PermissionProfile) => void;
   onCommandAction: (action: string) => void;
-  onSend: (text: string, attachments: string[]) => void;
+  onSend: (text: string, attachments: string[]) => void | Promise<boolean>;
   onStop: () => void;
+  cost?: SessionState['cost'];
+  onOpenContext?: () => void;
 }) {
   const [text, setText] = useState('');
+  const permissionDescription =
+    permissionProfile === 'standard'
+      ? '危险操作会询问'
+      : permissionProfile === 'auto'
+        ? '安全操作自动执行'
+        : '跳过 Helm 审批';
+  const contextRatio =
+    cost?.contextTokens != null && cost.contextWindow
+      ? Math.min(1, cost.contextTokens / cost.contextWindow)
+      : undefined;
   const [attachments, setAttachments] = useState<string[]>([]);
   const [highlight, setHighlight] = useState(0);
   const [dismissed, setDismissed] = useState(false);
@@ -79,13 +118,20 @@ export function Composer({
   const [mentionHighlight, setMentionHighlight] = useState(0);
   // 排队消息（变更-12）：轮次进行中发送 → 入队，本轮结束自动发出
   const [queue, setQueue] = useState<QueuedMessage[]>([]);
+  const [queuePaused, setQueuePaused] = useState(false);
   const ref = useRef<HTMLTextAreaElement>(null);
+  const onSendRef = useRef(onSend);
+  const queueSendingRef = useRef(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const activeItemRef = useRef<HTMLButtonElement>(null);
   // 输入历史（变更-12）：↑↓ 在空输入框时回溯已发送消息
   const historyRef = useRef<string[]>([]);
   const historyPosRef = useRef(-1);
   const draftRef = useRef('');
+
+  useEffect(() => {
+    onSendRef.current = onSend;
+  }, [onSend]);
 
   const modeTitle = (target: TurnMode) => {
     if (working) return '轮次进行中，结束后可切换模式';
@@ -94,11 +140,14 @@ export function Composer({
     }
     if (target === 'plan') return '本轮只调研并产出实施计划，不改动文件';
     if (target === 'ask') return '只读问答：不修改文件、不执行写命令';
+    if (target === 'build' && engine === 'codex') {
+      return 'Codex 构建模式由 Codex Runtime 管理权限；仅显式启用 Helm 保护路径时才要求强制验证';
+    }
     return '正常执行（按权限设置审批）';
   };
 
   // textarea 自增高（上限 190px，与原型一致）。
-  useLayoutEffect(() => {
+  useClientLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
     el.style.height = 'auto';
@@ -114,26 +163,83 @@ export function Composer({
     historyPosRef.current = -1;
   };
 
-  const submitOrQueue = () => {
+  const submitOrQueue = async () => {
     const t = text.trim();
     if (!t) return;
     rememberHistory(t);
     if (working) {
       setQueue((current) => [...current, { text: t, attachments }]);
+      setText('');
+      setAttachments([]);
     } else {
-      onSend(t, attachments);
+      const sent = await onSendRef.current(t, attachments);
+      if (sent === false) return;
+      setText('');
+      setAttachments([]);
     }
-    setText('');
-    setAttachments([]);
   };
 
-  // 本轮结束后自动发出队首消息（变更-12）
+  // 本轮结束后自动发出队首消息；手动 Stop 后由用户显式恢复，避免意外继续执行。
   useEffect(() => {
-    if (working || queue.length === 0) return;
-    const [next, ...rest] = queue;
-    setQueue(rest);
-    onSend(next.text, next.attachments);
-  }, [working, queue, onSend]);
+    if (working || queuePaused || queue.length === 0 || queueSendingRef.current) return;
+    queueSendingRef.current = true;
+    const next = queue[0];
+    void (async (): Promise<boolean | void> => onSendRef.current(next.text, next.attachments))()
+      .then((sent) => {
+        queueSendingRef.current = false;
+        setQueue((current) => settleQueuedMessage(current, next, sent).queue);
+        if (sent === false) {
+          setQueuePaused(true);
+          showToast('排队消息发送失败，已保留在队列中；修复后可再次发送', 'error');
+        }
+      })
+      .catch((error: unknown) => {
+        queueSendingRef.current = false;
+        setQueuePaused(true);
+        showToast(
+          `排队消息发送失败，已保留在队列中：${error instanceof Error ? error.message : String(error)}`,
+          'error',
+        );
+      });
+  }, [working, queue, queuePaused]);
+
+  const handleStop = () => {
+    if (queue.length) setQueuePaused(true);
+    onStop();
+  };
+
+  const sendQueuedMessage = async (index: number) => {
+    if (working || queueSendingRef.current) {
+      showToast('当前轮次仍在运行，请先停止或等待结束', 'info');
+      return;
+    }
+    const message = queue[index];
+    if (!message) return;
+    queueSendingRef.current = true;
+    setQueue((current) => current.filter((_item, itemIndex) => itemIndex !== index));
+    const sent = await onSendRef.current(message.text, message.attachments);
+    queueSendingRef.current = false;
+    if (sent === false) {
+      setQueue((current) => {
+        const next = [...current];
+        next.splice(Math.min(index, next.length), 0, message);
+        return next;
+      });
+      setQueuePaused(true);
+      showToast('排队消息发送失败，已保留在队列中', 'error');
+    }
+  };
+
+  const removeQueuedMessage = (index: number) => {
+    const removed = queue[index];
+    if (!removed) return;
+    const next = queue.filter((_item, itemIndex) => itemIndex !== index);
+    setQueue(next);
+    if (next.length === 0) setQueuePaused(false);
+    setText((current) => (current.trim() ? `${removed.text}\n\n${current}` : removed.text));
+    setAttachments((current) => Array.from(new Set([...removed.attachments, ...current])));
+    window.setTimeout(() => ref.current?.focus(), 0);
+  };
 
   // 斜杠菜单只在输入第一个 token（尚未出现空白）时展开；Esc 关闭后继续输入命令字符会重新打开。
   const slashQuery = text.trimStart();
@@ -463,6 +569,25 @@ export function Composer({
           >
             询问
           </button>
+          <label
+            className={`ws-permission-profile${permissionProfile === 'full_access' ? ' is-danger' : ''}`}
+            title={`当前会话权限档位：${permissionDescription}`}
+          >
+            <Icon name={permissionProfile === 'full_access' ? 'eyeoff' : 'shield'} />
+            <select
+              value={permissionProfile}
+              disabled={working}
+              aria-label="权限档位"
+              onChange={(event) =>
+                onPermissionProfileChange?.(event.target.value as PermissionProfile)
+              }
+            >
+              <option value="standard">标准</option>
+              <option value="auto">自动执行</option>
+              <option value="full_access">全部放开</option>
+            </select>
+            <span className="ws-permission-profile__hint">{permissionDescription}</span>
+          </label>
         </div>
         <div className="composer__box">
           <textarea
@@ -556,17 +681,28 @@ export function Composer({
                 <span className="composer__attachment ws-queued" key={`${index}-${message.text}`}>
                   <Icon name="clock" />
                   <span title={message.text}>
-                    排队 {index + 1}：{message.text.slice(0, 24)}
+                    {queuePaused ? '已暂停' : `排队 ${index + 1}`}：{message.text.slice(0, 24)}
                     {message.text.length > 24 ? '…' : ''}
                   </span>
                   <button
                     type="button"
-                    title="取消排队"
-                    aria-label={`取消排队消息 ${index + 1}`}
-                    onClick={() => setQueue((current) => current.filter((_item, i) => i !== index))}
+                    title="移回输入框"
+                    aria-label={`将排队消息 ${index + 1} 移回输入框`}
+                    onClick={() => removeQueuedMessage(index)}
                   >
                     <Icon name="x" />
                   </button>
+                  {queuePaused ? (
+                    <button
+                      type="button"
+                      title="立即发送这条消息"
+                      aria-label={`立即发送排队消息 ${index + 1}`}
+                      disabled={working}
+                      onClick={() => void sendQueuedMessage(index)}
+                    >
+                      <Icon name="play" />
+                    </button>
+                  ) : null}
                 </span>
               ))}
             </div>
@@ -634,36 +770,60 @@ export function Composer({
               <Icon name="folderopen" />
             </button>
             <div className="sp" />
+            <div className="composer__session-status" aria-label="当前会话状态">
+              <span title={`模型 ${model || '未选择'}`}>模型 {model || '未选择'}</span>
+              <span title={`推理强度 ${reasoningEffortLabel(reasoningEffort)}`}>
+                强度 {reasoningEffortLabel(reasoningEffort)}
+              </span>
+              {cost?.contextTokens != null ? (
+                <button
+                  type="button"
+                  className={`composer__context-status${contextRatio != null && contextRatio >= 0.95 ? ' is-danger' : contextRatio != null && contextRatio >= 0.8 ? ' is-warning' : ''}`}
+                  title="当前上下文占用，点击查看明细"
+                  aria-label={`当前上下文占用${contextRatio == null ? '' : ` ${Math.round(contextRatio * 100)}%`}，点击查看明细`}
+                  onClick={onOpenContext}
+                >
+                  上下文{' '}
+                  {contextRatio == null
+                    ? `${Math.round(cost.contextTokens / 1000)}K`
+                    : `${Math.round(contextRatio * 100)}% · ${Math.round(cost.contextTokens / 1000)}K/${Math.round((cost.contextWindow ?? 0) / 1000)}K`}
+                </button>
+              ) : (
+                <span>上下文 暂无</span>
+              )}
+              <span>花费 {cost ? `$${cost.costUsd.toFixed(4)}` : '暂无'}</span>
+            </div>
             <span className="mono faint" style={{ fontSize: 11 }} title="客户端粗估，非真实计费值">
-              ≈{tok} tok
+              本条约 {tok} token
             </span>
+            {working ? (
+              <button
+                type="button"
+                className="btn btn--danger btn--sm"
+                onClick={handleStop}
+                title="停止当前轮次 · Ctrl+Shift+."
+              >
+                <Icon name="stop" style={{ width: 14, height: 14 }} /> 停止
+              </button>
+            ) : null}
             <button
+              type="button"
               className="btn btn--primary btn--sm"
-              onClick={() => {
-                if (working && !text.trim()) {
-                  onStop();
-                } else if (working) {
-                  submitOrQueue();
-                } else {
-                  submitOrQueue();
-                }
-              }}
-              disabled={!working && !text.trim()}
-              title={working ? (text.trim() ? '排队发送（当前轮结束后自动发出）' : '停止') : '发送'}
+              onClick={() => void submitOrQueue()}
+              disabled={!text.trim()}
+              title={working ? '排队发送（当前轮结束后自动发出）' : '发送'}
             >
-              <Icon
-                name={working ? (text.trim() ? 'clock' : 'stop') : 'send'}
-                style={{ width: 14, height: 14 }}
-              />
+              <Icon name={working ? 'clock' : 'send'} style={{ width: 14, height: 14 }} />
+              {working ? '排队' : '发送'}
             </button>
           </div>
         </div>
         <div className="composer__hint">
           <span>
-            <span className="kbd">⏎</span> 发送
+            <span className="kbd">Enter</span> 发送
           </span>
           <span>
-            <span className="kbd">⇧⏎</span> 换行
+            <span className="kbd">Shift+Enter</span> 换行
           </span>
           <span>
             <span className="kbd">/</span> 命令

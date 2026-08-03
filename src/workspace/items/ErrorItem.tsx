@@ -18,7 +18,8 @@ const ERROR_KIND_META: Record<
   },
   version_incompatible: {
     title: 'CLI 版本不兼容',
-    hint: '当前 CLI 版本可能过旧，不支持 Helm 依赖的参数。请升级 CLI 后重试。',
+    hint: '当前 CLI 版本不支持 Helm 依赖的协议或受保护工具面。Codex 可切到计划/询问模式，Build 请改用兼容引擎；未来版本需在设置中重新检测通过后才会启用。',
+    action: { label: '去设置检测引擎', page: 'settings' },
   },
   cwd_invalid: {
     title: '工作目录无效',
@@ -29,6 +30,11 @@ const ERROR_KIND_META: Record<
     title: '引擎未绑定',
     hint: '当前引擎还没有绑定服务商和模型。完成绑定后即可对话。',
     action: { label: '去服务商页绑定', page: 'providers' },
+  },
+  model_unavailable: {
+    title: '模型不可用',
+    hint: '当前绑定的模型不存在或该服务商账号无权访问。请在服务商页重新同步模型并调整生效绑定。',
+    action: { label: '去服务商页', page: 'providers' },
   },
   network: {
     title: '网络错误',

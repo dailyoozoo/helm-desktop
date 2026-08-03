@@ -1,15 +1,25 @@
-import { useMemo, useState, type CSSProperties } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { toolTarget } from './toolTarget';
 import { Icon } from '../shell/icons';
 import type { SessionState } from '../engine/useSession';
 import { contextPanelData } from './contextPanelViewModel';
 import type { McpServer, Skill } from '../extensions/extensionsApi';
-import type { AppSettings } from '../settings/types';
+import type { PermissionProfile, RuntimeCapabilityAvailability } from '@helm/protocol';
+import { activityLogGroups } from './activityLog';
+import { getGitStatus, getGitStaged, type GitStatus, type StagedFile } from '../engine/transport';
+import { open } from '@tauri-apps/plugin-dialog';
+import {
+  addSessionContext,
+  listSessionContexts,
+  removeSessionContext,
+  type SessionContextRecord,
+} from '../sessions/api';
 
-type Tab = 'files' | 'context' | 'tools';
+type Tab = 'files' | 'log' | 'context' | 'tools';
 
-const panelStyle: CSSProperties = { display: 'flex', flexDirection: 'column', gap: 20 };
-const hintStyle: CSSProperties = { color: 'var(--fg-4)', fontSize: 12.5, lineHeight: 1.6 };
-const listStyle: CSSProperties = { display: 'flex', flexDirection: 'column', gap: 2 };
+const panelStyle = { display: 'flex', flexDirection: 'column', gap: 20 } as const;
+const hintStyle = { color: 'var(--fg-4)', fontSize: 12.5, lineHeight: 1.6 } as const;
+const listStyle = { display: 'flex', flexDirection: 'column', gap: 2 } as const;
 
 function statusText(status: 'pending' | 'success' | 'error') {
   if (status === 'pending') return '运行中';
@@ -17,16 +27,29 @@ function statusText(status: 'pending' | 'success' | 'error') {
   return '失败';
 }
 
-/** 权限值 → 药丸（原型工具 tab：自动/询问/关闭） */
-function permissionPill(value: string) {
-  if (value === 'allow') return { className: 'pill pill--success', label: '自动' };
-  if (value === 'deny') return { className: 'pill', label: '关闭' };
-  return { className: 'pill pill--warn', label: '询问' };
+/** 活动日志行的目标摘要：共享 toolTarget 提取后按紧凑列表截断到 48 字符。 */
+function toolTargetShort(item: Extract<SessionState['items'][number], { kind: 'tool' }>): string {
+  const target = toolTarget(item.name, item.input).trim().split(/\r?\n/, 1)[0];
+  return target.length > 48 ? `${target.slice(0, 47)}…` : target;
+}
+
+function toolLogMeta(item: Extract<SessionState['items'][number], { kind: 'tool' }>): string {
+  const duration =
+    item.startedAt && item.endedAt
+      ? ` · ${Math.max(0, (item.endedAt - item.startedAt) / 1000).toFixed(1)}s`
+      : '';
+  return `${statusText(item.status)}${duration}`;
+}
+
+function capabilityPill(value: RuntimeCapabilityAvailability) {
+  if (value === 'available') return { className: 'pill pill--success', label: '可用' };
+  if (value === 'unavailable') return { className: 'pill', label: '不可用' };
+  return { className: 'pill pill--warn', label: '未知' };
 }
 
 export function ContextPanel({
   state,
-  settings,
+  permissionProfile,
   mcpServers = [],
   skills = [],
   mcpLoadError,
@@ -34,34 +57,164 @@ export function ContextPanel({
   onRetryExtensions,
   onToggleMcp,
   onOpenExtensions,
-  onOpenSettings,
+  onLocateItem,
+  onLocateChange,
+  openContextRequest = 0,
 }: {
   state: SessionState;
-  settings?: AppSettings;
+  permissionProfile: PermissionProfile;
   mcpServers?: McpServer[];
   skills?: Skill[];
   mcpLoadError?: string | null;
   skillsLoadError?: string | null;
   onRetryExtensions?: () => void;
-  onToggleMcp?: (name: string) => void;
+  onToggleMcp?: (name: string) => void | Promise<void>;
   onOpenExtensions?: () => void;
-  onOpenSettings?: () => void;
+  onLocateItem?: (itemId: string) => void;
+  /** 批次 I：跳转到变更位置（文件路径 + 行号 + 工具 ID） */
+  onLocateChange?: (path: string, lineNumber: number, toolId: string) => void;
+  openContextRequest?: number;
 }) {
   const [tab, setTab] = useState<Tab>('context');
+  // 批次 I：变更导航器展开状态
+  const [expandedFiles, setExpandedFiles] = useState<Set<string>>(new Set());
+  const toggleExpand = (path: string) => {
+    setExpandedFiles((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) {
+        next.delete(path);
+      } else {
+        next.add(path);
+      }
+      return next;
+    });
+  };
+  // Git 状态（批次 E）
+  const [gitStatus, setGitStatus] = useState<GitStatus | undefined>();
+  const [stagedFiles, setStagedFiles] = useState<StagedFile[] | undefined>();
+  const [sessionContexts, setSessionContexts] = useState<SessionContextRecord[]>([]);
+  const [contextError, setContextError] = useState<string | null>(null);
+  const [contextBusy, setContextBusy] = useState(false);
+
+  const loadSessionContexts = useCallback(async () => {
+    if (!state.historyId) {
+      setSessionContexts([]);
+      return;
+    }
+    try {
+      setSessionContexts(await listSessionContexts(state.historyId));
+      setContextError(null);
+    } catch (error) {
+      setContextError(String(error));
+    }
+  }, [state.historyId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      if (!state.historyId) {
+        setSessionContexts([]);
+        return;
+      }
+      try {
+        const contexts = await listSessionContexts(state.historyId);
+        if (cancelled) return;
+        setSessionContexts(contexts);
+        setContextError(null);
+      } catch (error) {
+        if (cancelled) return;
+        setContextError(String(error));
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, [state.historyId, state.status]);
+
+  const pickSessionContext = async (directory: boolean) => {
+    if (!state.historyId || state.status === 'working') return;
+    setContextBusy(true);
+    setContextError(null);
+    try {
+      const selected = await open({ multiple: true, directory });
+      const paths = typeof selected === 'string' ? [selected] : (selected ?? []);
+      for (const path of paths) await addSessionContext(state.historyId, path);
+      await loadSessionContexts();
+    } catch (error) {
+      setContextError(String(error));
+    } finally {
+      setContextBusy(false);
+    }
+  };
+
+  const removeContext = async (contextId: string) => {
+    if (!state.historyId || state.status === 'working') return;
+    setContextBusy(true);
+    setContextError(null);
+    try {
+      await removeSessionContext(state.historyId, contextId);
+      await loadSessionContexts();
+    } catch (error) {
+      setContextError(String(error));
+    } finally {
+      setContextBusy(false);
+    }
+  };
+
+  // 当 cwd 变化时获取 git 状态
+  useEffect(() => {
+    if (!state.cwd) {
+      setGitStatus(undefined);
+      setStagedFiles(undefined);
+      return;
+    }
+
+    let cancelled = false;
+
+    Promise.all([getGitStatus(state.cwd), getGitStaged(state.cwd)])
+      .then(([status, staged]) => {
+        if (cancelled) return;
+        setGitStatus(status);
+        setStagedFiles(staged);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        // git 获取失败（可能不是 git 仓库）
+        setGitStatus(undefined);
+        setStagedFiles(undefined);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [state.cwd]);
+
   // 派生数据 memo（变更-09）：流式期间 Workspace 每帧重渲染，items/cost 未变时不重算
-  const data = useMemo(() => contextPanelData(state.items, state.cost), [state.items, state.cost]);
+  const data = useMemo(
+    () => contextPanelData(state.items, state.cost, gitStatus, stagedFiles),
+    [state.items, state.cost, gitStatus, stagedFiles],
+  );
+  const activityGroups = useMemo(() => activityLogGroups(state.items), [state.items]);
   const fmt = (n: number) => n.toLocaleString('zh-CN');
   const started = state.startedAt ? new Date(state.startedAt) : null;
-  const contextPercent = Math.round(data.contextWindow.usedRatio * 100);
   const enabledSkills = skills.filter((skill) => skill.enabled);
   const connectedMcp = mcpServers.filter(
     (server) => (server.toolCount ?? 0) > 0 && !server.lastError,
   );
-  const permissions = settings?.permissions;
+  useEffect(() => {
+    if (openContextRequest > 0) setTab('context');
+  }, [openContextRequest]);
 
   return (
     <aside className="ctx">
       <div className="ctx__tabs tabbar">
+        <button
+          className={'tab' + (tab === 'log' ? ' is-active' : '')}
+          onClick={() => setTab('log')}
+        >
+          活动
+        </button>
         <button
           className={'tab' + (tab === 'files' ? ' is-active' : '')}
           onClick={() => setTab('files')}
@@ -93,42 +246,156 @@ export function ContextPanel({
                 <span className="mono">{state.cwd || '—'}</span>
               </div>
             </div>
-            <div>
-              <div className="csec__t">
-                <Icon name="clip" /> 已挂载上下文
+
+            {/* Git 状态（批次 E） */}
+            {gitStatus && (
+              <div>
+                <div className="csec__t">
+                  <Icon name="gitbranch" /> Git 状态
+                </div>
+                <div className="kv">
+                  <span>当前分支</span>
+                  <span className="mono">{gitStatus.branch}</span>
+                </div>
+                <div className="kv">
+                  <span>工作区变更</span>
+                  <span>
+                    {gitStatus.modified > 0 && (
+                      <span className="pill pill--warn" style={{ marginRight: 4 }}>
+                        修改 {gitStatus.modified}
+                      </span>
+                    )}
+                    {gitStatus.added > 0 && (
+                      <span className="pill pill--success" style={{ marginRight: 4 }}>
+                        新增 {gitStatus.added}
+                      </span>
+                    )}
+                    {gitStatus.deleted > 0 && (
+                      <span className="pill pill--danger" style={{ marginRight: 4 }}>
+                        删除 {gitStatus.deleted}
+                      </span>
+                    )}
+                    {gitStatus.modified === 0 &&
+                      gitStatus.added === 0 &&
+                      gitStatus.deleted === 0 && <span className="faint">干净</span>}
+                  </span>
+                </div>
               </div>
-              {data.mountedPaths.length ? (
+            )}
+
+            {/* 暂存区文件列表（批次 E） */}
+            {stagedFiles && stagedFiles.length > 0 && (
+              <div>
+                <div className="csec__t">
+                  <Icon name="clip" /> 暂存区
+                </div>
                 <div style={listStyle}>
-                  {data.mountedPaths.map((path) => (
-                    <div className="filerow" key={path}>
-                      <span className="st m">C</span>
-                      <span className="nm mono">{path}</span>
+                  {stagedFiles.map((file) => (
+                    <div className="filerow" key={file.path}>
+                      <span className="st a">{file.status.charAt(0)}</span>
+                      <span className="nm">{file.path}</span>
                     </div>
                   ))}
                 </div>
-              ) : (
-                <div style={hintStyle}>暂无挂载文件/目录</div>
-              )}
-            </div>
+              </div>
+            )}
+
             <div>
               <div className="csec__t">
                 <Icon name="gitbranch" /> 文件变更
               </div>
-              {data.changedFiles.length ? (
+              {data.changeFiles.length ? (
                 <div style={listStyle}>
-                  {data.changedFiles.map((file) => (
-                    <div
-                      className="filerow"
-                      key={file.path}
-                      title={file.edits > 1 ? `${file.edits} 次编辑的累计行数` : undefined}
-                    >
-                      <span className="st m">M</span>
-                      <span className="nm">{file.path}</span>
-                      <span className="pm">
-                        <span className="a">+{file.added}</span>
-                        <span className="d">-{file.removed}</span>
-                        {file.edits > 1 ? <span className="faint">（累计）</span> : null}
-                      </span>
+                  {data.changeFiles.map((file) => (
+                    <div key={file.path}>
+                      <button
+                        type="button"
+                        className="filerow"
+                        style={{
+                          cursor: 'pointer',
+                          display: 'flex',
+                          alignItems: 'center',
+                          width: '100%',
+                          background: 'none',
+                          border: 'none',
+                          padding: '4px 0',
+                          textAlign: 'left',
+                        }}
+                        onClick={() => toggleExpand(file.path)}
+                        title={`${file.path}（${file.added} 新增，${file.removed} 删除）`}
+                      >
+                        <span className="st m">{expandedFiles.has(file.path) ? '▼' : '▶'}</span>
+                        <span className="nm">{file.path}</span>
+                        <span className="pm">
+                          <span className="a">+{file.added}</span>
+                          <span className="d">-{file.removed}</span>
+                        </span>
+                      </button>
+                      {expandedFiles.has(file.path) && (
+                        <div
+                          style={{
+                            marginLeft: 16,
+                            fontSize: 12,
+                            fontFamily: 'var(--font-mono)',
+                            lineHeight: 1.6,
+                          }}
+                        >
+                          {file.lines.slice(0, 50).map((line, index) => (
+                            <button
+                              type="button"
+                              key={`${file.path}-${line.lineNumber}-${index}`}
+                              style={{
+                                display: 'flex',
+                                width: '100%',
+                                background: 'none',
+                                border: 'none',
+                                padding: '1px 0',
+                                cursor: 'pointer',
+                                textAlign: 'left',
+                                color:
+                                  line.kind === 'add'
+                                    ? 'var(--green)'
+                                    : line.kind === 'del'
+                                      ? 'var(--red)'
+                                      : 'var(--fg-3)',
+                              }}
+                              onClick={() =>
+                                onLocateChange?.(line.path, line.lineNumber, line.toolId)
+                              }
+                              title={`跳转到 ${line.path}:${line.lineNumber}`}
+                            >
+                              <span
+                                style={{
+                                  width: 40,
+                                  textAlign: 'right',
+                                  marginRight: 8,
+                                  opacity: 0.5,
+                                }}
+                              >
+                                {line.lineNumber}
+                              </span>
+                              <span style={{ width: 16, textAlign: 'center', marginRight: 4 }}>
+                                {line.kind === 'add' ? '+' : line.kind === 'del' ? '-' : ' '}
+                              </span>
+                              <span
+                                style={{
+                                  flex: 1,
+                                  overflow: 'hidden',
+                                  textOverflow: 'ellipsis',
+                                  whiteSpace: 'nowrap',
+                                }}
+                              >
+                                {line.text}
+                              </span>
+                            </button>
+                          ))}
+                          {file.lines.length > 50 && (
+                            <div style={{ color: 'var(--fg-4)', padding: '2px 0' }}>
+                              … 共 {file.lines.length} 行变更
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -143,89 +410,230 @@ export function ContextPanel({
           <div style={panelStyle}>
             <div>
               <div className="csec__t">
+                <Icon name="layers" /> 上下文占用
+              </div>
+              <div className="usage">
+                <div className="usage__row">
+                  <span className="usage__big">
+                    {data.contextUsage.tokens == null
+                      ? '暂无数据'
+                      : `${fmt(data.contextUsage.tokens)}${data.contextUsage.maxTokens ? ` / ${fmt(data.contextUsage.maxTokens)}` : ''}`}
+                  </span>
+                  {data.contextUsage.ratio != null ? (
+                    <span
+                      className={`pill ${data.contextUsage.level === 'danger' ? 'pill--danger' : data.contextUsage.level === 'warning' ? 'pill--warn' : 'pill--accent'}`}
+                    >
+                      {Math.round(data.contextUsage.ratio * 100)}%
+                    </span>
+                  ) : null}
+                </div>
+                {data.contextUsage.ratio != null ? (
+                  <div className="meter">
+                    <i style={{ width: `${Math.round(data.contextUsage.ratio * 100)}%` }} />
+                  </div>
+                ) : null}
+                <div className="usage__note">
+                  {data.contextUsage.tokens == null
+                    ? '当前 Engine 路径未提供逐调用用量；Helm 不使用累计值估算。'
+                    : '口径：最近一次模型调用的真实输入规模，含缓存命中；非累计、非估算。'}
+                </div>
+                {data.contextUsage.level === 'warning' || data.contextUsage.level === 'danger' ? (
+                  <div
+                    className={`usage__hint${data.contextUsage.level === 'danger' ? ' is-danger' : ''}`}
+                  >
+                    <Icon name="alert" />
+                    <span>
+                      {data.contextUsage.level === 'danger'
+                        ? '已接近上下文上限，建议新开会话继续。'
+                        : '上下文占用较高，建议尽快收束当前任务。'}
+                    </span>
+                  </div>
+                ) : null}
+              </div>
+            </div>
+            <div>
+              <div className="csec__t">
+                <Icon name="dollar" /> 计费 token（累计）
+              </div>
+              <div className="usage">
+                <div className="billrow">
+                  <span>未缓存输入</span>
+                  <span className="mono">{fmt(data.billing.freshInput)}</span>
+                </div>
+                <div className="billrow">
+                  <span>缓存写入</span>
+                  <span className="mono">{fmt(data.billing.cacheWrite)}</span>
+                </div>
+                <div className="billrow">
+                  <span>缓存读取</span>
+                  <span className="mono">{fmt(data.billing.cacheRead)}</span>
+                </div>
+                <div className="billrow">
+                  <span>输出</span>
+                  <span className="mono">{fmt(data.billing.output)}</span>
+                </div>
+                <div className="billrow">
+                  <span>缓存读取占比</span>
+                  <span className="mono">
+                    {data.billing.cacheReadShare == null
+                      ? '暂无'
+                      : `${Math.round(data.billing.cacheReadShare * 100)}%`}
+                  </span>
+                </div>
+                <div className="usage__note">
+                  计费 token 跨轮累计；缓存读取的实际价格按当前定价目录计算。
+                </div>
+              </div>
+            </div>
+            <div>
+              <div className="csec__t">
+                <Icon name="layers" /> 会话上下文
+                <span className="ws-context-actions">
+                  <button
+                    type="button"
+                    className="btn-icon"
+                    title="添加文件"
+                    aria-label="添加文件到会话上下文"
+                    disabled={!state.historyId || state.status === 'working' || contextBusy}
+                    onClick={() => void pickSessionContext(false)}
+                  >
+                    <Icon name="file" />
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-icon"
+                    title="添加目录"
+                    aria-label="添加目录到会话上下文"
+                    disabled={!state.historyId || state.status === 'working' || contextBusy}
+                    onClick={() => void pickSessionContext(true)}
+                  >
+                    <Icon name="folder" />
+                  </button>
+                </span>
+              </div>
+              {sessionContexts.length ? (
+                <div style={listStyle}>
+                  {sessionContexts.map((context) => (
+                    <div
+                      className="filerow ws-context-row"
+                      key={context.id}
+                      title={context.canonicalPath}
+                    >
+                      <span className={`st ${context.status === 'ready' ? 'a' : 'd'}`}>
+                        {context.kind === 'directory' ? 'D' : 'F'}
+                      </span>
+                      <span className="nm mono">
+                        {context.displayName}
+                        {context.status !== 'ready' ? ` · ${context.statusDetail ?? '不可用'}` : ''}
+                      </span>
+                      <button
+                        type="button"
+                        className="btn-icon"
+                        title="从后续轮次移除"
+                        aria-label={`移除会话上下文 ${context.displayName}`}
+                        disabled={state.status === 'working' || contextBusy}
+                        onClick={() => void removeContext(context.id)}
+                      >
+                        <Icon name="x" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div style={hintStyle}>暂无会话上下文</div>
+              )}
+              {contextError ? <div className="usage__hint is-danger">{contextError}</div> : null}
+              <div className="usage__note">
+                增删只影响后续轮次；运行中不可修改。当前版本仅支持工作目录内路径。
+              </div>
+            </div>
+            <div>
+              <div className="csec__t">
+                <Icon name="clip" /> 历史附件
+              </div>
+              {data.historicalAttachments.length ? (
+                <div style={listStyle}>
+                  {data.historicalAttachments.map((path) => (
+                    <div className="filerow" key={path} title="已发送附件，只读历史">
+                      <span className="st m">A</span>
+                      <span className="nm mono">{path}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div style={hintStyle}>暂无历史附件</div>
+              )}
+              <div className="usage__note">已发送附件属于消息历史，不能在这里移除。</div>
+            </div>
+            <div>
+              <div className="csec__t">
                 <Icon name="dollar" /> 本次会话
               </div>
               <div className="kv">
-                <span>输入 token</span>
-                <span className="mono">{fmt(state.cost.inputTokens)}</span>
+                <span>消息数</span>
+                <span className="mono">{data.messageCount}</span>
               </div>
               <div className="kv">
-                <span>输出 token</span>
-                <span className="mono">{fmt(state.cost.outputTokens)}</span>
-              </div>
-              <div className="kv">
-                <span>预估花费</span>
+                <span>花费</span>
                 <span className="mono">
-                  {state.cost.costUsd > 0
-                    ? `$${state.cost.costUsd.toFixed(4)}`
-                    : state.cost.inputTokens + state.cost.outputTokens > 0
-                      ? '无价格数据'
-                      : '$0.0000'}
+                  {state.cost.costUsd > 0 ? `$${state.cost.costUsd.toFixed(4)}` : '暂无价格数据'}
                 </span>
               </div>
-              {started && (
+              {started ? (
                 <div className="kv">
                   <span>开始时间</span>
                   <span className="mono">
                     {started.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
                   </span>
                 </div>
-              )}
+              ) : null}
             </div>
-            <div>
-              <div className="csec__t">
-                <Icon name="layers" /> Token 用量（累计）
-              </div>
-              <div className="usage">
-                <div className="usage__row">
-                  <span>累计 token</span>
-                  <span className="usage__big">{fmt(data.contextWindow.usedTokens)}</span>
-                </div>
-                <div
-                  className="ctxmeter"
-                  aria-label="累计 token 相对上下文窗口上限的比例（非当前窗口占用）"
-                  title="这是本会话输入+输出的累计值与窗口上限之比，不是当前上下文窗口的实时占用"
-                >
-                  <span style={{ width: `${contextPercent}%` }} />
-                </div>
-                <div className="kv">
-                  <span>上下文窗口上限</span>
-                  <span className="mono">
-                    {data.contextWindow.maxTokens ? fmt(data.contextWindow.maxTokens) : '未知'}
-                  </span>
-                </div>
-                <div className="kv">
-                  <span>挂载路径</span>
-                  <span className="mono">{fmt(data.contextWindow.mountedPathCount)}</span>
-                </div>
-              </div>
-              <div style={hintStyle}>
-                CLI 只报告逐轮 token 用量：这里是累计值，不代表当前窗口实时占用； 文件级明细 CLI
-                未提供，Helm 不伪造估算。
-              </div>
+          </div>
+        )}
+
+        {tab === 'log' && (
+          <div style={panelStyle}>
+            <div className="csec__t">
+              <Icon name="clock" /> 活动日志{' '}
+              <span className="faint" style={{ marginLeft: 'auto' }}>
+                {data.tools.length} 个工具
+              </span>
             </div>
-            <div>
-              <div className="csec__t">
-                <Icon name="cpu" /> 本轮工具调用
+            {activityGroups.map((group) => (
+              <div key={group.id}>
+                <div className="lgt">{group.label}</div>
+                {group.items.map((item) => (
+                  <button
+                    className={`lgrow${item.kind === 'tool' && item.status === 'error' ? ' is-err' : ''}`}
+                    key={item.id}
+                    onClick={() => onLocateItem?.(item.id)}
+                  >
+                    <Icon
+                      name={
+                        item.kind === 'tool'
+                          ? 'zap'
+                          : item.kind === 'checkpoint'
+                            ? 'checkc'
+                            : item.kind === 'approval'
+                              ? 'shield'
+                              : 'layers'
+                      }
+                    />
+                    <span className="nm">
+                      {item.kind === 'tool'
+                        ? `${item.name}${toolTargetShort(item) ? ` · ${toolTargetShort(item)}` : ''}`
+                        : item.kind === 'checkpoint'
+                          ? item.label
+                          : item.kind === 'approval'
+                            ? item.action
+                            : '计划'}
+                    </span>
+                    <span className="m">{item.kind === 'tool' ? toolLogMeta(item) : ''}</span>
+                  </button>
+                ))}
               </div>
-              {data.tools.length ? (
-                <div>
-                  {data.tools.map((tool) => (
-                    <div className="toolrow" key={tool.id}>
-                      <span className="toolrow__ic">
-                        <Icon name={tool.name === 'Bash' ? 'terminal' : 'zap'} />
-                      </span>
-                      <span className="toolrow__meta">
-                        <b>{tool.name}</b>
-                        <small>{statusText(tool.status)}</small>
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div style={hintStyle}>暂无工具调用</div>
-              )}
-            </div>
+            ))}
+            {activityGroups.length === 0 ? <div style={hintStyle}>暂无活动</div> : null}
           </div>
         )}
 
@@ -235,42 +643,70 @@ export function ContextPanel({
               <div className="csec__t">
                 <Icon name="shield" /> 工具权限
               </div>
-              {permissions ? (
-                <div>
-                  {[
-                    { icon: 'file' as const, name: '读取文件', value: permissions.readFiles },
-                    { icon: 'edit' as const, name: '编辑文件', value: permissions.editFiles },
-                    {
-                      icon: 'terminal' as const,
-                      name: '运行命令',
-                      value: permissions.runCommands,
-                    },
-                    { icon: 'upright' as const, name: '网页抓取', value: permissions.fetchUrls },
-                    { icon: 'plug' as const, name: 'MCP 工具', value: permissions.mcpTools },
-                  ].map((row) => {
-                    const pill = permissionPill(row.value);
-                    return (
-                      <button
-                        type="button"
-                        className="toolrow ctx-linkrow"
-                        key={row.name}
-                        title="到设置 · 权限中修改"
-                        onClick={onOpenSettings}
-                      >
-                        <span className="toolrow__ic">
-                          <Icon name={row.icon} />
-                        </span>
-                        <span className="toolrow__meta">
-                          <b>{row.name}</b>
-                        </span>
-                        <span className={pill.className}>{pill.label}</span>
-                      </button>
-                    );
-                  })}
+              <div>
+                <div className="toolrow">
+                  <span className="toolrow__ic">
+                    <Icon name="shield" />
+                  </span>
+                  <span className="toolrow__meta">
+                    <b>当前会话权限</b>
+                    <small>在发送框按 Session 切换</small>
+                  </span>
+                  <span className="pill pill--success">
+                    {permissionProfile === 'standard'
+                      ? '标准'
+                      : permissionProfile === 'auto'
+                        ? '自动执行'
+                        : '全部放开'}
+                  </span>
                 </div>
-              ) : (
-                <div style={hintStyle}>设置加载中…</div>
-              )}
+                <div className="toolrow">
+                  <span className="toolrow__ic">
+                    <Icon name="terminal" />
+                  </span>
+                  <span className="toolrow__meta">
+                    <b>Runtime</b>
+                    <small>
+                      {state.engine === 'claude-code' ? 'Claude Code' : 'Codex'} 原生工具面
+                    </small>
+                  </span>
+                  <span className="pill pill--success">托管</span>
+                </div>
+                {(
+                  [
+                    ['upright', '网页搜索', state.runtimeCapabilities?.webSearch ?? 'unknown'],
+                    ['plug', '网页抓取', state.runtimeCapabilities?.webFetch ?? 'unknown'],
+                  ] as const
+                ).map(([icon, name, availability]) => {
+                  const pill = capabilityPill(availability);
+                  return (
+                    <div className="toolrow" key={name}>
+                      <span className="toolrow__ic">
+                        <Icon name={icon} />
+                      </span>
+                      <span className="toolrow__meta">
+                        <b>{name}</b>
+                        <small>来自当前 Runtime 能力握手</small>
+                      </span>
+                      <span className={pill.className}>{pill.label}</span>
+                    </div>
+                  );
+                })}
+                <div className="toolrow">
+                  <span className="toolrow__ic">
+                    <Icon name="check" />
+                  </span>
+                  <span className="toolrow__meta">
+                    <b>Runtime 审批</b>
+                    <small>当前代际协商的审批契约</small>
+                  </span>
+                  <span
+                    className={state.runtimeCapabilities ? 'pill pill--success' : 'pill pill--warn'}
+                  >
+                    {state.runtimeCapabilities?.approvalContractVersion || '未知'}
+                  </span>
+                </div>
+              </div>
             </div>
 
             <div>
@@ -315,7 +751,7 @@ export function ContextPanel({
                               ? '本会话已停用，下一轮生效'
                               : '本会话启用中；点击停用（下一轮生效）'
                           }
-                          onClick={() => onToggleMcp?.(server.name)}
+                          onClick={() => void onToggleMcp?.(server.name)}
                         >
                           <span className="ws-switch__knob" />
                         </button>

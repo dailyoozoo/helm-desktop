@@ -24,8 +24,10 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm run check:version
-      - run: cargo test --manifest-path src-tauri/Cargo.toml
+      - run: cargo test --manifest-path src-tauri/Cargo.toml -- --test-threads=1
+        timeout-minutes: 30
       - run: npm run build
+      - run: npm run release:audit
       - run: npm audit --omit=dev
 
   rustsec:

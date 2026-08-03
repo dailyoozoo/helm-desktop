@@ -4,7 +4,7 @@
 
 import type { AgentEvent, EngineId } from './events';
 
-export type Decision = 'allow' | 'deny' | 'always';
+export type Decision = 'allow' | 'turn' | 'session' | 'project' | 'always' | 'deny';
 
 /** 一个已启动会话的句柄。具体引擎可在此基础上扩展（如挂上子进程与事件流）。 */
 export interface SessionHandle {

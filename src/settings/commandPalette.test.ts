@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  commandPaletteResults,
   filterCommandPaletteCommands,
   filterProviders,
   paletteCommands,
@@ -32,6 +33,7 @@ function makeProvider(overrides: Partial<ProviderConfig> = {}): ProviderConfig {
   return {
     id: 'anthropic',
     name: 'Anthropic',
+    kind: 'api',
     baseUrl: 'https://api.anthropic.com',
     keyRef: 'key-1',
     ready: true,
@@ -101,5 +103,18 @@ describe('command palette view model', () => {
       'OpenAI',
       'Ollama',
     ]);
+  });
+
+  it('puts the three most recent sessions before static commands for an empty query', () => {
+    const sessions = [
+      makeSession({ id: 'old', title: '较早', updatedAt: 10 }),
+      makeSession({ id: 'latest', title: '最新', updatedAt: 30 }),
+      makeSession({ id: 'middle', title: '中间', updatedAt: 20 }),
+      makeSession({ id: 'fourth', title: '更早', updatedAt: 5 }),
+    ];
+    const results = commandPaletteResults('', sessions, []);
+    expect(results.slice(0, 3).map((item) => item.title)).toEqual(['最新', '中间', '较早']);
+    expect(results.slice(0, 3).every((item) => item.group === '最近会话')).toBe(true);
+    expect(results[3].id).toBe('workspace');
   });
 });

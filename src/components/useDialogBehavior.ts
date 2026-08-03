@@ -9,12 +9,13 @@ const FOCUSABLE = [
   '[tabindex]:not([tabindex="-1"])',
 ].join(',');
 
-export function useDialogBehavior(onClose: () => void) {
+export function useDialogBehavior(onClose: () => void, enabled = true) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
 
   useEffect(() => {
+    if (!enabled) return;
     const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const dialog = dialogRef.current;
     const focusables = () =>
@@ -50,7 +51,7 @@ export function useDialogBehavior(onClose: () => void) {
       document.removeEventListener('keydown', handleKeyDown);
       previous?.focus();
     };
-  }, []);
+  }, [enabled]);
 
   return dialogRef;
 }

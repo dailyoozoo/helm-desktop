@@ -1,5 +1,5 @@
 //! Rust 解析层的契约测试（对应 ADR 0002 的跨语言契约要求）：
-//! 用与 TS 契约测试**同一批真实录制 fixture**，断言 Rust 解析出的事件序列形状合理，
+//! 用 Rust parser 自有的去敏录制 fixture，断言解析出的事件序列形状合理，
 //! 并验证序列化 JSON 用 `type` 标签 + camelCase 字段（与 TS `isAgentEvent` 对齐）。
 
 use helm_lib::adapter::parse_codex_line_for_contract;
@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 fn fixture(name: &str) -> String {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("../packages/engine-claude-code/test/fixtures");
+    p.push("tests/fixtures");
     p.push(name);
     fs::read_to_string(&p).unwrap_or_else(|e| panic!("读不到 fixture {}: {e}", p.display()))
 }
@@ -228,6 +228,35 @@ fn parses_permission_denials_as_completed_turn_not_approval_request() {
         matches!(events.last(), Some(AgentEvent::TurnComplete { .. })),
         "拒绝后本轮应结束，而不是等待再次审批"
     );
+}
+
+#[test]
+fn auto_review_denial_serializes_controlled_not_started_facts() {
+    let line = serde_json::json!({
+        "type": "user",
+        "session_id": "s1",
+        "message": { "content": [{
+            "type": "tool_result",
+            "tool_use_id": "toolu_auto",
+            "is_error": true,
+            "toolDenialKind": "automode-unavailable",
+            "content": "classifier unavailable"
+        }] }
+    })
+    .to_string();
+    let value = serde_json::to_value(
+        parse_claude_line(&line)
+            .into_iter()
+            .next()
+            .expect("应解析 Auto denial"),
+    )
+    .unwrap();
+    assert_eq!(value["type"], "tool_result");
+    assert_eq!(value["outcome"], "auto_review_unavailable");
+    assert_eq!(value["started"], false);
+    assert_eq!(value["retryable"], true);
+    assert_eq!(value["denialSource"], "auto_reviewer");
+    assert_eq!(value["nativeDenialCode"], "automode-unavailable");
 }
 
 #[test]

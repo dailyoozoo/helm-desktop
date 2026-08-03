@@ -5,21 +5,42 @@
   padding: 4px 36px 56px;
 }
 
+/* 切周期局部刷新（B1-3）：保留已渲染数据，降透明度并禁交互，不整页替换 */
+.usage-wrap--refreshing {
+  opacity: 0.55;
+  pointer-events: none;
+  transition: opacity 0.15s;
+}
+
 .usage-inline-error,
 .usage-dialog-error {
   display: flex;
   align-items: center;
   gap: 10px;
   padding: 10px 12px;
-  border: 1px solid var(--danger-line, color-mix(in oklch, var(--danger) 35%, transparent));
+  border: 1px solid color-mix(in oklch, var(--danger) 35%, transparent);
   border-radius: var(--r-sm);
-  background: var(--danger-soft, color-mix(in oklch, var(--danger) 10%, transparent));
+  background: var(--danger-soft);
   color: var(--fg-2);
   font-size: 12.5px;
 }
 
 .usage-inline-error {
   margin-bottom: 16px;
+}
+
+.usage-top-session {
+  width: 100%;
+  border: 0;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  background: transparent;
+}
+
+.usage-top-session:hover {
+  background: var(--hover);
 }
 
 .usage-inline-error svg {
@@ -69,6 +90,13 @@
   font-size: 13px;
   color: var(--fg-4);
   font-weight: 400;
+}
+
+.usage-cost-kinds {
+  margin-top: 6px;
+  color: var(--fg-4);
+  font-size: 11px;
+  line-height: 1.45;
 }
 
 .stat__d {
@@ -164,6 +192,29 @@
   color: var(--fg-4);
   font-family: var(--font-mono);
   white-space: nowrap;
+}
+
+.chart .tip {
+  position: absolute;
+  bottom: calc(100% + 4px);
+  left: 50%;
+  transform: translateX(-50%) scale(0.96);
+  transform-origin: bottom center;
+  padding: 5px 9px;
+  background: var(--surface-2, var(--fg));
+  color: var(--bg, var(--surface));
+  font-size: 11.5px;
+  white-space: nowrap;
+  border-radius: 6px;
+  opacity: 0;
+  pointer-events: none;
+  transition: 0.15s;
+  z-index: 5;
+}
+
+.chart .col:hover .tip {
+  opacity: 1;
+  transform: translateX(-50%) scale(1);
 }
 
 .chart__foot {
@@ -411,7 +462,7 @@
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--surface-2);
-  color: var(--fg-1);
+  color: var(--fg);
   font-family: var(--font-mono);
 }
 

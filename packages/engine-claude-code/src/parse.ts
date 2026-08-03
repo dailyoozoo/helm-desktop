@@ -125,6 +125,9 @@ function parseSystem(obj: Record<string, unknown>, sessionId: string): AgentEven
     return [{ type: 'turn_stage', sessionId, stage: 'waiting_model', ts: Date.now() }];
   }
   if (obj.subtype !== 'init') return [];
+  const tools = Array.isArray(obj.tools)
+    ? obj.tools.filter((tool): tool is string => typeof tool === 'string')
+    : [];
   return [
     {
       type: 'session_started',
@@ -133,6 +136,17 @@ function parseSystem(obj: Record<string, unknown>, sessionId: string): AgentEven
       model: asString(obj.model),
       cwd: asString(obj.cwd),
       ts: Date.now(),
+      capabilities: {
+        webSearch:
+          tools.length === 0
+            ? 'unknown'
+            : tools.includes('WebSearch')
+              ? 'available'
+              : 'unavailable',
+        webFetch:
+          tools.length === 0 ? 'unknown' : tools.includes('WebFetch') ? 'available' : 'unavailable',
+        approvalContractVersion: 'claude-hook-bridge-v1',
+      },
     },
   ];
 }
@@ -175,7 +189,17 @@ function parseAssistant(obj: Record<string, unknown>, sessionId: string): AgentE
   for (const block of message.content) {
     if (!isRecord(block)) continue;
     if (block.type === 'text' && typeof block.text === 'string') {
-      out.push({ type: 'message_complete', sessionId, role: 'assistant', text: block.text });
+      if (isClaudeModelUnavailableMessage(block.text)) {
+        out.push({
+          type: 'error',
+          sessionId,
+          message: block.text,
+          recoverable: false,
+          kind: 'model_unavailable',
+        });
+      } else {
+        out.push({ type: 'message_complete', sessionId, role: 'assistant', text: block.text });
+      }
     } else if (block.type === 'thinking' && typeof block.thinking === 'string') {
       out.push({ type: 'thinking_complete', sessionId, text: block.thinking });
     } else if (
@@ -193,7 +217,27 @@ function parseAssistant(obj: Record<string, unknown>, sessionId: string): AgentE
       });
     }
   }
+  const usage = isRecord(message.usage) ? message.usage : undefined;
+  if (usage) {
+    const fresh = typeof usage.input_tokens === 'number' ? usage.input_tokens : 0;
+    const cached =
+      typeof usage.cache_read_input_tokens === 'number' ? usage.cache_read_input_tokens : 0;
+    const cacheWrite =
+      typeof usage.cache_creation_input_tokens === 'number' ? usage.cache_creation_input_tokens : 0;
+    const contextTokens = fresh + cached + cacheWrite;
+    if (contextTokens > 0) {
+      out.push({ type: 'context_usage', sessionId, contextTokens });
+    }
+  }
   return out;
+}
+
+function isClaudeModelUnavailableMessage(text: string): boolean {
+  const lower = text.toLowerCase();
+  return (
+    lower.includes("there's an issue with the selected model") &&
+    lower.includes('may not exist or you may not have access')
+  );
 }
 
 function parseUser(obj: Record<string, unknown>, sessionId: string): AgentEvent[] {
@@ -225,7 +269,12 @@ function mapStopReason(obj: Record<string, unknown>): 'end' | 'interrupted' | 'e
 
 function parseResult(obj: Record<string, unknown>, sessionId: string): AgentEvent[] {
   const usage = isRecord(obj.usage) ? obj.usage : {};
-  const inputTokens = typeof usage.input_tokens === 'number' ? usage.input_tokens : 0;
+  const uncachedInputTokens = typeof usage.input_tokens === 'number' ? usage.input_tokens : 0;
+  const cachedInputTokens =
+    typeof usage.cache_read_input_tokens === 'number' ? usage.cache_read_input_tokens : 0;
+  const cacheWriteInputTokens =
+    typeof usage.cache_creation_input_tokens === 'number' ? usage.cache_creation_input_tokens : 0;
+  const inputTokens = uncachedInputTokens + cachedInputTokens + cacheWriteInputTokens;
   const outputTokens = typeof usage.output_tokens === 'number' ? usage.output_tokens : 0;
   const costUsd = typeof obj.total_cost_usd === 'number' ? obj.total_cost_usd : 0;
   const contextWindow = contextWindowFromModelUsage(obj.modelUsage);
@@ -233,8 +282,14 @@ function parseResult(obj: Record<string, unknown>, sessionId: string): AgentEven
     type: 'token_usage',
     sessionId,
     inputTokens,
+    ...(cachedInputTokens > 0 ? { cachedInputTokens } : {}),
+    ...(cacheWriteInputTokens > 0 ? { cacheWriteInputTokens } : {}),
     outputTokens,
     costUsd,
+    ...(typeof usage.service_tier === 'string' &&
+    ['standard', 'batch', 'flex', 'priority'].includes(usage.service_tier)
+      ? { serviceTier: usage.service_tier }
+      : {}),
   };
   if (tokenUsage.type === 'token_usage' && contextWindow) {
     tokenUsage.contextWindow = contextWindow;
@@ -249,6 +304,7 @@ function parseResult(obj: Record<string, unknown>, sessionId: string): AgentEven
       id: deferred.id,
       action: deferred.name,
       detail: JSON.stringify('input' in deferred ? deferred.input : {}, null, 2),
+      availableDecisions: ['allow', 'deny'],
     });
     return out;
   }

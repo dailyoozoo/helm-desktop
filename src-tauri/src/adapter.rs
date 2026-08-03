@@ -6,27 +6,36 @@
 //! `claude -p --resume <sessionId>` 重新评估同一个工具调用。Helm 用这个真实 CLI
 //! 能力实现审批卡：先 defer → UI 批准/拒绝 → 写入 hook 状态 → resume 继续原会话。
 
-use crate::parse::parse_claude_line;
-use crate::protocol::{
-    AgentEvent, CallStatus, Diff, DiffHunk, DiffKind, DiffLine, EngineId, PlanStatus, PlanStep,
-    Role, StopReason, ToolStatus, TurnStage,
+use crate::codex_app_server::{
+    apply_codex_user_decision, automatic_approval_response, denied_approval_response,
+    evaluate_normalized_actions_with_kernel, normalize_approval_actions_for_turn,
+    spawn_codex_app_server, CodexAppServerProcess, CodexApprovalPolicy, CodexPendingApproval,
+    CodexUserDecision,
 };
+use crate::parse::parse_claude_line;
+use crate::permission_service::{PermissionService, PermissionSessionContext};
+use crate::protocol::{
+    AgentEvent, ApprovalDecisionOption, CallStatus, Diff, DiffHunk, DiffKind, DiffLine, EngineId,
+    PlanStatus, PlanStep, Role, StopReason, ToolStatus, TurnStage,
+};
+use crate::reasoning::ReasoningEffort;
 use crate::sessions::SessionHistoryStore;
 use crate::settings::AppSettings;
+use crate::util::now_millis;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify};
 
 const EVENT_NAME: &str = "agent-event";
 #[cfg(target_os = "windows")]
@@ -94,11 +103,12 @@ enum SessionCmd {
     Send {
         text: String,
         attachments: Vec<String>,
-        mode: TurnMode,
+        spec: crate::turn_start::TurnExecutionSpec,
     },
     Approve {
         request_id: String,
         decision: ApprovalDecision,
+        responder: oneshot::Sender<Result<(), String>>,
     },
     /// 检查点回溯后重建上下文（P2-5）：作废 CLI 会话 id，下一轮用截断历史重新开场
     ResetContext {
@@ -107,6 +117,11 @@ enum SessionCmd {
     /// 会话级 MCP 开关（变更-11）：设置停用名单，下一轮生效
     SetDisabledMcp {
         disabled: Vec<String>,
+        responder: oneshot::Sender<Result<(), String>>,
+    },
+    SetPermissionProfile {
+        profile: PermissionProfile,
+        responder: oneshot::Sender<Result<(), String>>,
     },
     Interrupt,
 }
@@ -121,6 +136,70 @@ pub enum TurnMode {
     Ask,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionProfile {
+    #[default]
+    Standard,
+    Auto,
+    FullAccess,
+}
+
+impl PermissionProfile {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "standard" => Ok(Self::Standard),
+            "auto" => Ok(Self::Auto),
+            "full_access" => Ok(Self::FullAccess),
+            _ => Err(format!("未知权限档位：{value}")),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Auto => "auto",
+            Self::FullAccess => "full_access",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FullAccessLease {
+    app_instance_id: String,
+    session_id: String,
+    engine: String,
+    canonical_cwd: String,
+}
+
+fn app_instance_id() -> &'static str {
+    static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| format!("{}-{}", std::process::id(), now_millis()))
+}
+
+fn full_access_lease(session_id: &str, engine: &str, cwd: &str) -> FullAccessLease {
+    FullAccessLease {
+        app_instance_id: app_instance_id().to_string(),
+        session_id: session_id.to_string(),
+        engine: engine.to_string(),
+        canonical_cwd: cwd.to_string(),
+    }
+}
+
+fn lease_is_valid(lease: &FullAccessLease, session_id: &str, engine: &str, cwd: &str) -> bool {
+    lease.app_instance_id == app_instance_id()
+        && lease.session_id == session_id
+        && lease.engine == engine
+        && lease.canonical_cwd.eq_ignore_ascii_case(cwd)
+}
+
+async fn terminal_turn_outcome(
+    terminals: &Mutex<HashMap<String, Result<(), String>>>,
+    turn_id: &str,
+) -> Option<Result<(), String>> {
+    terminals.lock().await.get(turn_id).cloned()
+}
+
 impl TurnMode {
     pub fn parse(value: Option<&str>) -> Self {
         match value {
@@ -130,7 +209,7 @@ impl TurnMode {
         }
     }
 
-    fn as_state_str(self) -> &'static str {
+    pub(crate) fn as_state_str(self) -> &'static str {
         match self {
             TurnMode::Build => "build",
             TurnMode::Plan => "plan",
@@ -151,6 +230,9 @@ const CODEX_PLAN_PROMPT_PREFIX: &str =
 #[derive(Debug, Clone, Copy)]
 pub enum ApprovalDecision {
     Allow,
+    Turn,
+    Session,
+    Project,
     Deny,
     Always,
 }
@@ -158,9 +240,68 @@ pub enum ApprovalDecision {
 impl ApprovalDecision {
     fn hook_decision(self) -> &'static str {
         match self {
-            ApprovalDecision::Allow | ApprovalDecision::Always => "allow",
+            ApprovalDecision::Allow
+            | ApprovalDecision::Turn
+            | ApprovalDecision::Session
+            | ApprovalDecision::Project
+            | ApprovalDecision::Always => "allow",
             ApprovalDecision::Deny => "deny",
         }
+    }
+
+    pub fn audit_value(self) -> &'static str {
+        match self {
+            ApprovalDecision::Allow => "allow",
+            ApprovalDecision::Turn => "turn",
+            ApprovalDecision::Session => "session",
+            ApprovalDecision::Project => "project",
+            ApprovalDecision::Deny => "deny",
+            ApprovalDecision::Always => "always",
+        }
+    }
+}
+
+pub(crate) fn available_approval_decisions(
+    action: Option<&crate::permissions::ActionDescriptor>,
+) -> Vec<ApprovalDecisionOption> {
+    let mut decisions = vec![ApprovalDecisionOption::Allow];
+    if let Some(action) =
+        action.filter(|action| crate::permissions::runtime_grant_display(action).is_some())
+    {
+        if !action.turn_id.is_empty() && !action.session_id.is_empty() {
+            decisions.push(ApprovalDecisionOption::Turn);
+        }
+        if !action.session_id.is_empty() {
+            decisions.push(ApprovalDecisionOption::Session);
+        }
+        if action.cwd.as_deref().is_some_and(|cwd| !cwd.is_empty()) {
+            decisions.push(ApprovalDecisionOption::Project);
+        }
+        decisions.push(ApprovalDecisionOption::Always);
+    }
+    decisions.push(ApprovalDecisionOption::Deny);
+    decisions
+}
+
+fn validate_approval_decision(
+    decision: ApprovalDecision,
+    available_decisions: &[ApprovalDecisionOption],
+) -> Result<(), String> {
+    let option = match decision {
+        ApprovalDecision::Allow => ApprovalDecisionOption::Allow,
+        ApprovalDecision::Turn => ApprovalDecisionOption::Turn,
+        ApprovalDecision::Session => ApprovalDecisionOption::Session,
+        ApprovalDecision::Project => ApprovalDecisionOption::Project,
+        ApprovalDecision::Always => ApprovalDecisionOption::Always,
+        ApprovalDecision::Deny => ApprovalDecisionOption::Deny,
+    };
+    if available_decisions.contains(&option) {
+        Ok(())
+    } else {
+        Err(format!(
+            "[approval_decision_unavailable] 当前审批不允许决定：{}",
+            decision.audit_value()
+        ))
     }
 }
 
@@ -168,10 +309,7 @@ impl ApprovalDecision {
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApprovalState {
-    #[serde(default)]
-    policy: ApprovalPolicy,
     decisions: HashMap<String, String>,
-    always_allow: Vec<String>,
     /// 当前轮次内被拒绝的操作目标（文件路径等），防止换工具重试
     denied_targets: Vec<String>,
     /// 当前轮次的会话模式（变更-04）：ask 时 hook 以最高优先级拒绝写操作
@@ -179,67 +317,16 @@ struct ApprovalState {
     turn_mode: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ApprovalPolicy {
-    pub confirm_before_command: bool,
-    pub read_files: String,
-    pub edit_files: String,
-    pub run_commands: String,
-    pub fetch_urls: String,
-    pub mcp_tools: String,
-    pub command_allowlist: Vec<String>,
-    /// 跨会话持久化的「始终允许」工具名（P2-4）；会话启动时播种进 hook state
-    #[serde(default)]
-    pub always_allow_tools: Vec<String>,
-}
-
-impl Default for ApprovalPolicy {
-    fn default() -> Self {
-        Self {
-            confirm_before_command: true,
-            read_files: "allow".to_string(),
-            edit_files: "ask".to_string(),
-            run_commands: "ask".to_string(),
-            fetch_urls: "deny".to_string(),
-            mcp_tools: "ask".to_string(),
-            command_allowlist: Vec::new(),
-            always_allow_tools: Vec::new(),
-        }
-    }
-}
-
-pub fn approval_policy_from_settings(settings: &AppSettings) -> ApprovalPolicy {
-    ApprovalPolicy {
-        confirm_before_command: settings.general.confirm_before_command,
-        read_files: settings.permissions.read_files.clone(),
-        edit_files: settings.permissions.edit_files.clone(),
-        run_commands: settings.permissions.run_commands.clone(),
-        fetch_urls: settings.permissions.fetch_urls.clone(),
-        mcp_tools: settings.permissions.mcp_tools.clone(),
-        command_allowlist: settings.permissions.command_allowlist.clone(),
-        always_allow_tools: Vec::new(),
-    }
-}
-
-pub fn codex_sandbox_from_settings(settings: &AppSettings) -> &'static str {
-    if matches!(settings.engines.codex.sandbox.as_deref(), Some("full")) {
-        return "danger-full-access";
-    }
-    if settings.permissions.edit_files == "deny" {
-        return "read-only";
-    }
-    match settings.engines.codex.sandbox.as_deref() {
-        Some("readonly") => "read-only",
-        _ => "workspace-write",
-    }
-}
-
 /// 逐轮解析 Codex sandbox（变更-04）：计划/询问强制只读（取更严值），构建沿用设置映射。
-pub fn codex_sandbox_for_mode(settings_sandbox: &str, mode: TurnMode) -> String {
+pub fn codex_sandbox_for_mode(settings_sandbox: &str, mode: TurnMode) -> Result<String, String> {
     match mode {
-        TurnMode::Plan | TurnMode::Ask => "read-only".to_string(),
-        TurnMode::Build => settings_sandbox.to_string(),
+        TurnMode::Plan | TurnMode::Ask => Ok("read-only".to_string()),
+        TurnMode::Build if matches!(settings_sandbox, "read-only" | "workspace-write") => {
+            Ok(settings_sandbox.to_string())
+        }
+        TurnMode::Build => Err(format!(
+            "unsupported Helm Codex sandbox ceiling: {settings_sandbox}"
+        )),
     }
 }
 
@@ -271,45 +358,77 @@ struct PendingToolInfo {
     input: serde_json::Value,
 }
 
+#[derive(Debug, Clone)]
+struct PreparedApproval {
+    pending_tool: Option<PendingToolInfo>,
+}
+
+#[derive(Debug, Default)]
+struct CommittedApprovalGrants {
+    rule_ids: Vec<String>,
+}
+
 struct SessionRuntime {
     app: AppHandle,
     history_session_id: String,
     bin: String,
-    model: String,
+    model: Mutex<String>,
     cwd: String,
+    policy_cwd: String,
     env: Vec<(String, String)>,
+    use_user_setting_source: bool,
+    capability_snapshot: Mutex<crate::capability_registry::EngineCapabilitySnapshot>,
     /// 当前轮次的会话模式（变更-04）：Send 时写入；审批恢复轮沿用发起轮的值
     turn_mode: Mutex<TurnMode>,
+    /// 当前 Session 的推理强度；每个新 Turn 可覆盖，审批恢复轮沿用发起值。
+    reasoning_effort: Mutex<ReasoningEffort>,
     settings_path: PathBuf,
     state_path: PathBuf,
     session_id: Mutex<Option<String>>,
     running_pid: Mutex<Option<u32>>,
     turn_lock: Mutex<()>,
+    /// 同一 Session 的审批事务必须串行，避免 Always 提交/回滚覆盖另一笔审批。
+    approval_lock: Mutex<()>,
+    permission_endpoint: String,
+    permission_token: String,
+    current_turn_id: Mutex<String>,
+    current_turn_spec: Mutex<Option<crate::turn_start::TurnExecutionSpec>>,
+    current_session_context: Mutex<Vec<crate::turn_start::FrozenSessionContext>>,
     busy: AtomicBool,
+    idle_notify: Notify,
     interrupted: AtomicBool,
+    auto_compat_attempted: AtomicBool,
     pending_tools: Mutex<HashMap<String, PendingToolInfo>>,
+    user_approved_tools: Mutex<HashSet<String>>,
     /// 回溯/恢复时的重建历史（P2-5）：没有 CLI 会话可 --resume 时，
     /// 下一轮把这份截断历史序列化进 prompt 重新开场，用后即清。
     rebuild_history: Mutex<Vec<crate::sessions::SessionMessage>>,
     /// 会话级停用的 MCP 服务器名单（变更-11）：非空时下一轮以
     /// `--strict-mcp-config --mcp-config <过滤后配置>` 启动，真实生效。
     disabled_mcp: std::sync::Mutex<Vec<String>>,
+    permission_profile: Mutex<PermissionProfile>,
+    full_access_lease: Mutex<Option<FullAccessLease>>,
 }
 
 /// 一个 Claude 会话句柄。每个用户轮次会拉起一次真实 `claude -p`；会话连续性通过
 /// Claude Code 的 sessionId + `--resume` 保持。
+#[derive(Clone)]
 pub struct ClaudeSession {
     tx: mpsc::UnboundedSender<SessionCmd>,
+    cwd: String,
+    control: Option<Arc<SessionRuntime>>,
 }
 
+#[derive(Clone)]
 pub struct CodexSession {
     app: AppHandle,
     history_session_id: String,
     bin: String,
-    model: String,
+    model: Arc<Mutex<String>>,
     cwd: String,
+    execution_cwd: Arc<Mutex<Option<String>>>,
+    policy_cwd: Arc<Mutex<String>>,
     env: Vec<(String, String)>,
-    sandbox_mode: String,
     running_pid: Arc<Mutex<Option<u32>>>,
     /// 每轮序列化进 prompt 的历史消息；检查点回溯会整体替换为截断后的清单（P2-5）
     history_messages: Arc<std::sync::Mutex<Vec<crate::sessions::SessionMessage>>>,
@@ -323,67 +442,306 @@ pub struct CodexSession {
     thread_id: Arc<std::sync::Mutex<Option<String>>>,
     /// API Key 模式的临时 CODEX_HOME 归 Session 所有，Turn 只借用路径。
     auth_home: Arc<std::sync::Mutex<Option<CodexAuthHome>>>,
+    /// Session 实际使用的 CODEX_HOME。API 接入指向受 Session 所有的快照；
+    /// subscription 指向 Helm-owned 持久 Profile。
+    effective_home: Arc<std::sync::Mutex<Option<PathBuf>>>,
     /// 回溯后下一轮必须丢弃旧 thread，并用截断历史新建一次 thread。
     force_history_rebuild: Arc<AtomicBool>,
+    /// 每个 Helm Codex Session 持有一个 app-server；旧 exec 路径仅作回退。
+    app_server: Arc<Mutex<Option<Arc<CodexAppServerProcess>>>>,
+    app_server_thread_ready: Arc<AtomicBool>,
+    /// 等待用户裁决的 Codex server requests，以 Helm approval id 索引。
+    pending_approvals: Arc<Mutex<HashMap<String, CodexPendingApproval>>>,
+    /// app-server 文件审批请求不带路径，通过同 itemId 的通知关联。
+    file_changes_by_item: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    /// Tool items must complete before a Codex Turn can be accepted as successful.
+    pending_tool_items: Arc<Mutex<HashSet<String>>>,
+    /// 通知循环向当前 Turn 等待者广播完成或协议错误。
+    turn_completions: broadcast::Sender<Result<String, String>>,
+    terminal_turns: Arc<Mutex<HashMap<String, Result<(), String>>>>,
+    terminal_notify: Arc<Notify>,
+    /// Helm 控制面分配的全局 TurnId；与 app-server 原生 turn id 分离。
+    current_helm_turn_id: Arc<Mutex<Option<String>>>,
+    current_app_server_turn_id: Arc<Mutex<Option<String>>>,
+    native_turn_contexts: Arc<Mutex<CodexTurnContextIndex>>,
+    permission_profile: Arc<std::sync::Mutex<PermissionProfile>>,
+    full_access_lease: Arc<std::sync::Mutex<Option<FullAccessLease>>>,
+    capability_snapshot: Arc<Mutex<crate::capability_registry::EngineCapabilitySnapshot>>,
 }
 
-struct CodexAuthHome {
-    path: PathBuf,
+#[derive(Default)]
+struct CodexTurnContextIndex {
+    contexts: HashMap<String, (String, u64)>,
+    order: VecDeque<String>,
 }
 
-fn codex_auth_home_path(
-    auth_home: &Arc<std::sync::Mutex<Option<CodexAuthHome>>>,
-) -> Option<PathBuf> {
-    auth_home
-        .lock()
-        .ok()
-        .and_then(|guard| guard.as_ref().map(|home| home.path.clone()))
+impl CodexTurnContextIndex {
+    fn insert(&mut self, native_turn_id: String, helm_turn_id: String, turn_epoch: u64) {
+        const MAX_CONTEXTS: usize = 32;
+        if !self.contexts.contains_key(&native_turn_id) {
+            self.order.push_back(native_turn_id.clone());
+        }
+        self.contexts
+            .insert(native_turn_id, (helm_turn_id, turn_epoch));
+        while self.order.len() > MAX_CONTEXTS {
+            if let Some(expired) = self.order.pop_front() {
+                self.contexts.remove(&expired);
+            }
+        }
+    }
+
+    fn resolve(&self, native_turn_id: &str) -> Option<(String, u64)> {
+        self.contexts.get(native_turn_id).cloned()
+    }
+}
+
+pub(crate) struct CodexAuthHome {
+    pub(crate) path: PathBuf,
 }
 
 impl Drop for CodexAuthHome {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        const ATTEMPTS: usize = 100;
+        for attempt in 0..ATTEMPTS {
+            match fs::remove_dir_all(&self.path) {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(error) if attempt + 1 == ATTEMPTS => {
+                    eprintln!(
+                        "[helm] 无法清理 Codex 临时认证目录（已重试 {ATTEMPTS} 次）：{}：{error}",
+                        self.path.display()
+                    );
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
     }
 }
 
+#[derive(Clone)]
 pub enum AgentSession {
     Claude(ClaudeSession),
     Codex(CodexSession),
 }
 
 impl AgentSession {
-    pub fn send(
+    pub fn history_session_id(&self) -> &str {
+        match self {
+            AgentSession::Claude(session) => session
+                .control
+                .as_ref()
+                .map(|runtime| runtime.history_session_id.as_str())
+                .unwrap_or_default(),
+            AgentSession::Codex(session) => &session.history_session_id,
+        }
+    }
+
+    pub async fn native_session_ref(&self) -> Result<Option<String>, String> {
+        match self {
+            AgentSession::Claude(session) => Ok(session
+                .control
+                .as_ref()
+                .ok_or_else(|| "Claude Runtime 控制面不可用".to_string())?
+                .session_id
+                .lock()
+                .await
+                .clone()),
+            AgentSession::Codex(session) => session
+                .thread_id
+                .lock()
+                .map(|thread_id| thread_id.clone())
+                .map_err(|_| "Codex thread id 锁中毒".to_string()),
+        }
+    }
+
+    pub async fn set_turn_capability_snapshot(
+        &self,
+        snapshot: crate::capability_registry::EngineCapabilitySnapshot,
+    ) -> Result<(), String> {
+        match self {
+            AgentSession::Claude(session) => {
+                if snapshot.identity.engine_id != "claude-code" {
+                    return Err("Claude Runtime 收到其他 Engine 的 CapabilitySnapshot".to_string());
+                }
+                let control = session
+                    .control
+                    .as_ref()
+                    .ok_or_else(|| "Claude Runtime 控制面不可用".to_string())?;
+                *control.capability_snapshot.lock().await = snapshot;
+            }
+            AgentSession::Codex(session) => {
+                if snapshot.identity.engine_id != "codex" {
+                    return Err("Codex Runtime 收到其他 Engine 的 CapabilitySnapshot".to_string());
+                }
+                *session.capability_snapshot.lock().await = snapshot;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn reserve_turn(&self) -> Result<(), String> {
+        let busy = match self {
+            AgentSession::Claude(session) => {
+                &session
+                    .control
+                    .as_ref()
+                    .ok_or_else(|| "Claude Runtime 控制面不可用".to_string())?
+                    .busy
+            }
+            AgentSession::Codex(session) => session.busy.as_ref(),
+        };
+        reserve_turn_flag(busy)
+    }
+
+    pub fn release_turn_reservation(&self) {
+        match self {
+            AgentSession::Claude(session) => {
+                if let Some(control) = &session.control {
+                    control.busy.store(false, Ordering::Release);
+                    control.idle_notify.notify_waiters();
+                }
+            }
+            AgentSession::Codex(session) => {
+                session.busy.store(false, Ordering::Release);
+            }
+        }
+    }
+
+    pub async fn send_reserved(
         &self,
         text: String,
         attachments: Vec<String>,
-        mode: TurnMode,
+        spec: crate::turn_start::TurnExecutionSpec,
     ) -> Result<(), String> {
+        if matches!(self, AgentSession::Claude(_))
+            && !spec.routed_reasoning_effort.is_claude_level()
+        {
+            return Err("Claude Code 不支持该推理强度".to_string());
+        }
+        let route_matches = match self {
+            AgentSession::Claude(session) => {
+                let control = session
+                    .control
+                    .as_ref()
+                    .ok_or_else(|| "Claude Runtime 控制面不可用".to_string())?;
+                spec.engine_id == "claude-code"
+                    && spec.permission_profile == control.permission_profile.lock().await.as_str()
+            }
+            AgentSession::Codex(session) => {
+                spec.engine_id == "codex"
+                    && spec.permission_profile
+                        == session
+                            .permission_profile
+                            .lock()
+                            .map_err(|_| "Codex 权限档位锁中毒".to_string())?
+                            .as_str()
+            }
+        };
+        if !route_matches {
+            self.release_turn_reservation();
+            return Err("TurnExecutionSpec 与已启动 Runtime 路由不一致".to_string());
+        }
         match self {
             AgentSession::Claude(session) => session
                 .tx
                 .send(SessionCmd::Send {
                     text,
                     attachments,
-                    mode,
+                    spec,
                 })
-                .map_err(|_| "会话已结束，无法发送".to_string()),
-            AgentSession::Codex(session) => session.send(text, attachments, mode),
+                .map_err(|_| {
+                    self.release_turn_reservation();
+                    "会话已结束，无法发送".to_string()
+                }),
+            AgentSession::Codex(session) => {
+                session.send_reserved(text, attachments, spec);
+                Ok(())
+            }
         }
     }
 
-    pub fn approve(&self, request_id: String, decision: ApprovalDecision) -> Result<(), String> {
+    pub async fn permission_profile(&self) -> Result<PermissionProfile, String> {
         match self {
-            AgentSession::Claude(session) => session
-                .tx
-                .send(SessionCmd::Approve {
-                    request_id,
-                    decision,
-                })
-                .map_err(|_| "会话已结束，无法审批".to_string()),
-            AgentSession::Codex(_) => {
-                let _ = (request_id, decision);
-                Err("Codex 当前没有待审批操作".to_string())
+            AgentSession::Claude(session) => {
+                let control = session
+                    .control
+                    .as_ref()
+                    .ok_or_else(|| "Claude Runtime 控制面不可用".to_string())?;
+                Ok(*control.permission_profile.lock().await)
             }
+            AgentSession::Codex(session) => session
+                .permission_profile
+                .lock()
+                .map(|profile| *profile)
+                .map_err(|_| "Codex 权限档位锁中毒".to_string()),
+        }
+    }
+
+    pub async fn approve(
+        &self,
+        request_id: String,
+        decision: ApprovalDecision,
+    ) -> Result<(), String> {
+        match self {
+            AgentSession::Claude(session) => {
+                let (responder, response) = oneshot::channel();
+                session
+                    .tx
+                    .send(SessionCmd::Approve {
+                        request_id,
+                        decision,
+                        responder,
+                    })
+                    .map_err(|_| "会话已结束，无法审批".to_string())?;
+                response
+                    .await
+                    .map_err(|_| "审批协调器已结束，无法确认审批结果".to_string())?
+            }
+            AgentSession::Codex(session) => session.approve(request_id, decision).await,
+        }
+    }
+
+    pub async fn set_permission_profile(&self, profile: PermissionProfile) -> Result<(), String> {
+        match self {
+            AgentSession::Claude(session) => {
+                let (responder, response) = oneshot::channel();
+                session
+                    .tx
+                    .send(SessionCmd::SetPermissionProfile { profile, responder })
+                    .map_err(|_| "会话已结束，无法更新权限档位".to_string())?;
+                response
+                    .await
+                    .map_err(|_| "会话已结束，无法确认权限档位".to_string())?
+            }
+            AgentSession::Codex(session) => {
+                if session.busy.load(Ordering::Acquire) {
+                    return Err("轮次进行中，结束后才能切换权限档位".to_string());
+                }
+                *session
+                    .permission_profile
+                    .lock()
+                    .map_err(|_| "Codex 权限档位锁中毒".to_string())? = profile;
+                *session
+                    .full_access_lease
+                    .lock()
+                    .map_err(|_| "Codex FullAccessLease 锁中毒".to_string())? = (profile
+                    == PermissionProfile::FullAccess)
+                    .then(|| full_access_lease(&session.history_session_id, "codex", &session.cwd));
+                if let Some(process) = session.app_server.lock().await.take() {
+                    process.shutdown().await;
+                }
+                session
+                    .app_server_thread_ready
+                    .store(false, Ordering::Release);
+                Ok(())
+            }
+        }
+    }
+
+    pub fn permission_confirmation_context(&self) -> (String, String) {
+        match self {
+            AgentSession::Claude(session) => ("Claude Code".to_string(), session.cwd.clone()),
+            AgentSession::Codex(session) => ("Codex".to_string(), session.cwd.clone()),
         }
     }
 
@@ -394,6 +752,30 @@ impl AgentSession {
                 .send(SessionCmd::Interrupt)
                 .map_err(|_| "会话已结束，无法中断".to_string()),
             AgentSession::Codex(session) => session.interrupt(),
+        }
+    }
+
+    pub fn close(&self) {
+        let _ = self.interrupt();
+        if let AgentSession::Codex(session) = self {
+            let app_server = session.app_server.clone();
+            spawn_agent_task(async move {
+                if let Some(process) = app_server.lock().await.take() {
+                    process.shutdown().await;
+                }
+            });
+        }
+    }
+
+    pub async fn shutdown(&self) {
+        let _ = self.interrupt();
+        if let AgentSession::Codex(session) = self {
+            if let Some(process) = session.app_server.lock().await.take() {
+                process.shutdown().await;
+            }
+            session
+                .app_server_thread_ready
+                .store(false, Ordering::Release);
         }
     }
 
@@ -409,44 +791,86 @@ impl AgentSession {
                 .tx
                 .send(SessionCmd::ResetContext { messages })
                 .map_err(|_| "会话已结束，无法重建上下文".to_string()),
-            AgentSession::Codex(session) => reset_codex_context_state(
-                &session.thread_id,
-                &session.force_history_rebuild,
-                &session.history_messages,
-                messages,
-            ),
+            AgentSession::Codex(session) => {
+                reset_codex_context_state(
+                    &session.thread_id,
+                    &session.force_history_rebuild,
+                    &session.history_messages,
+                    messages,
+                )?;
+                session
+                    .app_server_thread_ready
+                    .store(false, Ordering::Release);
+                Ok(())
+            }
         }
     }
 
     /// 会话级 MCP 开关（变更-11）：设置停用名单，下一轮真实生效。
     /// Claude：下一轮 `--strict-mcp-config --mcp-config <过滤后配置>`；
     /// Codex：API Key 模式下过滤临时 CODEX_HOME 的 config.toml（订阅登录暂不支持）。
-    pub fn set_disabled_mcp(&self, disabled: Vec<String>) -> Result<(), String> {
+    pub async fn set_disabled_mcp(&self, disabled: Vec<String>) -> Result<(), String> {
         match self {
-            AgentSession::Claude(session) => session
-                .tx
-                .send(SessionCmd::SetDisabledMcp { disabled })
-                .map_err(|_| "会话已结束，无法更新 MCP 开关".to_string()),
+            AgentSession::Claude(session) => {
+                let (responder, response) = oneshot::channel();
+                session
+                    .tx
+                    .send(SessionCmd::SetDisabledMcp {
+                        disabled,
+                        responder,
+                    })
+                    .map_err(|_| "会话已结束，无法更新 MCP 开关".to_string())?;
+                response
+                    .await
+                    .map_err(|_| "会话未返回 MCP 配置更新结果".to_string())?
+            }
             AgentSession::Codex(session) => {
-                // CODEX_HOME 仍归 Session 所有；只有用户显式变更 MCP 开关时才重建一次，
-                // 普通 Turn 之间始终复用同一路径。
+                if session.busy.load(Ordering::Acquire) {
+                    return Err("轮次进行中，结束后才能更新 MCP 开关".to_string());
+                }
+                // API Key Session 只有在用户显式变更 MCP 开关时才重建临时 HOME；
+                // subscription 没有临时认证目录，继续复用现有 Helm Profile。
                 let replacement = create_codex_auth_home(&session.env, &disabled)?;
+                let replacement_path = replacement.as_ref().map(|home| home.path.clone());
+                let existing_home = session
+                    .effective_home
+                    .lock()
+                    .map_err(|_| "Codex CODEX_HOME 锁中毒".to_string())?
+                    .clone();
+                let effective_home =
+                    select_effective_codex_home(replacement_path.as_ref(), existing_home.as_ref());
                 *session
                     .auth_home
                     .lock()
                     .map_err(|_| "Codex CODEX_HOME 锁中毒".to_string())? = replacement;
                 *session
+                    .effective_home
+                    .lock()
+                    .map_err(|_| "Codex CODEX_HOME 锁中毒".to_string())? = effective_home;
+                *session
                     .disabled_mcp
                     .lock()
                     .map_err(|_| "Codex MCP 开关锁中毒".to_string())? = disabled;
+                if let Some(process) = session.app_server.lock().await.take() {
+                    process.shutdown().await;
+                }
+                session
+                    .app_server_thread_ready
+                    .store(false, Ordering::Release);
                 Ok(())
             }
         }
     }
 }
 
-/// 按平台构造 `claude` 命令。Windows 上 npm 全局安装的 `claude` 是 `.cmd` 包装器，
-/// 必须经 `cmd /C` 走 PATH 解析（对应 TS 适配器里的 `shell: true`）。
+fn reserve_turn_flag(busy: &AtomicBool) -> Result<(), String> {
+    busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map(|_| ())
+        .map_err(|_| "当前会话已有轮次正在运行，请等待完成或先停止".to_string())
+}
+
+/// 按平台构造 `claude` 命令。Windows 优先解析官方 npm wrapper 指向的原生
+/// `claude.exe`，避免 `cmd /C` 在超时/中断时留下持有管道的孤儿子进程。
 fn validate_engine_bin(bin: &str) -> Result<(), String> {
     let trimmed = bin.trim();
     if trimmed.is_empty() {
@@ -519,14 +943,116 @@ where
         .collect()
 }
 
-fn apply_inherited_agent_environment(cmd: &mut Command) {
+pub(crate) fn apply_inherited_agent_environment(cmd: &mut Command) {
     cmd.env_clear();
     cmd.envs(filter_inherited_agent_environment(std::env::vars()));
 }
 
-fn build_command(bin: &str) -> Command {
+fn official_claude_npm_binary(wrapper: &Path) -> Option<PathBuf> {
+    wrapper.parent().map(|parent| {
+        parent
+            .join("node_modules")
+            .join("@anthropic-ai")
+            .join("claude-code")
+            .join("bin")
+            .join("claude.exe")
+    })
+}
+
+fn resolve_claude_binary_path(configured_bin: &str) -> Result<PathBuf, String> {
+    let configured = PathBuf::from(configured_bin);
+    #[cfg(windows)]
+    if configured.is_file() && configured.extension().is_none() {
+        if let Some(native) = official_claude_npm_binary(&configured).filter(|path| path.is_file())
+        {
+            return native
+                .canonicalize()
+                .map_err(|error| format!("resolve Claude native binary failed: {error}"));
+        }
+        for extension in ["exe", "cmd", "bat", "com"] {
+            let candidate = configured.with_extension(extension);
+            if candidate.is_file() {
+                return resolve_claude_binary_path(&candidate.to_string_lossy());
+            }
+        }
+    }
+    let mut candidates = if configured.is_file() {
+        vec![configured]
+    } else {
+        #[cfg(windows)]
+        {
+            let output = std::process::Command::new("where.exe")
+                .arg(configured_bin)
+                .output()
+                .map_err(|error| format!("resolve Claude binary failed: {error}"))?;
+            if !output.status.success() {
+                return Err("configured Claude binary is unavailable".to_string());
+            }
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        }
+        #[cfg(not(windows))]
+        {
+            let output = std::process::Command::new("which")
+                .arg(configured_bin)
+                .output()
+                .map_err(|error| format!("resolve Claude binary failed: {error}"))?;
+            if !output.status.success() {
+                return Err("configured Claude binary is unavailable".to_string());
+            }
+            vec![PathBuf::from(
+                String::from_utf8_lossy(&output.stdout).trim(),
+            )]
+        }
+    };
+    #[cfg(windows)]
+    candidates.sort_by_key(|path| {
+        match path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "exe" => 0,
+            "cmd" => 1,
+            "bat" => 2,
+            "com" => 3,
+            _ => 4,
+        }
+    });
+    let selected = candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| "configured Claude binary is unavailable".to_string())?;
+    if selected
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("cmd"))
+    {
+        if let Some(native) = official_claude_npm_binary(&selected).filter(|path| path.is_file()) {
+            return native
+                .canonicalize()
+                .map_err(|error| format!("resolve Claude native binary failed: {error}"));
+        }
+    }
+    selected
+        .canonicalize()
+        .map_err(|error| format!("resolve Claude binary failed: {error}"))
+}
+
+pub(crate) fn build_command(bin: &str) -> Command {
     #[cfg(target_os = "windows")]
     {
+        if let Ok(native) = resolve_claude_binary_path(bin) {
+            let mut command = Command::new(native);
+            command.creation_flags(CREATE_NO_WINDOW);
+            return command;
+        }
         let mut c = Command::new("cmd");
         c.arg("/C").arg(bin).creation_flags(CREATE_NO_WINDOW);
         c
@@ -537,9 +1063,172 @@ fn build_command(bin: &str) -> Command {
     }
 }
 
-fn build_codex_command(bin: &str) -> Command {
+pub(crate) fn build_claude_model_only_command(
+    bin: &str,
+    model: &str,
+    env: &[(String, String)],
+    cwd: &std::path::Path,
+    prompt: &str,
+    reasoning_effort: ReasoningEffort,
+) -> Result<Command, String> {
+    let mut command = build_command(bin);
+    apply_inherited_agent_environment(&mut command);
+    for (key, value) in env {
+        if !key.starts_with("HELM_") {
+            command.env(key, value);
+        }
+    }
+    command
+        .current_dir(cwd)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .args([
+            "--print",
+            "--output-format",
+            "json",
+            "--model",
+            model,
+            "--tools",
+            "",
+            "--disable-slash-commands",
+            "--strict-mcp-config",
+            "--mcp-config",
+            "{}",
+            "--no-session-persistence",
+            "--permission-mode",
+            "plan",
+            "--safe-mode",
+            "--setting-sources",
+            "",
+        ]);
+    if reasoning_effort != ReasoningEffort::Auto {
+        command.args(["--effort", reasoning_effort.as_str()]);
+        command.env("CLAUDE_CODE_EFFORT_LEVEL", reasoning_effort.as_str());
+    } else {
+        command.env_remove("CLAUDE_CODE_EFFORT_LEVEL");
+    }
+    command.arg(prompt);
+    Ok(command)
+}
+
+pub(crate) fn parse_claude_model_only_output(
+    stdout: &[u8],
+) -> Result<crate::operations::ModelOnlyOperationOutput, String> {
+    let payload: serde_json::Value = serde_json::from_slice(stdout)
+        .map_err(|error| format!("[operation_invalid_output] Claude JSON 解析失败：{error}"))?;
+    if model_only_payload_contains_forbidden_runtime_event(&payload) {
+        return Err(
+            "[operation_tool_not_allowed] ModelOnlyOperation 收到意外工具或审批事件".to_string(),
+        );
+    }
+    let text = payload
+        .get("result")
+        .or_else(|| payload.get("output_text"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "[operation_invalid_output] Claude 输出缺少 result".to_string())?;
+    let usage = payload.get("usage").unwrap_or(&serde_json::Value::Null);
+    Ok(crate::operations::ModelOnlyOperationOutput {
+        text: text.to_string(),
+        input_tokens: usage
+            .get("input_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        cached_input_tokens: usage
+            .get("cache_read_input_tokens")
+            .or_else(|| usage.get("cached_input_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        cache_write_input_tokens: usage
+            .get("cache_creation_input_tokens")
+            .or_else(|| usage.get("cache_write_input_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        output_tokens: usage
+            .get("output_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        reported_cost_usd: payload
+            .get("total_cost_usd")
+            .and_then(serde_json::Value::as_f64),
+        service_tier: usage
+            .get("service_tier")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+        observed_model_id: payload
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+    })
+}
+
+fn model_only_payload_contains_forbidden_runtime_event(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(fields) => fields.iter().any(|(key, value)| {
+            let normalized = key.to_ascii_lowercase().replace(['-', '_'], "");
+            let forbidden_key = matches!(
+                normalized.as_str(),
+                "tooluse"
+                    | "tooluses"
+                    | "toolcall"
+                    | "toolcalls"
+                    | "approval"
+                    | "approvalrequest"
+                    | "permissiondenial"
+                    | "permissiondenials"
+            );
+            (forbidden_key && runtime_event_value_is_present(value))
+                || model_only_payload_contains_forbidden_runtime_event(value)
+        }),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(model_only_payload_contains_forbidden_runtime_event),
+        serde_json::Value::String(value) => matches!(
+            value.to_ascii_lowercase().replace(['-', '_'], "").as_str(),
+            "tooluse" | "toolcall" | "approvalrequest" | "permissiondenial"
+        ),
+        _ => false,
+    }
+}
+
+fn runtime_event_value_is_present(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(value) => *value,
+        serde_json::Value::String(value) => !value.trim().is_empty(),
+        serde_json::Value::Array(value) => !value.is_empty(),
+        serde_json::Value::Object(value) => !value.is_empty(),
+        serde_json::Value::Number(_) => true,
+    }
+}
+
+pub(crate) fn claude_uses_user_setting_source(env: &[(String, String)]) -> bool {
+    !env.iter().any(|(key, value)| {
+        matches!(
+            key.to_ascii_uppercase().as_str(),
+            "ANTHROPIC_API_KEY" | "ANTHROPIC_AUTH_TOKEN"
+        ) && !value.trim().is_empty()
+    })
+}
+
+fn apply_claude_setting_source_policy(command: &mut Command, use_user_setting_source: bool) {
+    if !use_user_setting_source {
+        // API Binding 必须完全由 Helm 注入的 Provider/Model 配置决定，不能被
+        // ~/.claude 或项目设置中的 env/model 覆盖；显式 --settings 仍会加载审批 hook。
+        command.args(["--setting-sources", ""]);
+    }
+}
+
+pub(crate) fn build_codex_command(bin: &str) -> Command {
     #[cfg(target_os = "windows")]
     {
+        if let Ok(native) = crate::codex_app_server::resolve_codex_native_executable(bin) {
+            let mut command = Command::new(native);
+            command.creation_flags(CREATE_NO_WINDOW);
+            return command;
+        }
         let mut c = Command::new("cmd");
         c.arg("/C").arg(bin).creation_flags(CREATE_NO_WINDOW);
         c
@@ -571,68 +1260,34 @@ fn serialize_history_prompt(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum CodexExecCommand {
+enum CodexAppServerThreadPlan {
     Start,
-    Resume { thread_id: String },
+    Resume(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CodexExecPlan {
-    command: CodexExecCommand,
-    prompt: String,
+fn codex_app_server_thread_plan(
+    native_thread_id: Option<&str>,
+    force_history_rebuild: bool,
+) -> CodexAppServerThreadPlan {
+    if force_history_rebuild {
+        CodexAppServerThreadPlan::Start
+    } else if let Some(thread_id) = native_thread_id.filter(|id| !id.is_empty()) {
+        CodexAppServerThreadPlan::Resume(thread_id.to_string())
+    } else {
+        CodexAppServerThreadPlan::Start
+    }
 }
 
-fn codex_exec_plan(
-    thread_id: Option<&str>,
+fn codex_app_server_prompt(
     force_history_rebuild: bool,
     history: &[crate::sessions::SessionMessage],
     current_prompt: &str,
-) -> CodexExecPlan {
-    if !force_history_rebuild {
-        if let Some(thread_id) = thread_id.filter(|id| !id.trim().is_empty()) {
-            return CodexExecPlan {
-                command: CodexExecCommand::Resume {
-                    thread_id: thread_id.to_string(),
-                },
-                prompt: current_prompt.to_string(),
-            };
-        }
+) -> String {
+    if force_history_rebuild {
+        serialize_history_prompt(history, current_prompt)
+    } else {
+        current_prompt.to_string()
     }
-    CodexExecPlan {
-        command: CodexExecCommand::Start,
-        prompt: serialize_history_prompt(history, current_prompt),
-    }
-}
-
-fn codex_exec_args(plan: &CodexExecPlan, model: &str, sandbox_mode: &str) -> Vec<String> {
-    let mut args = vec![
-        "exec".to_string(),
-        "--sandbox".to_string(),
-        sandbox_mode.to_string(),
-    ];
-    if let CodexExecCommand::Resume { .. } = &plan.command {
-        args.push("resume".to_string());
-    }
-    args.extend([
-        "--json".to_string(),
-        "--model".to_string(),
-        model.to_string(),
-        "--skip-git-repo-check".to_string(),
-    ]);
-    if let CodexExecCommand::Resume { thread_id } = &plan.command {
-        args.push(thread_id.clone());
-    }
-    args.push(plan.prompt.clone());
-    args
-}
-
-fn codex_thread_id_from_line(raw: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(raw.trim()).ok()?;
-    (value.get("type").and_then(serde_json::Value::as_str) == Some("thread.started"))
-        .then(|| value.get("thread_id").and_then(serde_json::Value::as_str))
-        .flatten()
-        .filter(|id| !id.trim().is_empty())
-        .map(ToString::to_string)
 }
 
 fn is_codex_thread_missing_error(message: &str) -> bool {
@@ -640,19 +1295,6 @@ fn is_codex_thread_missing_error(message: &str) -> bool {
     normalized.contains("no rollout found for thread id")
         || ((normalized.contains("thread") || normalized.contains("session"))
             && (normalized.contains("not found") || normalized.contains("does not exist")))
-}
-
-fn codex_thread_missing_message_from_line(raw: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(raw.trim()).ok()?;
-    if value.get("type").and_then(serde_json::Value::as_str) != Some("turn.failed") {
-        return None;
-    }
-    let message = value
-        .get("error")
-        .and_then(|error| error.get("message"))
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| value.get("message").and_then(serde_json::Value::as_str))?;
-    is_codex_thread_missing_error(message).then(|| message.to_string())
 }
 
 fn reset_codex_context_state(
@@ -671,29 +1313,11 @@ fn reset_codex_context_state(
     Ok(())
 }
 
-fn append_codex_turn_history(
-    history: &mut Vec<crate::sessions::SessionMessage>,
-    user_text: &str,
-    assistant_text: &str,
-    ts: i64,
-) {
-    history.push(crate::sessions::SessionMessage {
-        role: Role::User,
-        text: user_text.to_string(),
-        ts,
-        reverted: false,
-    });
-    history.push(crate::sessions::SessionMessage {
-        role: Role::Assistant,
-        text: assistant_text.to_string(),
-        ts: ts.saturating_add(1),
-        reverted: false,
-    });
-}
-
-fn codex_provider_config_args(env: &[(String, String)]) -> Vec<String> {
+pub(crate) fn codex_provider_config_args(env: &[(String, String)]) -> Vec<String> {
     let Some((_, base_url)) = env.iter().find(|(key, _)| key == "OPENAI_BASE_URL") else {
-        return Vec::new();
+        // subscription 必须使用 Codex first-party Provider；不能让用户全局 config.toml
+        // 中残留的 custom model_provider 把官方 OAuth Binding 偷换成第三方路由。
+        return vec!["model_provider=openai".to_string()];
     };
     let wire_api = env
         .iter()
@@ -716,60 +1340,133 @@ where
     tauri::async_runtime::spawn(future);
 }
 
-/// 事件信封（变更-06）：`agent-event` 的实际载荷。
-/// `history_id` 是稳定的线程身份（历史会话 id；新会话即句柄 id），
-/// 前端一律按它路由事件——CLI 侧 session_id 每轮可能变化（Codex 每轮新 id、
-/// Claude resume 后可能换发），不能作为路由键。
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AgentEventEnvelope<'a> {
-    history_id: &'a str,
-    event: &'a AgentEvent,
+fn set_event_turn_context(history_session_id: &str, turn_id: &str, epoch: u64) {
+    event_turn_contexts()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(history_session_id.to_string(), (turn_id.to_string(), epoch));
+}
+
+fn event_turn_context(history_session_id: &str) -> Option<(String, u64)> {
+    event_turn_contexts()
+        .lock()
+        .ok()
+        .and_then(|contexts| contexts.get(history_session_id).cloned())
+}
+
+fn event_turn_contexts() -> &'static std::sync::Mutex<HashMap<String, (String, u64)>> {
+    static CONTEXTS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (String, u64)>>> =
+        std::sync::OnceLock::new();
+    CONTEXTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn begin_turn_supervisor(
+    app: &AppHandle,
+    history_session_id: &str,
+    turn_id: &str,
+    turn_epoch: u64,
+    mode: TurnMode,
+    permission_profile: PermissionProfile,
+) {
+    if let Some(supervisor) = app.try_state::<crate::turn_supervisor::TurnSupervisor>() {
+        supervisor.begin(
+            history_session_id,
+            turn_id,
+            turn_epoch,
+            mode.as_state_str(),
+            permission_profile.as_str(),
+        );
+    }
+}
+
+fn normalize_runtime_search_tool_result(event: &AgentEvent) -> AgentEvent {
+    let AgentEvent::ToolResult {
+        session_id,
+        id,
+        status: ToolStatus::Error,
+        output: Some(output),
+        diff,
+        ..
+    } = event
+    else {
+        return event.clone();
+    };
+    let lower = output.to_ascii_lowercase();
+    let search_name = if lower.contains("websearch") || lower.contains("web search") {
+        Some("WebSearch")
+    } else if lower.contains("webfetch") || lower.contains("web fetch") {
+        Some("WebFetch")
+    } else {
+        None
+    };
+    let unavailable = lower.contains("unknown tool")
+        || lower.contains("tool not found")
+        || lower.contains("not available")
+        || lower.contains("does not exist")
+        || lower.contains("unavailable");
+    if let Some(name) = search_name.filter(|_| unavailable) {
+        return AgentEvent::ToolResult {
+            session_id: session_id.clone(),
+            id: id.clone(),
+            status: ToolStatus::Error,
+            output: Some(format!(
+                "[runtime_web_search_unavailable] 当前 Runtime/Provider 未提供 {name}，未切换到其他网络服务。"
+            )),
+            diff: diff.clone(),
+            outcome: Some(crate::protocol::ToolOutcomeKind::RuntimeDenied),
+            started: Some(false),
+            has_output: Some(true),
+            retryable: Some(false),
+            denial_source: Some(crate::protocol::ToolDenialSource::Runtime),
+            native_denial_code: Some("runtime_web_search_unavailable".to_string()),
+        };
+    }
+    event.clone()
 }
 
 fn emit_agent_event(app: &AppHandle, history_session_id: &str, event: &AgentEvent) {
+    let context = event_turn_context(history_session_id);
+    emit_agent_event_in_turn(
+        app,
+        history_session_id,
+        context.as_ref().map(|(turn_id, _)| turn_id.as_str()),
+        context.as_ref().map(|(_, epoch)| *epoch),
+        event,
+    );
+}
+
+fn emit_agent_event_in_turn(
+    app: &AppHandle,
+    history_session_id: &str,
+    explicit_turn_id: Option<&str>,
+    explicit_turn_epoch: Option<u64>,
+    event: &AgentEvent,
+) {
+    let event =
+        crate::redaction::sanitize_agent_event(&normalize_runtime_search_tool_result(event));
+    let turn_id = explicit_turn_id.map(ToString::to_string);
+    let turn_epoch = explicit_turn_epoch;
+    if let Some(supervisor) = app.try_state::<crate::turn_supervisor::TurnSupervisor>() {
+        let _ = supervisor.submit_event(history_session_id, turn_id.as_deref(), turn_epoch, event);
+        return;
+    }
+    // 只供未安装 Tauri state 的旧测试壳使用；生产 setup 始终安装 Supervisor。
     if let Some(store) = app.try_state::<SessionHistoryStore>() {
-        if let Err(err) = store.record_event_for_session(history_session_id, event) {
+        if let Err(err) =
+            store.record_event_for_session_in_turn(history_session_id, turn_id.as_deref(), &event)
+        {
             eprintln!("[helm] 会话历史写入失败：{err}");
-            let _ = app.emit(
-                EVENT_NAME,
-                &AgentEventEnvelope {
-                    history_id: history_session_id,
-                    event: &AgentEvent::Error {
-                        session_id: event_session_id(event),
-                        message: format!("会话历史写入失败：{err}"),
-                        recoverable: true,
-                        kind: None,
-                    },
-                },
-            );
         }
-    }
-    // 用量托盘 + 阈值通知（P3-2）：真实 token 用量落库后刷新
-    if matches!(event, AgentEvent::TokenUsage { .. }) {
-        crate::tray::refresh_usage(app);
-    }
-    // 审批等待系统通知（变更-12）：用户可能切走了会话/页面/窗口，
-    // CLI 挂起等决定的状态必须主动可感知
-    if let AgentEvent::ApprovalRequest { action, .. } = event {
-        use tauri_plugin_notification::NotificationExt;
-        let _ = app
-            .notification()
-            .builder()
-            .title("Helm 等待审批")
-            .body(format!("Agent 请求执行「{action}」，请回到会话处理。"))
-            .show();
-    }
-    // fast model 自动起标题（P3-5）：首轮完成后后台生成，不阻塞事件流
-    if matches!(event, AgentEvent::TurnComplete { .. }) {
-        crate::titler::maybe_generate_title(app, history_session_id);
     }
     let _ = app.emit(
         EVENT_NAME,
-        &AgentEventEnvelope {
-            history_id: history_session_id,
-            event,
-        },
+        serde_json::json!({
+            "historyId": history_session_id,
+            "eventSeq": 0,
+            "turnId": turn_id,
+            "turnEpoch": turn_epoch,
+            "event": event,
+        }),
     );
 }
 
@@ -806,27 +1503,7 @@ fn merge_pending_delta(pending: &mut Option<AgentEvent>, event: &AgentEvent) -> 
     }
 }
 
-fn event_session_id(event: &AgentEvent) -> Option<String> {
-    match event {
-        AgentEvent::SessionStarted { session_id, .. }
-        | AgentEvent::MessageDelta { session_id, .. }
-        | AgentEvent::MessageComplete { session_id, .. }
-        | AgentEvent::ThinkingDelta { session_id, .. }
-        | AgentEvent::ThinkingComplete { session_id, .. }
-        | AgentEvent::TurnStage { session_id, .. }
-        | AgentEvent::ToolCall { session_id, .. }
-        | AgentEvent::ToolProgress { session_id, .. }
-        | AgentEvent::ToolResult { session_id, .. }
-        | AgentEvent::ApprovalRequest { session_id, .. }
-        | AgentEvent::PlanUpdate { session_id, .. }
-        | AgentEvent::Checkpoint { session_id, .. }
-        | AgentEvent::TokenUsage { session_id, .. }
-        | AgentEvent::TurnComplete { session_id, .. } => Some(session_id.clone()),
-        AgentEvent::Error { session_id, .. } => session_id.clone(),
-    }
-}
-
-fn create_codex_auth_home(
+pub(crate) fn create_codex_auth_home(
     env: &[(String, String)],
     disabled_mcp: &[String],
 ) -> Result<Option<CodexAuthHome>, String> {
@@ -944,9 +1621,91 @@ fn filter_codex_mcp_servers(raw: &str, disabled: &[String]) -> Result<String, St
     toml::to_string_pretty(&value).map_err(|e| format!("序列化 Codex 配置失败：{e}"))
 }
 
+fn claude_permission_mode(mode: TurnMode, profile: PermissionProfile) -> &'static str {
+    match mode {
+        TurnMode::Plan => "plan",
+        TurnMode::Ask => "manual",
+        TurnMode::Build => match profile {
+            PermissionProfile::Standard => "manual",
+            PermissionProfile::Auto => "auto",
+            PermissionProfile::FullAccess => "bypassPermissions",
+        },
+    }
+}
+
+fn claude_permission_mode_for_capability(
+    mode: TurnMode,
+    profile: PermissionProfile,
+    auto_support: crate::capability_registry::CapabilitySupport,
+) -> &'static str {
+    if mode == TurnMode::Build
+        && profile == PermissionProfile::Auto
+        && auto_support == crate::capability_registry::CapabilitySupport::Degraded
+    {
+        "acceptEdits"
+    } else {
+        claude_permission_mode(mode, profile)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoFallbackDecision {
+    None,
+    RetryCompatible,
+    Fuse,
+}
+
+fn auto_fallback_decision(
+    profile: PermissionProfile,
+    outcome: Option<crate::protocol::ToolOutcomeKind>,
+    already_attempted: bool,
+    saw_executed_tool: bool,
+) -> AutoFallbackDecision {
+    if profile != PermissionProfile::Auto
+        || !matches!(
+            outcome,
+            Some(
+                crate::protocol::ToolOutcomeKind::AutoReviewUnavailable
+                    | crate::protocol::ToolOutcomeKind::AutoReviewParseError
+            )
+        )
+    {
+        return AutoFallbackDecision::None;
+    }
+    if already_attempted || saw_executed_tool {
+        AutoFallbackDecision::Fuse
+    } else {
+        AutoFallbackDecision::RetryCompatible
+    }
+}
+
+fn codex_runtime_profile_policy(
+    mode: TurnMode,
+    profile: PermissionProfile,
+) -> (&'static str, bool, CodexApprovalPolicy) {
+    if mode != TurnMode::Build {
+        return ("read-only", false, CodexApprovalPolicy::Untrusted);
+    }
+    match profile {
+        PermissionProfile::Standard => ("workspace-write", false, CodexApprovalPolicy::Untrusted),
+        PermissionProfile::Auto => ("workspace-write", true, CodexApprovalPolicy::OnRequest),
+        PermissionProfile::FullAccess => ("danger-full-access", true, CodexApprovalPolicy::Never),
+    }
+}
+
 /// 会话级 MCP 开关（变更-11）：从真实 `~/.claude/settings.json` 读出 mcpServers，
 /// 剔除停用项后写成一份临时 mcp-config。配合 `--strict-mcp-config` 让本轮
 /// 只加载过滤后的集合（CLI 官方支持的完全控制路径）。
+fn restrict_claude_runtime_mcp_servers(
+    servers: serde_json::Map<String, serde_json::Value>,
+    disabled: &[String],
+) -> serde_json::Map<String, serde_json::Value> {
+    servers
+        .into_iter()
+        .filter(|(name, _)| name != "helm" && !disabled.iter().any(|item| item == name))
+        .collect()
+}
+
 fn build_claude_mcp_config_file(disabled: &[String], out_dir: &Path) -> Result<PathBuf, String> {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -961,10 +1720,7 @@ fn build_claude_mcp_config_file(disabled: &[String], out_dir: &Path) -> Result<P
             _ => None,
         })
         .unwrap_or_default();
-    let filtered: serde_json::Map<String, serde_json::Value> = servers
-        .into_iter()
-        .filter(|(name, _)| !disabled.iter().any(|item| item == name))
-        .collect();
+    let filtered = restrict_claude_runtime_mcp_servers(servers, disabled);
     let config = serde_json::json!({ "mcpServers": filtered });
     let path = out_dir.join("mcp-config.json");
     fs::write(
@@ -996,26 +1752,75 @@ fn prompt_with_attachments(text: &str, attachments: &[String]) -> String {
     prompt
 }
 
+fn apply_claude_session_context_args(
+    cmd: &mut Command,
+    cwd: &str,
+    session_context: &[crate::turn_start::FrozenSessionContext],
+) {
+    for context in session_context {
+        let allowed_dir = if context.kind == "directory" {
+            Path::new(&context.canonical_path)
+        } else {
+            Path::new(&context.canonical_path)
+                .parent()
+                .unwrap_or_else(|| Path::new(cwd))
+        };
+        cmd.arg("--add-dir").arg(allowed_dir);
+    }
+}
+
+const PROCESS_TREE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn run_process_command_with_timeout(mut command: Command, timeout: Duration) -> bool {
+    command.kill_on_drop(true);
+    matches!(
+        tokio::time::timeout(timeout, command.output()).await,
+        Ok(Ok(_))
+    )
+}
+
 /// 按 pid 杀掉整棵进程树（中断用）。Windows 走 `taskkill /T`，Unix 走 `kill -TERM`。
-async fn kill_tree(pid: Option<u32>) {
+/// 清理命令本身也属于不可信外部进程，必须有硬超时，避免中断路径永久挂死。
+pub(crate) async fn kill_tree(pid: Option<u32>) {
     let Some(pid) = pid else {
         return;
     };
     #[cfg(target_os = "windows")]
     {
-        let _ = Command::new("taskkill")
+        let mut command = Command::new("taskkill");
+        command
             .args(["/F", "/T", "/PID", &pid.to_string()])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .await;
+            .creation_flags(CREATE_NO_WINDOW);
+        let _ = run_process_command_with_timeout(command, PROCESS_TREE_CLEANUP_TIMEOUT).await;
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .output()
-            .await;
+        let mut command = Command::new("kill");
+        command.args(["-TERM", &pid.to_string()]);
+        let _ = run_process_command_with_timeout(command, PROCESS_TREE_CLEANUP_TIMEOUT).await;
     }
+}
+
+pub(crate) async fn terminate_child_bounded(
+    child: &mut tokio::process::Child,
+    pid: Option<u32>,
+    wait_timeout: Duration,
+) -> bool {
+    if pid.is_some() {
+        kill_tree(pid).await;
+        let exited = matches!(
+            tokio::time::timeout(wait_timeout, child.wait()).await,
+            Ok(Ok(_))
+        );
+        if exited {
+            return true;
+        }
+    }
+    let _ = child.start_kill();
+    matches!(
+        tokio::time::timeout(wait_timeout, child.wait()).await,
+        Ok(Ok(_))
+    )
 }
 
 /// 校验工作目录：为空或不存在都不允许启动进程（S8/S9 场景守卫）。
@@ -1031,13 +1836,6 @@ fn validate_cwd(cwd: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn now_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
-}
-
 fn unique_temp_dir(prefix: &str) -> PathBuf {
     let counter = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
@@ -1047,10 +1845,6 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
         now_millis(),
         counter
     ))
-}
-
-fn quoted(path: &Path) -> String {
-    format!("\"{}\"", path.to_string_lossy().replace('"', "\\\""))
 }
 
 #[cfg(target_os = "windows")]
@@ -1064,415 +1858,47 @@ fn hook_script_name() -> &'static str {
 }
 
 #[cfg(target_os = "windows")]
-fn hook_command(script_path: &Path, state_path: &Path) -> String {
+fn runtime_hook_command(script: &Path, state: &Path) -> String {
+    let _ = script;
+    let executable = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "helm.exe".to_string());
     format!(
-        "powershell -NoProfile -ExecutionPolicy Bypass -File {} {}",
-        quoted(script_path),
-        quoted(state_path)
+        "\"{executable}\" --helm-runtime-hook \"{}\"",
+        state.display()
     )
 }
 
 #[cfg(not(target_os = "windows"))]
-fn hook_command(script_path: &Path, state_path: &Path) -> String {
-    format!("python3 {} {}", quoted(script_path), quoted(state_path))
+fn runtime_hook_command(script: &Path, state: &Path) -> String {
+    format!("python3 \"{}\" \"{}\"", script.display(), state.display())
 }
 
-#[cfg(target_os = "windows")]
-fn hook_script_content() -> &'static str {
-    r#"
-param([Parameter(Mandatory=$true)][string]$StatePath)
-
-$raw = [Console]::In.ReadToEnd()
-try {
-  $payload = $raw | ConvertFrom-Json
-} catch {
-  $payload = $null
-}
-
-$toolName = ""
-$requestId = ""
-$toolInput = $null
-if ($payload -and $payload.tool_name) { $toolName = [string]$payload.tool_name }
-if ($payload -and $payload.tool_use_id) { $requestId = [string]$payload.tool_use_id }
-if ($payload -and $payload.tool_input) { $toolInput = $payload.tool_input }
-
-$decision = "defer"
-$reason = ""
-
-function Get-ToolTarget {
-  param($ToolName, $ToolInput)
-  if (-not $ToolInput) {
-    return $null
-  }
-  if ($ToolInput.file_path) {
-    return [string]$ToolInput.file_path
-  }
-  if ($ToolName -eq "NotebookEdit" -and $ToolInput.notebook_path) {
-    return [string]$ToolInput.notebook_path
-  }
-  if ($ToolName -eq "Bash" -and $ToolInput.command) {
-    $cmd = [string]$ToolInput.command
-    if ($cmd -match '>{1,2}\s*["'']?([^\s"''>][^\s"'']*)') {
-      return $Matches[1]
-    }
-    if ($cmd -match '\b(?:rm|rmdir|mv|dd|chmod)\b\s+(?:-[^\s]+\s+)*["'']?([^"'']\S*)') {
-      return $Matches[1]
-    }
-  }
-  return $null
-}
-
-$target = Get-ToolTarget $toolName $toolInput
-
-try {
-  $state = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
-} catch {
-  $state = $null
-}
-$policy = $null
-if ($state -and $state.policy) { $policy = $state.policy }
-
-# 询问模式（变更-04/07）：白名单化只读约束，最高优先级，优先于 decisions / alwaysAllow / 权限矩阵。
-# 原则：识别不了的操作一律拒绝——写文件类工具、全部 MCP 工具（读写不可判读）、
-# 以及不在只读白名单里的任何 Bash 命令。
-$turnMode = ""
-if ($state -and $state.turnMode) { $turnMode = [string]$state.turnMode }
-if ($turnMode -eq "ask") {
-  $askDeny = $false
-  if ($toolName -eq "Write" -or $toolName -eq "Edit" -or $toolName -eq "MultiEdit" -or $toolName -eq "NotebookEdit") {
-    $askDeny = $true
-  } elseif ($toolName -like "mcp__*") {
-    $askDeny = $true
-  } elseif ($toolName -eq "Bash") {
-    $askDeny = $true
-    if ($toolInput -and $toolInput.command) {
-      $cmd = ([string]$toolInput.command).Trim()
-      if ($cmd -notmatch '[>|;&]') {
-        $parts = $cmd -split '\s+'
-        $first = $parts[0].ToLowerInvariant()
-        $readOnly = @("ls","dir","cat","type","head","tail","grep","rg","findstr","find","pwd","whoami","which","where","wc","du","df","stat","file","tree","env","printenv","date","echo")
-        if ($readOnly -contains $first) {
-          $askDeny = $false
-        } elseif ($first -eq "git" -and $parts.Length -ge 2) {
-          $gitReadOnly = @("status","log","diff","show","branch","remote","rev-parse","blame","shortlog","describe","ls-files")
-          if ($gitReadOnly -contains $parts[1].ToLowerInvariant()) { $askDeny = $false }
-        }
-      }
-    }
-  }
-  if ($askDeny) {
-    $decision = "deny"
-    $reason = "当前为询问模式（只读），本轮只允许只读操作。请只回答问题，不要修改文件、执行写命令或调用 MCP 工具。"
-  }
-}
-
-function Get-PolicyMode {
-  param([string]$Name, [string]$Default)
-  if ($policy -and $policy.PSObject.Properties[$Name]) {
-    $value = [string]$policy.PSObject.Properties[$Name].Value
-    if ($value -eq "allow" -or $value -eq "ask" -or $value -eq "deny") {
-      return $value
-    }
-  }
-  return $Default
-}
-
-function Test-CommandAllowlisted {
-  param([string]$Command)
-  if (-not $policy -or -not $policy.commandAllowlist) { return $false }
-  foreach ($pattern in @($policy.commandAllowlist)) {
-    if ($Command -like [string]$pattern) { return $true }
-  }
-  return $false
-}
-
-function Get-ToolPolicyName {
-  param([string]$ToolName)
-  if ($ToolName -eq "Bash") { return "runCommands" }
-  if ($ToolName -eq "Read" -or $ToolName -eq "Glob" -or $ToolName -eq "Grep" -or $ToolName -eq "LS") { return "readFiles" }
-  if ($ToolName -eq "Write" -or $ToolName -eq "Edit" -or $ToolName -eq "MultiEdit" -or $ToolName -eq "NotebookEdit") { return "editFiles" }
-  if ($ToolName -eq "WebFetch" -or $ToolName -eq "WebSearch") { return "fetchUrls" }
-  if ($ToolName -like "mcp__*") { return "mcpTools" }
-  return $null
-}
-
-if ($target) {
-  if ($state -and $state.deniedTargets) {
-    foreach ($denied in @($state.deniedTargets)) {
-      if ([string]$denied -eq $target) {
-        $decision = "deny"
-        $reason = "User denied this operation. Do NOT retry with alternative tools or methods."
-        break
-      }
-    }  
-  }
-}
-
-if ($decision -eq "defer" -and $state) {
-  if ($state.decisions -and $state.decisions.PSObject.Properties[$requestId]) {
-    $decision = [string]$state.decisions.PSObject.Properties[$requestId].Value
-  }
-  elseif ($state.alwaysAllow) {
-    # 「始终允许」粒度（变更-07）：Bash 按命令首词记录为 "Bash:npm" 形式，
-    # 批准一次 npm 不再放行 rm -rf；其余工具仍按工具名。旧的裸 "Bash" 条目不再匹配。
-    $allowKey = $toolName
-    if ($toolName -eq "Bash" -and $toolInput -and $toolInput.command) {
-      $first = ((([string]$toolInput.command).Trim()) -split '\s+')[0]
-      $allowKey = "Bash:" + $first
-    }
-    foreach ($tool in @($state.alwaysAllow)) {
-      if ([string]$tool -eq $allowKey) { $decision = "allow" }
-    }
-  }
-}
-
-if ($decision -eq "defer") {
-  $policyName = Get-ToolPolicyName $toolName
-  if ($toolName -eq "Bash" -and $toolInput -and $toolInput.command) {
-    $cmd = [string]$toolInput.command
-    $confirmBeforeCommand = $true
-    if ($policy -and $policy.PSObject.Properties["confirmBeforeCommand"]) {
-      $confirmBeforeCommand = [bool]$policy.confirmBeforeCommand
-    }
-    $mode = Get-PolicyMode "runCommands" "ask"
-    if ($mode -eq "deny") {
-      $decision = "deny"
-    } elseif (Test-CommandAllowlisted $cmd) {
-      $decision = "allow"
-    } elseif ($confirmBeforeCommand) {
-      $decision = "defer"
-    } else {
-      if ($mode -eq "allow") { $decision = "allow" }
-    }
-  } elseif ($policyName) {
-    $mode = Get-PolicyMode $policyName "ask"
-    if ($mode -eq "allow") { $decision = "allow" }
-    elseif ($mode -eq "deny") { $decision = "deny" }
-  }
-}
-
-if (-not $reason) {
-  if ($decision -eq "deny") {
-    $reason = "User denied this operation. Do NOT retry with alternative tools or methods."
-  } else {
-    $reason = "Helm approval " + $decision
-  }
-}
-
-$out = @{
-  hookSpecificOutput = @{
-    hookEventName = "PreToolUse"
-    permissionDecision = $decision
-    permissionDecisionReason = $reason
-  }
-}
-$out | ConvertTo-Json -Depth 20 -Compress
-"#
-}
-
-#[cfg(not(target_os = "windows"))]
-fn hook_script_content() -> &'static str {
-    r#"#!/usr/bin/env python3
-import json
-import sys
-import re
-
-state_path = sys.argv[1]
-raw = sys.stdin.read()
-try:
-    payload = json.loads(raw)
-except Exception:
-    payload = {}
-
-tool_name = str(payload.get("tool_name") or "")
-request_id = str(payload.get("tool_use_id") or "")
-tool_input = payload.get("tool_input") or {}
-decision = "defer"
-reason = ""
-
-# 提取操作目标（文件路径等）
-def get_tool_target(tool_name, tool_input):
-    if "file_path" in tool_input:
-        return str(tool_input["file_path"])
-    # NotebookEdit 的目标是 notebook_path（变更-07）
-    if tool_name == "NotebookEdit" and "notebook_path" in tool_input:
-        return str(tool_input["notebook_path"])
-    if tool_name == "Bash" and "command" in tool_input:
-        cmd = str(tool_input["command"])
-        # >{1,2}：覆盖追加重定向 >>（此前 >> 会把第二个 > 捕进目标）
-        match = re.search(r'>{1,2}\s*["\']?([^\s"\'>][^\s"\']*)', cmd)
-        if match:
-            return match.group(1)
-        match = re.search(r'\b(?:rm|rmdir|mv|dd|chmod)\b\s+(?:-[^\s]+\s+)*["\']?([^\s"\']+)', cmd)
-        if match:
-            return match.group(1)
-    return None
-
-target = get_tool_target(tool_name, tool_input)
-
-try:
-    with open(state_path, "r", encoding="utf-8") as f:
-        state = json.load(f)
-except Exception:
-    state = {}
-policy = state.get("policy") or {}
-
-# 询问模式（变更-04/07）：白名单化只读约束，最高优先级。
-# 识别不了的操作一律拒绝——写文件类工具、全部 MCP 工具、不在只读白名单里的 Bash 命令。
-_READ_ONLY_BASH = {
-    "ls", "dir", "cat", "type", "head", "tail", "grep", "rg", "findstr", "find",
-    "pwd", "whoami", "which", "where", "wc", "du", "df", "stat", "file", "tree",
-    "env", "printenv", "date", "echo",
-}
-_READ_ONLY_GIT = {
-    "status", "log", "diff", "show", "branch", "remote", "rev-parse",
-    "blame", "shortlog", "describe", "ls-files",
-}
-
-def bash_is_read_only(command):
-    cmd = str(command).strip()
-    if re.search(r'[>|;&]', cmd):
-        return False
-    parts = cmd.split()
-    if not parts:
-        return False
-    first = parts[0].lower()
-    if first in _READ_ONLY_BASH:
-        return True
-    if first == "git" and len(parts) >= 2 and parts[1].lower() in _READ_ONLY_GIT:
-        return True
-    return False
-
-if str(state.get("turnMode") or "") == "ask":
-    ask_deny = False
-    if tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
-        ask_deny = True
-    elif tool_name.startswith("mcp__"):
-        ask_deny = True
-    elif tool_name == "Bash":
-        ask_deny = not bash_is_read_only(tool_input.get("command", ""))
-    if ask_deny:
-        decision = "deny"
-        reason = "当前为询问模式（只读），本轮只允许只读操作。请只回答问题，不要修改文件、执行写命令或调用 MCP 工具。"
-
-def get_policy_mode(name, default):
-    value = str(policy.get(name) or default)
-    return value if value in ("allow", "ask", "deny") else default
-
-def command_allowlisted(command):
-    import fnmatch
-    for pattern in policy.get("commandAllowlist") or []:
-        if fnmatch.fnmatch(command, str(pattern)):
-            return True
-    return False
-
-def tool_policy_name(tool_name):
-    if tool_name == "Bash":
-        return "runCommands"
-    if tool_name in ("Read", "Glob", "Grep", "LS"):
-        return "readFiles"
-    if tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
-        return "editFiles"
-    if tool_name in ("WebFetch", "WebSearch"):
-        return "fetchUrls"
-    if tool_name.startswith("mcp__"):
-        return "mcpTools"
-    return None
-
-if target and target in state.get("deniedTargets", []):
-    decision = "deny"
-    reason = "User denied this operation. Do NOT retry with alternative tools or methods."
-
-if decision == "defer":
-    if request_id in state.get("decisions", {}):
-        decision = str(state["decisions"][request_id])
-    else:
-        # 「始终允许」粒度（变更-07）：Bash 按命令首词 "Bash:npm"，其余按工具名
-        allow_key = tool_name
-        if tool_name == "Bash" and tool_input.get("command"):
-            allow_key = "Bash:" + str(tool_input["command"]).strip().split()[0]
-        if allow_key in state.get("alwaysAllow", []):
-            decision = "allow"
-
-if decision == "defer":
-    policy_name = tool_policy_name(tool_name)
-    if tool_name == "Bash" and tool_input.get("command"):
-        cmd = str(tool_input["command"])
-        confirm_before_command = bool(policy.get("confirmBeforeCommand", True))
-        mode = get_policy_mode("runCommands", "ask")
-        if mode == "deny":
-            decision = "deny"
-        elif command_allowlisted(cmd):
-            decision = "allow"
-        elif confirm_before_command:
-            decision = "defer"
-        else:
-            if mode == "allow":
-                decision = "allow"
-    elif policy_name:
-        mode = get_policy_mode(policy_name, "ask")
-        if mode == "allow":
-            decision = "allow"
-        elif mode == "deny":
-            decision = "deny"
-
-if not reason:
-    if decision == "deny":
-        reason = "User denied this operation. Do NOT retry with alternative tools or methods."
-    else:
-        reason = "Helm approval " + decision
-
-print(json.dumps({
-    "hookSpecificOutput": {
-        "hookEventName": "PreToolUse",
-        "permissionDecision": decision,
-        "permissionDecisionReason": reason,
-    }
-}, separators=(",", ":")))
-"#
-}
-
-fn create_approval_hook_files(policy: ApprovalPolicy) -> Result<ApprovalHookFiles, String> {
-    let root = unique_temp_dir("helm-approval");
-    fs::create_dir_all(&root).map_err(|e| format!("创建审批 hook 目录失败：{e}"))?;
-
+fn create_runtime_approval_hook_files() -> Result<ApprovalHookFiles, String> {
+    let root = unique_temp_dir("helm-runtime-approval");
+    fs::create_dir_all(&root).map_err(|e| format!("创建 Runtime 审批目录失败：{e}"))?;
     let state_path = root.join("approval-state.json");
-    // 持久化的「始终允许」清单播种进初始 state，hook 脚本读 alwaysAllow 顶层字段（P2-4）
-    let always_allow = policy.always_allow_tools.clone();
-    let initial_state = serde_json::to_string(&ApprovalState {
-        policy,
-        always_allow,
-        ..ApprovalState::default()
-    })
-    .map_err(|e| format!("序列化审批状态失败：{e}"))?;
-    fs::write(&state_path, initial_state).map_err(|e| format!("写入审批状态失败：{e}"))?;
-
+    write_approval_state(&state_path, &ApprovalState::default())?;
     let script_path = root.join(hook_script_name());
-    // Windows PowerShell 5.1 把无 BOM 文件按 ANSI 解析，脚本里的中文（询问模式拒绝文案）
-    // 会变乱码并破坏语法——必须带 UTF-8 BOM（变更-04 踩坑）。
-    #[cfg(target_os = "windows")]
-    let script_content = format!("\u{FEFF}{}", hook_script_content());
-    #[cfg(not(target_os = "windows"))]
-    let script_content = hook_script_content().to_string();
-    fs::write(&script_path, script_content).map_err(|e| format!("写入审批 hook 失败：{e}"))?;
-
+    crate::claude_permission_hook::write_runtime_hook_script(&script_path)?;
     let settings_path = root.join("claude-settings.json");
-    let settings = serde_json::json!({
+    let settings = json!({
         "hooks": {
             "PreToolUse": [{
                 "matcher": "Read|Glob|Grep|LS|Write|Edit|MultiEdit|NotebookEdit|Bash|WebFetch|WebSearch|mcp__.*",
                 "hooks": [{
                     "type": "command",
-                    "command": hook_command(&script_path, &state_path),
-                    "timeout": 30
+                    "command": runtime_hook_command(&script_path, &state_path),
+                    "timeout": 10
                 }]
             }]
         }
     });
-    let settings_text = serde_json::to_string_pretty(&settings)
-        .map_err(|e| format!("序列化 Claude 设置失败：{e}"))?;
-    fs::write(&settings_path, settings_text).map_err(|e| format!("写入 Claude 设置失败：{e}"))?;
-
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("写入 Runtime 审批设置失败：{e}"))?;
     Ok(ApprovalHookFiles {
         settings_path,
         state_path,
@@ -1534,14 +1960,86 @@ fn checkpoint_target_path(
     cwd: &Path,
 ) -> Option<PathBuf> {
     match tool_name {
-        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "Bash" => {
+        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
             let target = extract_tool_target(tool_name, input)?;
+            let target = target.trim();
+            if target.is_empty() || target.eq_ignore_ascii_case("null") {
+                return None;
+            }
             let path = PathBuf::from(target);
-            Some(if path.is_absolute() {
+            if path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                return None;
+            }
+            let path = if path.is_absolute() {
                 path
             } else {
                 cwd.join(path)
-            })
+            };
+            let normalized = path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase();
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            if normalized == "/dev/null"
+                || normalized.starts_with("//./")
+                || normalized.starts_with("//?/")
+                || matches!(
+                    file_name.as_str(),
+                    "nul"
+                        | "con"
+                        | "prn"
+                        | "aux"
+                        | "clock$"
+                        | "com1"
+                        | "com2"
+                        | "com3"
+                        | "com4"
+                        | "com5"
+                        | "com6"
+                        | "com7"
+                        | "com8"
+                        | "com9"
+                        | "lpt1"
+                        | "lpt2"
+                        | "lpt3"
+                        | "lpt4"
+                        | "lpt5"
+                        | "lpt6"
+                        | "lpt7"
+                        | "lpt8"
+                        | "lpt9"
+                )
+            {
+                return None;
+            }
+            let canonical_cwd = cwd.canonicalize().ok()?;
+            let scoped_path = if path.exists() {
+                path.canonicalize().ok()?
+            } else {
+                let parent = path.parent()?.canonicalize().ok()?;
+                parent.join(path.file_name()?)
+            };
+            let scope_key = |value: &Path| {
+                value
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .trim_end_matches('/')
+                    .to_ascii_lowercase()
+            };
+            let cwd_key = scope_key(&canonical_cwd);
+            let target_key = scope_key(&scoped_path);
+            if target_key != cwd_key && !target_key.starts_with(&format!("{cwd_key}/")) {
+                return None;
+            }
+            Some(scoped_path)
         }
         _ => None,
     }
@@ -1574,6 +2072,7 @@ fn create_auto_checkpoint_for_tool(
     tool_id: &str,
     tool_name: &str,
     input: &serde_json::Value,
+    turn_id: &str,
 ) -> Result<Option<AgentEvent>, String> {
     let Some(target) = checkpoint_target_path(tool_name, input, cwd) else {
         return Ok(None);
@@ -1582,6 +2081,9 @@ fn create_auto_checkpoint_for_tool(
     let checkpoint_id = checkpoint_id_for_tool(tool_id);
     let snapshot_store = crate::snapshots::SnapshotStore::new(snapshots_dir.to_path_buf());
     let snapshot = snapshot_store.capture_files(std::slice::from_ref(&target))?;
+    if snapshot.files.is_empty() {
+        return Ok(None);
+    }
     snapshot_store.save(&checkpoint_id, &snapshot)?;
 
     let label_target = target
@@ -1589,7 +2091,7 @@ fn create_auto_checkpoint_for_tool(
         .and_then(|name| name.to_str())
         .map(ToString::to_string)
         .unwrap_or_else(|| target.to_string_lossy().to_string());
-    let ts = now_millis() as i64;
+    let ts = now_millis();
     history_store.save_checkpoint(
         &checkpoint_id,
         history_session_id,
@@ -1597,6 +2099,10 @@ fn create_auto_checkpoint_for_tool(
         &format!("改动前：{label_target}"),
         &checkpoint_id,
         ts,
+        turn_id,
+        true,
+        snapshot.files.len() as u64,
+        None,
     )?;
 
     Ok(Some(AgentEvent::Checkpoint {
@@ -1604,289 +2110,586 @@ fn create_auto_checkpoint_for_tool(
         id: checkpoint_id,
         label: format!("改动前：{label_target}"),
         ts,
+        restorable: true,
+        file_count: snapshot.files.len() as u64,
+        reason: None,
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_environment_from_settings, append_codex_turn_history, approval_policy_from_settings,
-        checkpoint_target_path, codex_output_summary, codex_provider_config_args,
-        codex_sandbox_for_mode, codex_sandbox_from_settings, create_approval_hook_files,
-        create_auto_checkpoint_for_tool, create_codex_auth_home,
-        create_codex_auth_home_with_source, extract_tool_target,
-        filter_inherited_agent_environment, merge_pending_delta, parse_codex_line,
-        prompt_with_attachments, spawn_agent_task, validate_engine_bin, ApprovalPolicy, TurnMode,
+        agent_environment_from_settings, auto_fallback_decision, build_approval_action,
+        checkpoint_target_path, claude_exit_disposition, claude_permission_mode,
+        claude_permission_mode_for_capability, codex_provider_config_args,
+        codex_runtime_profile_policy, codex_sandbox_for_mode, create_auto_checkpoint_for_tool,
+        create_codex_auth_home, create_codex_auth_home_with_source,
+        create_runtime_approval_hook_files, extract_tool_target,
+        filter_inherited_agent_environment, finish_codex_interrupt_terminal, full_access_lease,
+        lease_is_valid, merge_pending_delta, normalize_runtime_search_tool_result,
+        parse_codex_line, prompt_with_attachments, record_approval_state, reserve_turn_flag,
+        rollback_prepared_approval_state, run_serialized_approval, should_process_claude_event,
+        spawn_agent_task, terminal_turn_outcome, validate_engine_bin, wait_until_idle_and_begin,
+        write_approval_state, AgentSession, ApprovalDecision, ApprovalState, AutoFallbackDecision,
+        ClaudeExitDisposition, ClaudeSession, PendingToolInfo, PermissionProfile, SessionCmd,
+        TurnMode,
     };
-    use crate::protocol::{AgentEvent, EngineId, Role, StopReason};
+    use crate::codex_app_server::CodexApprovalPolicy;
+    use crate::protocol::{AgentEvent, EngineId, Role, StopReason, ToolStatus};
     use crate::sessions::{NewSessionRecord, SessionHistoryStore};
     use crate::settings::AppSettings;
     use serde_json::json;
+    use std::collections::HashMap;
     use std::fs;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::{mpsc, Mutex, Notify};
 
     #[test]
-    fn approval_policy_follows_app_settings_permissions() {
-        let mut settings = AppSettings::default();
-        settings.general.confirm_before_command = false;
-        settings.permissions.read_files = "ask".to_string();
-        settings.permissions.edit_files = "deny".to_string();
-        settings.permissions.run_commands = "allow".to_string();
-        settings.permissions.fetch_urls = "deny".to_string();
-        settings.permissions.mcp_tools = "ask".to_string();
-        settings.permissions.command_allowlist = vec!["git status".to_string()];
-
-        let policy = approval_policy_from_settings(&settings);
-
-        assert!(!policy.confirm_before_command);
-        assert_eq!(policy.read_files, "ask");
-        assert_eq!(policy.edit_files, "deny");
-        assert_eq!(policy.run_commands, "allow");
-        assert_eq!(policy.fetch_urls, "deny");
-        assert_eq!(policy.mcp_tools, "ask");
-        assert_eq!(policy.command_allowlist, vec!["git status"]);
-    }
-
-    #[test]
-    fn codex_sandbox_uses_app_settings() {
-        let mut settings = AppSettings::default();
-        settings.engines.codex.sandbox = Some("readonly".to_string());
-        assert_eq!(codex_sandbox_from_settings(&settings), "read-only");
-
-        settings.engines.codex.sandbox = Some("workspace".to_string());
-        assert_eq!(codex_sandbox_from_settings(&settings), "workspace-write");
-
-        settings.engines.codex.sandbox = Some("full".to_string());
-        assert_eq!(codex_sandbox_from_settings(&settings), "danger-full-access");
-    }
-
-    #[test]
-    fn codex_sandbox_respects_file_edit_permission_matrix() {
-        let mut settings = AppSettings::default();
-        settings.engines.codex.sandbox = Some("workspace".to_string());
-        settings.permissions.edit_files = "deny".to_string();
-        assert_eq!(codex_sandbox_from_settings(&settings), "read-only");
-
-        settings.permissions.edit_files = "ask".to_string();
-        assert_eq!(codex_sandbox_from_settings(&settings), "workspace-write");
-    }
-
-    #[test]
-    fn claude_approval_hook_covers_reading_tools() {
-        let files = create_approval_hook_files(ApprovalPolicy::default()).unwrap();
-        let settings = fs::read_to_string(files.settings_path).unwrap();
-
-        assert!(settings.contains("Read"));
-        assert!(settings.contains("Glob"));
-        assert!(settings.contains("Grep"));
-        assert!(settings.contains("LS"));
-    }
-
-    #[test]
-    fn approval_hook_state_seeds_persistent_always_allow() {
-        // P2-4：持久化的「始终允许」清单必须播种进 hook state 顶层 alwaysAllow，
-        // hook 脚本不改就能直接放行
-        let policy = ApprovalPolicy {
-            always_allow_tools: vec!["Bash".to_string(), "Write".to_string()],
-            ..ApprovalPolicy::default()
+    fn missing_runtime_search_tool_is_normalized_without_fallback_service() {
+        let normalized = normalize_runtime_search_tool_result(&AgentEvent::ToolResult {
+            session_id: "cli".into(),
+            id: "tool-1".into(),
+            status: ToolStatus::Error,
+            output: Some("Unknown tool WebSearch: tool not found".into()),
+            diff: None,
+            outcome: None,
+            started: None,
+            has_output: None,
+            retryable: None,
+            denial_source: None,
+            native_denial_code: None,
+        });
+        let AgentEvent::ToolResult { output, .. } = normalized else {
+            panic!("expected tool result");
         };
-        let files = create_approval_hook_files(policy).unwrap();
-        let state: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(files.state_path).unwrap()).unwrap();
-
-        assert_eq!(
-            state["alwaysAllow"],
-            serde_json::json!(["Bash", "Write"]),
-            "初始 state 顶层 alwaysAllow 必须等于持久化清单"
-        );
-    }
-
-    /// 真实执行审批 hook 脚本（Windows: powershell / 其他: python3），返回 permissionDecision。
-    fn run_hook_script(state_path: &std::path::Path, payload: &serde_json::Value) -> String {
-        use std::io::Write as _;
-        use std::process::{Command, Stdio};
-
-        let script_path = state_path.parent().unwrap().join(super::hook_script_name());
-        #[cfg(target_os = "windows")]
-        let mut cmd = {
-            let mut cmd = Command::new("powershell");
-            cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-                .arg(&script_path)
-                .arg(state_path);
-            cmd
-        };
-        #[cfg(not(target_os = "windows"))]
-        let mut cmd = {
-            let mut cmd = Command::new("python3");
-            cmd.arg(&script_path).arg(state_path);
-            cmd
-        };
-        let mut child = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("启动 hook 脚本失败");
-        child
-            .stdin
-            .take()
+        assert!(output
             .unwrap()
-            .write_all(payload.to_string().as_bytes())
-            .unwrap();
-        let output = child.wait_with_output().expect("hook 脚本执行失败");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
-            .unwrap_or_else(|e| panic!("hook 输出不是 JSON：{e}\n{stdout}"));
-        parsed["hookSpecificOutput"]["permissionDecision"]
-            .as_str()
-            .unwrap_or("")
-            .to_string()
+            .starts_with("[runtime_web_search_unavailable]"));
     }
 
     #[test]
-    fn ask_mode_hook_denies_writes_above_always_allow() {
-        // 变更-04/07：询问模式白名单化只读约束（> alwaysAllow > 权限矩阵），真实执行脚本验证
-        let policy = ApprovalPolicy {
-            always_allow_tools: vec!["Write".to_string(), "Bash:echo".to_string()],
-            edit_files: "allow".to_string(),
-            ..ApprovalPolicy::default()
+    fn claude_terminal_candidate_is_committed_only_after_successful_exit() {
+        assert_eq!(
+            claude_exit_disposition(false, false, false, true, true, false),
+            ClaudeExitDisposition::EmitCandidate
+        );
+        // 有 terminal_candidate 时即使 exit code!=0 也优先 emit（如 API 403 错误场景）
+        assert_eq!(
+            claude_exit_disposition(false, false, false, false, true, false),
+            ClaudeExitDisposition::EmitCandidate
+        );
+        // 无 terminal_candidate 且 exit code!=0 → ProcessError
+        assert_eq!(
+            claude_exit_disposition(false, false, false, false, false, false),
+            ClaudeExitDisposition::ProcessError
+        );
+    }
+
+    #[test]
+    fn claude_successful_exit_without_result_fails_closed_unless_approval_is_deferred() {
+        assert_eq!(
+            claude_exit_disposition(false, false, false, true, false, false),
+            ClaudeExitDisposition::MissingResult
+        );
+        assert_eq!(
+            claude_exit_disposition(false, false, false, true, false, true),
+            ClaudeExitDisposition::ApprovalDeferred
+        );
+        assert_eq!(
+            claude_exit_disposition(false, false, false, true, true, true),
+            ClaudeExitDisposition::ApprovalDeferred
+        );
+    }
+
+    #[test]
+    fn claude_resume_ignores_tool_and_approval_replay_before_session_started() {
+        let approval = AgentEvent::ApprovalRequest {
+            session_id: "native".to_string(),
+            id: "old-approval".to_string(),
+            action: "Bash".to_string(),
+            detail: "echo old".to_string(),
+            input: None,
+            available_decisions: Vec::new(),
+            persistent_label: None,
+            matcher_summary: None,
         };
-        let files = create_approval_hook_files(policy).unwrap();
+        assert!(!should_process_claude_event(false, false, &approval));
+        assert!(should_process_claude_event(true, false, &approval));
+        let approved_result = AgentEvent::ToolResult {
+            session_id: "native".to_string(),
+            id: "current-approved".to_string(),
+            status: ToolStatus::Success,
+            output: Some("ok".to_string()),
+            diff: None,
+            outcome: None,
+            started: Some(true),
+            has_output: Some(true),
+            retryable: Some(false),
+            denial_source: None,
+            native_denial_code: None,
+        };
+        assert!(should_process_claude_event(false, true, &approved_result));
+        assert!(!should_process_claude_event(false, false, &approved_result));
+        assert!(should_process_claude_event(
+            false,
+            false,
+            &AgentEvent::SessionStarted {
+                session_id: "native".to_string(),
+                engine: EngineId::ClaudeCode,
+                model: "claude".to_string(),
+                cwd: "D:/work".to_string(),
+                ts: 1,
+                capabilities: None,
+            }
+        ));
+        assert!(should_process_claude_event(
+            false,
+            false,
+            &AgentEvent::Error {
+                session_id: None,
+                message: "launch failed".to_string(),
+                recoverable: false,
+                kind: None,
+            }
+        ));
+    }
 
-        let mut state = super::read_approval_state(&files.state_path);
-        state.turn_mode = "ask".to_string();
-        super::write_approval_state(&files.state_path, &state).unwrap();
-
-        let write_payload = serde_json::json!({
-            "tool_name": "Write",
-            "tool_use_id": "t-write",
-            "tool_input": {"file_path": "x.txt", "content": "hi"}
-        });
+    #[test]
+    fn claude_interruption_and_auto_fallback_own_their_terminal_flow() {
         assert_eq!(
-            run_hook_script(&files.state_path, &write_payload),
-            "deny",
-            "询问模式下写文件必须被拒绝，即使工具在 alwaysAllow 里"
+            claude_exit_disposition(true, false, false, false, true, false),
+            ClaudeExitDisposition::Return
         );
-
-        let bash_write_payload = serde_json::json!({
-            "tool_name": "Bash",
-            "tool_use_id": "t-bash",
-            "tool_input": {"command": "echo hi > out.txt"}
-        });
         assert_eq!(
-            run_hook_script(&files.state_path, &bash_write_payload),
-            "deny",
-            "询问模式下 Bash 写目标（重定向）必须被拒绝"
+            claude_exit_disposition(false, true, false, false, true, false),
+            ClaudeExitDisposition::Return
         );
+        assert_eq!(
+            claude_exit_disposition(false, false, true, false, false, false),
+            ClaudeExitDisposition::Return
+        );
+    }
 
-        // 变更-07：此前提取不到目标的写命令（cp/sed -i/tee）会漏网，现在一律拒绝
-        for cmd in [
-            "cp a.txt b.txt",
-            "sed -i 's/a/b/' x.txt",
-            "tee out.txt",
-            "python -c \"open('x','w')\"",
-        ] {
-            let payload = serde_json::json!({
-                "tool_name": "Bash",
-                "tool_use_id": "t-bash2",
-                "tool_input": {"command": cmd}
-            });
-            assert_eq!(
-                run_hook_script(&files.state_path, &payload),
-                "deny",
-                "询问模式下未被识别为只读的命令必须拒绝：{cmd}"
-            );
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn codex_auth_home_drop_retries_until_a_short_lived_exclusive_lock_releases() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let path = super::unique_temp_dir("helm-codex-drop-retry");
+        std::fs::create_dir_all(&path).unwrap();
+        let auth_path = path.join("auth.json");
+        std::fs::write(&auth_path, r#"{"OPENAI_API_KEY":"test-only"}"#).unwrap();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let lock_path = auth_path.clone();
+        let holder = std::thread::spawn(move || {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(lock_path)
+                .unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            drop(file);
+        });
+        locked_rx.recv().unwrap();
+
+        drop(super::CodexAuthHome { path: path.clone() });
+        holder.join().unwrap();
+
+        assert!(
+            !path.exists(),
+            "短暂文件锁释放后必须删除包含临时凭证的 CODEX_HOME"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn codex_auth_home_drop_tolerates_windows_locks_longer_than_one_second() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let path = super::unique_temp_dir("helm-codex-drop-long-retry");
+        std::fs::create_dir_all(&path).unwrap();
+        let auth_path = path.join("auth.json");
+        std::fs::write(&auth_path, r#"{"OPENAI_API_KEY":"test-only"}"#).unwrap();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let lock_path = auth_path.clone();
+        let holder = std::thread::spawn(move || {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(lock_path)
+                .unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(1_500));
+            drop(file);
+        });
+        locked_rx.recv().unwrap();
+
+        drop(super::CodexAuthHome { path: path.clone() });
+        holder.join().unwrap();
+
+        let removed = !path.exists();
+        if !removed {
+            std::fs::remove_dir_all(&path).unwrap();
         }
-
-        // 变更-07：MCP 工具在询问模式一律拒绝（读写不可判读）
-        let mcp_payload = serde_json::json!({
-            "tool_name": "mcp__github__create_issue",
-            "tool_use_id": "t-mcp",
-            "tool_input": {"title": "x"}
-        });
-        assert_eq!(
-            run_hook_script(&files.state_path, &mcp_payload),
-            "deny",
-            "询问模式下 MCP 工具必须被拒绝"
-        );
-
-        let read_payload = serde_json::json!({
-            "tool_name": "Read",
-            "tool_use_id": "t-read",
-            "tool_input": {"file_path": "x.txt"}
-        });
-        assert_eq!(
-            run_hook_script(&files.state_path, &read_payload),
-            "allow",
-            "询问模式不影响只读工具"
-        );
-
-        // 只读 Bash 命令（git status）不被询问模式硬拒，回落常规审批流程
-        let git_status = serde_json::json!({
-            "tool_name": "Bash",
-            "tool_use_id": "t-git",
-            "tool_input": {"command": "git status"}
-        });
-        assert_eq!(
-            run_hook_script(&files.state_path, &git_status),
-            "defer",
-            "询问模式下只读 Bash（git status）不硬拒，走常规审批"
-        );
-
-        // 同一 state 切回构建模式：alwaysAllow 恢复生效
-        let mut state = super::read_approval_state(&files.state_path);
-        state.turn_mode = "build".to_string();
-        super::write_approval_state(&files.state_path, &state).unwrap();
-        assert_eq!(
-            run_hook_script(&files.state_path, &write_payload),
-            "allow",
-            "构建模式下 alwaysAllow 的 Write 应放行"
+        assert!(
+            removed,
+            "Windows 扫描器或日志句柄占用超过一秒时仍必须删除临时 CODEX_HOME"
         );
     }
 
     #[test]
-    fn always_allow_bash_is_scoped_to_command_first_word() {
-        // 变更-07：批准一次 `Bash:echo` 不放行其他 Bash 命令（如 rm -rf）
-        let policy = ApprovalPolicy {
-            always_allow_tools: vec!["Bash:echo".to_string()],
-            run_commands: "ask".to_string(),
-            confirm_before_command: true,
-            ..ApprovalPolicy::default()
-        };
-        let files = create_approval_hook_files(policy).unwrap();
-
-        let echo = serde_json::json!({
-            "tool_name": "Bash",
-            "tool_use_id": "t-echo",
-            "tool_input": {"command": "echo hi"}
-        });
-        assert_eq!(
-            run_hook_script(&files.state_path, &echo),
-            "allow",
-            "已批准的 echo 命令应放行"
+    fn effective_codex_home_prefers_session_snapshot_and_falls_back_to_subscription_home() {
+        let session = std::path::PathBuf::from("D:/session-codex-home");
+        let subscription = std::path::PathBuf::from(
+            "C:/Users/test/AppData/Roaming/Helm/cli-profiles/codex-subscription",
         );
 
-        let rm = serde_json::json!({
-            "tool_name": "Bash",
-            "tool_use_id": "t-rm",
-            "tool_input": {"command": "rm -rf /tmp/x"}
-        });
         assert_eq!(
-            run_hook_script(&files.state_path, &rm),
-            "defer",
-            "未批准的 rm 命令不应被 Bash:echo 放行，需继续审批"
+            super::select_effective_codex_home(Some(&session), Some(&subscription)),
+            Some(session)
+        );
+        assert_eq!(
+            super::select_effective_codex_home(None, Some(&subscription)),
+            Some(subscription)
         );
     }
 
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn process_tree_cleanup_command_has_a_hard_timeout() {
+        let mut command = tokio::process::Command::new("powershell");
+        command
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ])
+            .creation_flags(super::CREATE_NO_WINDOW);
+        let started = std::time::Instant::now();
+
+        let completed =
+            super::run_process_command_with_timeout(command, Duration::from_millis(50)).await;
+
+        assert!(!completed, "挂住的清理命令不得被当作成功完成");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "清理命令必须在硬上限内返回，且测试需容忍 Windows 并行调度延迟"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn bounded_child_reap_falls_back_when_tree_kill_does_not_exit_target() {
+        let mut command = tokio::process::Command::new("powershell");
+        command
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ])
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let started = std::time::Instant::now();
+
+        let reaped = super::terminate_child_bounded(&mut child, None, Duration::from_secs(1)).await;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "tree kill 未命中时必须回退到直接 kill"
+        );
+        assert!(reaped, "清理函数必须报告子进程已被 reap");
+        assert!(child.try_wait().unwrap().is_some(), "子进程必须已被 reap");
+    }
+
+    #[tokio::test]
+    async fn approval_waits_for_busy_turn_then_acquires_execution_right() {
+        let busy = Arc::new(AtomicBool::new(true));
+        let idle_notify = Arc::new(Notify::new());
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let waiter_busy = busy.clone();
+        let waiter_notify = idle_notify.clone();
+        let waiter_interrupted = interrupted.clone();
+        let waiter = tokio::spawn(async move {
+            wait_until_idle_and_begin(&waiter_busy, &waiter_notify, &waiter_interrupted).await
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            busy.load(Ordering::Acquire),
+            "旧轮次释放前审批不能抢占执行权"
+        );
+
+        busy.store(false, Ordering::Release);
+        idle_notify.notify_waiters();
+
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("审批等待不应丢失 idle 通知")
+            .expect("审批等待任务不应崩溃")
+            .expect("旧轮次释放后审批应取得执行权");
+        assert!(busy.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn idle_check_does_not_depend_on_a_future_notification() {
+        let busy = AtomicBool::new(false);
+        let idle_notify = Notify::new();
+        let interrupted = AtomicBool::new(false);
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            wait_until_idle_and_begin(&busy, &idle_notify, &interrupted),
+        )
+        .await
+        .expect("已经 idle 时必须立即 CAS 成功，不能等待下一次通知")
+        .expect("已经 idle 时应取得执行权");
+        assert!(busy.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn interrupted_approval_never_acquires_or_resumes_after_busy_releases() {
+        let busy = Arc::new(AtomicBool::new(true));
+        let idle_notify = Arc::new(Notify::new());
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let waiter = tokio::spawn({
+            let busy = busy.clone();
+            let idle_notify = idle_notify.clone();
+            let interrupted = interrupted.clone();
+            async move { wait_until_idle_and_begin(&busy, &idle_notify, &interrupted).await }
+        });
+
+        tokio::task::yield_now().await;
+        interrupted.store(true, Ordering::Release);
+        busy.store(false, Ordering::Release);
+        idle_notify.notify_waiters();
+
+        let error = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("中断必须唤醒等待中的审批")
+            .expect("等待任务不应崩溃")
+            .expect_err("中断后不得启动恢复轮");
+        assert!(error.contains("已中断"));
+        assert!(!busy.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn approval_transactions_are_serialized_through_the_commit_window() {
+        let lock = Arc::new(Mutex::new(()));
+        let release_first = Arc::new(Notify::new());
+        let (entered_first, first_entered) = tokio::sync::oneshot::channel();
+        let first_lock = lock.clone();
+        let first_release = release_first.clone();
+        let first = tokio::spawn(async move {
+            run_serialized_approval(&first_lock, async move {
+                let _ = entered_first.send(());
+                first_release.notified().await;
+            })
+            .await;
+        });
+        first_entered.await.unwrap();
+
+        let (entered_second, mut second_entered) = tokio::sync::oneshot::channel();
+        let second_lock = lock.clone();
+        let second = tokio::spawn(async move {
+            run_serialized_approval(&second_lock, async move {
+                let _ = entered_second.send(());
+            })
+            .await;
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut second_entered)
+                .await
+                .is_err(),
+            "第一笔审批完成提交/回滚前，第二笔不得进入事务窗口"
+        );
+        release_first.notify_waiters();
+        first.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), second_entered)
+            .await
+            .expect("第一笔退出后第二笔应进入")
+            .unwrap();
+        second.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn approve_returns_the_actual_manager_error() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = AgentSession::Claude(ClaudeSession {
+            tx,
+            cwd: "D:/repo".to_string(),
+            control: None,
+        });
+        tokio::spawn(async move {
+            let Some(SessionCmd::Approve { responder, .. }) = rx.recv().await else {
+                panic!("manager 应收到审批命令");
+            };
+            let _ = responder.send(Err("manager 记录审批失败".to_string()));
+        });
+
+        let error = session
+            .approve("tool-1".to_string(), ApprovalDecision::Allow)
+            .await
+            .expect_err("调用方必须收到 manager 的真实失败");
+
+        assert_eq!(error, "manager 记录审批失败");
+    }
+
+    #[tokio::test]
+    async fn always_decision_without_pending_tool_info_is_rejected() {
+        let root = super::unique_temp_dir("helm-approval-missing-pending-test");
+        fs::create_dir_all(&root).unwrap();
+        let state_path = root.join("approval-state.json");
+        fs::write(
+            &state_path,
+            serde_json::to_string(&super::ApprovalState::default()).unwrap(),
+        )
+        .unwrap();
+        let pending_tools = Mutex::new(std::collections::HashMap::new());
+
+        let error = record_approval_state(
+            &state_path,
+            &pending_tools,
+            "missing-tool",
+            ApprovalDecision::Always,
+        )
+        .await
+        .expect_err("缺少 pending tool 信息时不能伪造始终允许成功");
+
+        assert!(error.contains("找不到待审批工具信息"));
+        let state = super::read_approval_state(&state_path);
+        assert!(!state.decisions.contains_key("missing-tool"));
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
-    fn always_allow_key_scopes_bash_by_first_word() {
-        assert_eq!(
-            super::always_allow_key("Bash", &serde_json::json!({"command": "npm test auth"})),
-            "Bash:npm"
+    fn approval_decision_has_stable_audit_values() {
+        assert_eq!(ApprovalDecision::Allow.audit_value(), "allow");
+        assert_eq!(ApprovalDecision::Turn.audit_value(), "turn");
+        assert_eq!(ApprovalDecision::Session.audit_value(), "session");
+        assert_eq!(ApprovalDecision::Project.audit_value(), "project");
+        assert_eq!(ApprovalDecision::Deny.audit_value(), "deny");
+        assert_eq!(ApprovalDecision::Always.audit_value(), "always");
+    }
+
+    #[test]
+    fn approval_decision_whitelist_rejects_persistent_scope_without_matcher() {
+        let available = super::available_approval_decisions(None);
+        assert!(super::validate_approval_decision(ApprovalDecision::Allow, &available).is_ok());
+        assert!(super::validate_approval_decision(ApprovalDecision::Deny, &available).is_ok());
+        for decision in [
+            ApprovalDecision::Turn,
+            ApprovalDecision::Session,
+            ApprovalDecision::Project,
+            ApprovalDecision::Always,
+        ] {
+            let error = super::validate_approval_decision(
+                decision,
+                &super::available_approval_decisions(None),
+            )
+            .unwrap_err();
+            assert!(error.starts_with("[approval_decision_unavailable]"));
+        }
+    }
+
+    #[test]
+    fn approval_decision_whitelist_tracks_available_identities() {
+        let mut action = crate::permissions::normalize_tool_action(
+            "claude-code",
+            "session-1",
+            "turn-1",
+            "tool-1",
+            "WebFetch",
+            &serde_json::json!({"url":"https://example.com/docs"}),
+            Some("D:/repo"),
         );
         assert_eq!(
-            super::always_allow_key("Write", &serde_json::json!({"file_path": "x"})),
-            "Write"
+            super::available_approval_decisions(Some(&action)),
+            vec![
+                crate::protocol::ApprovalDecisionOption::Allow,
+                crate::protocol::ApprovalDecisionOption::Turn,
+                crate::protocol::ApprovalDecisionOption::Session,
+                crate::protocol::ApprovalDecisionOption::Project,
+                crate::protocol::ApprovalDecisionOption::Always,
+                crate::protocol::ApprovalDecisionOption::Deny,
+            ]
         );
+
+        action.turn_id.clear();
+        assert!(!super::available_approval_decisions(Some(&action))
+            .contains(&crate::protocol::ApprovalDecisionOption::Turn));
+        action.session_id.clear();
+        assert!(!super::available_approval_decisions(Some(&action))
+            .contains(&crate::protocol::ApprovalDecisionOption::Session));
+        action.cwd = None;
+        assert!(!super::available_approval_decisions(Some(&action))
+            .contains(&crate::protocol::ApprovalDecisionOption::Project));
+        assert!(super::available_approval_decisions(Some(&action))
+            .contains(&crate::protocol::ApprovalDecisionOption::Always));
+    }
+
+    #[test]
+    fn failed_grant_commit_removes_the_prepared_hook_decision() {
+        let root = std::env::temp_dir().join(format!(
+            "helm-prepared-approval-rollback-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let state_path = root.join("state.json");
+        write_approval_state(
+            &state_path,
+            &ApprovalState {
+                decisions: HashMap::from([("tool-1".to_string(), "allow".to_string())]),
+                denied_targets: Vec::new(),
+                turn_mode: "build".to_string(),
+            },
+        )
+        .unwrap();
+
+        rollback_prepared_approval_state(&state_path, "tool-1").unwrap();
+        let state: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&state_path).unwrap()).unwrap();
+        assert!(state["decisions"].get("tool-1").is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn once_approval_rule_is_bound_to_the_exact_tool_call() {
+        let action = build_approval_action(
+            "history-1",
+            "turn-1",
+            "tool-1",
+            &PendingToolInfo {
+                name: "Bash".to_string(),
+                input: serde_json::json!({"command":"ls -la"}),
+            },
+            "D:/repo",
+        );
+        let rule = crate::permissions::build_once_rule_from_action(&action, 1_000);
+
+        assert_eq!(rule.scope, crate::permissions::PermissionScope::Once);
+        assert_eq!(rule.scope_binding.tool_call_id.as_deref(), Some("tool-1"));
+        assert_eq!(rule.scope_binding.turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(rule.scope_binding.session_id.as_deref(), Some("history-1"));
+        assert_eq!(rule.max_uses, Some(1));
+        assert_eq!(rule.operation.as_deref(), Some("ls"));
+    }
+
+    #[test]
+    fn runtime_claude_settings_registers_the_same_turn_permission_bridge() {
+        let files = create_runtime_approval_hook_files().unwrap();
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(files.settings_path).unwrap()).unwrap();
+        assert!(settings["hooks"]["PreToolUse"].is_array());
+        assert!(settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .is_some_and(|command| command.contains("--helm-runtime-hook")));
     }
 
     #[test]
@@ -1904,12 +2707,16 @@ mod tests {
                 text: "第一轮提问".to_string(),
                 ts: 1,
                 reverted: false,
+                turn_id: None,
+                attachments: Vec::new(),
             },
             SessionMessage {
                 role: Role::Assistant,
                 text: "第一轮回复".to_string(),
                 ts: 2,
                 reverted: false,
+                turn_id: None,
+                attachments: Vec::new(),
             },
         ];
         let prompt = super::serialize_history_prompt(&history, "当前问题");
@@ -1920,81 +2727,34 @@ mod tests {
     }
 
     #[test]
-    fn codex_resume_plan_sends_only_the_current_prompt() {
-        let first = super::codex_exec_plan(None, false, &[], "第一轮");
-        assert!(matches!(first.command, super::CodexExecCommand::Start));
-        assert_eq!(first.prompt, "第一轮");
-
+    fn codex_app_server_thread_plan_resumes_normally_and_restarts_after_rewind() {
+        assert_eq!(
+            super::codex_app_server_thread_plan(Some("thread-1"), false),
+            super::CodexAppServerThreadPlan::Resume("thread-1".to_string())
+        );
+        assert_eq!(
+            super::codex_app_server_thread_plan(Some("thread-1"), true),
+            super::CodexAppServerThreadPlan::Start
+        );
+        assert_eq!(
+            super::codex_app_server_thread_plan(None, false),
+            super::CodexAppServerThreadPlan::Start
+        );
         let history = vec![crate::sessions::SessionMessage {
             role: crate::protocol::Role::Assistant,
-            text: "第一轮回复".to_string(),
+            text: "回溯后保留的回答".to_string(),
             ts: 1,
             reverted: false,
+            turn_id: None,
+            attachments: Vec::new(),
         }];
-        let second = super::codex_exec_plan(Some("thread-1"), false, &history, "第二轮");
-        assert!(matches!(
-            second.command,
-            super::CodexExecCommand::Resume { ref thread_id } if thread_id == "thread-1"
-        ));
-        assert_eq!(second.prompt, "第二轮");
-        assert!(!second.prompt.contains("第一轮回复"));
-    }
-
-    #[test]
-    fn codex_rebuild_plan_discards_native_thread_and_serializes_history() {
-        let history = vec![crate::sessions::SessionMessage {
-            role: crate::protocol::Role::Assistant,
-            text: "截断后的回复".to_string(),
-            ts: 1,
-            reverted: false,
-        }];
-        let plan = super::codex_exec_plan(Some("stale-thread"), true, &history, "当前问题");
-
-        assert!(matches!(plan.command, super::CodexExecCommand::Start));
-        assert!(plan.prompt.contains("截断后的回复"));
-        assert!(plan.prompt.ends_with("用户: 当前问题"));
-    }
-
-    #[test]
-    fn codex_resume_command_places_resume_before_thread_and_prompt() {
-        let plan = super::CodexExecPlan {
-            command: super::CodexExecCommand::Resume {
-                thread_id: "thread-1".to_string(),
-            },
-            prompt: "只发送当前问题".to_string(),
-        };
-
-        let args = super::codex_exec_args(&plan, "gpt-5", "read-only");
-
         assert_eq!(
-            args,
-            vec![
-                "exec",
-                "--sandbox",
-                "read-only",
-                "resume",
-                "--json",
-                "--model",
-                "gpt-5",
-                "--skip-git-repo-check",
-                "thread-1",
-                "只发送当前问题",
-            ]
+            super::codex_app_server_prompt(false, &history, "当前问题"),
+            "当前问题"
         );
-    }
-
-    #[test]
-    fn codex_thread_started_exposes_native_thread_id() {
-        assert_eq!(
-            super::codex_thread_id_from_line(
-                r#"{"type":"thread.started","thread_id":"019eaa24-be0b"}"#
-            ),
-            Some("019eaa24-be0b".to_string())
-        );
-        assert_eq!(
-            super::codex_thread_id_from_line(r#"{"type":"turn.started"}"#),
-            None
-        );
+        let rebuilt = super::codex_app_server_prompt(true, &history, "当前问题");
+        assert!(rebuilt.contains("回溯后保留的回答"));
+        assert!(rebuilt.contains("当前问题"));
     }
 
     #[test]
@@ -2022,8 +2782,13 @@ mod tests {
         })));
         let turn = owner.clone();
 
-        assert_eq!(super::codex_auth_home_path(&owner), Some(path.clone()));
-        assert_eq!(super::codex_auth_home_path(&turn), Some(path.clone()));
+        let auth_path = |arc: &std::sync::Arc<std::sync::Mutex<Option<super::CodexAuthHome>>>| {
+            arc.lock()
+                .ok()
+                .and_then(|guard| guard.as_ref().map(|home| home.path.clone()))
+        };
+        assert_eq!(auth_path(&owner), Some(path.clone()));
+        assert_eq!(auth_path(&turn), Some(path.clone()));
         drop(turn);
         assert!(
             path.exists(),
@@ -2048,6 +2813,8 @@ mod tests {
             text: "保留到检查点的回复".to_string(),
             ts: 1,
             reverted: false,
+            turn_id: None,
+            attachments: Vec::new(),
         }];
 
         super::reset_codex_context_state(
@@ -2061,30 +2828,6 @@ mod tests {
         assert_eq!(*thread_id.lock().unwrap(), None);
         assert!(force_history_rebuild.load(std::sync::atomic::Ordering::Acquire));
         assert_eq!(*history.lock().unwrap(), truncated);
-    }
-
-    #[test]
-    fn completed_codex_turn_is_appended_to_runtime_history() {
-        use crate::sessions::SessionMessage;
-
-        let mut history = vec![SessionMessage {
-            role: Role::Assistant,
-            text: "已有回复".to_string(),
-            ts: 10,
-            reverted: false,
-        }];
-
-        append_codex_turn_history(&mut history, "本轮问题", "本轮回答", 20);
-
-        assert_eq!(history.len(), 3);
-        assert_eq!(history[0].text, "已有回复");
-        assert_eq!(history[1].role, Role::User);
-        assert_eq!(history[1].text, "本轮问题");
-        assert_eq!(history[1].ts, 20);
-        assert_eq!(history[2].role, Role::Assistant);
-        assert_eq!(history[2].text, "本轮回答");
-        assert_eq!(history[2].ts, 21);
-        assert!(history.iter().all(|message| !message.reverted));
     }
 
     #[test]
@@ -2148,23 +2891,188 @@ mod tests {
     }
 
     #[test]
+    fn session_turn_lease_rejects_concurrent_send_before_ledger_commit() {
+        let busy = AtomicBool::new(false);
+        reserve_turn_flag(&busy).unwrap();
+        assert!(reserve_turn_flag(&busy).is_err());
+        busy.store(false, Ordering::Release);
+        reserve_turn_flag(&busy).unwrap();
+    }
+
+    #[test]
+    fn runtime_permission_profiles_map_to_the_declared_engine_contracts() {
+        assert_eq!(
+            claude_permission_mode(TurnMode::Build, PermissionProfile::Standard),
+            "manual"
+        );
+        assert_eq!(
+            claude_permission_mode(TurnMode::Build, PermissionProfile::Auto),
+            "auto"
+        );
+        assert_eq!(
+            claude_permission_mode(TurnMode::Build, PermissionProfile::FullAccess),
+            "bypassPermissions"
+        );
+        assert_eq!(
+            claude_permission_mode(TurnMode::Plan, PermissionProfile::FullAccess),
+            "plan"
+        );
+        assert_eq!(
+            claude_permission_mode_for_capability(
+                TurnMode::Build,
+                PermissionProfile::Auto,
+                crate::capability_registry::CapabilitySupport::Degraded,
+            ),
+            "acceptEdits"
+        );
+        assert_eq!(
+            claude_permission_mode_for_capability(
+                TurnMode::Build,
+                PermissionProfile::Auto,
+                crate::capability_registry::CapabilitySupport::Unknown,
+            ),
+            "auto"
+        );
+
+        assert_eq!(
+            codex_runtime_profile_policy(TurnMode::Build, PermissionProfile::Standard),
+            ("workspace-write", false, CodexApprovalPolicy::Untrusted)
+        );
+        assert_eq!(
+            codex_runtime_profile_policy(TurnMode::Build, PermissionProfile::Auto),
+            ("workspace-write", true, CodexApprovalPolicy::OnRequest)
+        );
+        assert_eq!(
+            codex_runtime_profile_policy(TurnMode::Build, PermissionProfile::FullAccess),
+            ("danger-full-access", true, CodexApprovalPolicy::Never)
+        );
+        assert_eq!(
+            codex_runtime_profile_policy(TurnMode::Ask, PermissionProfile::FullAccess),
+            ("read-only", false, CodexApprovalPolicy::Untrusted)
+        );
+    }
+
+    #[test]
+    fn auto_fallback_retries_once_only_before_any_tool_execution() {
+        use crate::protocol::ToolOutcomeKind;
+
+        assert_eq!(
+            auto_fallback_decision(
+                PermissionProfile::Auto,
+                Some(ToolOutcomeKind::AutoReviewUnavailable),
+                false,
+                false,
+            ),
+            AutoFallbackDecision::RetryCompatible
+        );
+        assert_eq!(
+            auto_fallback_decision(
+                PermissionProfile::Auto,
+                Some(ToolOutcomeKind::AutoReviewParseError),
+                true,
+                false,
+            ),
+            AutoFallbackDecision::Fuse
+        );
+        assert_eq!(
+            auto_fallback_decision(
+                PermissionProfile::Auto,
+                Some(ToolOutcomeKind::AutoReviewUnavailable),
+                false,
+                true,
+            ),
+            AutoFallbackDecision::Fuse
+        );
+        assert_eq!(
+            auto_fallback_decision(
+                PermissionProfile::Auto,
+                Some(ToolOutcomeKind::AutoReviewBlocked),
+                false,
+                false,
+            ),
+            AutoFallbackDecision::None
+        );
+    }
+
+    #[test]
+    fn full_access_lease_is_bound_to_session_engine_cwd_and_app_instance() {
+        let lease = full_access_lease("session-1", "codex", "D:/repo");
+        assert!(lease_is_valid(&lease, "session-1", "codex", "d:/repo"));
+        assert!(!lease_is_valid(&lease, "session-2", "codex", "D:/repo"));
+        assert!(!lease_is_valid(
+            &lease,
+            "session-1",
+            "claude-code",
+            "D:/repo"
+        ));
+        assert!(!lease_is_valid(&lease, "session-1", "codex", "D:/other"));
+    }
+
+    #[tokio::test]
+    async fn terminal_turn_ledger_survives_waiter_reads_for_notification_deduplication() {
+        let terminals = Mutex::new(HashMap::from([("turn-1".to_string(), Ok(()))]));
+        assert_eq!(
+            terminal_turn_outcome(&terminals, "turn-1").await,
+            Some(Ok(()))
+        );
+        assert_eq!(
+            terminal_turn_outcome(&terminals, "turn-1").await,
+            Some(Ok(()))
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_interrupt_notifies_waiter_after_terminal_event() {
+        let terminals = Arc::new(Mutex::new(HashMap::new()));
+        let notify = Arc::new(Notify::new());
+        let terminal_event_emitted = Arc::new(AtomicBool::new(false));
+        let waiter = tokio::spawn({
+            let terminals = terminals.clone();
+            let notify = notify.clone();
+            let terminal_event_emitted = terminal_event_emitted.clone();
+            async move {
+                loop {
+                    let notified = notify.notified();
+                    if terminal_turn_outcome(&terminals, "turn-1").await.is_some() {
+                        assert!(terminal_event_emitted.load(Ordering::Acquire));
+                        return;
+                    }
+                    notified.await;
+                }
+            }
+        });
+
+        tokio::task::yield_now().await;
+        finish_codex_interrupt_terminal(&terminals, &notify, Some("turn-1".to_string()), || {
+            terminal_event_emitted.store(true, Ordering::Release);
+        })
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("Codex Stop 必须唤醒当前 Turn 等待器")
+            .expect("Codex Turn 等待任务不应崩溃");
+    }
+
+    #[test]
     fn codex_sandbox_for_mode_forces_read_only_on_plan_and_ask() {
         // 计划/询问强制只读（取更严值）；构建沿用设置映射，包括显式 full
         assert_eq!(
-            codex_sandbox_for_mode("workspace-write", TurnMode::Plan),
+            codex_sandbox_for_mode("workspace-write", TurnMode::Plan).unwrap(),
             "read-only"
         );
         assert_eq!(
-            codex_sandbox_for_mode("danger-full-access", TurnMode::Ask),
+            codex_sandbox_for_mode("danger-full-access", TurnMode::Ask).unwrap(),
             "read-only"
         );
         assert_eq!(
-            codex_sandbox_for_mode("workspace-write", TurnMode::Build),
+            codex_sandbox_for_mode("workspace-write", TurnMode::Build).unwrap(),
             "workspace-write"
         );
-        assert_eq!(
-            codex_sandbox_for_mode("danger-full-access", TurnMode::Build),
-            "danger-full-access"
+        assert!(
+            codex_sandbox_for_mode("danger-full-access", TurnMode::Build)
+                .unwrap_err()
+                .contains("unsupported")
         );
     }
 
@@ -2279,13 +3187,32 @@ mod tests {
     #[test]
     fn checkpoint_target_resolves_write_paths_and_ignores_read_tools() {
         let cwd = std::env::temp_dir().join("helm-checkpoint-cwd");
+        let _ = fs::remove_dir_all(&cwd);
+        fs::create_dir_all(cwd.join("src")).unwrap();
         let input = json!({ "file_path": "src/main.rs" });
 
         assert_eq!(
             checkpoint_target_path("Write", &input, &cwd),
-            Some(cwd.join("src/main.rs"))
+            Some(cwd.canonicalize().unwrap().join("src/main.rs"))
         );
         assert_eq!(checkpoint_target_path("Read", &input, &cwd), None);
+        assert_eq!(
+            checkpoint_target_path("Bash", &json!({ "command": "which wm 2>/dev/null" }), &cwd),
+            None
+        );
+        assert_eq!(
+            checkpoint_target_path("Bash", &json!({ "command": "echo x > file" }), &cwd),
+            None
+        );
+        assert_eq!(
+            checkpoint_target_path("Write", &json!({ "file_path": "../outside.txt" }), &cwd),
+            None
+        );
+        assert_eq!(
+            checkpoint_target_path("Write", &json!({ "file_path": "NUL" }), &cwd),
+            None
+        );
+        let _ = fs::remove_dir_all(&cwd);
     }
 
     #[test]
@@ -2318,6 +3245,7 @@ mod tests {
             "tool-1",
             "Edit",
             &json!({ "file_path": "src/main.rs" }),
+            "turn-1",
         )
         .unwrap()
         .expect("Edit should create checkpoint");
@@ -2329,6 +3257,9 @@ mod tests {
 
         let checkpoint = history_store.get_checkpoint(&id).unwrap().unwrap();
         assert_eq!(checkpoint.snapshot_ref, id);
+        assert_eq!(checkpoint.turn_id.as_deref(), Some("turn-1"));
+        assert!(checkpoint.restorable);
+        assert_eq!(checkpoint.file_count, 1);
 
         fs::write(&file_path, "new content").unwrap();
         let snapshot_store = crate::snapshots::SnapshotStore::new(root.join("snapshots"));
@@ -2353,74 +3284,97 @@ mod tests {
     }
 
     #[test]
-    fn parses_codex_failed_jsonl_error_from_stdout() {
-        let stdout = r#"{"type":"thread.started","thread_id":"019eaa24-be0b-7e11-9ecc-d9b3dacc4805"}
-{"type":"turn.started"}
-{"type":"error","message":"Reconnecting... 1/5"}
-{"type":"turn.failed","error":{"message":"unexpected status 503 Service Unavailable"}}
-"#;
-
-        let summary = codex_output_summary(stdout);
-
-        assert_eq!(summary.final_text, None);
+    fn claude_session_context_uses_native_add_dir_arguments() {
+        let mut command = tokio::process::Command::new("claude");
+        super::apply_claude_session_context_args(
+            &mut command,
+            "D:/repo",
+            &[
+                crate::turn_start::FrozenSessionContext {
+                    id: "file".into(),
+                    kind: "file".into(),
+                    canonical_path: "D:/repo/docs/guide.md".into(),
+                    canonical_path_digest: "sha256:file".into(),
+                    identity_digest: "sha256:file-id".into(),
+                },
+                crate::turn_start::FrozenSessionContext {
+                    id: "directory".into(),
+                    kind: "directory".into(),
+                    canonical_path: "D:/repo/examples".into(),
+                    canonical_path_digest: "sha256:directory".into(),
+                    identity_digest: "sha256:directory-id".into(),
+                },
+            ],
+        );
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
         assert_eq!(
-            summary.error_message,
-            Some("unexpected status 503 Service Unavailable".to_string())
+            args,
+            vec!["--add-dir", "D:/repo/docs", "--add-dir", "D:/repo/examples"]
         );
     }
 
     #[test]
-    fn parses_codex_final_answer_from_message_event() {
-        let stdout = r#"{"type":"thread.started","thread_id":"t1"}
-{"type":"item.completed","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"HELM_CODEX_REAL_CLI_OK"}]}}
-{"type":"turn.completed"}
-"#;
-
-        let summary = codex_output_summary(stdout);
-
-        assert_eq!(
-            summary.final_text,
-            Some("HELM_CODEX_REAL_CLI_OK".to_string())
-        );
-        assert_eq!(summary.error_message, None);
+    fn claude_model_only_command_disables_every_extension_surface() {
+        let cwd = std::env::temp_dir();
+        let command = super::build_claude_model_only_command(
+            "claude",
+            "claude-fixture",
+            &[],
+            &cwd,
+            "只生成标题",
+            crate::reasoning::ReasoningEffort::Auto,
+        )
+        .unwrap();
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        for pair in [
+            ["--tools", ""],
+            ["--mcp-config", "{}"],
+            ["--permission-mode", "plan"],
+            ["--setting-sources", ""],
+        ] {
+            assert!(args.windows(2).any(|args| args == pair));
+        }
+        for flag in [
+            "--print",
+            "--disable-slash-commands",
+            "--strict-mcp-config",
+            "--no-session-persistence",
+            "--safe-mode",
+        ] {
+            assert!(args.iter().any(|arg| arg == flag), "缺少 {flag}");
+        }
     }
 
     #[test]
-    fn parses_codex_final_answer_from_agent_message_event() {
-        let stdout = r#"{"type":"thread.started","thread_id":"t1"}
-{"type":"turn.started"}
-{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"OK"}}
-{"type":"turn.completed"}
-"#;
+    fn claude_model_only_parser_records_usage_and_rejects_runtime_events() {
+        let output = super::parse_claude_model_only_output(
+            r#"{"result":"标题\n摘要","model":"claude-fixture","total_cost_usd":0.02,"permission_denials":[],"usage":{"input_tokens":11,"cache_read_input_tokens":3,"cache_creation_input_tokens":2,"output_tokens":5,"service_tier":"standard"}}"#.as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(output.text, "标题\n摘要");
+        assert_eq!(output.input_tokens, 11);
+        assert_eq!(output.cached_input_tokens, 3);
+        assert_eq!(output.cache_write_input_tokens, 2);
+        assert_eq!(output.output_tokens, 5);
+        assert_eq!(output.reported_cost_usd, Some(0.02));
+        assert_eq!(output.observed_model_id.as_deref(), Some("claude-fixture"));
 
-        let summary = codex_output_summary(stdout);
-
-        assert_eq!(summary.final_text, Some("OK".to_string()));
-        assert_eq!(summary.error_message, None);
-    }
-
-    #[test]
-    fn parses_codex_usage_from_turn_completed_event() {
-        let stdout = r#"{"type":"thread.started","thread_id":"t1"}
-{"type":"turn.completed","usage":{"input_tokens":123,"output_tokens":45},"total_cost_usd":0.0123}
-"#;
-
-        let summary = codex_output_summary(stdout);
-
-        assert_eq!(summary.input_tokens, 123);
-        assert_eq!(summary.output_tokens, 45);
-        assert_eq!(summary.cost_usd, 0.0123);
-    }
-
-    #[test]
-    fn parses_codex_usage_from_camelcase_event() {
-        let stdout = r#"{"type":"turn.completed","tokenUsage":{"inputTokens":7,"outputTokens":8,"costUsd":0.0009}}"#;
-
-        let summary = codex_output_summary(stdout);
-
-        assert_eq!(summary.input_tokens, 7);
-        assert_eq!(summary.output_tokens, 8);
-        assert_eq!(summary.cost_usd, 0.0009);
+        for forbidden in [
+            r#"{"result":"不应接受","permission_denials":[{"tool_name":"Bash"}]}"#.as_bytes(),
+            r#"{"result":"不应接受","messages":[{"type":"tool_use","name":"Read"}]}"#.as_bytes(),
+            r#"{"result":"不应接受","approval_request":{"id":"approval-1"}}"#.as_bytes(),
+        ] {
+            let error = super::parse_claude_model_only_output(forbidden).unwrap_err();
+            assert!(error.starts_with("[operation_tool_not_allowed]"));
+        }
     }
 
     #[test]
@@ -2490,6 +3444,14 @@ mod tests {
                 "model_providers.helm.wire_api=chat".to_string(),
                 "model_providers.helm.requires_openai_auth=true".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn codex_subscription_overrides_stale_global_custom_provider_routing() {
+        assert_eq!(
+            codex_provider_config_args(&[]),
+            vec!["model_provider=openai".to_string()]
         );
     }
 
@@ -2649,14 +3611,89 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&out_dir);
     }
+
+    #[test]
+    fn claude_runtime_managed_api_binding_does_not_load_external_setting_sources() {
+        let mut api_command = super::build_command("claude");
+        super::apply_claude_setting_source_policy(&mut api_command, false);
+        let api_args = api_command
+            .as_std()
+            .get_args()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(api_args.ends_with(&["--setting-sources".to_string(), "".to_string()]));
+
+        let mut subscription_command = super::build_command("claude");
+        super::apply_claude_setting_source_policy(&mut subscription_command, true);
+        assert_eq!(subscription_command.as_std().get_args().count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn claude_command_launches_the_resolved_native_binary_without_cmd_wrapper() {
+        let root = std::env::temp_dir().join(format!(
+            "helm-claude-native-command-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let native = root
+            .join("node_modules")
+            .join("@anthropic-ai")
+            .join("claude-code")
+            .join("bin")
+            .join("claude.exe");
+        std::fs::create_dir_all(native.parent().unwrap()).unwrap();
+        std::fs::write(&native, b"native").unwrap();
+        let wrapper = root.join("claude.cmd");
+        std::fs::write(&wrapper, "@echo off\r\n").unwrap();
+
+        let command = super::build_command(wrapper.to_str().unwrap());
+        assert_eq!(
+            std::path::PathBuf::from(command.as_std().get_program()),
+            native.canonicalize().unwrap()
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn codex_command_launches_the_resolved_native_binary_without_cmd_wrapper() {
+        let root = std::env::temp_dir().join(format!(
+            "helm-codex-native-command-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let native = root
+            .join("node_modules/@openai/codex/node_modules/@openai/codex-win32-x64")
+            .join("vendor/x86_64-pc-windows-msvc/bin/codex.exe");
+        std::fs::create_dir_all(native.parent().unwrap()).unwrap();
+        std::fs::write(&native, b"native").unwrap();
+        let wrapper = root.join("codex.cmd");
+        std::fs::write(&wrapper, "@echo off\r\n").unwrap();
+
+        let command = super::build_codex_command(wrapper.to_str().unwrap());
+        assert_eq!(
+            std::path::PathBuf::from(command.as_std().get_program()),
+            native.canonicalize().unwrap()
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 /// 从错误文案（含透传的 CLI stderr）推断错误分类，供前端渲染修复动作。
 /// 顺序敏感：具体原因（未安装/未登录/目录无效）要排在笼统的"进程异常退出"之前。
 pub(crate) fn classify_error(message: &str) -> Option<String> {
     let lower = message.to_lowercase();
-    let kind = if lower.contains("未设置工作目录") || lower.contains("工作目录不存在")
+    let kind = if lower.contains("there's an issue with the selected model")
+        || (lower.contains("model") && lower.contains("may not exist or you may not have access"))
+        || lower.contains("模型不存在")
+        || lower.contains("模型不可用")
+        || lower.contains("模型授权")
     {
+        "model_unavailable"
+    } else if lower.contains("未设置工作目录") || lower.contains("工作目录不存在") {
         "cwd_invalid"
     } else if lower.contains("还没有配置生效绑定") {
         "no_binding"
@@ -2674,9 +3711,11 @@ pub(crate) fn classify_error(message: &str) -> Option<String> {
         || lower.contains("authentication")
         || lower.contains("please run /login")
         || lower.contains("钥匙串中没有找到")
+        || lower.contains("服务商认证失败")
     {
         "auth_missing"
-    } else if lower.contains("unknown option")
+    } else if lower.contains("[codex_probe_tool_surface_")
+        || lower.contains("unknown option")
         || lower.contains("unrecognized option")
         || lower.contains("unexpected argument")
         || lower.contains("版本不兼容")
@@ -2689,6 +3728,7 @@ pub(crate) fn classify_error(message: &str) -> Option<String> {
         || lower.contains("fetch failed")
         || lower.contains("network")
         || lower.contains("connection refused")
+        || lower.contains("连接服务商失败")
     {
         "network"
     } else if lower.contains("进程异常退出") {
@@ -2738,6 +3778,12 @@ async fn emit_denied_turn(runtime: &SessionRuntime, request_id: String) {
                 status: ToolStatus::Error,
                 output: Some("用户已拒绝，操作已终止。".to_string()),
                 diff: None,
+                outcome: Some(crate::protocol::ToolOutcomeKind::RuntimeDenied),
+                started: Some(false),
+                has_output: Some(true),
+                retryable: Some(false),
+                denial_source: Some(crate::protocol::ToolDenialSource::Runtime),
+                native_denial_code: Some("user_denied".to_string()),
             },
         );
         emit_agent_event(
@@ -2751,49 +3797,101 @@ async fn emit_denied_turn(runtime: &SessionRuntime, request_id: String) {
     }
 }
 
-/// 「始终允许」的匹配键（变更-07）：Bash 细化到命令首词（`Bash:npm`），
-/// 批准一次某命令不再放行所有 Bash（含 `rm -rf`）；其余工具仍按工具名。
-/// 必须与 hook 脚本里的 allowKey 构造保持一致。
-fn always_allow_key(tool_name: &str, input: &serde_json::Value) -> String {
-    if tool_name == "Bash" {
-        if let Some(cmd) = input.get("command").and_then(|c| c.as_str()) {
-            if let Some(first) = cmd.trim().split_whitespace().next() {
-                return format!("Bash:{first}");
-            }
-        }
+#[derive(Debug, PartialEq, Eq)]
+enum ClaudeExitDisposition {
+    Return,
+    ProcessError,
+    EmitCandidate,
+    ApprovalDeferred,
+    MissingResult,
+}
+
+fn should_process_claude_event(
+    session_started: bool,
+    current_approved_tool_result: bool,
+    event: &AgentEvent,
+) -> bool {
+    session_started
+        || (current_approved_tool_result && matches!(event, AgentEvent::ToolResult { .. }))
+        || matches!(
+            event,
+            AgentEvent::SessionStarted { .. } | AgentEvent::Error { .. }
+        )
+}
+
+fn claude_exit_disposition(
+    interrupted: bool,
+    auto_fallback_requested: bool,
+    parser_error_terminal: bool,
+    exit_succeeded: bool,
+    has_terminal_candidate: bool,
+    saw_approval: bool,
+) -> ClaudeExitDisposition {
+    if interrupted || auto_fallback_requested || parser_error_terminal {
+        ClaudeExitDisposition::Return
+    } else if !exit_succeeded && has_terminal_candidate {
+        // CLI 以非零码退出但已产出 result（如 API 403 错误）：优先 emit 候选事件，
+        // 让用户看到真实 API 错误，而非泛化 "进程异常退出"。
+        ClaudeExitDisposition::EmitCandidate
+    } else if !exit_succeeded {
+        ClaudeExitDisposition::ProcessError
+    } else if saw_approval {
+        ClaudeExitDisposition::ApprovalDeferred
+    } else if has_terminal_candidate {
+        ClaudeExitDisposition::EmitCandidate
+    } else {
+        ClaudeExitDisposition::MissingResult
     }
-    tool_name.to_string()
+}
+
+fn build_approval_action(
+    history_session_id: &str,
+    turn_id: &str,
+    tool_call_id: &str,
+    tool: &PendingToolInfo,
+    cwd: &str,
+) -> crate::permissions::ActionDescriptor {
+    crate::permissions::normalize_tool_action(
+        "claude-code",
+        history_session_id,
+        turn_id,
+        tool_call_id,
+        &tool.name,
+        &tool.input,
+        Some(cwd),
+    )
 }
 
 async fn record_approval(
     runtime: &SessionRuntime,
     request_id: &str,
     decision: ApprovalDecision,
-) -> Result<(), String> {
-    let mut state = read_approval_state(&runtime.state_path);
+) -> Result<PreparedApproval, String> {
+    record_approval_state(
+        &runtime.state_path,
+        &runtime.pending_tools,
+        request_id,
+        decision,
+    )
+    .await
+}
+
+async fn record_approval_state(
+    state_path: &Path,
+    pending_tools: &Mutex<HashMap<String, PendingToolInfo>>,
+    request_id: &str,
+    decision: ApprovalDecision,
+) -> Result<PreparedApproval, String> {
+    let pending_info = pending_tools.lock().await.get(request_id).cloned();
+    if !matches!(decision, ApprovalDecision::Deny) && pending_info.is_none() {
+        return Err(format!("找不到待审批工具信息：{request_id}"));
+    }
+
+    let mut state = read_approval_state(state_path);
     let hook_decision = decision.hook_decision().to_string();
     state
         .decisions
         .insert(request_id.to_string(), hook_decision);
-
-    // 获取待审批工具的信息
-    let pending_info = runtime.pending_tools.lock().await.get(request_id).cloned();
-
-    if matches!(decision, ApprovalDecision::Always) {
-        if let Some(info) = &pending_info {
-            let allow_key = always_allow_key(&info.name, &info.input);
-            if !state.always_allow.iter().any(|item| item == &allow_key) {
-                state.always_allow.push(allow_key.clone());
-            }
-            // 跨会话持久化（P2-4）：写入 SQLite，下个会话启动时播种回 hook state。
-            // 持久化失败不阻断本次审批（会话内仍然生效），只留诊断日志。
-            if let Some(store) = runtime.app.try_state::<SessionHistoryStore>() {
-                if let Err(err) = store.add_always_allow_tool(&allow_key) {
-                    eprintln!("[approval] 持久化「始终允许」失败（{allow_key}）：{err}");
-                }
-            }
-        }
-    }
 
     // 拒绝时记录被拒绝的目标，防止换工具重试
     if matches!(decision, ApprovalDecision::Deny) {
@@ -2806,14 +3904,142 @@ async fn record_approval(
         }
     }
 
-    write_approval_state(&runtime.state_path, &state)
+    write_approval_state(state_path, &state)?;
+    Ok(PreparedApproval {
+        pending_tool: pending_info,
+    })
 }
 
-fn try_begin_turn(runtime: &SessionRuntime) -> bool {
-    runtime
-        .busy
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
+fn rollback_prepared_approval_state(state_path: &Path, request_id: &str) -> Result<(), String> {
+    let mut state = read_approval_state(state_path);
+    state.decisions.remove(request_id);
+    write_approval_state(state_path, &state)
+}
+
+async fn commit_approval_grants(
+    runtime: &SessionRuntime,
+    request_id: &str,
+    decision: ApprovalDecision,
+    prepared: &PreparedApproval,
+) -> Result<CommittedApprovalGrants, String> {
+    let history_store = runtime
+        .app
+        .try_state::<SessionHistoryStore>()
+        .ok_or_else(|| "会话历史存储不可用，无法提交审批授权".to_string())?;
+    let mut grants = CommittedApprovalGrants::default();
+    if !matches!(decision, ApprovalDecision::Deny) {
+        let tool = prepared
+            .pending_tool
+            .as_ref()
+            .ok_or_else(|| format!("找不到待审批工具信息：{request_id}"))?;
+        let turn_id = runtime.current_turn_id.lock().await.clone();
+        let action = build_approval_action(
+            &runtime.history_session_id,
+            &turn_id,
+            request_id,
+            tool,
+            &runtime.cwd,
+        );
+        let created_at = now_millis();
+        let rule = match decision {
+            ApprovalDecision::Allow => {
+                crate::permissions::build_once_rule_from_action(&action, created_at)
+            }
+            ApprovalDecision::Turn => {
+                crate::permissions::build_turn_rule_from_action(&action, created_at)
+            }
+            ApprovalDecision::Session => {
+                crate::permissions::build_session_rule_from_action(&action, created_at)
+            }
+            ApprovalDecision::Project => {
+                crate::permissions::build_project_rule_from_action(&action, created_at)?
+            }
+            ApprovalDecision::Always => {
+                crate::permissions::build_always_rule_from_action(&action, created_at)
+            }
+            ApprovalDecision::Deny => unreachable!(),
+        };
+        let existed = history_store
+            .list_permission_rules()?
+            .iter()
+            .any(|existing| existing.id == rule.id);
+        if matches!(decision, ApprovalDecision::Allow) {
+            history_store.save_consumed_permission_rule(&rule)?;
+        } else {
+            history_store.save_permission_rule(&rule)?;
+        }
+        if matches!(
+            decision,
+            ApprovalDecision::Project | ApprovalDecision::Always
+        ) {
+            if let Err(error) = history_store.save_runtime_grant_for_action(&rule, &action) {
+                if !existed {
+                    let _ = history_store.remove_permission_rule(&rule.id);
+                }
+                return Err(format!("无法保存 Runtime 永久授权：{error}"));
+            }
+        }
+        if !existed {
+            grants.rule_ids.push(rule.id);
+        }
+    }
+    Ok(grants)
+}
+
+fn rollback_approval_grants(
+    runtime: &SessionRuntime,
+    grants: CommittedApprovalGrants,
+) -> Result<(), String> {
+    let history_store = runtime
+        .app
+        .try_state::<SessionHistoryStore>()
+        .ok_or_else(|| "会话历史存储不可用，无法回滚审批授权".to_string())?;
+    let mut errors = Vec::new();
+    for rule_id in grants.rule_ids {
+        if let Err(error) = history_store.remove_permission_rule(&rule_id) {
+            errors.push(error);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("；"))
+    }
+}
+
+async fn wait_until_idle_and_begin(
+    busy: &AtomicBool,
+    idle_notify: &Notify,
+    interrupted: &AtomicBool,
+) -> Result<(), String> {
+    loop {
+        let notified = idle_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if interrupted.load(Ordering::Acquire) {
+            return Err("审批等待期间会话已中断，未启动恢复轮".to_string());
+        }
+        if busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            if interrupted.load(Ordering::Acquire) {
+                busy.store(false, Ordering::Release);
+                idle_notify.notify_waiters();
+                return Err("审批等待期间会话已中断，未启动恢复轮".to_string());
+            }
+            return Ok(());
+        }
+        notified.as_mut().await;
+    }
+}
+
+async fn run_serialized_approval<T, F>(lock: &Mutex<()>, operation: F) -> T
+where
+    F: Future<Output = T>,
+{
+    let _guard = lock.lock().await;
+    operation.await
 }
 
 struct TurnBusyGuard {
@@ -2823,6 +4049,7 @@ struct TurnBusyGuard {
 impl Drop for TurnBusyGuard {
     fn drop(&mut self) {
         self.runtime.busy.store(false, Ordering::Release);
+        self.runtime.idle_notify.notify_waiters();
     }
 }
 
@@ -2831,6 +4058,7 @@ async fn run_claude_turn(
     prompt: Option<String>,
     attachments: Vec<String>,
     resume: bool,
+    mut start_ack: Option<oneshot::Sender<Result<(), String>>>,
 ) {
     let _busy_guard = TurnBusyGuard {
         runtime: runtime.clone(),
@@ -2843,41 +4071,74 @@ async fn run_claude_turn(
     {
         let running = runtime.running_pid.lock().await;
         if running.is_some() {
-            emit_error(
-                &runtime,
-                "已有轮次正在运行，请先等待或停止当前任务".to_string(),
-                true,
-            )
-            .await;
+            let error = "已有轮次正在运行，请先等待或停止当前任务".to_string();
+            if let Some(ack) = start_ack.take() {
+                let _ = ack.send(Err(error.clone()));
+            }
+            emit_error(&runtime, error, true).await;
             return;
         }
     }
 
     let resume_id = runtime.session_id.lock().await.clone();
     if resume && resume_id.is_none() {
-        emit_error(
-            &runtime,
-            "无法继续审批：Claude sessionId 尚未建立".to_string(),
-            false,
-        )
-        .await;
+        let error = "无法继续审批：Claude sessionId 尚未建立".to_string();
+        if let Some(ack) = start_ack.take() {
+            let _ = ack.send(Err(error.clone()));
+        }
+        emit_error(&runtime, error, false).await;
         return;
     }
 
-    runtime.interrupted.store(false, Ordering::Release);
-
     // 工作目录守卫：绝不静默继承 Helm 进程自身目录（Agent 会在错误的地方读写文件）。
     if let Err(message) = validate_cwd(&runtime.cwd) {
+        if let Some(ack) = start_ack.take() {
+            let _ = ack.send(Err(message.clone()));
+        }
         emit_error(&runtime, message, false).await;
         return;
     }
     if let Err(message) = validate_engine_bin(&runtime.bin) {
+        if let Some(ack) = start_ack.take() {
+            let _ = ack.send(Err(message.clone()));
+        }
         emit_error(&runtime, message, false).await;
         return;
     }
 
     // 本轮会话模式（变更-04）：Send 时已写入 runtime；审批恢复轮沿用发起轮的值
     let mode = *runtime.turn_mode.lock().await;
+    let reasoning_effort = *runtime.reasoning_effort.lock().await;
+    let configured_profile = *runtime.permission_profile.lock().await;
+    let auto_support = runtime
+        .capability_snapshot
+        .lock()
+        .await
+        .capabilities
+        .auto_approval
+        .support;
+    let current_turn_id = runtime.current_turn_id.lock().await.clone();
+
+    let _workspace_lease = if mode == TurnMode::Build {
+        let coordinator = runtime
+            .app
+            .try_state::<crate::workspace_execution::WorkspaceExecutionCoordinator>();
+        let result = coordinator
+            .ok_or_else(|| "工作目录执行协调器未启动".to_string())
+            .and_then(|coordinator| coordinator.acquire(&runtime.history_session_id, &runtime.cwd));
+        match result {
+            Ok(lease) => Some(lease),
+            Err(message) => {
+                if let Some(ack) = start_ack.take() {
+                    let _ = ack.send(Err(message.clone()));
+                }
+                emit_error(&runtime, message, false).await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
 
     // 新轮次开始时清空被拒绝目标列表（允许重新尝试），并把本轮模式同步给 hook
     if !resume {
@@ -2889,18 +4150,24 @@ async fn run_claude_turn(
 
     let mut cmd = build_command(&runtime.bin);
     apply_inherited_agent_environment(&mut cmd);
-    cmd.arg("-p")
-        .args([
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--include-partial-messages",
-            "--include-hook-events",
-        ])
-        .arg("--settings")
-        .arg(&runtime.settings_path);
+    apply_claude_setting_source_policy(&mut cmd, runtime.use_user_setting_source);
+    cmd.arg("-p").args([
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+        "--include-hook-events",
+    ]);
+    let session_context = runtime.current_session_context.lock().await.clone();
+    apply_claude_session_context_args(&mut cmd, &runtime.cwd, &session_context);
+    if mode != TurnMode::Build
+        || configured_profile == PermissionProfile::Standard
+        || (configured_profile == PermissionProfile::Auto
+            && auto_support == crate::capability_registry::CapabilitySupport::Degraded)
+    {
+        cmd.arg("--settings").arg(&runtime.settings_path);
+    }
 
-    // 会话级 MCP 开关（变更-11）：停用名单非空时，以过滤后的配置完全接管本轮 MCP 集合
     let disabled_mcp = runtime
         .disabled_mcp
         .lock()
@@ -2919,27 +4186,61 @@ async fn run_claude_turn(
                     .arg(config_path);
             }
             Err(err) => {
-                emit_error(&runtime, format!("应用会话级 MCP 开关失败：{err}"), true).await;
+                let message = format!("Claude MCP 配置失败，已阻止本轮启动：{err}");
+                if let Some(ack) = start_ack.take() {
+                    let _ = ack.send(Err(message.clone()));
+                }
+                emit_error(&runtime, message, false).await;
+                return;
             }
         }
     }
 
-    if let Some(model) = (!runtime.model.is_empty()).then_some(runtime.model.as_str()) {
-        cmd.args(["--model", model]);
+    let model = runtime.model.lock().await.clone();
+    if !model.is_empty() {
+        cmd.args(["--model", &model]);
     }
-    // 模式 → CLI 参数（变更-04，C.1 实测契约）：
+    // Claude 的环境变量优先级高于 CLI flag，因此 Helm 同时覆盖继承环境；auto 通过
+    // 环境变量明确恢复模型默认，非 auto 再带 --effort 形成可审计的 CLI 契约。
+    cmd.args(crate::reasoning::claude_cli_effort_args(reasoning_effort));
+    let system_prompt = if mode == TurnMode::Ask {
+        ASK_MODE_APPEND_PROMPT.to_string()
+    } else {
+        String::new()
+    };
+    if !system_prompt.is_empty() {
+        cmd.args(["--append-system-prompt", &system_prompt]);
+    }
+    // 模式 + Session 权限档位 → CLI 参数（普通 RuntimeManaged 由 Runtime 托管）：
     // 计划 = 原生 plan 权限模式（CLI 自带只读约束 + 计划指令）；
     // 询问 = 软约束走 --append-system-prompt，硬约束在审批 hook 的 turnMode 判定；
     // 构建 = 不加参数（现状默认行为）。
-    match mode {
-        TurnMode::Plan => {
-            cmd.args(["--permission-mode", "plan"]);
+    let profile = *runtime.permission_profile.lock().await;
+    let profile = if profile == PermissionProfile::FullAccess {
+        let valid = runtime
+            .full_access_lease
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|lease| {
+                lease_is_valid(
+                    lease,
+                    &runtime.history_session_id,
+                    "claude-code",
+                    &runtime.cwd,
+                )
+            });
+        if valid {
+            profile
+        } else {
+            *runtime.permission_profile.lock().await = PermissionProfile::Standard;
+            PermissionProfile::Standard
         }
-        TurnMode::Ask => {
-            cmd.args(["--append-system-prompt", ASK_MODE_APPEND_PROMPT]);
-        }
-        TurnMode::Build => {}
-    }
+    } else {
+        profile
+    };
+    let permission_mode = claude_permission_mode_for_capability(mode, profile, auto_support);
+    cmd.args(["--permission-mode", permission_mode]);
     if let Some(sid) = resume_id {
         cmd.args(["--resume", &sid]);
     }
@@ -2953,6 +4254,12 @@ async fn run_claude_turn(
     for (key, value) in &runtime.env {
         cmd.env(key, value);
     }
+    cmd.env("CLAUDE_CODE_EFFORT_LEVEL", reasoning_effort.as_str());
+    cmd.env("HELM_PERMISSION_ENDPOINT", &runtime.permission_endpoint)
+        .env("HELM_PERMISSION_TOKEN", &runtime.permission_token)
+        .env("HELM_HISTORY_SESSION_ID", &runtime.history_session_id)
+        .env("HELM_TURN_ID", current_turn_id)
+        .env("HELM_SESSION_CWD", &runtime.cwd);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2961,7 +4268,11 @@ async fn run_claude_turn(
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            emit_error(&runtime, format!("无法启动 claude 进程：{e}"), false).await;
+            let error = format!("无法启动 claude 进程：{e}");
+            if let Some(ack) = start_ack.take() {
+                let _ = ack.send(Err(error.clone()));
+            }
+            emit_error(&runtime, error, false).await;
             return;
         }
     };
@@ -2970,30 +4281,68 @@ async fn run_claude_turn(
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
+            let error = "无法获取 claude stdout".to_string();
+            kill_tree(child.id()).await;
+            let _ = child.wait().await;
             set_running_pid(&runtime.running_pid, None).await;
-            emit_error(&runtime, "无法获取 claude stdout".to_string(), false).await;
+            if let Some(ack) = start_ack.take() {
+                let _ = ack.send(Err(error.clone()));
+            }
+            emit_error(&runtime, error, false).await;
             return;
         }
     };
     let stderr = match child.stderr.take() {
         Some(stderr) => stderr,
         None => {
+            let error = "无法获取 claude stderr".to_string();
+            kill_tree(child.id()).await;
+            let _ = child.wait().await;
             set_running_pid(&runtime.running_pid, None).await;
-            emit_error(&runtime, "无法获取 claude stderr".to_string(), false).await;
+            if let Some(ack) = start_ack.take() {
+                let _ = ack.send(Err(error.clone()));
+            }
+            emit_error(&runtime, error, false).await;
             return;
         }
     };
 
-    // 终态与活动追踪：saw_turn_complete 用于兜底"退出码 0 但无 result"；
+    if runtime.interrupted.load(Ordering::Acquire) {
+        let error = "审批等待期间会话已中断，未启动恢复轮".to_string();
+        kill_tree(child.id()).await;
+        let _ = child.wait().await;
+        set_running_pid(&runtime.running_pid, None).await;
+        if let Some(ack) = start_ack.take() {
+            let _ = ack.send(Err(error));
+        }
+        return;
+    }
+    if let Some(ack) = start_ack.take() {
+        let _ = ack.send(Ok(()));
+    }
+
+    // Claude 的 result 只是候选终态，必须等子进程退出成功后才能提交；否则 CLI 可能先输出
+    // subtype=success，随后以非零状态退出，导致 Supervisor 把真正的错误当作迟到事件丢弃。
+    // saw_turn_complete 用于兜底"退出码 0 但无 result"；
     // saw_approval 豁免审批 defer 场景（此时进程退出等待用户决定是正常流程）；
     // last_activity_ms 供看门狗判断进程是否挂起。
     let saw_turn_complete = Arc::new(AtomicBool::new(false));
     let saw_approval = Arc::new(AtomicBool::new(false));
+    let saw_model_error = Arc::new(AtomicBool::new(false));
+    let saw_session_started = Arc::new(AtomicBool::new(false));
+    let auto_fallback_requested = Arc::new(AtomicBool::new(false));
+    let saw_executed_tool = Arc::new(AtomicBool::new(false));
+    let terminal_candidate = Arc::new(Mutex::new(None::<AgentEvent>));
     let last_activity_ms = Arc::new(AtomicU64::new(now_millis() as u64));
 
     let stdout_runtime = runtime.clone();
     let stdout_saw_turn_complete = saw_turn_complete.clone();
     let stdout_saw_approval = saw_approval.clone();
+    let stdout_saw_model_error = saw_model_error.clone();
+    let stdout_saw_session_started = saw_session_started.clone();
+    let stdout_auto_fallback_requested = auto_fallback_requested.clone();
+    let stdout_saw_executed_tool = saw_executed_tool.clone();
+    let stdout_terminal_candidate = terminal_candidate.clone();
     let stdout_last_activity = last_activity_ms.clone();
     let stdout_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
@@ -3026,7 +4375,24 @@ async fn run_claude_turn(
             stdout_last_activity.store(now_millis() as u64, Ordering::Release);
             let events = parse_claude_line(&line);
 
-            for event in events {
+            for mut event in events {
+                let session_started = stdout_saw_session_started.load(Ordering::Acquire);
+                let current_approved_tool_result = match &event {
+                    AgentEvent::ToolResult { id, .. } => {
+                        stdout_runtime.user_approved_tools.lock().await.contains(id)
+                    }
+                    _ => false,
+                };
+                if !should_process_claude_event(
+                    session_started,
+                    current_approved_tool_result,
+                    &event,
+                ) {
+                    continue;
+                }
+                if matches!(&event, AgentEvent::SessionStarted { .. }) {
+                    stdout_saw_session_started.store(true, Ordering::Release);
+                }
                 if merge_pending_delta(&mut pending_delta, &event) {
                     continue;
                 }
@@ -3044,9 +4410,22 @@ async fn run_claude_turn(
                     pending_delta = Some(event);
                     continue;
                 }
-                match &event {
-                    AgentEvent::SessionStarted { session_id, .. } => {
+                let mut suppress_event = false;
+                let mut post_event_error = None;
+                match &mut event {
+                    AgentEvent::SessionStarted {
+                        session_id,
+                        capabilities,
+                        ..
+                    } => {
                         *stdout_runtime.session_id.lock().await = Some(session_id.clone());
+                        let capability_snapshot =
+                            stdout_runtime.capability_snapshot.lock().await.clone();
+                        if let Some(observed) = capabilities.as_mut() {
+                            observed.capability_snapshot_id = Some(capability_snapshot.id.clone());
+                        } else {
+                            *capabilities = Some(capability_snapshot.runtime_projection());
+                        }
                     }
                     AgentEvent::ToolCall {
                         session_id,
@@ -3077,6 +4456,7 @@ async fn run_claude_turn(
                                     id,
                                     name,
                                     input,
+                                    &stdout_runtime.current_turn_id.lock().await,
                                 ) {
                                     Ok(Some(checkpoint)) => emit_agent_event(
                                         &stdout_runtime.app,
@@ -3121,29 +4501,174 @@ async fn run_claude_turn(
                         }
                     }
                     AgentEvent::ApprovalRequest {
-                        id, action, input, ..
+                        id,
+                        action,
+                        input,
+                        persistent_label,
+                        matcher_summary,
+                        available_decisions,
+                        ..
                     } => {
                         stdout_saw_approval.store(true, Ordering::Release);
+                        let pending = PendingToolInfo {
+                            name: action.clone(),
+                            input: input.clone().unwrap_or(serde_json::Value::Null),
+                        };
                         stdout_runtime
                             .pending_tools
                             .lock()
                             .await
                             .entry(id.clone())
-                            .or_insert_with(|| PendingToolInfo {
-                                name: action.clone(),
-                                input: input.clone().unwrap_or(serde_json::Value::Null),
-                            });
+                            .or_insert_with(|| pending.clone());
+                        let turn_id = stdout_runtime.current_turn_id.lock().await.clone();
+                        let descriptor = build_approval_action(
+                            &stdout_runtime.history_session_id,
+                            &turn_id,
+                            id,
+                            &pending,
+                            &stdout_runtime.cwd,
+                        );
+                        if let Some(display) =
+                            crate::permissions::runtime_grant_display(&descriptor)
+                        {
+                            *persistent_label = Some(display.persistent_label);
+                            *matcher_summary = Some(display.matcher_summary);
+                        }
+                        *available_decisions = available_approval_decisions(Some(&descriptor));
                     }
-                    AgentEvent::TurnComplete { .. } => {
+                    AgentEvent::ToolResult {
+                        id,
+                        status,
+                        outcome,
+                        started,
+                        output,
+                        native_denial_code,
+                        ..
+                    } => {
+                        if started == &Some(true) {
+                            stdout_saw_executed_tool.store(true, Ordering::Release);
+                        }
+                        if matches!(
+                            outcome,
+                            Some(
+                                crate::protocol::ToolOutcomeKind::AutoReviewUnavailable
+                                    | crate::protocol::ToolOutcomeKind::AutoReviewParseError
+                            )
+                        ) {
+                            let decision = auto_fallback_decision(
+                                configured_profile,
+                                *outcome,
+                                stdout_runtime.auto_compat_attempted.load(Ordering::Acquire),
+                                stdout_saw_executed_tool.load(Ordering::Acquire),
+                            );
+                            if let Some(code) = native_denial_code.as_deref() {
+                                if let Some(registry) = stdout_runtime
+                                    .app
+                                    .try_state::<crate::capability_registry::EngineCapabilityRegistry>()
+                                {
+                                    let current =
+                                        stdout_runtime.capability_snapshot.lock().await.clone();
+                                    if let Ok(updated) =
+                                        registry.record_auto_review_degraded(&current, code)
+                                    {
+                                        *stdout_runtime.capability_snapshot.lock().await = updated;
+                                    }
+                                }
+                            }
+                            if decision == AutoFallbackDecision::RetryCompatible {
+                                *output = Some(
+                                    "自动审查暂时不可用，工具尚未执行。Helm 正在切换兼容执行方式。"
+                                        .to_string(),
+                                );
+                                stdout_auto_fallback_requested.store(true, Ordering::Release);
+                            } else {
+                                *output = Some(
+                                    "自动审查不可用，工具未执行。本轮已停止，以避免重复尝试。"
+                                        .to_string(),
+                                );
+                            }
+                        }
+                        let user_approved =
+                            stdout_runtime.user_approved_tools.lock().await.remove(id);
+                        if user_approved && started == &Some(true) {
+                            let audit_result =
+                                match stdout_runtime.pending_tools.lock().await.get(id).cloned() {
+                                    Some(tool) => {
+                                        let turn_id =
+                                            stdout_runtime.current_turn_id.lock().await.clone();
+                                        let action = build_approval_action(
+                                            &stdout_runtime.history_session_id,
+                                            &turn_id,
+                                            id,
+                                            &tool,
+                                            &stdout_runtime.cwd,
+                                        );
+                                        match stdout_runtime.app.try_state::<SessionHistoryStore>()
+                                        {
+                                            Some(history_store) => history_store
+                                                .mark_user_approved_execution_started(&action)
+                                                .and_then(|()| {
+                                                    history_store.finish_permission_execution(
+                                                        &action,
+                                                        status == &ToolStatus::Success,
+                                                    )
+                                                }),
+                                            None => {
+                                                Err("会话历史存储不可用，无法记录已批准工具执行"
+                                                    .to_string())
+                                            }
+                                        }
+                                    }
+                                    None => Err(format!("找不到已批准工具的执行审计上下文：{id}")),
+                                };
+                            if let Err(error) = audit_result {
+                                post_event_error =
+                                    Some(format!("已批准工具执行审计失败，已终止本轮：{error}"));
+                            }
+                        }
+                    }
+                    AgentEvent::Error { kind, .. }
+                        if kind.as_deref() == Some("model_unavailable") =>
+                    {
+                        stdout_saw_model_error.store(true, Ordering::Release);
+                    }
+                    AgentEvent::TurnComplete { stop_reason, .. } => {
+                        if stdout_saw_model_error.load(Ordering::Acquire) {
+                            *stop_reason = StopReason::Error;
+                        }
                         stdout_saw_turn_complete.store(true, Ordering::Release);
+                        suppress_event = true;
+                        if !stdout_auto_fallback_requested.load(Ordering::Acquire)
+                            && !stdout_saw_model_error.load(Ordering::Acquire)
+                        {
+                            let mut candidate = stdout_terminal_candidate.lock().await;
+                            if candidate.is_none() {
+                                *candidate = Some(event.clone());
+                            }
+                        }
                     }
                     _ => {}
+                }
+                if suppress_event {
+                    continue;
                 }
                 emit_agent_event(
                     &stdout_runtime.app,
                     &stdout_runtime.history_session_id,
                     &event,
                 );
+                if let Some(message) = post_event_error {
+                    emit_agent_event(
+                        &stdout_runtime.app,
+                        &stdout_runtime.history_session_id,
+                        &AgentEvent::Error {
+                            session_id: stdout_runtime.session_id.lock().await.clone(),
+                            message,
+                            recoverable: false,
+                            kind: Some("permission_audit_failed".to_string()),
+                        },
+                    );
+                }
             }
         }
         // 流结束：冲刷残留缓冲
@@ -3158,6 +4683,7 @@ async fn run_claude_turn(
 
     let stderr_runtime = runtime.clone();
     let stderr_saw_approval = saw_approval.clone();
+    let stderr_saw_session_started = saw_session_started.clone();
     let stderr_last_activity = last_activity_ms.clone();
     let stderr_task = tokio::spawn(async move {
         let mut buf = String::new();
@@ -3165,7 +4691,9 @@ async fn run_claude_turn(
         while let Ok(Some(line)) = lines.next_line().await {
             stderr_last_activity.store(now_millis() as u64, Ordering::Release);
             // 检测 Hook 的审批通知（兜底通道：常规链路走 stdout 的 deferred_tool_use）
-            if line.starts_with("APPROVAL_NEEDED:") {
+            if line.starts_with("APPROVAL_NEEDED:")
+                && stderr_saw_session_started.load(Ordering::Acquire)
+            {
                 stderr_saw_approval.store(true, Ordering::Release);
                 if let Some(request_id) = line.strip_prefix("APPROVAL_NEEDED:") {
                     let pending_info = stderr_runtime
@@ -3196,6 +4724,9 @@ async fn run_claude_turn(
                             action: name,
                             detail,
                             input: Some(input),
+                            available_decisions: available_approval_decisions(None),
+                            persistent_label: None,
+                            matcher_summary: None,
                         },
                     );
                 }
@@ -3216,13 +4747,23 @@ async fn run_claude_turn(
             let idle =
                 (now_millis() as u64).saturating_sub(watchdog_activity.load(Ordering::Acquire));
             if idle >= IDLE_WARN_MS {
-                emit_error(
-                    &watchdog_runtime,
-                    "claude 已超过 5 分钟没有任何输出，可能已挂起；可点击停止按钮中断本轮"
-                        .to_string(),
-                    true,
-                )
-                .await;
+                let session_id = watchdog_runtime
+                    .session_id
+                    .lock()
+                    .await
+                    .clone()
+                    .unwrap_or_else(|| watchdog_runtime.history_session_id.clone());
+                emit_agent_event(
+                    &watchdog_runtime.app,
+                    &watchdog_runtime.history_session_id,
+                    &AgentEvent::TurnStage {
+                        session_id,
+                        stage: TurnStage::Stalled,
+                        ts: now_millis(),
+                        engine_reported_ttft_ms: None,
+                        retry_attempt: None,
+                    },
+                );
                 return;
             }
         }
@@ -3234,10 +4775,6 @@ async fn run_claude_turn(
     let detail = stderr_task.await.unwrap_or_default().trim().to_string();
     set_running_pid(&runtime.running_pid, None).await;
 
-    if runtime.interrupted.load(Ordering::Acquire) {
-        return;
-    }
-
     // 退出码判定：wait 出错或被信号杀死（无退出码）一律视为异常，绝不能默认成功——
     // 否则既无报错也无 turn_complete，UI 会永远停在"思考中"。
     let code = match &status {
@@ -3245,7 +4782,91 @@ async fn run_claude_turn(
         Ok(s) => s.code().unwrap_or(-1),
         Err(_) => -1,
     };
-    if code != 0 {
+    let mut terminal_candidate = terminal_candidate.lock().await.take();
+    let disposition = claude_exit_disposition(
+        runtime.interrupted.load(Ordering::Acquire),
+        auto_fallback_requested.load(Ordering::Acquire),
+        saw_model_error.load(Ordering::Acquire),
+        code == 0,
+        terminal_candidate.is_some(),
+        saw_approval.load(Ordering::Acquire),
+    );
+    if disposition == ClaudeExitDisposition::Return && runtime.interrupted.load(Ordering::Acquire) {
+        return;
+    }
+    if auto_fallback_requested.load(Ordering::Acquire) {
+        runtime.auto_compat_attempted.store(true, Ordering::Release);
+        drop(_workspace_lease);
+        drop(_turn_guard);
+        drop(_busy_guard);
+        let retry_spec = runtime.current_turn_spec.lock().await.clone();
+        let retry_result = match retry_spec.as_ref() {
+            Some(spec) => match runtime
+                .app
+                .try_state::<crate::runtime_registry::RuntimeRegistry>()
+            {
+                Some(registry) => {
+                    registry
+                        .begin_compatibility_retry(
+                            &crate::runtime_registry::RuntimeOwnerRef::Session(
+                                runtime.history_session_id.clone(),
+                            ),
+                            spec,
+                            "[auto_review_compatibility_retry] 原生自动审查在工具执行前不可用",
+                        )
+                        .await
+                }
+                None => Err("RuntimeRegistry 未启动，无法登记兼容恢复 Attempt".to_string()),
+            },
+            None => Err("当前 TurnExecutionSpec 缺失，拒绝兼容恢复".to_string()),
+        };
+        if let Err(error) = retry_result {
+            emit_error(&runtime, format!("自动审查兼容恢复未启动：{error}"), false).await;
+            return;
+        }
+        if wait_until_idle_and_begin(&runtime.busy, &runtime.idle_notify, &runtime.interrupted)
+            .await
+            .is_ok()
+        {
+            Box::pin(run_claude_turn(
+                runtime,
+                Some(
+                    "继续当前轮次。上一项工具请求在执行前被自动审查拒绝，尚未产生副作用；请仅重新发起该未执行动作，不要重复已完成动作。"
+                        .to_string(),
+                ),
+                Vec::new(),
+                true,
+                None,
+            ))
+            .await;
+        }
+        return;
+    }
+
+    if permission_mode == "auto"
+        && code == 0
+        && saw_turn_complete.load(Ordering::Acquire)
+        && configured_profile == PermissionProfile::Auto
+    {
+        if let Some(registry) = runtime
+            .app
+            .try_state::<crate::capability_registry::EngineCapabilityRegistry>()
+        {
+            let current = runtime.capability_snapshot.lock().await.clone();
+            if let Ok(updated) = registry.record_auto_review_native(&current) {
+                *runtime.capability_snapshot.lock().await = updated;
+            }
+        }
+    }
+
+    if disposition == ClaudeExitDisposition::ProcessError {
+        let current_model = runtime.model.lock().await.clone();
+        let resume_sid = runtime.session_id.lock().await.clone();
+        eprintln!(
+            "[helm] claude ProcessError: code={code}, model={current_model}, resume={resume_sid:?}, stderr_len={}, stderr_preview={}",
+            detail.len(),
+            if detail.is_empty() { "(empty)" } else { &detail[..detail.len().min(500)] }
+        );
         let cause = match &status {
             Err(e) => format!("（无法获取退出状态：{e}）"),
             _ => String::new(),
@@ -3261,7 +4882,11 @@ async fn run_claude_turn(
             false,
         )
         .await;
-    } else if !saw_turn_complete.load(Ordering::Acquire) && !saw_approval.load(Ordering::Acquire) {
+    } else if disposition == ClaudeExitDisposition::EmitCandidate {
+        if let Some(event) = terminal_candidate.take() {
+            emit_agent_event(&runtime.app, &runtime.history_session_id, &event);
+        }
+    } else if disposition == ClaudeExitDisposition::MissingResult {
         // 进程正常退出但没有输出 result 行（且不是审批 defer 场景）：
         // 同样必须给出终态事件，否则 UI 悬空。
         emit_error(
@@ -3276,57 +4901,93 @@ async fn run_claude_turn(
 
 async fn interrupt_running(runtime: Arc<SessionRuntime>) {
     runtime.interrupted.store(true, Ordering::Release);
+    runtime.idle_notify.notify_waiters();
     let pid = *runtime.running_pid.lock().await;
     kill_tree(pid).await;
     set_running_pid(&runtime.running_pid, None).await;
     emit_interrupted(&runtime).await;
 }
 
-/// 创建 Claude 会话运行时。真正的 CLI 进程在每次 send / approve(resume) 时启动。
-pub fn start_claude(
-    app: AppHandle,
-    history_session_id: String,
-    bin: String,
-    model: String,
-    cwd: String,
-    env: Vec<(String, String)>,
-    approval_policy: ApprovalPolicy,
-) -> Result<AgentSession, String> {
-    start_claude_with_resume(
-        app,
-        history_session_id,
-        bin,
-        model,
-        cwd,
-        env,
-        approval_policy,
-        None,
-        Vec::new(),
-    )
+fn select_effective_codex_home(
+    session_home: Option<&PathBuf>,
+    subscription_home: Option<&PathBuf>,
+) -> Option<PathBuf> {
+    session_home.cloned().or_else(|| subscription_home.cloned())
+}
+
+async fn update_permission_context(
+    runtime: &SessionRuntime,
+    turn_id: String,
+    _turn_mode: TurnMode,
+) -> Result<(), String> {
+    let service = runtime
+        .app
+        .try_state::<PermissionService>()
+        .ok_or_else(|| "权限服务未启动".to_string())?;
+    service.self_check(&runtime.permission_token).await?;
+    service
+        .update_context(
+            &runtime.permission_token,
+            PermissionSessionContext {
+                engine: "claude-code".to_string(),
+                history_session_id: runtime.history_session_id.clone(),
+                turn_id: turn_id.clone(),
+                cwd: runtime.policy_cwd.clone(),
+                permission_profile: runtime.permission_profile.lock().await.as_str().to_string(),
+            },
+        )
+        .await?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn start_claude_with_resume(
+pub async fn start_claude_with_resume_and_reasoning(
     app: AppHandle,
     history_session_id: String,
     bin: String,
     model: String,
     cwd: String,
     env: Vec<(String, String)>,
-    approval_policy: ApprovalPolicy,
+    reasoning_effort: ReasoningEffort,
     resume_id: Option<String>,
-    // 没有可 --resume 的 CLI 会话（如回溯后被作废）时，用这份历史序列化重建上下文（P2-5）
     history_messages: Vec<crate::sessions::SessionMessage>,
+    capability_snapshot: crate::capability_registry::EngineCapabilitySnapshot,
 ) -> Result<AgentSession, String> {
-    let hook_files = create_approval_hook_files(approval_policy)?;
+    let use_user_setting_source = claude_uses_user_setting_source(&env);
+    let hook_files = create_runtime_approval_hook_files()?;
+    validate_cwd(&cwd)?;
+    let canonical_cwd = std::path::Path::new(&cwd)
+        .canonicalize()
+        .map_err(|error| format!("工作目录不可用：{error}"))?
+        .to_string_lossy()
+        .to_string();
+    let execution_cwd = canonical_cwd.clone();
+    let policy_cwd = canonical_cwd.clone();
+    let permission_service = app
+        .try_state::<PermissionService>()
+        .ok_or_else(|| "权限服务未启动，无法创建 Claude 会话".to_string())?;
+    let initial_turn_id = "turn-unassigned".to_string();
+    let registration = permission_service
+        .register(PermissionSessionContext {
+            engine: "claude-code".to_string(),
+            history_session_id: history_session_id.clone(),
+            turn_id: initial_turn_id.clone(),
+            cwd: policy_cwd.clone(),
+            permission_profile: PermissionProfile::Standard.as_str().to_string(),
+        })
+        .await;
     let runtime = Arc::new(SessionRuntime {
         app,
         history_session_id,
         bin,
-        model,
-        cwd,
+        model: Mutex::new(model),
+        cwd: execution_cwd,
+        policy_cwd,
         env,
+        use_user_setting_source,
+        capability_snapshot: Mutex::new(capability_snapshot),
         turn_mode: Mutex::new(TurnMode::Build),
+        reasoning_effort: Mutex::new(reasoning_effort),
         settings_path: hook_files.settings_path,
         state_path: hook_files.state_path,
         // 有 resume_id 时优先 --resume；否则首轮用序列化历史重建上下文
@@ -3338,12 +4999,22 @@ pub fn start_claude_with_resume(
         session_id: Mutex::new(resume_id),
         running_pid: Mutex::new(None),
         turn_lock: Mutex::new(()),
+        approval_lock: Mutex::new(()),
+        permission_endpoint: registration.endpoint,
+        permission_token: registration.token,
+        current_turn_id: Mutex::new(initial_turn_id),
+        current_turn_spec: Mutex::new(None),
+        current_session_context: Mutex::new(Vec::new()),
         busy: AtomicBool::new(false),
+        idle_notify: Notify::new(),
         interrupted: AtomicBool::new(false),
+        auto_compat_attempted: AtomicBool::new(false),
         pending_tools: Mutex::new(HashMap::new()),
+        user_approved_tools: Mutex::new(HashSet::new()),
         disabled_mcp: std::sync::Mutex::new(Vec::new()),
+        permission_profile: Mutex::new(PermissionProfile::Standard),
+        full_access_lease: Mutex::new(None),
     });
-
     let (tx, mut rx) = mpsc::unbounded_channel::<SessionCmd>();
     let manager_runtime = runtime.clone();
     tokio::spawn(async move {
@@ -3352,55 +5023,188 @@ pub fn start_claude_with_resume(
                 SessionCmd::Send {
                     text,
                     attachments,
-                    mode,
+                    spec,
                 } => {
-                    if !try_begin_turn(&manager_runtime) {
+                    let mode = TurnMode::parse(Some(&spec.turn_mode));
+                    let configured_profile = *manager_runtime.permission_profile.lock().await;
+                    if spec.engine_id != "claude-code"
+                        || spec.permission_profile != configured_profile.as_str()
+                    {
+                        manager_runtime.busy.store(false, Ordering::Release);
+                        manager_runtime.idle_notify.notify_waiters();
                         emit_error(
                             &manager_runtime,
-                            "已有轮次正在运行，请先等待或停止当前任务".to_string(),
-                            true,
+                            "TurnExecutionSpec 与 Claude Runtime 路由不一致".to_string(),
+                            false,
                         )
                         .await;
                         continue;
                     }
+                    *manager_runtime.model.lock().await = spec.routed_model_id.clone();
+                    manager_runtime.interrupted.store(false, Ordering::Release);
+                    manager_runtime
+                        .auto_compat_attempted
+                        .store(false, Ordering::Release);
+                    let turn_id = spec.turn_id.clone();
+                    set_event_turn_context(
+                        &manager_runtime.history_session_id,
+                        &turn_id,
+                        spec.turn_epoch,
+                    );
+                    begin_turn_supervisor(
+                        &manager_runtime.app,
+                        &manager_runtime.history_session_id,
+                        &turn_id,
+                        spec.turn_epoch,
+                        mode,
+                        configured_profile,
+                    );
+                    manager_runtime.pending_tools.lock().await.clear();
+                    manager_runtime.user_approved_tools.lock().await.clear();
+                    *manager_runtime.current_turn_id.lock().await = turn_id.clone();
+                    *manager_runtime.current_turn_spec.lock().await = Some(spec.clone());
+                    *manager_runtime.current_session_context.lock().await =
+                        spec.session_context.clone();
+                    if let Err(error) =
+                        update_permission_context(&manager_runtime, turn_id, mode).await
+                    {
+                        manager_runtime.busy.store(false, Ordering::Release);
+                        manager_runtime.idle_notify.notify_waiters();
+                        emit_error(&manager_runtime, error, false).await;
+                        continue;
+                    }
                     // 模式随发起轮固定（变更-04）：审批恢复轮读到的仍是这里写入的值
                     *manager_runtime.turn_mode.lock().await = mode;
+                    *manager_runtime.reasoning_effort.lock().await = spec.routed_reasoning_effort;
                     tokio::spawn(run_claude_turn(
                         manager_runtime.clone(),
                         Some(text),
                         attachments,
                         false,
+                        None,
                     ));
                 }
                 SessionCmd::Approve {
                     request_id,
                     decision,
+                    responder,
                 } => {
-                    if !try_begin_turn(&manager_runtime) {
-                        emit_error(
-                            &manager_runtime,
-                            "已有轮次正在运行，请先等待或停止当前任务".to_string(),
-                            true,
-                        )
-                        .await;
-                        continue;
-                    }
-                    if let Err(e) = record_approval(&manager_runtime, &request_id, decision).await {
-                        manager_runtime.busy.store(false, Ordering::Release);
-                        emit_error(&manager_runtime, e, false).await;
-                        continue;
-                    }
-                    if matches!(decision, ApprovalDecision::Deny) {
-                        emit_denied_turn(&manager_runtime, request_id).await;
-                        manager_runtime.busy.store(false, Ordering::Release);
-                        continue;
-                    }
-                    tokio::spawn(run_claude_turn(
-                        manager_runtime.clone(),
-                        None,
-                        Vec::new(),
-                        true,
-                    ));
+                    let approval_runtime = manager_runtime.clone();
+                    tokio::spawn(async move {
+                        let result: Result<(), String> =
+                            run_serialized_approval(&approval_runtime.approval_lock, async {
+                                let prepared =
+                                    {
+                                        let pending = approval_runtime
+                                            .pending_tools
+                                            .lock()
+                                            .await
+                                            .get(&request_id)
+                                            .cloned();
+                                        let turn_id = approval_runtime.current_turn_id.lock().await.clone();
+                                        let available_decisions = pending.as_ref().map_or_else(
+                                            || available_approval_decisions(None),
+                                            |tool| {
+                                            let action = build_approval_action(
+                                                &approval_runtime.history_session_id,
+                                                &turn_id,
+                                                &request_id,
+                                                tool,
+                                                &approval_runtime.cwd,
+                                            );
+                                                available_approval_decisions(Some(&action))
+                                            },
+                                        );
+                                        validate_approval_decision(decision, &available_decisions)?;
+                                        record_approval(&approval_runtime, &request_id, decision).await?
+                                    };
+                                if matches!(decision, ApprovalDecision::Deny) {
+                                    approval_runtime.interrupted.store(true, Ordering::Release);
+                                    approval_runtime.idle_notify.notify_waiters();
+                                    let pid = *approval_runtime.running_pid.lock().await;
+                                    kill_tree(pid).await;
+                                    set_running_pid(&approval_runtime.running_pid, None).await;
+                                    emit_denied_turn(&approval_runtime, request_id).await;
+                                    return Ok(());
+                                }
+                                wait_until_idle_and_begin(
+                                    &approval_runtime.busy,
+                                    &approval_runtime.idle_notify,
+                                    &approval_runtime.interrupted,
+                                )
+                                .await?;
+                                let permission_service = approval_runtime
+                                    .app
+                                    .try_state::<PermissionService>()
+                                    .ok_or_else(|| "权限服务未启动，无法恢复审批".to_string())?;
+                                permission_service
+                                    .self_check(&approval_runtime.permission_token)
+                                    .await?;
+                                let committed = match commit_approval_grants(
+                                    &approval_runtime,
+                                    &request_id,
+                                    decision,
+                                    &prepared,
+                                )
+                                .await
+                                {
+                                    Ok(committed) => committed,
+                                    Err(error) => {
+                                        let state_error = rollback_prepared_approval_state(
+                                            &approval_runtime.state_path,
+                                            &request_id,
+                                        )
+                                        .err();
+                                        approval_runtime.busy.store(false, Ordering::Release);
+                                        approval_runtime.idle_notify.notify_waiters();
+                                        return Err(match state_error {
+                                            Some(state_error) => {
+                                                format!("{error}；同时回滚临时审批状态失败：{state_error}")
+                                            }
+                                            None => error,
+                                        });
+                                    }
+                                };
+                                if approval_runtime.interrupted.load(Ordering::Acquire) {
+                                    rollback_approval_grants(&approval_runtime, committed)?;
+                                    approval_runtime.busy.store(false, Ordering::Release);
+                                    approval_runtime.idle_notify.notify_waiters();
+                                    return Err("审批等待期间会话已中断，未启动恢复轮".to_string());
+                                }
+                                approval_runtime
+                                    .user_approved_tools
+                                    .lock()
+                                    .await
+                                    .insert(request_id.clone());
+                                let (start_ack, started) = oneshot::channel();
+                                tokio::spawn(run_claude_turn(
+                                    approval_runtime.clone(),
+                                    None,
+                                    Vec::new(),
+                                    true,
+                                    Some(start_ack),
+                                ));
+                                let start_result = match started.await {
+                                    Ok(result) => result,
+                                    Err(_) => Err("Claude 恢复任务在启动确认前结束".to_string()),
+                                };
+                                if let Err(start_error) = start_result {
+                                    approval_runtime
+                                        .user_approved_tools
+                                        .lock()
+                                        .await
+                                        .remove(&request_id);
+                                    rollback_approval_grants(&approval_runtime, committed)?;
+                                    return Err(start_error);
+                                }
+                                Ok(())
+                            })
+                            .await;
+                        if let Err(error) = &result {
+                            emit_error(&approval_runtime, error.clone(), false).await;
+                        }
+                        let _ = responder.send(result);
+                    });
                 }
                 SessionCmd::ResetContext { messages } => {
                     // 回溯重建（P2-5）：作废 CLI 会话 id，下一轮以截断历史重新开场。
@@ -3408,10 +5212,37 @@ pub fn start_claude_with_resume(
                     *manager_runtime.session_id.lock().await = None;
                     *manager_runtime.rebuild_history.lock().await = messages;
                 }
-                SessionCmd::SetDisabledMcp { disabled } => {
+                SessionCmd::SetDisabledMcp {
+                    disabled,
+                    responder,
+                } => {
                     // 会话级 MCP 开关（变更-11）：只改状态，下一轮拉进程时生效
-                    if let Ok(mut guard) = manager_runtime.disabled_mcp.lock() {
-                        *guard = disabled;
+                    let result = if manager_runtime.busy.load(Ordering::Acquire) {
+                        Err("轮次进行中，结束后才能更新 MCP 开关".to_string())
+                    } else {
+                        manager_runtime
+                            .disabled_mcp
+                            .lock()
+                            .map(|mut guard| *guard = disabled)
+                            .map_err(|_| "Claude MCP 开关锁中毒".to_string())
+                    };
+                    let _ = responder.send(result);
+                }
+                SessionCmd::SetPermissionProfile { profile, responder } => {
+                    if manager_runtime.busy.load(Ordering::Acquire) {
+                        let _ =
+                            responder.send(Err("轮次进行中，结束后才能切换权限档位".to_string()));
+                    } else {
+                        *manager_runtime.permission_profile.lock().await = profile;
+                        *manager_runtime.full_access_lease.lock().await =
+                            (profile == PermissionProfile::FullAccess).then(|| {
+                                full_access_lease(
+                                    &manager_runtime.history_session_id,
+                                    "claude-code",
+                                    &manager_runtime.cwd,
+                                )
+                            });
+                        let _ = responder.send(Ok(()));
                     }
                 }
                 SessionCmd::Interrupt => {
@@ -3419,99 +5250,779 @@ pub fn start_claude_with_resume(
                 }
             }
         }
+        if let Some(permission_service) = manager_runtime.app.try_state::<PermissionService>() {
+            permission_service
+                .unregister(&manager_runtime.permission_token)
+                .await;
+        }
     });
 
-    Ok(AgentSession::Claude(ClaudeSession { tx }))
+    Ok(AgentSession::Claude(ClaudeSession {
+        tx,
+        cwd: runtime.cwd.clone(),
+        control: Some(runtime),
+    }))
+}
+
+fn spawn_codex_app_server_loops(session: CodexSession, process: Arc<CodexAppServerProcess>) {
+    let approval_session = session.clone();
+    let approval_rpc = process.rpc.clone();
+    spawn_agent_task(async move {
+        while let Some(request) = approval_rpc.next_approval_request().await {
+            let request = match request {
+                Ok(request) => request,
+                Err(error) => {
+                    let _ = approval_session.turn_completions.send(Err(error));
+                    break;
+                }
+            };
+            let correlations = approval_session.file_changes_by_item.lock().await.clone();
+            let history_store = match approval_session.app.try_state::<SessionHistoryStore>() {
+                Some(store) => store,
+                None => {
+                    let response = denied_approval_response(&request);
+                    let _ = approval_rpc.respond(request.request_id(), response).await;
+                    let _ = approval_session
+                        .turn_completions
+                        .send(Err("会话历史存储不可用，Codex 审批已拒绝".to_string()));
+                    break;
+                }
+            };
+            let helm_turn_id = approval_session.current_helm_turn_id.lock().await.clone();
+            let native_turn_id = approval_session
+                .current_app_server_turn_id
+                .lock()
+                .await
+                .clone();
+            let actions = match (helm_turn_id, native_turn_id) {
+                (Some(helm_turn_id), Some(native_turn_id))
+                    if request.native_turn_id() == native_turn_id =>
+                {
+                    normalize_approval_actions_for_turn(
+                        &approval_session.history_session_id,
+                        &helm_turn_id,
+                        &request,
+                        &correlations,
+                    )
+                }
+                _ => Err("Codex 审批不属于当前 Helm Turn，已拒绝".to_string()),
+            };
+            let decision = actions.as_ref().map_err(Clone::clone).and_then(|actions| {
+                evaluate_normalized_actions_with_kernel(&history_store, actions)
+            });
+            let decision = match decision {
+                Ok(decision) => decision,
+                Err(error) => {
+                    let denied = crate::permissions::PermissionDecision {
+                        effect: crate::permissions::PermissionEffect::Deny,
+                        reason: error,
+                        rule_id: None,
+                        policy_version: history_store.permission_policy_version().unwrap_or(1),
+                    };
+                    if let Some(response) = automatic_approval_response(&request, &denied) {
+                        if let Err(error) = approval_rpc
+                            .respond(
+                                match &request {
+                                    crate::codex_app_server::CodexApprovalRequest::Command(
+                                        value,
+                                    ) => value.request_id.clone(),
+                                    crate::codex_app_server::CodexApprovalRequest::FileChange(
+                                        value,
+                                    ) => value.request_id.clone(),
+                                    crate::codex_app_server::CodexApprovalRequest::Permissions(
+                                        value,
+                                    ) => value.request_id.clone(),
+                                },
+                                response,
+                            )
+                            .await
+                        {
+                            let _ = approval_session.turn_completions.send(Err(error));
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            };
+            if let Some(response) = automatic_approval_response(&request, &decision) {
+                let request_id = match &request {
+                    crate::codex_app_server::CodexApprovalRequest::Command(value) => {
+                        value.request_id.clone()
+                    }
+                    crate::codex_app_server::CodexApprovalRequest::FileChange(value) => {
+                        value.request_id.clone()
+                    }
+                    crate::codex_app_server::CodexApprovalRequest::Permissions(value) => {
+                        value.request_id.clone()
+                    }
+                };
+                if let Err(error) = approval_rpc.respond(request_id, response).await {
+                    let _ = approval_session.turn_completions.send(Err(error));
+                    break;
+                }
+                continue;
+            }
+            let Ok(mut actions) = actions else {
+                continue;
+            };
+            if actions.len() != 1 {
+                let response = denied_approval_response(&request);
+                if let Err(error) = approval_rpc.respond(request.request_id(), response).await {
+                    let _ = approval_session.turn_completions.send(Err(error));
+                    break;
+                }
+                let _ = approval_session
+                    .turn_completions
+                    .send(Err("Codex 审批包含多个不可原子裁决的动作".to_string()));
+                break;
+            }
+            let action = actions.remove(0);
+            let grant_display = crate::permissions::runtime_grant_display(&action);
+            let approval_id = action.tool_call_id.clone();
+            approval_session.pending_approvals.lock().await.insert(
+                approval_id.clone(),
+                CodexPendingApproval {
+                    request,
+                    action: action.clone(),
+                },
+            );
+            let session_id = approval_session
+                .thread_id
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+                .unwrap_or_else(|| approval_session.history_session_id.clone());
+            emit_agent_event(
+                &approval_session.app,
+                &approval_session.history_session_id,
+                &codex_turn_stage(&session_id, TurnStage::WaitingApproval),
+            );
+            emit_agent_event(
+                &approval_session.app,
+                &approval_session.history_session_id,
+                &AgentEvent::ApprovalRequest {
+                    session_id,
+                    id: approval_id,
+                    action: action.operation.clone(),
+                    detail: action.resources.join(", "),
+                    available_decisions: available_approval_decisions(Some(&action)),
+                    input: Some(action.raw_input),
+                    persistent_label: grant_display
+                        .as_ref()
+                        .map(|display| display.persistent_label.clone()),
+                    matcher_summary: grant_display.map(|display| display.matcher_summary),
+                },
+            );
+        }
+    });
+
+    let notification_session = session;
+    let notification_rpc = process.rpc.clone();
+    spawn_agent_task(async move {
+        while let Some(notification) = notification_rpc.next_notification().await {
+            let notification = match notification {
+                Ok(notification) => notification,
+                Err(error) => {
+                    let _ = notification_session.turn_completions.send(Err(error));
+                    fail_codex_active_turn(&notification_session, "Codex app-server 通知协议失败")
+                        .await;
+                    break;
+                }
+            };
+            if matches!(
+                notification
+                    .get("method")
+                    .and_then(serde_json::Value::as_str),
+                Some("item/started" | "item/completed")
+            ) {
+                if let Some(item) = notification.pointer("/params/item") {
+                    let item_type = item.get("type").and_then(serde_json::Value::as_str);
+                    let method = notification
+                        .get("method")
+                        .and_then(serde_json::Value::as_str);
+                    if let Some(id) = item.get("id").and_then(serde_json::Value::as_str) {
+                        if method == Some("item/started")
+                            && matches!(item_type, Some("commandExecution" | "fileChange"))
+                        {
+                            notification_session
+                                .pending_tool_items
+                                .lock()
+                                .await
+                                .insert(id.to_string());
+                        } else if method == Some("item/completed") {
+                            notification_session
+                                .pending_tool_items
+                                .lock()
+                                .await
+                                .remove(id);
+                        }
+                    }
+                    if item_type == Some("fileChange") {
+                        if let Some(id) = item.get("id").and_then(serde_json::Value::as_str) {
+                            let paths = item
+                                .get("changes")
+                                .and_then(serde_json::Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|change| {
+                                    change
+                                        .get("path")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(ToString::to_string)
+                                })
+                                .collect::<Vec<_>>();
+                            if !paths.is_empty() {
+                                notification_session
+                                    .file_changes_by_item
+                                    .lock()
+                                    .await
+                                    .insert(id.to_string(), paths);
+                            }
+                        }
+                    }
+                }
+            }
+            let pending_tool_count = if notification
+                .get("method")
+                .and_then(serde_json::Value::as_str)
+                == Some("turn/completed")
+            {
+                notification_session.pending_tool_items.lock().await.len()
+            } else {
+                0
+            };
+            let terminal_outcome =
+                codex_app_server_terminal_outcome_with_pending(&notification, pending_tool_count);
+            if let Some((turn_id, outcome)) = &terminal_outcome {
+                let inserted = {
+                    let mut terminal_turns = notification_session.terminal_turns.lock().await;
+                    record_codex_terminal_once(
+                        &mut terminal_turns,
+                        turn_id.clone(),
+                        outcome.clone(),
+                    )
+                };
+                if !inserted {
+                    continue;
+                }
+                let completion = match outcome {
+                    Ok(()) => Ok(turn_id.clone()),
+                    Err(error) => Err(error.clone()),
+                };
+                let _ = notification_session.turn_completions.send(completion);
+            }
+            let session_id = notification_session
+                .thread_id
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+                .unwrap_or_else(|| notification_session.history_session_id.clone());
+            let event_notification = codex_notification_for_terminal_outcome(
+                &notification,
+                terminal_outcome.as_ref().map(|(_, outcome)| outcome),
+            );
+            let explicit_context =
+                if let Some(native_turn_id) = codex_notification_native_turn_id(&notification) {
+                    notification_session
+                        .native_turn_contexts
+                        .lock()
+                        .await
+                        .resolve(native_turn_id)
+                        .or_else(|| {
+                            let digest = crate::turn_start::digest_json(native_turn_id)
+                                .unwrap_or_else(|_| "sha256:unknown".to_string());
+                            Some((format!("unknown-native-turn:{digest}"), 0))
+                        })
+                } else {
+                    None
+                };
+            for event in parse_codex_app_server_notification(&session_id, &event_notification) {
+                if let Some((helm_turn_id, turn_epoch)) = explicit_context.as_ref() {
+                    emit_agent_event_in_turn(
+                        &notification_session.app,
+                        &notification_session.history_session_id,
+                        Some(helm_turn_id),
+                        Some(*turn_epoch),
+                        &event,
+                    );
+                } else {
+                    emit_agent_event(
+                        &notification_session.app,
+                        &notification_session.history_session_id,
+                        &event,
+                    );
+                }
+            }
+            if terminal_outcome.is_some() {
+                notification_session.terminal_notify.notify_waiters();
+            }
+        }
+        let _ = notification_session.turn_completions.send(Err(
+            "Codex app-server notification stream closed".to_string(),
+        ));
+        fail_codex_active_turn(
+            &notification_session,
+            "Codex app-server notification stream closed",
+        )
+        .await;
+    });
+}
+
+async fn fail_codex_active_turn(session: &CodexSession, error: &str) {
+    if let Some(turn_id) = session.current_app_server_turn_id.lock().await.clone() {
+        session
+            .terminal_turns
+            .lock()
+            .await
+            .entry(turn_id)
+            .or_insert_with(|| Err(error.to_string()));
+        session.terminal_notify.notify_waiters();
+    }
 }
 
 impl CodexSession {
-    fn send(&self, text: String, attachments: Vec<String>, mode: TurnMode) -> Result<(), String> {
-        // 轮次互斥（变更-06）：Codex 每轮独立 spawn，没有 Claude 的 manager 循环，
-        // 在 send 入口做 CAS，防止前端状态失真时同一会话双进程并发。
-        if self
-            .busy
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Err("当前会话已有轮次正在运行，请等待完成或先停止".to_string());
+    async fn ensure_app_server(&self) -> Result<Arc<CodexAppServerProcess>, String> {
+        let mut slot = self.app_server.lock().await;
+        if let Some(process) = slot.as_ref() {
+            return Ok(process.clone());
         }
-        let app = self.app.clone();
-        let history_session_id = self.history_session_id.clone();
-        let bin = self.bin.clone();
-        let model = self.model.clone();
-        let cwd = self.cwd.clone();
-        let env = self.env.clone();
-        // 逐轮解析 sandbox（变更-04）：计划/询问强制只读，构建沿用设置映射值
-        let sandbox_mode = codex_sandbox_for_mode(&self.sandbox_mode, mode);
-        let running_pid = self.running_pid.clone();
-        let history_messages = self.history_messages.clone();
-        let busy = self.busy.clone();
-        let interrupted = self.interrupted.clone();
-        let disabled_mcp = self.disabled_mcp.clone();
-        let thread_id = self.thread_id.clone();
-        let auth_home = self.auth_home.clone();
-        let force_history_rebuild = self.force_history_rebuild.clone();
-        interrupted.store(false, Ordering::Release);
-        spawn_agent_task(async move {
-            run_codex_turn(
-                app,
-                history_session_id,
-                bin,
-                model,
-                cwd,
-                env,
-                sandbox_mode,
-                running_pid,
-                history_messages,
-                interrupted,
-                disabled_mcp,
-                thread_id,
-                auth_home,
-                force_history_rebuild,
-                text,
-                attachments,
-                mode,
-                true,
+        validate_cwd(&self.cwd)?;
+        validate_engine_bin(&self.bin)?;
+        let canonical_cwd = std::path::Path::new(&self.cwd)
+            .canonicalize()
+            .map_err(|error| format!("工作目录不可用：{error}"))?;
+        *self.execution_cwd.lock().await = Some(canonical_cwd.display().to_string());
+        *self.policy_cwd.lock().await = canonical_cwd.display().to_string();
+        let configure_command = |command: &mut Command| {
+            apply_inherited_agent_environment(command);
+            for value in codex_provider_config_args(&self.env) {
+                command.arg("-c").arg(value);
+            }
+            command.current_dir(&canonical_cwd).kill_on_drop(true);
+            if let Some(path) = self
+                .effective_home
+                .lock()
+                .ok()
+                .and_then(|home| home.clone())
+            {
+                command.env("CODEX_HOME", path);
+            }
+            for (key, value) in &self.env {
+                if !key.starts_with("HELM_") {
+                    command.env(key, value);
+                }
+            }
+        };
+        let mut command = build_codex_command(&self.bin);
+        configure_command(&mut command);
+        let process = Arc::new(spawn_codex_app_server(command).await?);
+        *slot = Some(process.clone());
+        drop(slot);
+        spawn_codex_app_server_loops(self.clone(), process.clone());
+        Ok(process)
+    }
+
+    async fn run_app_server_turn(
+        &self,
+        prompt: String,
+        attachments: Vec<String>,
+        spec: crate::turn_start::TurnExecutionSpec,
+    ) -> Result<(), String> {
+        let mode = TurnMode::parse(Some(&spec.turn_mode));
+        let reasoning_effort = spec.routed_reasoning_effort;
+        let helm_turn_id = spec.turn_id.clone();
+        *self.current_helm_turn_id.lock().await = Some(helm_turn_id.clone());
+        set_event_turn_context(&self.history_session_id, &helm_turn_id, spec.turn_epoch);
+        let selected_profile = *self
+            .permission_profile
+            .lock()
+            .map_err(|_| "Codex 权限档位锁中毒".to_string())?;
+        if spec.engine_id != "codex" || spec.permission_profile != selected_profile.as_str() {
+            return Err("TurnExecutionSpec 与 Codex Runtime 路由不一致".to_string());
+        }
+        *self.model.lock().await = spec.routed_model_id.clone();
+        let routed_model = spec.routed_model_id.clone();
+        begin_turn_supervisor(
+            &self.app,
+            &self.history_session_id,
+            &helm_turn_id,
+            spec.turn_epoch,
+            mode,
+            selected_profile,
+        );
+        let _workspace_lease = if mode == TurnMode::Build {
+            Some(
+                self.app
+                    .try_state::<crate::workspace_execution::WorkspaceExecutionCoordinator>()
+                    .ok_or_else(|| "工作目录执行协调器未启动".to_string())?
+                    .acquire(&self.history_session_id, &self.cwd)?,
             )
-            .await;
-            busy.store(false, Ordering::Release);
-        });
+        } else {
+            None
+        };
+        let process = self.ensure_app_server().await?;
+        let mut permission_profile = *self
+            .permission_profile
+            .lock()
+            .map_err(|_| "Codex 权限档位锁中毒".to_string())?;
+        if permission_profile == PermissionProfile::FullAccess {
+            let valid = self
+                .full_access_lease
+                .lock()
+                .map_err(|_| "Codex FullAccessLease 锁中毒".to_string())?
+                .as_ref()
+                .is_some_and(|lease| {
+                    lease_is_valid(lease, &self.history_session_id, "codex", &self.cwd)
+                });
+            if !valid {
+                permission_profile = PermissionProfile::Standard;
+                *self
+                    .permission_profile
+                    .lock()
+                    .map_err(|_| "Codex 权限档位锁中毒".to_string())? = permission_profile;
+            }
+        }
+        let (sandbox, native_network_allowed, approval_policy) =
+            codex_runtime_profile_policy(mode, permission_profile);
+        let prompt = prompt_with_attachments(&prompt, &attachments);
+        let prompt = if mode == TurnMode::Plan {
+            format!("{CODEX_PLAN_PROMPT_PREFIX}\n\n{prompt}")
+        } else {
+            prompt
+        };
+        let existing_thread = self.thread_id.lock().ok().and_then(|guard| guard.clone());
+        let force_rebuild = self.force_history_rebuild.load(Ordering::Acquire);
+        let history = self
+            .history_messages
+            .lock()
+            .map(|history| history.clone())
+            .unwrap_or_default();
+        let base_prompt = prompt;
+        let mut prompt = codex_app_server_prompt(force_rebuild, &history, &base_prompt);
+        let execution_cwd = self
+            .execution_cwd
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| "Codex 工作目录尚未初始化".to_string())?;
+        let thread_id = if self.app_server_thread_ready.load(Ordering::Acquire) {
+            existing_thread.ok_or_else(|| "Codex app-server thread state is missing".to_string())?
+        } else {
+            let thread_id =
+                match codex_app_server_thread_plan(existing_thread.as_deref(), force_rebuild) {
+                    CodexAppServerThreadPlan::Start => {
+                        process
+                            .rpc
+                            .start_thread_with_policy(
+                                &execution_cwd,
+                                &routed_model,
+                                sandbox,
+                                approval_policy,
+                            )
+                            .await?
+                    }
+                    CodexAppServerThreadPlan::Resume(thread_id) => {
+                        match process
+                            .rpc
+                            .resume_thread_with_policy(
+                                &thread_id,
+                                &execution_cwd,
+                                &routed_model,
+                                sandbox,
+                                approval_policy,
+                            )
+                            .await
+                        {
+                            Ok(thread_id) => thread_id,
+                            Err(error) if is_codex_thread_missing_error(&error) => {
+                                // app-server reports a missing rollout synchronously from
+                                // thread/resume, before the turn stream can trigger the normal
+                                // exec-path fallback. Rebuild from Helm's local history here.
+                                if let Ok(mut guard) = self.thread_id.lock() {
+                                    *guard = None;
+                                }
+                                self.force_history_rebuild.store(true, Ordering::Release);
+                                self.app_server_thread_ready.store(false, Ordering::Release);
+                                prompt = codex_app_server_prompt(true, &history, &base_prompt);
+                                emit_agent_event(
+                                    &self.app,
+                                    &self.history_session_id,
+                                    &AgentEvent::Error {
+                                        session_id: Some(self.history_session_id.clone()),
+                                        message: format!(
+                                        "Codex 原生 thread 已不存在，将用本地历史重建一次：{error}"
+                                    ),
+                                        recoverable: true,
+                                        kind: Some("thread_missing".to_string()),
+                                    },
+                                );
+                                emit_agent_event(
+                                    &self.app,
+                                    &self.history_session_id,
+                                    &AgentEvent::TurnStage {
+                                        session_id: self.history_session_id.clone(),
+                                        stage: TurnStage::Retrying,
+                                        ts: now_millis(),
+                                        engine_reported_ttft_ms: None,
+                                        retry_attempt: Some(1),
+                                    },
+                                );
+                                process
+                                    .rpc
+                                    .start_thread_with_policy(
+                                        &execution_cwd,
+                                        &routed_model,
+                                        sandbox,
+                                        approval_policy,
+                                    )
+                                    .await?
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                };
+            if let Ok(mut guard) = self.thread_id.lock() {
+                *guard = Some(thread_id.clone());
+            }
+            self.force_history_rebuild.store(false, Ordering::Release);
+            self.app_server_thread_ready.store(true, Ordering::Release);
+            if let Some(history_store) = self.app.try_state::<SessionHistoryStore>() {
+                history_store
+                    .attach_native_thread_to_session(&self.history_session_id, &thread_id)?;
+            }
+            thread_id
+        };
+        emit_agent_event(
+            &self.app,
+            &self.history_session_id,
+            &AgentEvent::SessionStarted {
+                session_id: thread_id.clone(),
+                engine: EngineId::Codex,
+                model: routed_model.clone(),
+                cwd: execution_cwd.clone(),
+                ts: now_millis(),
+                capabilities: Some(self.capability_snapshot.lock().await.runtime_projection()),
+            },
+        );
+        self.pending_tool_items.lock().await.clear();
+        let native_turn_id = process
+            .rpc
+            .start_turn_with_context_policy(
+                &thread_id,
+                &prompt,
+                &routed_model,
+                sandbox,
+                &execution_cwd,
+                native_network_allowed,
+                (!reasoning_effort.is_auto()).then_some(reasoning_effort.as_str()),
+                approval_policy,
+                &spec.session_context,
+            )
+            .await?;
+        self.native_turn_contexts.lock().await.insert(
+            native_turn_id.clone(),
+            helm_turn_id,
+            spec.turn_epoch,
+        );
+        *self.current_app_server_turn_id.lock().await = Some(native_turn_id.clone());
+        loop {
+            let notified = self.terminal_notify.notified();
+            if let Some(outcome) =
+                terminal_turn_outcome(&self.terminal_turns, &native_turn_id).await
+            {
+                match outcome {
+                    Ok(()) => break,
+                    Err(error) if error.starts_with(CODEX_TURN_FAILED_PREFIX) => break,
+                    Err(error) => return Err(error),
+                }
+            }
+            if tokio::time::timeout(std::time::Duration::from_secs(300), notified)
+                .await
+                .is_err()
+            {
+                emit_agent_event(
+                    &self.app,
+                    &self.history_session_id,
+                    &AgentEvent::TurnStage {
+                        session_id: thread_id.clone(),
+                        stage: TurnStage::Stalled,
+                        ts: now_millis(),
+                        engine_reported_ttft_ms: None,
+                        retry_attempt: None,
+                    },
+                );
+            }
+        }
+        *self.current_app_server_turn_id.lock().await = None;
         Ok(())
     }
 
+    async fn approve(&self, request_id: String, decision: ApprovalDecision) -> Result<(), String> {
+        let pending = self
+            .pending_approvals
+            .lock()
+            .await
+            .get(&request_id)
+            .cloned()
+            .ok_or_else(|| format!("找不到 Codex 待审批请求：{request_id}"))?;
+        let available_decisions = available_approval_decisions(Some(&pending.action));
+        validate_approval_decision(decision, &available_decisions)?;
+        let process = self
+            .app_server
+            .lock()
+            .await
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "Codex app-server 未运行，无法应用审批".to_string())?;
+        let history_store = self
+            .app
+            .try_state::<SessionHistoryStore>()
+            .ok_or_else(|| "会话历史存储不可用，无法提交 Codex 审批".to_string())?;
+        let decision = match decision {
+            ApprovalDecision::Allow => CodexUserDecision::Allow,
+            ApprovalDecision::Turn => CodexUserDecision::Turn,
+            ApprovalDecision::Session => CodexUserDecision::Session,
+            ApprovalDecision::Project => CodexUserDecision::Project,
+            ApprovalDecision::Deny => CodexUserDecision::Deny,
+            ApprovalDecision::Always => CodexUserDecision::Always,
+        };
+        apply_codex_user_decision(&history_store, &process.rpc, &pending, decision).await?;
+        self.pending_approvals.lock().await.remove(&request_id);
+        Ok(())
+    }
+
+    fn send_reserved(
+        &self,
+        text: String,
+        attachments: Vec<String>,
+        spec: crate::turn_start::TurnExecutionSpec,
+    ) {
+        let session = self.clone();
+        let busy = self.busy.clone();
+        self.interrupted.store(false, Ordering::Release);
+        spawn_agent_task(async move {
+            if let Err(error) = session.run_app_server_turn(text, attachments, spec).await {
+                emit_agent_event(
+                    &session.app,
+                    &session.history_session_id,
+                    &AgentEvent::Error {
+                        session_id: session
+                            .thread_id
+                            .lock()
+                            .ok()
+                            .and_then(|guard| guard.clone()),
+                        message: error,
+                        recoverable: true,
+                        kind: Some("process_crash".to_string()),
+                    },
+                );
+                let session_id = session
+                    .thread_id
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.clone())
+                    .unwrap_or_else(|| session.history_session_id.clone());
+                emit_agent_event(
+                    &session.app,
+                    &session.history_session_id,
+                    &AgentEvent::TurnComplete {
+                        session_id,
+                        stop_reason: StopReason::Error,
+                    },
+                );
+            }
+            busy.store(false, Ordering::Release);
+        });
+    }
+
     fn interrupt(&self) -> Result<(), String> {
+        let process = self.app_server.clone();
+        let app = self.app.clone();
+        let history_session_id = self.history_session_id.clone();
+        let thread_id = self.thread_id.clone();
+        let turn_id = self.current_app_server_turn_id.clone();
+        let terminal_turns = self.terminal_turns.clone();
+        let terminal_notify = self.terminal_notify.clone();
         let running_pid = self.running_pid.clone();
-        // 先立标志再杀进程：run_codex_turn 收尾时据此改发 TurnComplete{Interrupted}
+        // 先立标志再杀进程：app-server 轮次收尾时据此改发 TurnComplete{Interrupted}
         self.interrupted.store(true, Ordering::Release);
         spawn_agent_task(async move {
+            if let (Some(process), Some(thread_id), Some(turn_id)) = (
+                process.lock().await.as_ref().cloned(),
+                thread_id.lock().ok().and_then(|guard| guard.clone()),
+                turn_id.lock().await.clone(),
+            ) {
+                let _ = process
+                    .rpc
+                    .request(
+                        "turn/interrupt",
+                        serde_json::json!({"threadId":thread_id,"turnId":turn_id}),
+                    )
+                    .await;
+            }
             let pid = *running_pid.lock().await;
             kill_tree(pid).await;
             set_running_pid(&running_pid, None).await;
+            let active_turn_id = turn_id.lock().await.clone();
+            finish_codex_interrupt_terminal(
+                &terminal_turns,
+                &terminal_notify,
+                active_turn_id,
+                || {
+                    let session_id = thread_id
+                        .lock()
+                        .ok()
+                        .and_then(|guard| guard.clone())
+                        .unwrap_or_else(|| history_session_id.clone());
+                    emit_agent_event(
+                        &app,
+                        &history_session_id,
+                        &AgentEvent::TurnComplete {
+                            session_id,
+                            stop_reason: StopReason::Interrupted,
+                        },
+                    );
+                },
+            )
+            .await;
         });
         Ok(())
     }
 }
 
-pub fn start_codex(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start_codex_with_reasoning(
     app: AppHandle,
     history_session_id: String,
     bin: String,
     model: String,
     cwd: String,
     env: Vec<(String, String)>,
-    sandbox_mode: String,
     history_messages: Vec<crate::sessions::SessionMessage>,
     native_thread_id: Option<String>,
+    auth_home: Option<CodexAuthHome>,
+    subscription_home: Option<PathBuf>,
+    capability_snapshot: crate::capability_registry::EngineCapabilitySnapshot,
+    _reasoning_effort: ReasoningEffort,
 ) -> Result<AgentSession, String> {
-    let auth_home = create_codex_auth_home(&env, &[])?;
+    let canonical_cwd = std::path::Path::new(&cwd)
+        .canonicalize()
+        .map_err(|error| format!("工作目录不可用：{error}"))?
+        .to_string_lossy()
+        .to_string();
+    let (turn_completions, _) = broadcast::channel(32);
+    let session_home = auth_home.as_ref().map(|home| home.path.clone());
+    let effective_home =
+        select_effective_codex_home(session_home.as_ref(), subscription_home.as_ref());
     Ok(AgentSession::Codex(CodexSession {
         app,
         history_session_id,
         bin,
-        model,
-        cwd,
+        model: Arc::new(Mutex::new(model)),
+        cwd: canonical_cwd.clone(),
+        execution_cwd: Arc::new(Mutex::new(Some(canonical_cwd.clone()))),
+        policy_cwd: Arc::new(Mutex::new(canonical_cwd)),
         env,
-        sandbox_mode,
         running_pid: Arc::new(Mutex::new(None)),
         history_messages: Arc::new(std::sync::Mutex::new(history_messages)),
         busy: Arc::new(AtomicBool::new(false)),
@@ -3519,504 +6030,485 @@ pub fn start_codex(
         disabled_mcp: Arc::new(std::sync::Mutex::new(Vec::new())),
         thread_id: Arc::new(std::sync::Mutex::new(native_thread_id)),
         auth_home: Arc::new(std::sync::Mutex::new(auth_home)),
+        effective_home: Arc::new(std::sync::Mutex::new(effective_home)),
         force_history_rebuild: Arc::new(AtomicBool::new(false)),
+        app_server: Arc::new(Mutex::new(None)),
+        app_server_thread_ready: Arc::new(AtomicBool::new(false)),
+        pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+        file_changes_by_item: Arc::new(Mutex::new(HashMap::new())),
+        pending_tool_items: Arc::new(Mutex::new(HashSet::new())),
+        turn_completions,
+        terminal_turns: Arc::new(Mutex::new(HashMap::new())),
+        terminal_notify: Arc::new(Notify::new()),
+        current_helm_turn_id: Arc::new(Mutex::new(None)),
+        current_app_server_turn_id: Arc::new(Mutex::new(None)),
+        native_turn_contexts: Arc::new(Mutex::new(CodexTurnContextIndex::default())),
+        permission_profile: Arc::new(std::sync::Mutex::new(PermissionProfile::Standard)),
+        full_access_lease: Arc::new(std::sync::Mutex::new(None)),
+        capability_snapshot: Arc::new(Mutex::new(capability_snapshot)),
     }))
 }
 
-async fn run_codex_turn(
-    app: AppHandle,
-    history_session_id: String,
-    bin: String,
-    model: String,
-    cwd: String,
-    env: Vec<(String, String)>,
-    sandbox_mode: String,
-    running_pid: Arc<Mutex<Option<u32>>>,
-    history_messages: Arc<std::sync::Mutex<Vec<crate::sessions::SessionMessage>>>,
-    interrupted: Arc<AtomicBool>,
-    disabled_mcp: Arc<std::sync::Mutex<Vec<String>>>,
-    thread_id: Arc<std::sync::Mutex<Option<String>>>,
-    auth_home: Arc<std::sync::Mutex<Option<CodexAuthHome>>>,
-    force_history_rebuild: Arc<AtomicBool>,
-    prompt: String,
-    attachments: Vec<String>,
-    mode: TurnMode,
-    allow_missing_thread_fallback: bool,
-) {
-    let seeded_thread_id = thread_id.lock().ok().and_then(|guard| guard.clone());
-    let session_id = seeded_thread_id
-        .clone()
-        .unwrap_or_else(|| format!("codex-{}-{}", std::process::id(), now_millis()));
-    emit_agent_event(
-        &app,
-        &history_session_id,
-        &AgentEvent::SessionStarted {
-            session_id: session_id.clone(),
-            engine: EngineId::Codex,
-            model: model.clone(),
-            cwd: cwd.clone(),
-            ts: now_millis() as i64,
-        },
-    );
+const CODEX_TURN_FAILED_PREFIX: &str = "[codex_turn_failed]";
 
-    // 工作目录守卫：与 Claude 一致，绝不静默继承 Helm 进程自身目录。
-    if let Err(message) = validate_cwd(&cwd) {
-        emit_agent_event(
-            &app,
-            &history_session_id,
-            &AgentEvent::Error {
-                session_id: Some(session_id),
-                kind: Some("cwd_invalid".to_string()),
-                message,
-                recoverable: false,
-            },
-        );
-        return;
-    }
-    if let Err(message) = validate_engine_bin(&bin) {
-        emit_agent_event(
-            &app,
-            &history_session_id,
-            &AgentEvent::Error {
-                session_id: Some(session_id),
-                kind: Some("invalid_engine_bin".to_string()),
-                message,
-                recoverable: false,
-            },
-        );
-        return;
-    }
-
-    let history_user_prompt = prompt_with_attachments(&prompt, &attachments);
-    // 计划模式软约束（变更-04 A.3）：只注入发给 CLI 的 prompt，Helm 历史存的是用户原文
-    let current_prompt = if mode == TurnMode::Plan {
-        format!("{CODEX_PLAN_PROMPT_PREFIX}\n\n{history_user_prompt}")
-    } else {
-        history_user_prompt.clone()
-    };
-    let history_snapshot = history_messages
-        .lock()
-        .map(|history| history.clone())
-        .unwrap_or_default();
-    let rebuild_requested = force_history_rebuild.load(Ordering::Acquire);
-    let exec_plan = codex_exec_plan(
-        seeded_thread_id.as_deref(),
-        rebuild_requested,
-        &history_snapshot,
-        &current_prompt,
-    );
-    let is_resume = matches!(exec_plan.command, CodexExecCommand::Resume { .. });
-
-    let mut cmd = build_codex_command(&bin);
-    apply_inherited_agent_environment(&mut cmd);
-    let exec_args = codex_exec_args(&exec_plan, &model, &sandbox_mode);
-    cmd.arg(&exec_args[0]);
-    for arg in codex_provider_config_args(&env) {
-        cmd.arg("-c").arg(arg);
-    }
-    cmd.args(&exec_args[1..]);
-    cmd.current_dir(&cwd);
-    let disabled_mcp_list = disabled_mcp
-        .lock()
-        .map(|guard| guard.clone())
-        .unwrap_or_default();
-    if let Some(path) = codex_auth_home_path(&auth_home) {
-        cmd.env("CODEX_HOME", path);
-    } else if !disabled_mcp_list.is_empty() {
-        // 订阅登录（无 API Key）直接用真实 ~/.codex，改不了它的 config.toml——
-        // 会话级 MCP 开关无法生效，明确告知而不是静默忽略（变更-11）
-        emit_agent_event(
-            &app,
-            &history_session_id,
-            &AgentEvent::Error {
-                session_id: Some(session_id.clone()),
-                message: "Codex 订阅登录暂不支持会话级 MCP 开关，本轮沿用全局 MCP 配置".to_string(),
-                recoverable: true,
-                kind: None,
-            },
-        );
-    }
-    for (key, value) in &env {
-        if key.starts_with("HELM_") {
-            continue;
-        }
-        cmd.env(key, value);
-    }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    emit_agent_event(
-        &app,
-        &history_session_id,
-        &AgentEvent::TurnStage {
-            session_id: session_id.clone(),
-            stage: if is_resume {
-                TurnStage::RestoringSession
-            } else {
-                TurnStage::StartingEngine
-            },
-            ts: now_millis() as i64,
-            engine_reported_ttft_ms: None,
-            retry_attempt: None,
-        },
-    );
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            emit_agent_event(
-                &app,
-                &history_session_id,
-                &AgentEvent::Error {
-                    session_id: Some(session_id),
-                    message: format!("无法启动 codex 进程：{e}"),
-                    recoverable: false,
-                    kind: Some("not_installed".to_string()),
-                },
-            );
-            return;
-        }
-    };
-    set_running_pid(&running_pid, child.id()).await;
-
-    let last_activity_ms = Arc::new(AtomicU64::new(now_millis() as u64));
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let stdout_app = app.clone();
-    let stdout_history_session_id = history_session_id.clone();
-    let stdout_session_id = session_id.clone();
-    let stdout_cwd = cwd.clone();
-    let stdout_running_pid = running_pid.clone();
-    let stdout_last_activity = last_activity_ms.clone();
-    let stdout_thread_id = thread_id.clone();
-    let stdout_force_history_rebuild = force_history_rebuild.clone();
-    let out_task = tokio::spawn(async move {
-        let mut result = CodexStreamResult::default();
-        if let Some(stdout) = stdout {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                stdout_last_activity.store(now_millis() as u64, Ordering::Release);
-                result.stdout.push_str(&line);
-                result.stdout.push('\n');
-                if is_resume {
-                    if let Some(message) = codex_thread_missing_message_from_line(&line) {
-                        result.thread_missing_error = Some(message);
-                        continue;
-                    }
-                }
-                if let Some(native_thread_id) = codex_thread_id_from_line(&line) {
-                    if let Ok(mut guard) = stdout_thread_id.lock() {
-                        *guard = Some(native_thread_id.clone());
-                    }
-                    stdout_force_history_rebuild.store(false, Ordering::Release);
-                    if let Some(history_store) = stdout_app.try_state::<SessionHistoryStore>() {
-                        if let Err(err) = history_store.attach_native_thread_to_session(
-                            &stdout_history_session_id,
-                            &native_thread_id,
-                        ) {
-                            emit_agent_event(
-                                &stdout_app,
-                                &stdout_history_session_id,
-                                &AgentEvent::Error {
-                                    session_id: Some(stdout_session_id.clone()),
-                                    message: format!("保存 Codex thread id 失败：{err}"),
-                                    recoverable: true,
-                                    kind: Some("session_persist_failed".to_string()),
-                                },
-                            );
-                        }
-                    }
-                }
-                for event in parse_codex_line(&stdout_session_id, &line) {
-                    match &event {
-                        AgentEvent::MessageComplete { .. } => result.emitted_message = true,
-                        AgentEvent::TokenUsage { .. } => result.emitted_usage = true,
-                        AgentEvent::TurnComplete { .. } => result.emitted_turn_complete = true,
-                        AgentEvent::ToolCall {
-                            session_id,
-                            id,
-                            name,
-                            input,
-                            ..
-                        } => {
-                            if let Some(history_store) =
-                                stdout_app.try_state::<SessionHistoryStore>()
-                            {
-                                let cwd = PathBuf::from(&stdout_cwd);
-                                let checkpoint_result = stdout_app
-                                    .path()
-                                    .app_data_dir()
-                                    .map_err(|err| format!("获取检查点目录失败：{err}"))
-                                    .and_then(|app_data_dir| {
-                                        create_auto_checkpoint_for_tool(
-                                            &history_store,
-                                            &app_data_dir.join("snapshots"),
-                                            &stdout_history_session_id,
-                                            session_id,
-                                            &cwd,
-                                            id,
-                                            name,
-                                            input,
-                                        )
-                                    });
-                                match checkpoint_result {
-                                    Ok(Some(checkpoint)) => emit_agent_event(
-                                        &stdout_app,
-                                        &stdout_history_session_id,
-                                        &checkpoint,
-                                    ),
-                                    Ok(None) => {}
-                                    Err(err) => {
-                                        emit_agent_event(
-                                            &stdout_app,
-                                            &stdout_history_session_id,
-                                            &AgentEvent::Error {
-                                                session_id: Some(session_id.clone()),
-                                                message: format!(
-                                                    "自动创建检查点失败，已终止本轮：{err}"
-                                                ),
-                                                recoverable: false,
-                                                kind: Some("checkpoint_failed".to_string()),
-                                            },
-                                        );
-                                        let pid = *stdout_running_pid.lock().await;
-                                        kill_tree(pid).await;
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                    emit_agent_event(&stdout_app, &stdout_history_session_id, &event);
-                }
-            }
-        }
-        result
-    });
-    let err_last_activity = last_activity_ms.clone();
-    let err_task = tokio::spawn(async move {
-        let mut text = String::new();
-        if let Some(stderr) = stderr {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                err_last_activity.store(now_millis() as u64, Ordering::Release);
-                text.push_str(&line);
-                text.push('\n');
-            }
-        }
-        text
-    });
-
-    // 看门狗：codex 长时间无输出时提示用户（不强杀）。
-    let watchdog_app = app.clone();
-    let watchdog_history = history_session_id.clone();
-    let watchdog_session = session_id.clone();
-    let watchdog_activity = last_activity_ms.clone();
-    let watchdog = tokio::spawn(async move {
-        const IDLE_WARN_MS: u64 = 300_000;
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            let idle =
-                (now_millis() as u64).saturating_sub(watchdog_activity.load(Ordering::Acquire));
-            if idle >= IDLE_WARN_MS {
-                emit_agent_event(
-                    &watchdog_app,
-                    &watchdog_history,
-                    &AgentEvent::Error {
-                        session_id: Some(watchdog_session),
-                        message:
-                            "codex 已超过 5 分钟没有任何输出，可能已挂起；可点击停止按钮中断本轮"
-                                .to_string(),
-                        recoverable: true,
-                        kind: Some("timeout".to_string()),
-                    },
-                );
-                return;
-            }
-        }
-    });
-
-    let status = child.wait().await;
-    watchdog.abort();
-    set_running_pid(&running_pid, None).await;
-    let stream_result = out_task.await.unwrap_or_default();
-    let stderr_text = err_task.await.unwrap_or_default();
-    let output_summary = codex_output_summary(&stream_result.stdout);
-    let final_text = output_summary.final_text.unwrap_or_default();
-
-    // 用户中断（变更-09）：杀进程导致的非零退出是预期行为，
-    // 发 TurnComplete{Interrupted} 而不是红色错误卡（与 Claude 路径对齐）
-    if interrupted.load(Ordering::Acquire) {
-        emit_agent_event(
-            &app,
-            &history_session_id,
-            &AgentEvent::TurnComplete {
-                session_id,
-                stop_reason: StopReason::Interrupted,
-            },
-        );
-        return;
-    }
-
-    if is_resume && allow_missing_thread_fallback {
-        if let Some(message) = stream_result.thread_missing_error.as_deref().or_else(|| {
-            let trimmed = stderr_text.trim();
-            is_codex_thread_missing_error(trimmed).then_some(trimmed)
-        }) {
-            if let Ok(mut guard) = thread_id.lock() {
-                *guard = None;
-            }
-            force_history_rebuild.store(true, Ordering::Release);
-            emit_agent_event(
-                &app,
-                &history_session_id,
-                &AgentEvent::Error {
-                    session_id: Some(session_id.clone()),
-                    message: format!("Codex 原生 thread 已不存在，将用本地历史重建一次：{message}"),
-                    recoverable: true,
-                    kind: Some("thread_missing".to_string()),
-                },
-            );
-            emit_agent_event(
-                &app,
-                &history_session_id,
-                &AgentEvent::TurnStage {
-                    session_id: session_id.clone(),
-                    stage: TurnStage::Retrying,
-                    ts: now_millis() as i64,
-                    engine_reported_ttft_ms: None,
-                    retry_attempt: Some(1),
-                },
-            );
-            Box::pin(run_codex_turn(
-                app,
-                history_session_id,
-                bin,
-                model,
-                cwd,
-                env,
-                sandbox_mode,
-                running_pid,
-                history_messages,
-                interrupted,
-                disabled_mcp,
-                thread_id,
-                auth_home,
-                force_history_rebuild,
-                prompt,
-                attachments,
-                mode,
-                false,
-            ))
-            .await;
-            return;
-        }
-    }
-
-    if !stream_result.emitted_message && !final_text.is_empty() {
-        emit_agent_event(
-            &app,
-            &history_session_id,
-            &AgentEvent::MessageComplete {
-                session_id: session_id.clone(),
-                role: Role::Assistant,
-                text: final_text.clone(),
-            },
-        );
-    }
-
-    if !stream_result.emitted_usage
-        && (output_summary.input_tokens > 0 || output_summary.output_tokens > 0)
+fn codex_app_server_terminal_outcome(
+    notification: &serde_json::Value,
+) -> Option<(String, Result<(), String>)> {
+    if notification
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        != Some("turn/completed")
     {
-        emit_agent_event(
-            &app,
-            &history_session_id,
-            &AgentEvent::TokenUsage {
-                session_id: session_id.clone(),
-                input_tokens: output_summary.input_tokens,
-                output_tokens: output_summary.output_tokens,
-                cost_usd: output_summary.cost_usd,
-                context_window: None,
-            },
-        );
+        return None;
     }
+    let turn_id = notification
+        .pointer("/params/turn/id")
+        .and_then(serde_json::Value::as_str)?
+        .to_string();
+    let status = notification
+        .pointer("/params/turn/status")
+        .and_then(serde_json::Value::as_str);
+    let outcome = if status == Some("failed") {
+        Err(format!(
+            "{CODEX_TURN_FAILED_PREFIX} {}",
+            codex_app_server_failure_message(notification)
+        ))
+    } else {
+        Ok(())
+    };
+    Some((turn_id, outcome))
+}
 
-    let ok = status.map(|status| status.success()).unwrap_or(false);
-    if ok && !final_text.is_empty() {
-        match history_messages.lock() {
-            Ok(mut history) => append_codex_turn_history(
-                &mut history,
-                &history_user_prompt,
-                &final_text,
-                now_millis() as i64,
-            ),
-            Err(_) => emit_agent_event(
-                &app,
-                &history_session_id,
-                &AgentEvent::Error {
-                    session_id: Some(session_id.clone()),
-                    message: "Codex 运行时历史更新失败，下一轮上下文可能不完整".to_string(),
-                    recoverable: true,
-                    kind: Some("history_update_failed".to_string()),
-                },
-            ),
+fn codex_app_server_terminal_outcome_with_pending(
+    notification: &serde_json::Value,
+    pending_tool_count: usize,
+) -> Option<(String, Result<(), String>)> {
+    let (turn_id, outcome) = codex_app_server_terminal_outcome(notification)?;
+    if outcome.is_ok() && pending_tool_count > 0 {
+        return Some((
+            turn_id,
+            Err(format!(
+                "{CODEX_TURN_FAILED_PREFIX} Codex turn completed with {pending_tool_count} unfinished tool item(s)"
+            )),
+        ));
+    }
+    Some((turn_id, outcome))
+}
+
+fn codex_notification_for_terminal_outcome(
+    notification: &serde_json::Value,
+    outcome: Option<&Result<(), String>>,
+) -> serde_json::Value {
+    let Some(Err(error)) = outcome else {
+        return notification.clone();
+    };
+    if notification
+        .pointer("/params/turn/status")
+        .and_then(serde_json::Value::as_str)
+        == Some("failed")
+    {
+        return notification.clone();
+    }
+    let mut adjusted = notification.clone();
+    adjusted["params"]["turn"]["status"] = serde_json::json!("failed");
+    adjusted["params"]["turn"]["error"] = serde_json::json!({"message": error});
+    adjusted
+}
+
+fn codex_notification_native_turn_id(notification: &serde_json::Value) -> Option<&str> {
+    notification
+        .pointer("/params/turnId")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            notification
+                .pointer("/params/turn/id")
+                .and_then(serde_json::Value::as_str)
+        })
+}
+
+fn record_codex_terminal_once(
+    terminal_turns: &mut HashMap<String, Result<(), String>>,
+    turn_id: String,
+    outcome: Result<(), String>,
+) -> bool {
+    if terminal_turns.contains_key(&turn_id) {
+        return false;
+    }
+    if terminal_turns.len() >= 64 {
+        if let Some(oldest) = terminal_turns.keys().next().cloned() {
+            terminal_turns.remove(&oldest);
         }
     }
-    if !ok {
-        let detail = output_summary.error_message.as_deref().or_else(|| {
-            let trimmed = stderr_text.trim();
-            (!trimmed.is_empty()).then_some(trimmed)
-        });
-        emit_agent_event(
-            &app,
-            &history_session_id,
-            &AgentEvent::Error {
-                session_id: Some(session_id.clone()),
-                message: if let Some(detail) = detail {
-                    format!("codex 进程异常退出：{detail}")
-                } else {
-                    "codex 进程异常退出".to_string()
-                },
-                recoverable: false,
-                kind: detail
-                    .and_then(classify_error)
-                    .or_else(|| Some("process_crash".to_string())),
-            },
-        );
+    terminal_turns.insert(turn_id, outcome);
+    true
+}
+
+async fn finish_codex_interrupt_terminal<F>(
+    terminal_turns: &Mutex<HashMap<String, Result<(), String>>>,
+    terminal_notify: &Notify,
+    active_turn_id: Option<String>,
+    emit_terminal: F,
+) where
+    F: FnOnce(),
+{
+    let should_emit = if let Some(active_turn_id) = active_turn_id.as_ref() {
+        let mut terminal_turns = terminal_turns.lock().await;
+        record_codex_terminal_once(&mut terminal_turns, active_turn_id.clone(), Ok(()))
+    } else {
+        true
+    };
+    if should_emit {
+        emit_terminal();
     }
-    if !stream_result.emitted_turn_complete {
-        emit_agent_event(
-            &app,
-            &history_session_id,
-            &AgentEvent::TurnComplete {
-                session_id,
-                stop_reason: if ok {
-                    StopReason::End
-                } else {
-                    StopReason::Error
-                },
-            },
-        );
+    if active_turn_id.is_some() {
+        terminal_notify.notify_waiters();
     }
 }
 
-#[derive(Default)]
-struct CodexStreamResult {
-    stdout: String,
-    emitted_message: bool,
-    emitted_usage: bool,
-    emitted_turn_complete: bool,
-    thread_missing_error: Option<String>,
+pub(crate) fn codex_app_server_failure_message(notification: &serde_json::Value) -> String {
+    let message = notification
+        .pointer("/params/turn/error/message")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            notification
+                .pointer("/params/error/message")
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            notification
+                .pointer("/params/turn/error")
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or_default();
+    // v2 的结构化详情仅参与分类，不能原样展示，避免泄露 URL、请求 ID 或 header。
+    let additional_details = notification
+        .pointer("/params/turn/error/additionalDetails")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let error_info = notification
+        .pointer("/params/turn/error/codexErrorInfo")
+        .map(serde_json::Value::to_string)
+        .unwrap_or_default();
+    let raw = format!("{message}\n{additional_details}\n{error_info}").to_ascii_lowercase();
+    if raw.contains("unfinished tool") || raw.contains("missing tool result") {
+        "Codex 工具执行未返回结果，已阻止本轮伪成功；请检查当前 Codex 版本的命令执行能力。"
+            .to_string()
+    } else if raw.contains("401") || raw.contains("unauthorized") || raw.contains("authentication")
+    {
+        "Codex 服务商认证失败，请重新验证当前 API 接入。".to_string()
+    } else if raw.contains("403") || raw.contains("forbidden") {
+        "Codex 服务商拒绝了当前请求，请检查账号权限与模型授权。".to_string()
+    } else if raw.contains("model")
+        && (raw.contains("not found")
+            || raw.contains("does not exist")
+            || raw.contains("access")
+            || raw.contains("unavailable"))
+    {
+        "Codex 当前绑定的模型不存在或账号无权访问，请重新同步模型并调整生效绑定。".to_string()
+    } else if raw.contains("429") || raw.contains("rate limit") {
+        "Codex 服务商触发了请求频率限制，请稍后重试。".to_string()
+    } else if raw.contains("usagelimitexceeded") || raw.contains("sessionbudgetexceeded") {
+        "Codex 订阅账号当前用量已达上限，请在官方账号页面确认额度后重试。".to_string()
+    } else if raw.contains("contextwindowexceeded") {
+        "Codex 当前对话超过模型上下文上限，请新建会话或减少输入内容。".to_string()
+    } else if raw.contains("serveroverloaded") || raw.contains("internalservererror") {
+        "Codex 服务暂时繁忙，请稍后重试。".to_string()
+    } else if raw.contains("timeout")
+        || raw.contains("timed out")
+        || raw.contains("connection")
+        || raw.contains("network")
+        || raw.contains("httpconnectionfailed")
+        || raw.contains("responsestreamconnectionfailed")
+        || raw.contains("responsestreamdisconnected")
+        || raw.contains("responsetoomanyfailedattempts")
+    {
+        "Codex 连接服务商失败，请检查网络、代理与服务商可达性。".to_string()
+    } else {
+        "Codex 轮次失败；服务商未返回可安全展示的详细原因。".to_string()
+    }
 }
 
-#[derive(Default)]
-struct CodexOutputSummary {
-    final_text: Option<String>,
-    error_message: Option<String>,
-    input_tokens: u64,
-    output_tokens: u64,
-    cost_usd: f64,
+fn parse_codex_app_server_notification(
+    session_id: &str,
+    notification: &serde_json::Value,
+) -> Vec<AgentEvent> {
+    let Some(method) = notification
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Vec::new();
+    };
+    let params = notification
+        .get("params")
+        .unwrap_or(&serde_json::Value::Null);
+    match method {
+        "thread/started" | "turn/started" => {
+            vec![codex_turn_stage(session_id, TurnStage::WaitingModel)]
+        }
+        "item/agentMessage/delta" => params
+            .get("delta")
+            .and_then(serde_json::Value::as_str)
+            .map(|text| {
+                vec![AgentEvent::MessageDelta {
+                    session_id: session_id.to_string(),
+                    role: Role::Assistant,
+                    text: text.to_string(),
+                }]
+            })
+            .unwrap_or_default(),
+        "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => params
+            .get("delta")
+            .and_then(serde_json::Value::as_str)
+            .map(|text| {
+                vec![AgentEvent::ThinkingDelta {
+                    session_id: session_id.to_string(),
+                    text: text.to_string(),
+                }]
+            })
+            .unwrap_or_default(),
+        "item/started" => params
+            .get("item")
+            .map(|item| codex_app_server_started_item(session_id, item))
+            .unwrap_or_default(),
+        "item/completed" => params
+            .get("item")
+            .map(|item| codex_app_server_completed_item(session_id, item))
+            .unwrap_or_default(),
+        "thread/tokenUsage/updated" => {
+            let usage = params.pointer("/tokenUsage/last");
+            let input_tokens = usage
+                .and_then(|value| value.get("inputTokens"))
+                .and_then(serde_json::Value::as_u64);
+            let output_tokens = usage
+                .and_then(|value| value.get("outputTokens"))
+                .and_then(serde_json::Value::as_u64);
+            let cached_input_tokens = usage
+                .and_then(|value| value.get("cachedInputTokens"))
+                .and_then(serde_json::Value::as_u64);
+            match (input_tokens, output_tokens) {
+                (Some(input_tokens), Some(output_tokens)) => {
+                    let context_window = params
+                        .pointer("/tokenUsage/modelContextWindow")
+                        .and_then(serde_json::Value::as_u64);
+                    vec![
+                        AgentEvent::ContextUsage {
+                            session_id: session_id.to_string(),
+                            // Codex app-server 的 inputTokens 已包含 cachedInputTokens。
+                            context_tokens: input_tokens,
+                            context_window,
+                        },
+                        AgentEvent::TokenUsage {
+                            session_id: session_id.to_string(),
+                            input_tokens,
+                            cached_input_tokens,
+                            cache_write_input_tokens: None,
+                            output_tokens,
+                            cost_usd: 0.0,
+                            service_tier: None,
+                            context_window,
+                        },
+                    ]
+                }
+                _ => Vec::new(),
+            }
+        }
+        "turn/completed" => {
+            let status = params
+                .pointer("/turn/status")
+                .and_then(serde_json::Value::as_str);
+            let stop_reason = match status {
+                Some("interrupted") => StopReason::Interrupted,
+                Some("failed") => StopReason::Error,
+                _ => StopReason::End,
+            };
+            let mut events = Vec::new();
+            if status == Some("failed") {
+                let message = codex_app_server_failure_message(notification);
+                events.push(AgentEvent::Error {
+                    session_id: Some(session_id.to_string()),
+                    kind: classify_error(&message),
+                    message,
+                    recoverable: true,
+                });
+            }
+            events.push(AgentEvent::TurnComplete {
+                session_id: session_id.to_string(),
+                stop_reason,
+            });
+            events
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn codex_app_server_started_item(session_id: &str, item: &serde_json::Value) -> Vec<AgentEvent> {
+    match item.get("type").and_then(serde_json::Value::as_str) {
+        Some("reasoning") => vec![codex_turn_stage(session_id, TurnStage::Reasoning)],
+        Some("agentMessage") => vec![codex_turn_stage(session_id, TurnStage::Responding)],
+        Some("commandExecution") => {
+            let mut events = vec![codex_turn_stage(session_id, TurnStage::UsingTool)];
+            if let Some(id) = codex_item_id(item) {
+                events.push(AgentEvent::ToolCall {
+                    session_id: session_id.to_string(),
+                    id,
+                    name: "Bash".to_string(),
+                    input: serde_json::json!({
+                        "command": item.get("command").cloned().unwrap_or_default(),
+                        "cwd": item.get("cwd").cloned().unwrap_or_default(),
+                    }),
+                    status: CallStatus::Pending,
+                });
+            }
+            events
+        }
+        Some("fileChange") => {
+            let mut events = vec![codex_turn_stage(session_id, TurnStage::UsingTool)];
+            if let Some(id) = codex_item_id(item) {
+                let paths = item
+                    .get("changes")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|change| change.get("path").and_then(serde_json::Value::as_str))
+                    .collect::<Vec<_>>();
+                events.push(AgentEvent::ToolCall {
+                    session_id: session_id.to_string(),
+                    id,
+                    name: "Write".to_string(),
+                    input: serde_json::json!({"paths": paths}),
+                    status: CallStatus::Pending,
+                });
+            }
+            events
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn codex_app_server_completed_item(session_id: &str, item: &serde_json::Value) -> Vec<AgentEvent> {
+    match item.get("type").and_then(serde_json::Value::as_str) {
+        Some("agentMessage") => item
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(|text| {
+                vec![AgentEvent::MessageComplete {
+                    session_id: session_id.to_string(),
+                    role: Role::Assistant,
+                    text: text.to_string(),
+                }]
+            })
+            .unwrap_or_default(),
+        Some("reasoning") => {
+            let text = item
+                .get("summary")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .chain(
+                    item.get("content")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(serde_json::Value::as_str),
+                )
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty())
+                .then(|| {
+                    vec![AgentEvent::ThinkingComplete {
+                        session_id: session_id.to_string(),
+                        text,
+                    }]
+                })
+                .unwrap_or_default()
+        }
+        Some("commandExecution") => {
+            if item
+                .get("aggregatedOutput")
+                .is_none_or(serde_json::Value::is_null)
+                && item.get("exitCode").is_none_or(serde_json::Value::is_null)
+                && item
+                    .get("durationMs")
+                    .is_none_or(serde_json::Value::is_null)
+            {
+                return Vec::new();
+            }
+            let Some(id) = codex_item_id(item) else {
+                return Vec::new();
+            };
+            let failed = matches!(
+                item.get("status").and_then(serde_json::Value::as_str),
+                Some("failed" | "declined")
+            );
+            let output = item
+                .get("aggregatedOutput")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string);
+            vec![AgentEvent::ToolResult {
+                session_id: session_id.to_string(),
+                id,
+                status: if failed {
+                    ToolStatus::Error
+                } else {
+                    ToolStatus::Success
+                },
+                output: output.clone(),
+                diff: None,
+                outcome: Some(if failed {
+                    crate::protocol::ToolOutcomeKind::ToolFailed
+                } else {
+                    crate::protocol::ToolOutcomeKind::ToolSucceeded
+                }),
+                started: Some(true),
+                has_output: Some(output.as_deref().is_some_and(|value| !value.is_empty())),
+                retryable: Some(false),
+                denial_source: if failed {
+                    Some(crate::protocol::ToolDenialSource::Tool)
+                } else {
+                    None
+                },
+                native_denial_code: None,
+            }]
+        }
+        Some("fileChange") => {
+            let Some(id) = codex_item_id(item) else {
+                return Vec::new();
+            };
+            let failed = matches!(
+                item.get("status").and_then(serde_json::Value::as_str),
+                Some("failed" | "declined")
+            );
+            vec![AgentEvent::ToolResult {
+                session_id: session_id.to_string(),
+                id,
+                status: if failed {
+                    ToolStatus::Error
+                } else {
+                    ToolStatus::Success
+                },
+                output: item
+                    .get("changes")
+                    .and_then(|changes| serde_json::to_string(changes).ok()),
+                diff: None,
+                outcome: Some(if failed {
+                    crate::protocol::ToolOutcomeKind::ToolFailed
+                } else {
+                    crate::protocol::ToolOutcomeKind::ToolSucceeded
+                }),
+                started: Some(true),
+                has_output: Some(item.get("changes").is_some()),
+                retryable: Some(false),
+                denial_source: if failed {
+                    Some(crate::protocol::ToolDenialSource::Tool)
+                } else {
+                    None
+                },
+                native_denial_code: None,
+            }]
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn parse_codex_line(session_id: &str, raw: &str) -> Vec<AgentEvent> {
@@ -4048,8 +6540,11 @@ fn parse_codex_line(session_id: &str, raw: &str) -> Vec<AgentEvent> {
                 events.push(AgentEvent::TokenUsage {
                     session_id: session_id.to_string(),
                     input_tokens,
+                    cached_input_tokens: None,
+                    cache_write_input_tokens: None,
                     output_tokens,
                     cost_usd,
+                    service_tier: None,
                     context_window: None,
                 });
             }
@@ -4142,7 +6637,7 @@ fn codex_turn_stage(session_id: &str, stage: TurnStage) -> AgentEvent {
     AgentEvent::TurnStage {
         session_id: session_id.to_string(),
         stage,
-        ts: now_millis() as i64,
+        ts: now_millis(),
         engine_reported_ttft_ms: None,
         retry_attempt: None,
     }
@@ -4210,8 +6705,24 @@ fn codex_tool_result_from_item(session_id: &str, item: &serde_json::Value) -> Op
         } else {
             ToolStatus::Success
         },
-        output,
+        output: output.clone(),
         diff,
+        outcome: Some(
+            if item.get("is_error").and_then(serde_json::Value::as_bool) == Some(true) {
+                crate::protocol::ToolOutcomeKind::ToolFailed
+            } else {
+                crate::protocol::ToolOutcomeKind::ToolSucceeded
+            },
+        ),
+        started: Some(true),
+        has_output: Some(output.as_deref().is_some_and(|value| !value.is_empty())),
+        retryable: Some(false),
+        denial_source: if item.get("is_error").and_then(serde_json::Value::as_bool) == Some(true) {
+            Some(crate::protocol::ToolDenialSource::Tool)
+        } else {
+            None
+        },
+        native_denial_code: None,
     })
 }
 
@@ -4359,36 +6870,6 @@ fn parse_unified_hunk_header(header: &str) -> Option<(u32, u32)> {
     ))
 }
 
-fn codex_output_summary(stdout: &str) -> CodexOutputSummary {
-    let mut summary = CodexOutputSummary::default();
-    for line in stdout.lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if let Some(text) = codex_text_from_value(&value) {
-            summary.final_text = Some(text);
-        }
-        if let Some((input_tokens, output_tokens, cost_usd)) = codex_usage_from_value(&value) {
-            summary.input_tokens = input_tokens;
-            summary.output_tokens = output_tokens;
-            summary.cost_usd = cost_usd;
-        }
-        if let Some(message) = value
-            .get("error")
-            .and_then(|error| error.get("message"))
-            .and_then(|message| message.as_str())
-            .or_else(|| {
-                (value.get("type").and_then(|kind| kind.as_str()) == Some("error"))
-                    .then(|| value.get("message").and_then(|message| message.as_str()))
-                    .flatten()
-            })
-        {
-            summary.error_message = Some(message.to_string());
-        }
-    }
-    summary
-}
-
 fn codex_usage_from_value(value: &serde_json::Value) -> Option<(u64, u64, f64)> {
     let usage = value
         .get("usage")
@@ -4415,19 +6896,6 @@ fn usage_f64(value: &serde_json::Value, keys: &[&str]) -> Option<f64> {
         .find_map(|key| value.get(key).and_then(serde_json::Value::as_f64))
 }
 
-fn codex_text_from_value(value: &serde_json::Value) -> Option<String> {
-    if value.get("type").and_then(|kind| kind.as_str()) == Some("error") {
-        return None;
-    }
-    value
-        .get("message")
-        .and_then(|message| message.as_str())
-        .or_else(|| value.get("text").and_then(|message| message.as_str()))
-        .or_else(|| value.get("content").and_then(|message| message.as_str()))
-        .map(ToString::to_string)
-        .or_else(|| codex_text_from_item(value.get("item")?))
-}
-
 fn codex_text_from_item(item: &serde_json::Value) -> Option<String> {
     match item.get("type").and_then(|kind| kind.as_str()) {
         Some("agent_message") => item
@@ -4448,13 +6916,72 @@ fn codex_text_from_item(item: &serde_json::Value) -> Option<String> {
 
 #[cfg(test)]
 mod turn_stage_tests {
-    use super::parse_codex_line;
+    use super::{
+        codex_app_server_terminal_outcome, codex_notification_native_turn_id,
+        parse_codex_app_server_notification, parse_codex_line, record_codex_terminal_once,
+        CodexTurnContextIndex,
+    };
+    use std::collections::HashMap;
 
     fn serialized_events(raw: serde_json::Value) -> Vec<serde_json::Value> {
         parse_codex_line("codex-session", &raw.to_string())
             .into_iter()
             .map(|event| serde_json::to_value(event).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn native_codex_turn_ids_resolve_to_the_frozen_helm_turn_context() {
+        let mut contexts = CodexTurnContextIndex::default();
+        contexts.insert("native-1".into(), "helm-1".into(), 7);
+        contexts.insert("native-2".into(), "helm-2".into(), 8);
+        assert_eq!(contexts.resolve("native-1"), Some(("helm-1".into(), 7)));
+        assert_eq!(contexts.resolve("native-2"), Some(("helm-2".into(), 8)));
+        assert_eq!(contexts.resolve("unknown"), None);
+        assert_eq!(
+            codex_notification_native_turn_id(&serde_json::json!({
+                "method": "item/started",
+                "params": {"turnId": "native-1"}
+            })),
+            Some("native-1")
+        );
+        assert_eq!(
+            codex_notification_native_turn_id(&serde_json::json!({
+                "method": "turn/completed",
+                "params": {"turn": {"id": "native-2"}}
+            })),
+            Some("native-2")
+        );
+    }
+
+    #[test]
+    fn codex_failed_turn_classifies_structured_details_without_exposing_them() {
+        let notification = serde_json::json!({"method":"turn/completed","params":{"turn":{
+        "id":"turn-2","status":"failed","error":{
+            "message":"request rejected",
+            "additionalDetails":"model gpt-private is unavailable at https://secret.example",
+            "codexErrorInfo":"badRequest"
+        }}}});
+        let events = parse_codex_app_server_notification("codex-session", &notification);
+        let error = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(error["kind"], "model_unavailable");
+        assert!(error["message"].as_str().unwrap().contains("模型不存在"));
+        assert!(!error["message"]
+            .as_str()
+            .unwrap()
+            .contains("secret.example"));
+        assert!(!error["message"].as_str().unwrap().contains("gpt-private"));
+    }
+
+    #[test]
+    fn codex_failed_turn_classifies_structured_usage_limit() {
+        let notification = serde_json::json!({"method":"turn/completed","params":{"turn":{
+        "id":"turn-3","status":"failed","error":{
+            "message":"request rejected","codexErrorInfo":"usageLimitExceeded"
+        }}}});
+        let events = parse_codex_app_server_notification("codex-session", &notification);
+        let error = serde_json::to_value(&events[0]).unwrap();
+        assert!(error["message"].as_str().unwrap().contains("用量已达上限"));
     }
 
     #[test]
@@ -4469,6 +6996,80 @@ mod turn_stage_tests {
             assert_eq!(events[0]["sessionId"], "codex-session");
             assert_eq!(events[0]["stage"], "waiting_model");
         }
+    }
+
+    #[test]
+    fn codex_failed_app_server_turn_emits_safe_error_and_records_one_failed_terminal() {
+        let notification = serde_json::json!({
+            "method":"turn/completed",
+            "params":{
+                "threadId":"thread-1",
+                "turn":{
+                    "id":"turn-1",
+                    "status":"failed",
+                    "error":{
+                        "message":"model unavailable at https://secret.example/v1 request_id=req-secret Authorization: Bearer secret"
+                    },
+                    "items":[]
+                }
+            }
+        });
+        let events = parse_codex_app_server_notification("codex-session", &notification);
+        assert_eq!(events.len(), 2);
+        let serialized = events
+            .iter()
+            .map(|event| serde_json::to_value(event).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(serialized[0]["type"], "error");
+        assert_eq!(serialized[0]["kind"], "model_unavailable");
+        assert_eq!(serialized[1]["type"], "turn_complete");
+        assert_eq!(serialized[1]["stopReason"], "error");
+        let safe_message = serialized[0]["message"].as_str().unwrap();
+        assert!(!safe_message.contains("secret.example"));
+        assert!(!safe_message.contains("req-secret"));
+        assert!(!safe_message.contains("Bearer"));
+
+        let (turn_id, outcome) = codex_app_server_terminal_outcome(&notification).unwrap();
+        assert!(outcome.is_err());
+        let mut terminal_turns = HashMap::new();
+        assert!(record_codex_terminal_once(
+            &mut terminal_turns,
+            turn_id.clone(),
+            outcome.clone()
+        ));
+        assert!(!record_codex_terminal_once(
+            &mut terminal_turns,
+            turn_id,
+            outcome
+        ));
+        assert_eq!(terminal_turns.len(), 1);
+        assert!(terminal_turns["turn-1"].is_err());
+    }
+
+    #[test]
+    fn codex_successful_turn_with_unfinished_tool_is_not_accepted() {
+        let notification = serde_json::json!({
+            "method": "turn/completed",
+            "params": {"turn": {"id": "turn-1", "status": "completed"}}
+        });
+        let (_, outcome) = super::codex_app_server_terminal_outcome_with_pending(&notification, 1)
+            .expect("turn completion should be recognized");
+        let error = outcome.expect_err("unfinished tool must fail closed");
+        assert!(error.starts_with(super::CODEX_TURN_FAILED_PREFIX));
+        assert!(error.contains("unfinished tool"));
+        let adjusted =
+            super::codex_notification_for_terminal_outcome(&notification, Some(&Err(error)));
+        let events = parse_codex_app_server_notification("codex-session", &adjusted)
+            .into_iter()
+            .map(|event| serde_json::to_value(event).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events[0]["type"], "error");
+        assert!(events[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("工具执行未返回结果"));
+        assert_eq!(events[1]["type"], "turn_complete");
+        assert_eq!(events[1]["stopReason"], "error");
     }
 
     #[test]
@@ -4514,5 +7115,160 @@ mod turn_stage_tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn app_server_notifications_map_messages_tools_files_and_turn_terminal_state() {
+        let delta = parse_codex_app_server_notification(
+            "codex-session",
+            &serde_json::json!({
+                "method":"item/agentMessage/delta",
+                "params":{"threadId":"thread-1","turnId":"turn-1","itemId":"msg-1","delta":"你好"}
+            }),
+        );
+        assert!(matches!(
+            &delta[0],
+            super::AgentEvent::MessageDelta { text, .. } if text == "你好"
+        ));
+
+        let command = parse_codex_app_server_notification(
+            "codex-session",
+            &serde_json::json!({
+                "method":"item/started",
+                "params":{"threadId":"thread-1","turnId":"turn-1","startedAtMs":1,"item":{
+                    "id":"cmd-1","type":"commandExecution","command":"cargo test","cwd":"D:/repo",
+                    "commandActions":[],"status":"inProgress"
+                }}
+            }),
+        );
+        assert!(command.iter().any(|event| matches!(
+            event,
+            super::AgentEvent::ToolCall { id, name, .. } if id == "cmd-1" && name == "Bash"
+        )));
+
+        let file = parse_codex_app_server_notification(
+            "codex-session",
+            &serde_json::json!({
+                "method":"item/started",
+                "params":{"threadId":"thread-1","turnId":"turn-1","startedAtMs":1,"item":{
+                    "id":"file-1","type":"fileChange","status":"inProgress","changes":[
+                        {"path":"src/main.rs","diff":"@@ -1 +1 @@\n-old\n+new","kind":{"type":"update"}}
+                    ]
+                }}
+            }),
+        );
+        assert!(file.iter().any(|event| matches!(
+            event,
+            super::AgentEvent::ToolCall { id, name, input, .. }
+                if id == "file-1" && name == "Write" && input["paths"][0] == "src/main.rs"
+        )));
+
+        let completed = parse_codex_app_server_notification(
+            "codex-session",
+            &serde_json::json!({
+                "method":"turn/completed",
+                "params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"interrupted","items":[]}}
+            }),
+        );
+        assert!(matches!(
+            completed.last().unwrap(),
+            super::AgentEvent::TurnComplete {
+                stop_reason: super::StopReason::Interrupted,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn app_server_token_usage_uses_last_increment_instead_of_cumulative_total() {
+        let events = parse_codex_app_server_notification(
+            "codex-session",
+            &serde_json::json!({
+                "method":"thread/tokenUsage/updated",
+                "params":{
+                    "threadId":"thread-1",
+                    "turnId":"turn-1",
+                    "tokenUsage":{
+                        "total":{
+                            "totalTokens":29051,
+                            "inputTokens":28324,
+                            "cachedInputTokens":19456,
+                            "outputTokens":727,
+                            "reasoningOutputTokens":563
+                        },
+                        "last":{
+                            "totalTokens":14645,
+                            "inputTokens":14456,
+                            "cachedInputTokens":12800,
+                            "outputTokens":189,
+                            "reasoningOutputTokens":153
+                        },
+                        "modelContextWindow":353400
+                    }
+                }
+            }),
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+            super::AgentEvent::ContextUsage {
+                session_id: context_session_id,
+                context_tokens: 14456,
+                context_window: Some(353400),
+            },
+            super::AgentEvent::TokenUsage {
+                session_id,
+                input_tokens: 14456,
+                cached_input_tokens: Some(12800),
+                output_tokens: 189,
+                cost_usd,
+                context_window: Some(353400),
+                ..
+            }] if context_session_id == "codex-session" && session_id == "codex-session" && *cost_usd == 0.0
+        ));
+    }
+
+    #[test]
+    fn app_server_ignores_provisional_command_completion_without_terminal_payload() {
+        let provisional = parse_codex_app_server_notification(
+            "codex-session",
+            &serde_json::json!({
+                "method":"item/completed",
+                "params":{"item":{
+                    "type":"commandExecution",
+                    "id":"cmd-1",
+                    "status":"declined",
+                    "aggregatedOutput":null,
+                    "exitCode":null,
+                    "durationMs":null
+                }}
+            }),
+        );
+        let terminal = parse_codex_app_server_notification(
+            "codex-session",
+            &serde_json::json!({
+                "method":"item/completed",
+                "params":{"item":{
+                    "type":"commandExecution",
+                    "id":"cmd-1",
+                    "status":"declined",
+                    "aggregatedOutput":"exec command rejected by user",
+                    "exitCode":-1,
+                    "durationMs":0
+                }}
+            }),
+        );
+
+        assert!(provisional.is_empty());
+        assert!(matches!(
+            terminal.as_slice(),
+            [super::AgentEvent::ToolResult {
+                id,
+                status: super::ToolStatus::Error,
+                output: Some(output),
+                ..
+            }] if id == "cmd-1" && output == "exec command rejected by user"
+        ));
     }
 }

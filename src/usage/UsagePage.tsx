@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Icon } from '../shell/icons';
 import { EmptyState } from '../components/EmptyState';
 import { useDialogBehavior } from '../components/useDialogBehavior';
@@ -13,12 +13,18 @@ import {
   type Budget,
   type DailyUsage,
   type ModelUsage,
-  type ProviderUsage,
   type TopSession,
   type UsageStats,
 } from './api';
-import { getProviderConfig } from '../providers/api';
+import { detectCliLogin, getProviderConfig } from '../providers/api';
 import { buildUsageCsv } from './exportCsv';
+import {
+  comparisonText,
+  createRequestGate,
+  mergeProviderUsage,
+  projectedMonthEndCost,
+  type ProviderUsageRow,
+} from './metrics';
 import './usage.css';
 
 type Period = '7d' | '30d';
@@ -27,21 +33,22 @@ export function UsagePage() {
   const [period, setPeriod] = useState<Period>('7d');
   const [stats, setStats] = useState<UsageStats | null>(null);
   const [modelUsage, setModelUsage] = useState<ModelUsage[]>([]);
-  const [providerUsage, setProviderUsage] = useState<ProviderUsage[]>([]);
-  const [providerNames, setProviderNames] = useState<Record<string, string>>({});
+  const [providerUsage, setProviderUsage] = useState<ProviderUsageRow[]>([]);
   const [dailyUsage, setDailyUsage] = useState<DailyUsage[]>([]);
   const [topSessions, setTopSessions] = useState<TopSession[]>([]);
   const [budget, setBudget] = useState<Budget | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const loadGate = useRef(createRequestGate());
 
   const days = period === '7d' ? 7 : 30;
 
   const loadData = useCallback(async () => {
+    const generation = loadGate.current.begin();
     setLoading(true);
     setLoadError(null);
     try {
-      const [statsData, modelData, providerData, dailyData, topData, budgetData] =
+      const [statsData, modelData, providerData, dailyData, topData, budgetData, providers] =
         await Promise.all([
           getUsageStats(days),
           getUsageByModel(days),
@@ -49,18 +56,44 @@ export function UsagePage() {
           getDailyUsage(days),
           getTopSessions(days, 3),
           getBudget(),
+          getProviderConfig()
+            .then((config) => config.providers)
+            .catch(() => []),
         ]);
+      const loginEntries = await Promise.all(
+        providers
+          .filter((provider) => provider.kind === 'subscription')
+          .map(async (provider) => {
+            const engine = provider.protocol === 'anthropic' ? 'claude-code' : 'codex';
+            try {
+              return [provider.id, await detectCliLogin(engine)] as const;
+            } catch {
+              return [
+                provider.id,
+                {
+                  state: 'unknown',
+                  authMethod: 'unknown',
+                  detail: 'CLI 登录状态检测失败',
+                },
+              ] as const;
+            }
+          }),
+      );
+      if (!loadGate.current.isCurrent(generation)) return;
       setStats(statsData);
       setModelUsage(modelData);
-      setProviderUsage(providerData);
+      setProviderUsage(
+        mergeProviderUsage(providers, providerData, Object.fromEntries(loginEntries)),
+      );
       setDailyUsage(dailyData);
       setTopSessions(topData);
       setBudget(budgetData);
     } catch (err) {
+      if (!loadGate.current.isCurrent(generation)) return;
       console.error('加载用量数据失败:', err);
       setLoadError('加载用量数据失败：' + (err instanceof Error ? err.message : String(err)));
     } finally {
-      setLoading(false);
+      if (loadGate.current.isCurrent(generation)) setLoading(false);
     }
   }, [days]);
 
@@ -68,25 +101,8 @@ export function UsagePage() {
     loadData();
   }, [loadData]);
 
-  // 服务商 id → 显示名（P3-6）：读取失败只影响显示名，回退为 id
-  useEffect(() => {
-    let active = true;
-    getProviderConfig()
-      .then((config) => {
-        if (!active) return;
-        const names: Record<string, string> = {};
-        for (const provider of config.providers) names[provider.id] = provider.name;
-        setProviderNames(names);
-      })
-      .catch(() => {
-        // 豁免提示：拿不到服务商名时直接显示 provider id，数据本身不受影响
-      });
-    return () => {
-      active = false;
-    };
-  }, []);
-
-  if (loading) {
+  // 首次加载才整页占位（B1-3）；已有数据时切周期走局部刷新，不清空已渲染内容
+  if (loading && !stats) {
     return (
       <div className="page">
         <div className="page__head">
@@ -97,8 +113,39 @@ export function UsagePage() {
     );
   }
 
+  if (loadError && !stats) {
+    return (
+      <div className="page">
+        <div className="page__head">
+          <div>
+            <div className="page__title">用量与成本</div>
+            <div className="page__sub">当前无法读取用量数据，原有数据不会被覆盖。</div>
+          </div>
+        </div>
+        <div className="usage-wrap">
+          <div className="usage-inline-error" role="alert">
+            <Icon name="alert" />
+            <span>{loadError}</span>
+            <button
+              className="btn btn--subtle btn--sm"
+              onClick={() => void loadData()}
+              type="button"
+            >
+              重试
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   const avgPerSession =
     stats && stats.session_count > 0 ? stats.total_cost / stats.session_count : 0;
+  const previousAvgPerSession =
+    stats && stats.previous_session_count > 0
+      ? stats.previous_total_cost / stats.previous_session_count
+      : 0;
+  const comparisonLabel = period === '7d' ? '较前 7 天' : '较前 30 天';
 
   function exportCsv() {
     const csv = buildUsageCsv({
@@ -132,23 +179,31 @@ export function UsagePage() {
         </div>
         <div className="row gap-sm">
           <div className="seg">
-            <button className={period === '7d' ? 'is-active' : ''} onClick={() => setPeriod('7d')}>
+            <button
+              className={period === '7d' ? 'is-active' : ''}
+              disabled={loading}
+              onClick={() => setPeriod('7d')}
+            >
               近 7 天
             </button>
             <button
               className={period === '30d' ? 'is-active' : ''}
+              disabled={loading}
               onClick={() => setPeriod('30d')}
             >
               近 30 天
             </button>
           </div>
-          <button className="btn btn--subtle" onClick={exportCsv}>
+          <button className="btn btn--subtle" disabled={loading} onClick={exportCsv}>
             <Icon name="upright" /> 导出 CSV
           </button>
         </div>
       </div>
 
-      <div className="usage-wrap">
+      <div
+        className={'usage-wrap' + (loading ? ' usage-wrap--refreshing' : '')}
+        aria-busy={loading}
+      >
         {loadError ? (
           <div className="usage-inline-error">
             <Icon name="alert" />
@@ -169,6 +224,26 @@ export function UsagePage() {
               ${Math.floor(stats?.total_cost || 0)}
               <small>.{((stats?.total_cost || 0) % 1).toFixed(2).slice(2)}</small>
             </div>
+            <div className="stat__d">
+              {comparisonText(
+                stats?.total_cost ?? 0,
+                stats?.previous_total_cost ?? 0,
+                comparisonLabel,
+              )}
+            </div>
+            <div className="usage-cost-kinds">
+              实际 ${(stats?.actual_cost ?? 0).toFixed(2)} · 估算 $
+              {(stats?.estimated_cost ?? 0).toFixed(2)}
+              {(stats?.subscription_count ?? 0) > 0
+                ? ` · 订阅内 ${stats?.subscription_count ?? 0} 次`
+                : ''}
+              {(stats?.unknown_count ?? 0) > 0
+                ? ` · ${stats?.unknown_count ?? 0} 次无价格数据`
+                : ''}
+              {(stats?.legacy_count ?? 0) > 0
+                ? ` · 历史未分类 $${(stats?.legacy_cost ?? 0).toFixed(2)}（${stats?.legacy_count ?? 0} 次）`
+                : ''}
+            </div>
           </div>
 
           <div className="card stat">
@@ -180,6 +255,13 @@ export function UsagePage() {
               {((stats?.total_tokens || 0) / 1_000_000).toFixed(2)}
               <small>M</small>
             </div>
+            <div className="stat__d">
+              {comparisonText(
+                stats?.total_tokens ?? 0,
+                stats?.previous_total_tokens ?? 0,
+                '吞吐量较前一期',
+              )}
+            </div>
           </div>
 
           <div className="card stat">
@@ -188,6 +270,13 @@ export function UsagePage() {
               请求数 <small>· {period === '7d' ? '近 7 天' : '近 30 天'}</small>
             </div>
             <div className="stat__v">{stats?.request_count || 0}</div>
+            <div className="stat__d">
+              {comparisonText(
+                stats?.request_count ?? 0,
+                stats?.previous_request_count ?? 0,
+                comparisonLabel,
+              )}
+            </div>
             <div className="stat__d flat">跨 {stats?.session_count || 0} 个会话</div>
           </div>
 
@@ -199,6 +288,9 @@ export function UsagePage() {
             <div className="stat__v">
               ${Math.floor(avgPerSession)}
               <small>.{(avgPerSession % 1).toFixed(2).slice(2)}</small>
+            </div>
+            <div className="stat__d">
+              {comparisonText(avgPerSession, previousAvgPerSession, '较前一期')}
             </div>
           </div>
         </div>
@@ -228,7 +320,9 @@ export function UsagePage() {
           <div className="card" style={{ marginBottom: 14 }}>
             <div className="panel__h">
               <b>按模型花费</b>
-              <small>本月 · {modelUsage.length} 个模型活跃</small>
+              <small>
+                近 {days} 天 · {modelUsage.length} 个模型活跃
+              </small>
             </div>
             <table className="table">
               <thead>
@@ -289,16 +383,23 @@ export function UsagePage() {
             </div>
             <div className="panel__b" style={{ paddingTop: 6, paddingBottom: 8 }}>
               {providerUsage.map((p) => {
-                const label = p.provider
-                  ? (providerNames[p.provider] ?? p.provider)
-                  : '未标注（旧会话）';
                 return (
                   <div key={p.provider || 'unknown'} className="brow">
                     <div className="brow__ic">
                       <Icon name={p.provider ? 'server' : 'history'} />
                     </div>
                     <div className="brow__m">
-                      <b>{label}</b>
+                      <b>{p.name}</b>
+                      <small>
+                        {p.kind === 'subscription'
+                          ? `订阅${p.ready ? ' · 已就绪' : ''}`
+                          : p.kind === 'local'
+                            ? `本地${p.ready ? ' · 已就绪' : ''}`
+                            : p.kind === 'api'
+                              ? `API${p.ready ? ' · 已就绪' : ''}`
+                              : '历史记录'}
+                        {p.cost_usd === 0 && p.ready ? ' · 本期未使用' : ''}
+                      </small>
                       <div className="meter">
                         <i style={{ width: `${p.share * 100}%` }} />
                       </div>
@@ -335,7 +436,16 @@ export function UsagePage() {
               </div>
               <div className="panel__b" style={{ paddingTop: 6, paddingBottom: 8 }}>
                 {topSessions.map((s) => (
-                  <div key={s.id} className="brow">
+                  <button
+                    key={s.id}
+                    className="brow usage-top-session"
+                    type="button"
+                    onClick={() =>
+                      window.dispatchEvent(
+                        new CustomEvent('helm:open-session', { detail: { sessionId: s.id } }),
+                      )
+                    }
+                  >
                     <div className="brow__ic">
                       <Icon name={s.engine === 'claude-code' ? 'zap' : 'cpu'} />
                     </div>
@@ -347,7 +457,7 @@ export function UsagePage() {
                       <b>${s.cost_usd.toFixed(2)}</b>
                       <small>{(s.total_tokens / 1000).toFixed(1)}K token</small>
                     </div>
-                  </div>
+                  </button>
                 ))}
               </div>
             </div>
@@ -376,16 +486,27 @@ function DailyChart({ data }: { data: DailyUsage[] }) {
       <div className="chart">
         {data.map((d, i) => {
           const height = maxCost > 0 ? (d.cost_usd / maxCost) * 100 : 0;
-          const label = new Date(d.date).toLocaleDateString('zh-CN', {
-            month: 'numeric',
-            day: 'numeric',
-          });
+          const date = new Date(d.date);
+          const label = date.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' });
+          const weekday = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][date.getDay()];
+          const daysAgo = data.length - 1 - i;
+          const isToday = daysAgo === 0;
+          const showLabel = data.length <= 7 || isToday || daysAgo % 7 === 0;
           return (
-            <div key={i} className="col" title={`${label} · $${d.cost_usd.toFixed(2)}`}>
+            <div key={i} className="col">
+              <span className="tip">
+                {isToday ? '今天' : `${label} ${weekday}`} · ${d.cost_usd.toFixed(2)}
+              </span>
               <div className="bcell">
                 <div className="bar" style={{ height: `${height}%` }} />
               </div>
-              {data.length <= 7 && <div className="cl">{label}</div>}
+              {showLabel ? (
+                <div className="cl">{isToday ? '今天' : label}</div>
+              ) : (
+                <div className="cl" style={{ visibility: 'hidden' }}>
+                  ·
+                </div>
+              )}
             </div>
           );
         })}
@@ -403,7 +524,29 @@ function DailyChart({ data }: { data: DailyUsage[] }) {
 function BudgetCard({ budget, onUpdate }: { budget: Budget | null; onUpdate: () => void }) {
   const [editing, setEditing] = useState(false);
 
-  if (!budget) return null;
+  if (!budget) {
+    return (
+      <div className="card">
+        <div className="panel__h">
+          <b>本月预算</b>
+        </div>
+        <div
+          className="panel__b budget"
+          style={{ textAlign: 'center', padding: '2rem 0', color: 'var(--fg-4)' }}
+        >
+          <div>预算数据加载失败</div>
+          <button
+            className="btn btn--subtle btn--sm"
+            style={{ marginTop: 12 }}
+            onClick={onUpdate}
+            type="button"
+          >
+            重试
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   const remaining = budget.monthly_limit - budget.current_month_cost;
   // 阈值提醒档位与托盘通知一致（P3-2）：70% 起视为已触发
@@ -431,7 +574,8 @@ function BudgetCard({ budget, onUpdate }: { budget: Budget | null; onUpdate: () 
             </div>
             <div className="budget__sub">
               {new Date().getFullYear()} 年 {new Date().getMonth() + 1} 月 · 已用{' '}
-              {budget.percentage.toFixed(0)}%
+              {budget.percentage.toFixed(0)}% · 预计月末达 $
+              {projectedMonthEndCost(budget.current_month_cost).toFixed(0)}
             </div>
             <div className={`meter ${isAlert ? 'meter--warn' : ''}`}>
               <i style={{ width: `${Math.min(budget.percentage, 100)}%` }} />
@@ -441,7 +585,12 @@ function BudgetCard({ budget, onUpdate }: { budget: Budget | null; onUpdate: () 
               style={{ fontSize: 11.5, color: 'var(--fg-4)', marginTop: 10 }}
             >
               <span>下月 1 日重置</span>
-              <span className="mono">剩余 ${remaining.toFixed(2)}</span>
+              <span
+                className="mono"
+                style={remaining < 0 ? { color: 'var(--danger)', fontWeight: 600 } : undefined}
+              >
+                剩余 ${remaining.toFixed(2)}
+              </span>
             </div>
             <div className="alerts">
               {budget.alert_at_80 && (

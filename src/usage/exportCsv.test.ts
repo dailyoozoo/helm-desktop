@@ -11,6 +11,16 @@ describe('buildUsageCsv', () => {
       output_tokens: 500,
       request_count: 3,
       session_count: 2,
+      actual_cost: 9.5,
+      estimated_cost: 2.8456,
+      subscription_count: 0,
+      unknown_count: 0,
+      legacy_cost: 0,
+      legacy_count: 0,
+      previous_total_cost: 10,
+      previous_total_tokens: 1200,
+      previous_request_count: 2,
+      previous_session_count: 1,
     };
     const dailyUsage: DailyUsage[] = [{ date: '2026-06-15', cost_usd: 1.25 }];
     const modelUsage: ModelUsage[] = [
@@ -55,6 +65,7 @@ describe('buildUsageCsv', () => {
     expect(csv).toContain('Helm 用量与成本导出');
     expect(csv).toContain('统计项,值');
     expect(csv).toContain('总花费 USD,12.3456');
+    expect(csv).toContain('实际花费 USD,9.5000');
     expect(csv).toContain('每日花费');
     expect(csv).toContain('2026-06-15,1.2500');
     expect(csv).toContain('"gpt-5, codex",codex,2,700,300,9.5000,75.00%');

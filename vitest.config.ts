@@ -11,6 +11,12 @@ export default defineConfig({
     },
   },
   test: {
-    include: ['packages/*/test/**/*.test.ts', 'src/**/*.test.ts', 'src/**/*.test.tsx'],
+    fileParallelism: false,
+    include: [
+      'packages/*/test/**/*.test.ts',
+      'scripts/change-27l-release-audit.test.mjs',
+      'src/**/*.test.ts',
+      'src/**/*.test.tsx',
+    ],
   },
 });

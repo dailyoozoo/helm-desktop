@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { Decision } from '@helm/protocol';
 import type { SessionState } from '../engine/useSession';
 import { Icon } from '../shell/icons';
@@ -12,6 +12,9 @@ import { CheckpointItem } from './items/CheckpointItem';
 import { PlanItem } from './items/PlanItem';
 import { ThinkingItem } from './items/ThinkingItem';
 import { DEFAULT_THREAD_WINDOW, expandThreadWindow, threadWindow } from './threadWindow';
+import { layoutThreadItems, type ThreadRenderEntry } from './threadGroups';
+import { ToolGroup } from './items/ToolGroup';
+import { TurnProcess } from './items/TurnProcess';
 
 const useClientLayoutEffect = typeof window === 'undefined' ? useEffect : useLayoutEffect;
 
@@ -22,16 +25,34 @@ type UndoRevertFn = () => void;
 /** 距底部小于该值视为「贴底」，继续自动跟随流式输出 */
 const AT_BOTTOM_THRESHOLD = 80;
 
+export function currentWorkingTurnId(state: SessionState): string | null {
+  if (state.status !== 'working') return null;
+  let lastUserIndex = -1;
+  for (let index = state.items.length - 1; index >= 0; index -= 1) {
+    if (state.items[index]?.kind === 'user') {
+      lastUserIndex = index;
+      break;
+    }
+  }
+  for (let index = state.items.length - 1; index > lastUserIndex; index -= 1) {
+    const turnId = state.items[index]?.turnId;
+    if (turnId) return turnId;
+  }
+  return null;
+}
+
 export function Thread({
   state,
   onApprove,
   onRestoreCheckpoint,
   onUndoRevert,
+  locateTarget,
 }: {
   state: SessionState;
   onApprove: ApproveFn;
   onRestoreCheckpoint: RestoreCheckpointFn;
   onUndoRevert: UndoRevertFn;
+  locateTarget?: { id: string; request: number } | null;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   // 滚动锁定（变更-09）：用户上翻阅读时暂停自动滚底，露出「回到底部」浮标；
@@ -78,12 +99,131 @@ export function Thread({
   }, [state.items, state.status, state.turnActivity]);
 
   const empty = state.items.length === 0;
-  const { hiddenCount, visibleItems } = threadWindow(state.items, visibleCount);
+  const { hiddenCount, visibleItems } = useMemo(
+    () => threadWindow(state.items, visibleCount),
+    [state.items, visibleCount],
+  );
+  const renderEntries = useMemo(() => layoutThreadItems(visibleItems), [visibleItems]);
+  useEffect(() => {
+    if (!locateTarget) return;
+    const index = state.items.findIndex((item) => item.id === locateTarget.id);
+    if (index < 0) return;
+    const required = state.items.length - index;
+    if (required > visibleCount) {
+      setVisibleCount(required);
+      return;
+    }
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        const element = Array.from(
+          document.querySelectorAll<HTMLElement>('[data-thread-item-id]'),
+        ).find((candidate) => candidate.dataset.threadItemId === locateTarget.id);
+        element?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        element?.classList.add('is-flash');
+        window.setTimeout(() => element?.classList.remove('is-flash'), 1_400);
+      }),
+    );
+  }, [locateTarget, state.items, visibleCount]);
   // 空态文案跟随当前引擎（P2-3：不写死引擎名）
   const engineIntro =
     state.engine === 'codex'
       ? { label: 'Codex', bin: 'codex' }
       : { label: 'Claude Code', bin: 'claude' };
+  const hasPendingTool = state.items.some(
+    (item) => item.kind === 'tool' && item.status === 'pending' && !item.reverted,
+  );
+  const hasOpenThinking = state.items.some(
+    (item) => item.kind === 'thinking' && !item.done && !item.reverted,
+  );
+  const showActivity =
+    Boolean(state.turnActivity) &&
+    !(state.turnActivity?.stage === 'using_tool' && hasPendingTool) &&
+    !(state.turnActivity?.stage === 'reasoning' && hasOpenThinking);
+  const activeTurnId = currentWorkingTurnId(state);
+
+  const renderEntry = (entry: ThreadRenderEntry) => {
+    if (entry.kind === 'tool-group') {
+      return (
+        <ToolGroup key={`tool-group-${entry.id}`} items={entry.items} locateTarget={locateTarget} />
+      );
+    }
+    const it = entry.item;
+    const className = 'reverted' in it && it.reverted ? 'item rolled' : undefined;
+    switch (it.kind) {
+      case 'user':
+        return (
+          <UserMessage
+            key={`user-${it.id}`}
+            text={it.text}
+            mode={it.mode}
+            permissionProfile={it.permissionProfile}
+            className={className}
+          />
+        );
+      case 'assistant':
+        return (
+          <div key={`assistant-${it.id}`} data-thread-item-id={it.id}>
+            <AssistantMessage
+              text={it.text}
+              className={className}
+              streaming={state.openAssistantId === it.id}
+              interrupted={it.interrupted}
+            />
+          </div>
+        );
+      case 'thinking':
+        return (
+          <ThinkingItem
+            key={`thinking-${it.id}`}
+            item={it}
+            className={className}
+            locateTarget={locateTarget}
+          />
+        );
+      case 'tool':
+        return (
+          <div key={`tool-${it.id}`} data-thread-item-id={it.id}>
+            <ToolBlock item={it} className={className} locateTarget={locateTarget} />
+          </div>
+        );
+      case 'approval':
+        return (
+          <div key={`approval-${it.id}`} data-thread-item-id={it.id}>
+            <ApprovalCard item={it} onRespond={onApprove} className={className} />
+          </div>
+        );
+      case 'plan':
+        return (
+          <div key={`plan-${it.id}`} data-thread-item-id={it.id}>
+            <PlanItem item={it} className={className} />
+          </div>
+        );
+      case 'checkpoint':
+        return (
+          <div key={`checkpoint-${it.id}`} data-thread-item-id={it.id}>
+            <CheckpointItem
+              id={it.id}
+              label={it.label}
+              ts={it.ts}
+              restored={it.restored}
+              restorable={it.restorable}
+              fileCount={it.fileCount}
+              reason={it.reason}
+              onRestore={onRestoreCheckpoint}
+              onUndo={onUndoRevert}
+            />
+          </div>
+        );
+      case 'error':
+        return (
+          <div key={`error-${it.id}`} data-thread-item-id={it.id}>
+            <ErrorItem message={it.message} errorKind={it.errorKind} />
+          </div>
+        );
+      default:
+        return null;
+    }
+  };
 
   return (
     <div className="thread__scroll" ref={scrollRef} onScroll={handleScroll}>
@@ -113,65 +253,30 @@ export function Thread({
           </button>
         ) : null}
 
-        {visibleItems.map((it) => {
-          const className = 'reverted' in it && it.reverted ? 'item rolled' : undefined;
-          switch (it.kind) {
-            case 'user':
-              return (
-                <UserMessage
-                  key={`user-${it.id}`}
-                  text={it.text}
-                  mode={it.mode}
-                  className={className}
-                />
-              );
-            case 'assistant':
-              return (
-                <AssistantMessage
-                  key={`assistant-${it.id}`}
-                  text={it.text}
-                  className={className}
-                  streaming={state.openAssistantId === it.id}
-                  interrupted={it.interrupted}
-                />
-              );
-            case 'thinking':
-              return <ThinkingItem key={`thinking-${it.id}`} item={it} className={className} />;
-            case 'tool':
-              return <ToolBlock key={`tool-${it.id}`} item={it} className={className} />;
-            case 'approval':
-              return (
-                <ApprovalCard
-                  key={`approval-${it.id}`}
-                  item={it}
-                  onRespond={onApprove}
-                  className={className}
-                />
-              );
-            case 'plan':
-              return <PlanItem key={`plan-${it.id}`} item={it} className={className} />;
-            case 'checkpoint':
-              return (
-                <CheckpointItem
-                  key={`checkpoint-${it.id}`}
-                  id={it.id}
-                  label={it.label}
-                  ts={it.ts}
-                  restored={it.restored}
-                  onRestore={onRestoreCheckpoint}
-                  onUndo={onUndoRevert}
-                />
-              );
-            case 'error':
-              return (
-                <ErrorItem key={`error-${it.id}`} message={it.message} errorKind={it.errorKind} />
-              );
-            default:
-              return null;
-          }
+        {renderEntries.map((entry) => {
+          if (entry.kind !== 'turn-process') return renderEntry(entry);
+          const waitingApproval = state.items.some(
+            (item) =>
+              item.kind === 'approval' &&
+              item.turnId === entry.turnId &&
+              (item.status === 'pending' || item.status === 'applying'),
+          );
+          return (
+            <TurnProcess
+              key={entry.id}
+              id={entry.id}
+              entries={entry.entries}
+              completed={entry.completed && entry.turnId !== activeTurnId}
+              terminalStatus={entry.terminalStatus}
+              waitingApproval={waitingApproval}
+              locateTarget={locateTarget}
+            >
+              {entry.entries.map(renderEntry)}
+            </TurnProcess>
+          );
         })}
 
-        {state.turnActivity ? <ActivityRow state={state} /> : null}
+        {showActivity ? <ActivityRow state={state} /> : null}
       </div>
       {showJump ? (
         <button type="button" className="thread-jump" onClick={scrollToBottom} title="回到底部">

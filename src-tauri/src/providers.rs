@@ -1,3 +1,8 @@
+use crate::pricing::{
+    PricingBand, PricingCatalog, PricingCatalogStore, PricingTier, ProviderPricingMode,
+    ResolvedPricingProfile, ServiceTier,
+};
+use crate::reasoning::ReasoningEffort;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -55,10 +60,56 @@ pub enum AuthMethod {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+pub enum ProviderKind {
+    Subscription,
+    Api,
+    Local,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 pub enum TestOutcome {
     Ok,
     Fail,
     Unverified,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FailureCategory {
+    Network,
+    Auth,
+    Timeout,
+    Unknown,
+}
+
+/// 从错误消息文本推断失败分类。
+pub fn classify_failure(message: &str, ok: bool, verified: bool) -> Option<FailureCategory> {
+    if ok || !verified {
+        return None;
+    }
+    let lower = message.to_lowercase();
+    if lower.contains("timed out") || lower.contains("timeout") || lower.contains("超时") {
+        Some(FailureCategory::Timeout)
+    } else if lower.contains("401")
+        || lower.contains("403")
+        || lower.contains("密钥")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("api key")
+    {
+        Some(FailureCategory::Auth)
+    } else if lower.contains("connection")
+        || lower.contains("connect")
+        || lower.contains("dns")
+        || lower.contains("network")
+        || lower.contains("http")
+        || lower.contains("网络")
+    {
+        Some(FailureCategory::Network)
+    } else {
+        Some(FailureCategory::Unknown)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -67,6 +118,8 @@ pub struct ProviderTest {
     pub result: TestOutcome,
     pub latency_ms: Option<u128>,
     pub at: i64,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub failure_category: Option<FailureCategory>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +127,8 @@ pub struct ProviderTest {
 pub struct ProviderConfig {
     pub id: String,
     pub name: String,
+    #[serde(default = "default_provider_kind")]
+    pub kind: ProviderKind,
     pub base_url: String,
     pub key_ref: Option<String>,
     #[serde(default)]
@@ -97,6 +152,12 @@ pub struct ModelConfig {
     #[serde(default)]
     pub price_source: Option<PriceSource>,
     pub enabled: bool,
+    /// 模型上下文窗口大小（token 数），上游无数据时为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    /// 模型能力标签列表，上游无数据时为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -105,6 +166,7 @@ pub enum PriceSource {
     Provider,
     Builtin,
     Manual,
+    Subscription,
     Unknown,
 }
 
@@ -126,6 +188,13 @@ pub struct BindingConfig {
     pub provider_id: String,
     pub primary_model: String,
     pub fast_model: Option<String>,
+    /// 旧配置迁移输入；读取后迁入 fast_model，保存时清理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,6 +226,10 @@ fn default_auth_method() -> AuthMethod {
     AuthMethod::ApiKey
 }
 
+fn default_provider_kind() -> ProviderKind {
+    ProviderKind::Api
+}
+
 fn refresh_provider_readiness(config: &mut AppConfig) {
     for provider in &mut config.providers {
         provider.ready = provider_is_ready(provider);
@@ -164,10 +237,10 @@ fn refresh_provider_readiness(config: &mut AppConfig) {
 }
 
 fn provider_is_ready(provider: &ProviderConfig) -> bool {
-    if provider.id.trim().is_empty()
-        || provider.name.trim().is_empty()
-        || provider.base_url.trim().is_empty()
-    {
+    if provider.id.trim().is_empty() || provider.name.trim().is_empty() {
+        return false;
+    }
+    if !matches!(provider.kind, ProviderKind::Subscription) && provider.base_url.trim().is_empty() {
         return false;
     }
     match provider.auth_method {
@@ -271,14 +344,47 @@ impl SecretStore for KeyringSecretStore {
 pub struct ProviderStore<S: SecretStore> {
     path: PathBuf,
     secrets: S,
+    gate: Arc<Mutex<ProviderGateState>>,
+}
+
+#[derive(Default)]
+struct ProviderGateState {
+    published: Option<AppConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RouteCandidate {
+    pub config: AppConfig,
+    pub config_digest: String,
 }
 
 impl<S: SecretStore> ProviderStore<S> {
     pub fn new(path: PathBuf, secrets: S) -> Self {
-        Self { path, secrets }
+        Self {
+            path,
+            secrets,
+            gate: Arc::new(Mutex::new(ProviderGateState::default())),
+        }
     }
 
     pub fn load(&self) -> Result<AppConfig, String> {
+        let mut gate = self
+            .gate
+            .lock()
+            .map_err(|_| "ProviderStore 闸门锁中毒".to_string())?;
+        self.load_locked(&mut gate)
+    }
+
+    fn load_locked(&self, gate: &mut ProviderGateState) -> Result<AppConfig, String> {
+        if let Some(config) = &gate.published {
+            return Ok(config.clone());
+        }
+        let config = self.load_from_disk()?;
+        gate.published = Some(config.clone());
+        Ok(config)
+    }
+
+    fn load_from_disk(&self) -> Result<AppConfig, String> {
         if !self.path.exists() {
             return Ok(seed_config());
         }
@@ -300,18 +406,117 @@ impl<S: SecretStore> ProviderStore<S> {
         let mut config: AppConfig =
             serde_json::from_value(value).map_err(|e| format!("解析服务商配置失败：{e}"))?;
         refresh_provider_readiness(&mut config);
-        apply_builtin_model_pricing(&mut config);
+        let pricing_store = PricingCatalogStore::new(
+            self.path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
+        );
+        let catalog = pricing_store
+            .active_catalog()
+            .map(|(catalog, _)| catalog)
+            .or_else(|_| PricingCatalog::builtin())?;
+        apply_catalog_model_pricing(&mut config, &catalog, Some(&pricing_store));
+        ensure_subscription_model_catalogs(&mut config);
+        deduplicate_models(&mut config.models);
         migrate_bindings(&mut config);
         Ok(config)
     }
 
     pub fn save(&self, config: &AppConfig) -> Result<(), String> {
+        let mut gate = self
+            .gate
+            .lock()
+            .map_err(|_| "ProviderStore 闸门锁中毒".to_string())?;
+        self.save_locked(&mut gate, config)
+    }
+
+    fn save_locked(&self, gate: &mut ProviderGateState, config: &AppConfig) -> Result<(), String> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败：{e}"))?;
         }
         let raw = serde_json::to_string_pretty(config)
             .map_err(|e| format!("序列化服务商配置失败：{e}"))?;
-        write_atomically(&self.path, &raw)
+        write_atomically(&self.path, &raw)?;
+        gate.published = Some(config.clone());
+        Ok(())
+    }
+
+    pub fn route_candidate(&self) -> Result<RouteCandidate, String> {
+        let config = self.load()?;
+        let config_digest = crate::turn_start::digest_json(&config)?;
+        Ok(RouteCandidate {
+            config,
+            config_digest,
+        })
+    }
+
+    pub fn commit_route_if_unchanged<T>(
+        &self,
+        expected_config_digest: &str,
+        commit: impl FnOnce(&AppConfig) -> Result<T, String>,
+    ) -> Result<Option<T>, String> {
+        let mut gate = self
+            .gate
+            .lock()
+            .map_err(|_| "ProviderStore 闸门锁中毒".to_string())?;
+        let config = self.load_locked(&mut gate)?;
+        if crate::turn_start::digest_json(&config)? != expected_config_digest {
+            return Ok(None);
+        }
+        commit(&config).map(Some)
+    }
+
+    pub fn model_pricing_profile(
+        &self,
+        config: &AppConfig,
+        model: &ModelConfig,
+    ) -> Result<Option<ResolvedPricingProfile>, String> {
+        let provider = config
+            .providers
+            .iter()
+            .find(|provider| provider.id == model.provider_id)
+            .ok_or_else(|| format!("找不到模型所属服务商：{}", model.provider_id))?;
+        if matches!(provider.kind, ProviderKind::Subscription)
+            || matches!(model.price_source, Some(PriceSource::Subscription))
+        {
+            return Ok(Some(simple_pricing_profile(
+                "subscription",
+                "subscription",
+                0.0,
+                0.0,
+            )));
+        }
+        let pricing_store = PricingCatalogStore::new(
+            self.path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
+        );
+        let (catalog, _) = pricing_store.active_catalog()?;
+        if let Some(profile) = pricing_store.profile_for_provider(
+            &catalog,
+            &provider.protocol,
+            &provider.id,
+            &model.id,
+        )? {
+            return Ok(Some(profile));
+        }
+        Ok(match model.price_source {
+            Some(PriceSource::Manual) => Some(simple_pricing_profile(
+                "manual:legacy",
+                "manual",
+                model.input_price_per_mtok,
+                model.output_price_per_mtok,
+            )),
+            Some(PriceSource::Provider) => Some(simple_pricing_profile(
+                "provider",
+                "provider",
+                model.input_price_per_mtok,
+                model.output_price_per_mtok,
+            )),
+            _ => None,
+        })
     }
 
     pub fn save_provider(
@@ -319,7 +524,73 @@ impl<S: SecretStore> ProviderStore<S> {
         mut provider: ProviderConfig,
         api_key: Option<&str>,
     ) -> Result<AppConfig, String> {
-        let mut config = self.load()?;
+        let mut gate = self
+            .gate
+            .lock()
+            .map_err(|_| "ProviderStore 闸门锁中毒".to_string())?;
+        let mut config = self.load_locked(&mut gate)?;
+        let previous_key_ref = config
+            .providers
+            .iter()
+            .find(|existing| existing.id == provider.id)
+            .and_then(|existing| existing.key_ref.clone());
+        if matches!(provider.auth_method, AuthMethod::OAuth) {
+            provider.kind = ProviderKind::Subscription;
+        } else if matches!(provider.auth_method, AuthMethod::Local) {
+            provider.kind = ProviderKind::Local;
+        }
+        if matches!(provider.kind, ProviderKind::Subscription) {
+            if let Some(existing) = config.providers.iter().find(|existing| {
+                existing.id != provider.id
+                    && matches!(existing.kind, ProviderKind::Subscription)
+                    && existing.protocol == provider.protocol
+            }) {
+                return Err(format!("同协议订阅「{}」已存在，请直接复用", existing.name));
+            }
+            provider.auth_method = AuthMethod::OAuth;
+            provider.base_url.clear();
+            provider.key_ref = None;
+            provider.last_test = None;
+            let previous_secret = previous_key_ref
+                .as_deref()
+                .map(|key_ref| self.secret(key_ref))
+                .transpose()?
+                .flatten();
+            if let Some(key_ref) = previous_key_ref.as_deref() {
+                self.secrets.delete(key_ref)?;
+            }
+            provider.ready = provider_is_ready(&provider);
+            upsert_by_id(&mut config.providers, provider.clone(), |item| &item.id);
+            let seeded_models = subscription_models_for_provider(&provider);
+            if !seeded_models.is_empty() {
+                let enabled_by_id = config
+                    .models
+                    .iter()
+                    .filter(|model| model.provider_id == provider.id)
+                    .map(|model| (model.id.clone(), model.enabled))
+                    .collect::<HashMap<_, _>>();
+                config
+                    .models
+                    .retain(|model| model.provider_id != provider.id);
+                config
+                    .models
+                    .extend(seeded_models.into_iter().map(|mut model| {
+                        if let Some(enabled) = enabled_by_id.get(&model.id) {
+                            model.enabled = *enabled;
+                        }
+                        model
+                    }));
+            }
+            if let Err(save_error) = self.save_locked(&mut gate, &config) {
+                if let (Some(key_ref), Some(secret)) =
+                    (previous_key_ref.as_deref(), previous_secret.as_deref())
+                {
+                    let _ = self.secrets.set(key_ref, secret);
+                }
+                return Err(save_error);
+            }
+            return Ok(config);
+        }
         if let Some(secret) = api_key.filter(|secret| !secret.is_empty()) {
             let key_ref = key_ref_for_provider(&provider.id);
             self.secrets.set(&key_ref, secret)?;
@@ -336,19 +607,27 @@ impl<S: SecretStore> ProviderStore<S> {
         }
         provider.ready = provider_is_ready(&provider);
         upsert_by_id(&mut config.providers, provider, |item| &item.id);
-        self.save(&config)?;
+        self.save_locked(&mut gate, &config)?;
         Ok(config)
     }
 
     pub fn save_engine(&self, engine: EngineConfig) -> Result<AppConfig, String> {
-        let mut config = self.load()?;
+        let mut gate = self
+            .gate
+            .lock()
+            .map_err(|_| "ProviderStore 闸门锁中毒".to_string())?;
+        let mut config = self.load_locked(&mut gate)?;
         upsert_by_id(&mut config.engines, engine, |item| &item.id);
-        self.save(&config)?;
+        self.save_locked(&mut gate, &config)?;
         Ok(config)
     }
 
     pub fn save_model(&self, model: ModelConfig) -> Result<AppConfig, String> {
-        let mut config = self.load()?;
+        let mut gate = self
+            .gate
+            .lock()
+            .map_err(|_| "ProviderStore 闸门锁中毒".to_string())?;
+        let mut config = self.load_locked(&mut gate)?;
         let model = normalize_saved_model(model);
         if !config
             .providers
@@ -358,7 +637,7 @@ impl<S: SecretStore> ProviderStore<S> {
             return Err(format!("找不到模型所属服务商：{}", model.provider_id));
         }
         upsert_model(&mut config.models, model);
-        self.save(&config)?;
+        self.save_locked(&mut gate, &config)?;
         Ok(config)
     }
 
@@ -367,7 +646,11 @@ impl<S: SecretStore> ProviderStore<S> {
         provider_id: &str,
         models: Vec<ModelConfig>,
     ) -> Result<AppConfig, String> {
-        let mut config = self.load()?;
+        let mut gate = self
+            .gate
+            .lock()
+            .map_err(|_| "ProviderStore 闸门锁中毒".to_string())?;
+        let mut config = self.load_locked(&mut gate)?;
         if !config
             .providers
             .iter()
@@ -375,13 +658,85 @@ impl<S: SecretStore> ProviderStore<S> {
         {
             return Err(format!("找不到模型所属服务商：{provider_id}"));
         }
+        let enabled_by_id = config
+            .models
+            .iter()
+            .filter(|model| model.provider_id == provider_id)
+            .map(|model| (model.id.clone(), model.enabled))
+            .collect::<HashMap<_, _>>();
         config
             .models
             .retain(|model| model.provider_id != provider_id);
-        config
+        config.models.extend(models.into_iter().map(|model| {
+            let mut model = normalize_saved_model(model);
+            if let Some(enabled) = enabled_by_id.get(&model.id) {
+                model.enabled = *enabled;
+            }
+            model
+        }));
+        self.save_locked(&mut gate, &config)?;
+        Ok(config)
+    }
+
+    pub fn save_provider_model_selection(
+        &self,
+        provider_id: &str,
+        enabled_model_ids: &[String],
+    ) -> Result<AppConfig, String> {
+        let mut gate = self
+            .gate
+            .lock()
+            .map_err(|_| "ProviderStore 闸门锁中毒".to_string())?;
+        let mut config = self.load_locked(&mut gate)?;
+        if !config
+            .providers
+            .iter()
+            .any(|provider| provider.id == provider_id)
+        {
+            return Err(format!("找不到服务商：{provider_id}"));
+        }
+        let enabled = enabled_model_ids.iter().cloned().collect::<HashSet<_>>();
+        let known = config
             .models
-            .extend(models.into_iter().map(normalize_saved_model));
-        self.save(&config)?;
+            .iter()
+            .filter(|model| model.provider_id == provider_id)
+            .map(|model| model.id.clone())
+            .collect::<HashSet<_>>();
+        if let Some(unknown) = enabled.iter().find(|model_id| !known.contains(*model_id)) {
+            return Err(format!("当前服务商没有模型目录项：{unknown}"));
+        }
+        for binding in config
+            .bindings
+            .iter()
+            .filter(|binding| binding.provider_id == provider_id)
+        {
+            if !enabled.contains(&binding.primary_model) {
+                return Err(format!(
+                    "模型 {} 正在被 {} 用作主模型，请先更改引擎绑定",
+                    binding.primary_model, binding.engine_id
+                ));
+            }
+            if let Some(fast_model) = binding
+                .fast_model
+                .as_deref()
+                .filter(|model| !model.trim().is_empty())
+            {
+                if !enabled.contains(fast_model) {
+                    return Err(format!(
+                        "模型 {fast_model} 正在被 {} 用作快速模型，请先更改引擎绑定",
+                        binding.engine_id
+                    ));
+                }
+            }
+        }
+        for model in config
+            .models
+            .iter_mut()
+            .filter(|model| model.provider_id == provider_id)
+        {
+            model.enabled = enabled.contains(&model.id);
+        }
+        self.save_locked(&mut gate, &config)?;
         Ok(config)
     }
 
@@ -390,22 +745,100 @@ impl<S: SecretStore> ProviderStore<S> {
         provider_id: &str,
         test: ProviderTest,
     ) -> Result<AppConfig, String> {
-        let mut config = self.load()?;
+        let mut gate = self
+            .gate
+            .lock()
+            .map_err(|_| "ProviderStore 闸门锁中毒".to_string())?;
+        let mut config = self.load_locked(&mut gate)?;
         let provider = config
             .providers
             .iter_mut()
             .find(|provider| provider.id == provider_id)
             .ok_or_else(|| format!("找不到服务商：{provider_id}"))?;
         provider.last_test = Some(test);
-        self.save(&config)?;
+        self.save_locked(&mut gate, &config)?;
         Ok(config)
     }
 
-    pub fn save_binding(&self, binding: BindingConfig) -> Result<AppConfig, String> {
-        let mut config = self.load()?;
+    pub fn save_binding(&self, mut binding: BindingConfig) -> Result<AppConfig, String> {
+        let mut gate = self
+            .gate
+            .lock()
+            .map_err(|_| "ProviderStore 闸门锁中毒".to_string())?;
+        let mut config = self.load_locked(&mut gate)?;
+        if binding.fast_model.as_deref().is_none_or(str::is_empty) {
+            if let Some(legacy) = binding
+                .assistant_model_id
+                .as_deref()
+                .filter(|model| !model.trim().is_empty())
+            {
+                let valid = config.models.iter().any(|model| {
+                    model.enabled && model.provider_id == binding.provider_id && model.id == legacy
+                });
+                if valid {
+                    binding.fast_model = Some(legacy.to_string());
+                }
+            }
+        }
+        binding.assistant_model_id = None;
         validate_binding(&config, &binding)?;
+        let previous_revision = config
+            .bindings
+            .iter()
+            .find(|item| item.engine_id == binding.engine_id)
+            .map(|item| item.revision)
+            .unwrap_or(0);
+        binding.revision = previous_revision
+            .checked_add(1)
+            .ok_or_else(|| format!("Binding revision 已溢出：{}", binding.engine_id))?;
         upsert_by_id(&mut config.bindings, binding, |item| &item.engine_id);
-        self.save(&config)?;
+        self.save_locked(&mut gate, &config)?;
+        Ok(config)
+    }
+
+    pub fn migrate_legacy_assistant_model(
+        &self,
+        legacy_general_model: Option<&str>,
+    ) -> Result<AppConfig, String> {
+        let mut gate = self
+            .gate
+            .lock()
+            .map_err(|_| "ProviderStore 闸门锁中毒".to_string())?;
+        let mut config = self.load_locked(&mut gate)?;
+        let enabled_models = config
+            .models
+            .iter()
+            .filter(|model| model.enabled)
+            .map(|model| (model.id.clone(), model.provider_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut changed = false;
+        for binding in &mut config.bindings {
+            let legacy = binding
+                .assistant_model_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| legacy_general_model.filter(|value| !value.trim().is_empty()));
+            if binding.fast_model.as_deref().is_none_or(str::is_empty) {
+                if let Some(legacy) = legacy.filter(|legacy| {
+                    enabled_models
+                        .get(*legacy)
+                        .is_some_and(|provider_id| provider_id == &binding.provider_id)
+                }) {
+                    binding.fast_model = Some(legacy.to_string());
+                    binding.revision = binding
+                        .revision
+                        .checked_add(1)
+                        .ok_or_else(|| format!("Binding revision 已溢出：{}", binding.engine_id))?;
+                    changed = true;
+                }
+            }
+            if binding.assistant_model_id.take().is_some() {
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_locked(&mut gate, &config)?;
+        }
         Ok(config)
     }
 
@@ -416,7 +849,15 @@ impl<S: SecretStore> ProviderStore<S> {
 
     pub fn launch_env(&self, binding: &BindingConfig) -> Result<Vec<(String, String)>, String> {
         let config = self.load()?;
-        let mut env = env_for_config(&config, binding, SecretValueMode::Omit)?;
+        self.launch_env_for_config(&config, binding)
+    }
+
+    pub fn launch_env_for_config(
+        &self,
+        config: &AppConfig,
+        binding: &BindingConfig,
+    ) -> Result<Vec<(String, String)>, String> {
+        let mut env = env_for_config(config, binding, SecretValueMode::Omit)?;
         let provider = config
             .providers
             .iter()
@@ -442,18 +883,7 @@ impl<S: SecretStore> ProviderStore<S> {
                     env.push((secret_name.to_string(), secret));
                 }
                 AuthMethod::OAuth => {
-                    // 订阅登录（P3-1）：默认复用 CLI 自己的登录态（claude login / codex login），
-                    // 不注入令牌；用户手动粘贴过令牌（key_ref 存在）时才注入以保持兼容。
-                    if let Some(key_ref) = provider
-                        .key_ref
-                        .as_deref()
-                        .filter(|key_ref| !key_ref.trim().is_empty())
-                    {
-                        let secret = self
-                            .secret(key_ref)?
-                            .ok_or_else(|| "钥匙串中没有找到订阅令牌".to_string())?;
-                        env.push((secret_name.to_string(), secret));
-                    }
+                    // 订阅凭证只由官方 CLI 管理，Helm 永不读取或注入。
                 }
                 AuthMethod::Cloud | AuthMethod::Local => {}
             }
@@ -462,7 +892,30 @@ impl<S: SecretStore> ProviderStore<S> {
     }
 
     pub fn delete_provider(&self, provider_id: &str) -> Result<AppConfig, String> {
-        let original = self.load()?;
+        let mut gate = self
+            .gate
+            .lock()
+            .map_err(|_| "ProviderStore 闸门锁中毒".to_string())?;
+        let original = self.load_locked(&mut gate)?;
+        let bound_engines: Vec<String> = original
+            .bindings
+            .iter()
+            .filter(|binding| binding.provider_id == provider_id)
+            .map(|binding| {
+                original
+                    .engines
+                    .iter()
+                    .find(|engine| engine.id == binding.engine_id)
+                    .map(|engine| engine.name.clone())
+                    .unwrap_or_else(|| binding.engine_id.clone())
+            })
+            .collect();
+        if !bound_engines.is_empty() {
+            return Err(format!(
+                "该服务商正在被 {} 使用，请先更改或解除引擎绑定",
+                bound_engines.join("、")
+            ));
+        }
         let removed_key_ref = original
             .providers
             .iter()
@@ -496,7 +949,7 @@ impl<S: SecretStore> ProviderStore<S> {
                 .map(|model| model.id.clone())
                 .unwrap_or_default();
         }
-        self.save(&config)?;
+        self.save_locked(&mut gate, &config)?;
         if let Some(key_ref) = removed_key_ref.filter(|key_ref| {
             !config
                 .providers
@@ -504,7 +957,7 @@ impl<S: SecretStore> ProviderStore<S> {
                 .any(|provider| provider.key_ref.as_deref() == Some(key_ref.as_str()))
         }) {
             if let Err(secret_error) = self.secrets.delete(&key_ref) {
-                return match self.save(&original) {
+                return match self.save_locked(&mut gate, &original) {
                     Ok(()) => Err(format!("{secret_error}；服务商配置已恢复，请重试删除")),
                     Err(restore_error) => Err(format!(
                         "{secret_error}；同时恢复服务商配置失败：{restore_error}"
@@ -516,7 +969,11 @@ impl<S: SecretStore> ProviderStore<S> {
     }
 
     pub fn set_defaults(&self, engine_id: &str, model_id: &str) -> Result<AppConfig, String> {
-        let mut config = self.load()?;
+        let mut gate = self
+            .gate
+            .lock()
+            .map_err(|_| "ProviderStore 闸门锁中毒".to_string())?;
+        let mut config = self.load_locked(&mut gate)?;
         if !config.engines.iter().any(|engine| engine.id == engine_id) {
             return Err(format!("找不到引擎：{engine_id}"));
         }
@@ -532,7 +989,7 @@ impl<S: SecretStore> ProviderStore<S> {
         {
             engine.default_model = model_id.to_string();
         }
-        self.save(&config)?;
+        self.save_locked(&mut gate, &config)?;
         Ok(config)
     }
 
@@ -572,6 +1029,17 @@ fn apply_config_defaults(value: &mut serde_json::Value) {
             }
             if provider.get("authMethod").is_none() {
                 provider["authMethod"] = serde_json::Value::String("apikey".to_string());
+            }
+            if provider.get("kind").is_none() {
+                let kind = match provider
+                    .get("authMethod")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some("oauth") => "subscription",
+                    Some("local") => "local",
+                    _ => "api",
+                };
+                provider["kind"] = serde_json::Value::String(kind.to_string());
             }
         }
     }
@@ -624,6 +1092,9 @@ fn migrate_bindings(config: &mut AppConfig) {
                 provider_id: provider.id.clone(),
                 primary_model: model.id.clone(),
                 fast_model: None,
+                assistant_model_id: None,
+                reasoning_effort: None,
+                revision: 0,
             });
         }
     }
@@ -669,6 +1140,13 @@ fn validate_binding(config: &AppConfig, binding: &BindingConfig) -> Result<(), S
         .filter(|model| !model.is_empty())
     {
         validate_binding_model(config, &binding.provider_id, fast_model, "快速模型")?;
+    }
+    if binding.engine_id == "claude-code"
+        && binding
+            .reasoning_effort
+            .is_some_and(|effort| !effort.is_claude_level())
+    {
+        return Err("Claude Code 不支持该推理强度".to_string());
     }
     Ok(())
 }
@@ -777,11 +1255,17 @@ fn env_for_config(
         }
     }
     if matches!(secret_mode, SecretValueMode::Masked) {
-        if let Some(secret_name) = auth_env_name(provider) {
+        if matches!(provider.kind, ProviderKind::Subscription) {
+            env.push((
+                "# 凭证".to_string(),
+                "由 Helm 独立订阅 Profile 管理，Helm 不注入".to_string(),
+            ));
+        } else if let Some(secret_name) = auth_env_name(provider) {
             match provider.auth_method {
-                AuthMethod::ApiKey | AuthMethod::OAuth => {
+                AuthMethod::ApiKey => {
                     env.push((secret_name.to_string(), "••••（系统钥匙串）".to_string()));
                 }
+                AuthMethod::OAuth => {}
                 AuthMethod::Cloud => env.push((secret_name.to_string(), "云凭证链".to_string())),
                 AuthMethod::Local => {}
             }
@@ -819,6 +1303,25 @@ fn upsert_model(models: &mut Vec<ModelConfig>, model: ModelConfig) {
     } else {
         models.push(model);
     }
+}
+
+fn deduplicate_models(models: &mut Vec<ModelConfig>) {
+    let mut deduplicated: Vec<ModelConfig> = Vec::with_capacity(models.len());
+    for model in models.drain(..) {
+        if let Some(existing) = deduplicated
+            .iter_mut()
+            .find(|existing| existing.provider_id == model.provider_id && existing.id == model.id)
+        {
+            let enabled = existing.enabled || model.enabled;
+            if model.enabled || !existing.enabled {
+                *existing = model;
+            }
+            existing.enabled = enabled;
+        } else {
+            deduplicated.push(model);
+        }
+    }
+    *models = deduplicated;
 }
 
 pub fn key_ref_for_provider(provider_id: &str) -> String {
@@ -986,6 +1489,12 @@ struct ModelEnvelopeItem {
     display_name_camel: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    /// Anthropic: context_window; OpenAI: context_length
+    #[serde(default, alias = "context_length")]
+    context_window: Option<u64>,
+    /// 能力标签数组
+    #[serde(default)]
+    capabilities: Option<Vec<String>>,
 }
 
 pub fn models_from_provider_response(
@@ -1034,56 +1543,91 @@ pub fn models_from_provider_response(
                 PriceSource::Unknown
             }),
             enabled: true,
+            context_window: item.context_window,
+            capabilities: item.capabilities,
         });
     }
     Ok(models)
 }
 
 fn builtin_model_pricing(protocol: &Protocol, model_id: &str) -> Option<(f64, f64)> {
-    match normalize_model_id(model_id).as_str() {
-        "gpt-5.5" => Some((1.25, 10.0)),
-        "gpt-5.4" => Some((1.25, 10.0)),
-        "gpt-5.4-mini" => Some((0.25, 2.0)),
-        "gpt-5.3-codex" => Some((1.25, 10.0)),
-        "gpt-5.3-codex-spark" => Some((0.25, 2.0)),
-        "gpt-5-codex" => Some((1.25, 10.0)),
-        "gpt-5-mini" => Some((0.25, 2.0)),
-        "claude-opus-4-8" => Some((5.0, 25.0)),
-        "claude-opus-4-7" => Some((5.0, 25.0)),
-        "claude-opus-4-6" => Some((5.0, 25.0)),
-        "claude-opus-4-5-20251101" => Some((5.0, 25.0)),
-        "claude-sonnet-4-6" => Some((3.0, 15.0)),
-        "claude-haiku-4-5-20251001" => Some((0.8, 4.0)),
-        "claude-haiku-4-5" => Some((0.8, 4.0)),
-        "minimax-m3" => Some((0.4, 2.0)),
-        _ => match protocol {
-            Protocol::OpenAiResponses | Protocol::OpenAiChat => None,
-            Protocol::Anthropic => None,
-            Protocol::Bedrock | Protocol::Vertex => None,
-        },
-    }
+    PricingCatalog::builtin()
+        .ok()?
+        .resolve(protocol, model_id, ServiceTier::Standard, 0)
+        .map(|rate| (rate.band.input, rate.band.output))
 }
 
-fn apply_builtin_model_pricing(config: &mut AppConfig) {
+fn apply_catalog_model_pricing(
+    config: &mut AppConfig,
+    catalog: &PricingCatalog,
+    pricing_store: Option<&PricingCatalogStore>,
+) {
     for idx in 0..config.models.len() {
-        let protocol = config
+        let provider = config
             .providers
             .iter()
-            .find(|provider| provider.id == config.models[idx].provider_id)
+            .find(|provider| provider.id == config.models[idx].provider_id);
+        let protocol = provider
             .map(|provider| provider.protocol.clone())
             .unwrap_or(Protocol::OpenAiResponses);
-        apply_builtin_model_pricing_to_model(&protocol, &mut config.models[idx]);
+        if let (Some(store), Some(provider)) = (pricing_store, provider) {
+            if let Ok(Some(rate)) = store.resolve_for_provider(
+                catalog,
+                &protocol,
+                &provider.id,
+                &config.models[idx].id,
+                ServiceTier::Standard,
+                0,
+            ) {
+                if rate.vendor == "manual" {
+                    config.models[idx].input_price_per_mtok = rate.band.input;
+                    config.models[idx].output_price_per_mtok = rate.band.output;
+                    config.models[idx].price_source = Some(PriceSource::Manual);
+                    continue;
+                }
+            }
+            if let Ok(preference) = store.provider_preference(&provider.id) {
+                if matches!(
+                    preference.mode,
+                    ProviderPricingMode::Disabled
+                        | ProviderPricingMode::Manual
+                        | ProviderPricingMode::Provider
+                ) && matches!(
+                    config.models[idx].price_source,
+                    None | Some(PriceSource::Builtin | PriceSource::Unknown)
+                ) {
+                    config.models[idx].input_price_per_mtok = 0.0;
+                    config.models[idx].output_price_per_mtok = 0.0;
+                    config.models[idx].price_source = Some(PriceSource::Unknown);
+                    continue;
+                }
+            }
+        }
+        apply_catalog_model_pricing_to_model(catalog, &protocol, &mut config.models[idx]);
     }
 }
 
 fn apply_builtin_model_pricing_to_model(protocol: &Protocol, model: &mut ModelConfig) {
+    let Ok(catalog) = PricingCatalog::builtin() else {
+        return;
+    };
+    apply_catalog_model_pricing_to_model(&catalog, protocol, model);
+}
+
+fn apply_catalog_model_pricing_to_model(
+    catalog: &PricingCatalog,
+    protocol: &Protocol,
+    model: &mut ModelConfig,
+) {
     if matches!(
         model.price_source,
-        Some(PriceSource::Manual | PriceSource::Provider)
+        Some(PriceSource::Manual | PriceSource::Provider | PriceSource::Subscription)
     ) {
         return;
     }
-    if let Some((input, output)) = builtin_model_pricing(protocol, &model.id) {
+    if let Some(rate) = catalog.resolve(protocol, &model.id, ServiceTier::Standard, 0) {
+        let input = rate.band.input;
+        let output = rate.band.output;
         if model.input_price_per_mtok == 0.0 || model.output_price_per_mtok == 0.0 {
             model.input_price_per_mtok = input;
             model.output_price_per_mtok = output;
@@ -1109,15 +1653,83 @@ fn normalize_saved_model(mut model: ModelConfig) -> ModelConfig {
     model
 }
 
-fn normalize_model_id(model_id: &str) -> String {
-    model_id
-        .trim()
-        .to_ascii_lowercase()
-        .replace('@', "-")
-        .trim_start_matches("models/")
-        .trim_start_matches("anthropic/")
-        .trim_start_matches("openai/")
-        .to_string()
+fn simple_pricing_profile(
+    catalog_version: &str,
+    source: &str,
+    input: f64,
+    output: f64,
+) -> ResolvedPricingProfile {
+    ResolvedPricingProfile {
+        catalog_version: catalog_version.to_string(),
+        source: source.to_string(),
+        currency: "USD".to_string(),
+        source_url: String::new(),
+        observed_at: String::new(),
+        tiers: HashMap::from([(
+            ServiceTier::Standard,
+            PricingTier {
+                bands: vec![PricingBand {
+                    min_input_tokens: None,
+                    max_input_tokens: None,
+                    input,
+                    cached_input: None,
+                    cache_write: None,
+                    output,
+                }],
+            },
+        )]),
+    }
+}
+
+pub(crate) fn subscription_models_for_provider(provider: &ProviderConfig) -> Vec<ModelConfig> {
+    let catalog: &[(&str, &str)] = match provider.protocol {
+        Protocol::Anthropic => &[
+            ("default", "Claude 默认（当前账号推荐）"),
+            ("best", "Claude Best（当前账号可用的最强模型）"),
+            ("sonnet", "Claude Sonnet（订阅）"),
+            ("opus", "Claude Opus（订阅）"),
+            ("haiku", "Claude Haiku（订阅）"),
+        ],
+        // ChatGPT 订阅的可用模型由当前登录账号的 Codex app-server
+        // `model/list` 决定，不能用发布时固定目录代替账号权限。
+        Protocol::OpenAiResponses => &[],
+        Protocol::OpenAiChat | Protocol::Bedrock | Protocol::Vertex => &[],
+    };
+    catalog
+        .iter()
+        .map(|(id, display_name)| ModelConfig {
+            id: (*id).to_string(),
+            provider_id: provider.id.clone(),
+            display_name: (*display_name).to_string(),
+            input_price_per_mtok: 0.0,
+            output_price_per_mtok: 0.0,
+            price_source: Some(PriceSource::Subscription),
+            enabled: true,
+            context_window: None,
+            capabilities: None,
+        })
+        .collect()
+}
+
+fn ensure_subscription_model_catalogs(config: &mut AppConfig) {
+    let providers: Vec<_> = config
+        .providers
+        .iter()
+        .filter(|provider| matches!(provider.kind, ProviderKind::Subscription))
+        .cloned()
+        .collect();
+    for provider in providers {
+        if config
+            .models
+            .iter()
+            .any(|model| model.provider_id == provider.id)
+        {
+            continue;
+        }
+        config
+            .models
+            .extend(subscription_models_for_provider(&provider));
+    }
 }
 
 pub fn seed_config() -> AppConfig {
@@ -1170,7 +1782,7 @@ pub async fn test_provider_connection<S: SecretStore>(
         return Ok(ConnectionResult {
             ok: false,
             verified: false,
-            message: "未验证：订阅登录将复用本机 CLI 登录态；请用「检测登录态」确认 CLI 已登录。"
+            message: "未验证：订阅登录使用 Helm 独立 CLI Profile；请用「检测登录态」确认该 Profile 已登录。"
                 .to_string(),
             latency_ms: started.elapsed().as_millis(),
         });
@@ -1243,6 +1855,10 @@ pub async fn sync_provider_models<S: SecretStore>(
         .iter()
         .find(|provider| provider.id == provider_id)
         .ok_or_else(|| format!("找不到服务商：{provider_id}"))?;
+    if matches!(provider.kind, ProviderKind::Subscription) {
+        return store
+            .save_models_for_provider(provider_id, subscription_models_for_provider(provider));
+    }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -1269,30 +1885,7 @@ pub async fn sync_provider_models<S: SecretStore>(
             };
         }
         AuthMethod::OAuth => {
-            // 订阅登录（P3-1）：有手动令牌就带上；没有则说明模型目录无法在线同步
-            let stored = provider
-                .key_ref
-                .as_deref()
-                .filter(|key_ref| !key_ref.trim().is_empty())
-                .map(|key_ref| store.secret(key_ref))
-                .transpose()?
-                .flatten();
-            match stored {
-                Some(api_key) => {
-                    request = match provider.protocol {
-                        Protocol::Anthropic => request
-                            .header("x-api-key", api_key)
-                            .header("anthropic-version", "2023-06-01"),
-                        _ => request.bearer_auth(api_key),
-                    };
-                }
-                None => {
-                    return Err(
-                        "订阅登录模式下 Helm 不持有凭证，无法在线同步模型目录；请手动添加模型，或临时粘贴一枚 API Key 用于同步"
-                            .to_string(),
-                    );
-                }
-            }
+            return Err("订阅接入不调用服务商模型接口，请重新保存服务商以恢复内置目录".to_string());
         }
         AuthMethod::Cloud | AuthMethod::Local => {}
     }
@@ -1361,5 +1954,60 @@ fn build_version_command(bin: &str) -> Command {
         let mut cmd = Command::new(bin);
         cmd.arg("--version");
         cmd
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_failure_returns_none_when_ok() {
+        assert_eq!(classify_failure("anything", true, true), None);
+    }
+
+    #[test]
+    fn classify_failure_returns_none_when_unverified() {
+        assert_eq!(classify_failure("anything", false, false), None);
+    }
+
+    #[test]
+    fn classify_failure_timeout_from_timed_out() {
+        assert_eq!(
+            classify_failure("connection timed out", false, true),
+            Some(FailureCategory::Timeout)
+        );
+    }
+
+    #[test]
+    fn classify_failure_auth_from_401() {
+        assert_eq!(
+            classify_failure("探活失败：HTTP 401", false, true),
+            Some(FailureCategory::Auth)
+        );
+    }
+
+    #[test]
+    fn classify_failure_auth_from_api_key() {
+        assert_eq!(
+            classify_failure("请先保存 API 密钥", false, true),
+            Some(FailureCategory::Auth)
+        );
+    }
+
+    #[test]
+    fn classify_failure_network_from_http_status() {
+        assert_eq!(
+            classify_failure("探活失败：HTTP 502", false, true),
+            Some(FailureCategory::Network)
+        );
+    }
+
+    #[test]
+    fn classify_failure_unknown_for_generic_error() {
+        assert_eq!(
+            classify_failure("something unexpected happened", false, true),
+            Some(FailureCategory::Unknown)
+        );
     }
 }

@@ -16,20 +16,22 @@
 //! 无状态：所需 sessionId 每行都带；tool_use 入参直接取自已定稿的 assistant 消息。
 
 use crate::protocol::{
-    AgentEvent, CallStatus, Diff, DiffHunk, DiffKind, DiffLine, EngineId, Role, StopReason,
-    ToolStatus, TurnStage,
+    AgentEvent, CallStatus, Diff, DiffHunk, DiffKind, DiffLine, EngineId, Role,
+    RuntimeCapabilityAvailability, RuntimeCapabilitySnapshot, StopReason, ToolDenialSource,
+    ToolOutcomeKind, ToolStatus, TurnStage,
 };
+use crate::util::now_millis;
 use serde_json::{Map, Value};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 const ENGINE: EngineId = EngineId::ClaudeCode;
 
-/// 当前 Unix 毫秒时间戳（对应 TS 的 `Date.now()`）。
-fn now_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+/// 缓存 tool_use 的 input（key = tool_use_id），用于在 tool_result 时构造 diff。
+/// Claude Code 的 Write 工具在 tool_result 中只返回纯文本，不包含 diff 结构，
+/// 但 tool_use 阶段的 input 中有 file_path 和 content，可以用来生成 diff。
+thread_local! {
+    static TOOL_USE_INPUT_CACHE: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
 }
 
 /// 取字符串字段，缺失/非字符串时返回空串（对应 TS `asString`）。
@@ -209,12 +211,28 @@ fn parse_system(obj: &Value, session_id: &str) -> Vec<AgentEvent> {
     if obj.get("subtype").and_then(Value::as_str) != Some("init") {
         return vec![];
     }
+    let tools = obj.get("tools").and_then(Value::as_array);
+    let availability = |name: &str| match tools {
+        None => RuntimeCapabilityAvailability::Unknown,
+        Some(tools) if tools.is_empty() => RuntimeCapabilityAvailability::Unknown,
+        Some(tools) if tools.iter().any(|tool| tool.as_str() == Some(name)) => {
+            RuntimeCapabilityAvailability::Available
+        }
+        Some(_) => RuntimeCapabilityAvailability::Unavailable,
+    };
     vec![AgentEvent::SessionStarted {
         session_id: session_id.to_string(),
         engine: ENGINE,
         model: str_field(obj, "model"),
         cwd: str_field(obj, "cwd"),
         ts: now_millis(),
+        capabilities: Some(RuntimeCapabilitySnapshot {
+            web_search: availability("WebSearch"),
+            web_fetch: availability("WebFetch"),
+            approval_contract_version: "claude-hook-bridge-v1".to_string(),
+            capability_snapshot_id: None,
+            auto_review_strategy: None,
+        }),
     }]
 }
 
@@ -274,6 +292,15 @@ fn parse_assistant(obj: &Value, session_id: &str) -> Vec<AgentEvent> {
         match block.get("type").and_then(Value::as_str) {
             Some("text") => {
                 if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    if is_claude_model_unavailable_message(text) {
+                        out.push(AgentEvent::Error {
+                            session_id: Some(session_id.to_string()),
+                            message: text.to_string(),
+                            recoverable: false,
+                            kind: Some("model_unavailable".to_string()),
+                        });
+                        continue;
+                    }
                     out.push(AgentEvent::MessageComplete {
                         session_id: session_id.to_string(),
                         role: Role::Assistant,
@@ -309,7 +336,35 @@ fn parse_assistant(obj: &Value, session_id: &str) -> Vec<AgentEvent> {
             _ => {}
         }
     }
+    if let Some(usage) = obj.get("message").and_then(|message| message.get("usage")) {
+        let fresh = usage
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let cached = usage
+            .get("cache_read_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let cache_write = usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let context_tokens = fresh.saturating_add(cached).saturating_add(cache_write);
+        if context_tokens > 0 {
+            out.push(AgentEvent::ContextUsage {
+                session_id: session_id.to_string(),
+                context_tokens,
+                context_window: None,
+            });
+        }
+    }
     out
+}
+
+pub(crate) fn is_claude_model_unavailable_message(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("there's an issue with the selected model")
+        && lower.contains("may not exist or you may not have access")
 }
 
 fn parse_user(obj: &Value, session_id: &str) -> Vec<AgentEvent> {
@@ -328,6 +383,50 @@ fn parse_user(obj: &Value, session_id: &str) -> Vec<AgentEvent> {
         if let Some(tool_use_id) = block.get("tool_use_id").and_then(Value::as_str) {
             let is_error = block.get("is_error").and_then(Value::as_bool) == Some(true);
             let tool_content = block.get("content");
+            let denial_code = block
+                .get("toolDenialKind")
+                .or_else(|| block.get("tool_denial_kind"))
+                .or_else(|| {
+                    block
+                        .get("content")
+                        .and_then(|content| content.get("toolDenialKind"))
+                })
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let (outcome, started, retryable, denial_source) = match denial_code.as_deref() {
+                Some("automode-unavailable") => (
+                    ToolOutcomeKind::AutoReviewUnavailable,
+                    false,
+                    true,
+                    Some(ToolDenialSource::AutoReviewer),
+                ),
+                Some("automode-parsing-error") => (
+                    ToolOutcomeKind::AutoReviewParseError,
+                    false,
+                    true,
+                    Some(ToolDenialSource::AutoReviewer),
+                ),
+                Some("automode-blocked") => (
+                    ToolOutcomeKind::AutoReviewBlocked,
+                    false,
+                    false,
+                    Some(ToolDenialSource::AutoReviewer),
+                ),
+                Some(_) => (
+                    ToolOutcomeKind::RuntimeDenied,
+                    false,
+                    false,
+                    Some(ToolDenialSource::Runtime),
+                ),
+                None if is_error => (
+                    ToolOutcomeKind::ToolFailed,
+                    true,
+                    false,
+                    Some(ToolDenialSource::Tool),
+                ),
+                None => (ToolOutcomeKind::ToolSucceeded, true, false, None),
+            };
+            let output = tool_content.map(stringify_tool_content);
             out.push(AgentEvent::ToolResult {
                 session_id: session_id.to_string(),
                 id: tool_use_id.to_string(),
@@ -336,8 +435,14 @@ fn parse_user(obj: &Value, session_id: &str) -> Vec<AgentEvent> {
                 } else {
                     ToolStatus::Success
                 },
-                output: tool_content.map(stringify_tool_content),
+                has_output: Some(output.as_deref().is_some_and(|value| !value.is_empty())),
+                output,
                 diff: tool_content.and_then(extract_diff),
+                outcome: Some(outcome),
+                started: Some(started),
+                retryable: Some(retryable),
+                denial_source,
+                native_denial_code: denial_code,
             });
         }
     }
@@ -345,10 +450,22 @@ fn parse_user(obj: &Value, session_id: &str) -> Vec<AgentEvent> {
 }
 
 fn map_stop_reason(obj: &Value) -> StopReason {
+    // API 错误（is_error=true 或 terminal_reason 为已知错误类型）优先判定为 Error，
+    // 即使 CLI 同时标记 subtype="success"。否则进程以 code!=0 退出时 Helm 只显示泛化
+    // "进程异常退出"，淹没真实 API 错误原因。
+    let is_api_error = obj.get("is_error").and_then(Value::as_bool) == Some(true);
+    let terminal_reason = obj.get("terminal_reason").and_then(Value::as_str);
+    let is_error_terminal = matches!(
+        terminal_reason,
+        Some("api_error" | "tool_error" | "authentication_failed")
+    );
+    if is_api_error || is_error_terminal {
+        return StopReason::Error;
+    }
     if obj.get("subtype").and_then(Value::as_str) == Some("success") {
         return StopReason::End;
     }
-    let interrupted = obj.get("terminal_reason").and_then(Value::as_str) == Some("interrupted")
+    let interrupted = terminal_reason == Some("interrupted")
         || obj.get("stop_reason").and_then(Value::as_str) == Some("interrupted");
     if interrupted {
         StopReason::Interrupted
@@ -359,10 +476,19 @@ fn map_stop_reason(obj: &Value) -> StopReason {
 
 fn parse_result(obj: &Value, session_id: &str) -> Vec<AgentEvent> {
     let usage = obj.get("usage");
-    let input_tokens = usage
+    let uncached_input_tokens = usage
         .and_then(|u| u.get("input_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let cached_input_tokens = usage
+        .and_then(|u| u.get("cache_read_input_tokens"))
+        .and_then(Value::as_u64);
+    let cache_write_input_tokens = usage
+        .and_then(|u| u.get("cache_creation_input_tokens"))
+        .and_then(Value::as_u64);
+    let input_tokens = uncached_input_tokens
+        .saturating_add(cached_input_tokens.unwrap_or_default())
+        .saturating_add(cache_write_input_tokens.unwrap_or_default());
     let output_tokens = usage
         .and_then(|u| u.get("output_tokens"))
         .and_then(Value::as_u64)
@@ -375,8 +501,14 @@ fn parse_result(obj: &Value, session_id: &str) -> Vec<AgentEvent> {
     let mut out = vec![AgentEvent::TokenUsage {
         session_id: session_id.to_string(),
         input_tokens,
+        cached_input_tokens,
+        cache_write_input_tokens,
         output_tokens,
         cost_usd,
+        service_tier: usage
+            .and_then(|u| u.get("service_tier"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
         context_window,
     }];
 
@@ -399,6 +531,12 @@ fn parse_result(obj: &Value, session_id: &str) -> Vec<AgentEvent> {
                 action: name.to_string(),
                 detail,
                 input,
+                available_decisions: vec![
+                    crate::protocol::ApprovalDecisionOption::Allow,
+                    crate::protocol::ApprovalDecisionOption::Deny,
+                ],
+                persistent_label: None,
+                matcher_summary: None,
             });
             return out;
         }
@@ -450,5 +588,139 @@ pub fn parse_claude_line(raw: &str) -> Vec<AgentEvent> {
         Some("user") => parse_user(&obj, &session_id),
         Some("result") => parse_result(&obj, &session_id),
         _ => vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_claude_line;
+    use crate::protocol::{AgentEvent, StopReason};
+
+    #[test]
+    fn model_unavailable_assistant_text_is_an_error() {
+        let raw = serde_json::json!({
+            "type":"assistant",
+            "session_id":"s1",
+            "message":{
+                "content":[{
+                    "type":"text",
+                    "text":"There's an issue with the selected model (missing-model). It may not exist or you may not have access to it. Run --model to pick a different model."
+                }]
+            }
+        });
+        let events = parse_claude_line(&raw.to_string());
+        assert!(matches!(
+            events.as_slice(),
+            [AgentEvent::Error { kind: Some(kind), recoverable: false, .. }]
+                if kind == "model_unavailable"
+        ));
+    }
+
+    #[test]
+    fn assistant_usage_emits_replacement_context_usage() {
+        let raw = serde_json::json!({
+            "type":"assistant",
+            "session_id":"s1",
+            "message":{
+                "content":[{"type":"text","text":"ok"}],
+                "usage":{
+                    "input_tokens":2,
+                    "cache_read_input_tokens":37187,
+                    "cache_creation_input_tokens":6024,
+                    "output_tokens":2
+                }
+            }
+        });
+        let events = parse_claude_line(&raw.to_string());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ContextUsage {
+                context_tokens: 43213,
+                context_window: None,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn api_error_result_maps_to_error_stop_reason() {
+        // CLI 输出 is_error=true + subtype=success 的 result 行，应映射为 Error 而非 End
+        let raw = serde_json::json!({
+            "type":"result",
+            "session_id":"s1",
+            "is_error":true,
+            "subtype":"success",
+            "terminal_reason":"api_error",
+            "api_error_status":403,
+            "result":"Failed to authenticate. API Error: 403"
+        });
+        let events = parse_claude_line(&raw.to_string());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TurnComplete { stop_reason: StopReason::Error, .. }
+        )));
+        // 正常成功的 result 行仍映射为 End
+        let ok_raw = serde_json::json!({
+            "type":"result",
+            "session_id":"s1",
+            "subtype":"success",
+            "terminal_reason":"end_turn"
+        });
+        let ok_events = parse_claude_line(&ok_raw.to_string());
+        assert!(ok_events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TurnComplete { stop_reason: StopReason::End, .. }
+        )));
+    }
+
+    #[test]
+    fn automode_unavailable_preserves_not_started_denial_evidence() {
+        let raw = serde_json::json!({
+            "type":"user",
+            "session_id":"s1",
+            "message":{"content":[{
+                "type":"tool_result",
+                "tool_use_id":"tool-1",
+                "is_error":true,
+                "toolDenialKind":"automode-unavailable",
+                "content":"mimo-v2.5-pro is temporarily unavailable"
+            }]}
+        });
+        let events = parse_claude_line(&raw.to_string());
+        assert!(matches!(
+            events.as_slice(),
+            [AgentEvent::ToolResult {
+                outcome: Some(crate::protocol::ToolOutcomeKind::AutoReviewUnavailable),
+                started: Some(false),
+                retryable: Some(true),
+                native_denial_code: Some(code),
+                ..
+            }] if code == "automode-unavailable"
+        ));
+    }
+
+    #[test]
+    fn automode_blocked_is_not_retryable_or_started() {
+        let raw = serde_json::json!({
+            "type":"user",
+            "session_id":"s1",
+            "message":{"content":[{
+                "type":"tool_result",
+                "tool_use_id":"tool-1",
+                "is_error":true,
+                "toolDenialKind":"automode-blocked",
+                "content":"blocked"
+            }]}
+        });
+        let events = parse_claude_line(&raw.to_string());
+        assert!(matches!(
+            events.as_slice(),
+            [AgentEvent::ToolResult {
+                outcome: Some(crate::protocol::ToolOutcomeKind::AutoReviewBlocked),
+                started: Some(false),
+                retryable: Some(false),
+                ..
+            }]
+        ));
     }
 }
