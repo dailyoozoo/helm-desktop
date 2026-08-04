@@ -750,27 +750,22 @@ pub async fn create_session(
             .await
         }
         "codex" => {
-            match create_codex_auth_home(&env, &[]) {
-                Ok(auth_home) => {
-                    // RuntimeManaged Session 只使用 app-server 协议能力握手；已退役的
-                    // 模型驱动保护探针不得因 Provider 不可达而阻断普通 Build。
-                    start_codex_with_reasoning(
-                        app,
-                        handle.clone(),
-                        bin,
-                        model.clone(),
-                        cwd.clone(),
-                        env,
-                        vec![],
-                        None,
-                        auth_home,
-                        subscription_home,
-                        capability_snapshot.clone(),
-                        reasoning_effort,
-                    )
-                }
-                Err(error) => Err(error),
-            }
+            // API Runtime Profile 由 start_codex_with_reasoning 从 Helm-owned 持久目录解析；
+            // Provider Key 只通过进程环境传递，不再创建 Session auth.json。
+            start_codex_with_reasoning(
+                app,
+                handle.clone(),
+                bin,
+                model.clone(),
+                cwd.clone(),
+                env,
+                vec![],
+                None,
+                None,
+                subscription_home,
+                capability_snapshot.clone(),
+                reasoning_effort,
+            )
         }
         _ => Err(format!("暂不支持的引擎：{engine}")),
     };
@@ -1102,23 +1097,20 @@ pub async fn resume_session(
             )
             .await?
         }
-        EngineId::Codex => {
-            let auth_home = create_codex_auth_home(&env, &[])?;
-            start_codex_with_reasoning(
-                app,
-                detail.summary.id.clone(),
-                bin,
-                model.clone(),
-                detail.summary.cwd.clone(),
-                env,
-                context_messages,
-                native_resume_id,
-                auth_home,
-                subscription_home,
-                capability_snapshot.clone(),
-                reasoning_effort,
-            )?
-        }
+        EngineId::Codex => start_codex_with_reasoning(
+            app,
+            detail.summary.id.clone(),
+            bin,
+            model.clone(),
+            detail.summary.cwd.clone(),
+            env,
+            context_messages,
+            native_resume_id,
+            None,
+            subscription_home,
+            capability_snapshot.clone(),
+            reasoning_effort,
+        )?,
     };
     let restored_profile =
         crate::adapter::PermissionProfile::parse(&detail.summary.safe_permission_profile)?;
@@ -1690,23 +1682,20 @@ async fn start_route_runtime(
             )
             .await
         }
-        "codex" => {
-            let auth_home = create_codex_auth_home(&env, &[])?;
-            start_codex_with_reasoning(
-                app,
-                history_session_id,
-                bin,
-                model,
-                cwd,
-                env,
-                history_messages,
-                None,
-                auth_home,
-                subscription_home,
-                capability_snapshot,
-                reasoning_effort,
-            )
-        }
+        "codex" => start_codex_with_reasoning(
+            app,
+            history_session_id,
+            bin,
+            model,
+            cwd,
+            env,
+            history_messages,
+            None,
+            None,
+            subscription_home,
+            capability_snapshot,
+            reasoning_effort,
+        ),
         _ => Err(format!("暂不支持的引擎：{engine}")),
     }
 }

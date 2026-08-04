@@ -16,15 +16,15 @@ use crate::parse::parse_claude_line;
 use crate::permission_service::{PermissionService, PermissionSessionContext};
 use crate::protocol::{
     AgentEvent, ApprovalDecisionOption, CallStatus, Diff, DiffHunk, DiffKind, DiffLine, EngineId,
-    PlanStatus, PlanStep, Role, StopReason, ToolStatus, TurnStage,
+    PlanStatus, PlanStep, Role, RuntimeCapabilityAvailability, StopReason, ToolStatus, TurnStage,
 };
 use crate::reasoning::ReasoningEffort;
 use crate::sessions::SessionHistoryStore;
 use crate::settings::AppSettings;
-use crate::util::now_millis;
+use crate::util::{now_millis, sha256_hex};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -38,6 +38,11 @@ use tokio::process::Command;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify};
 
 const EVENT_NAME: &str = "agent-event";
+const CODEX_SANDBOX_SETUP_STALLED_AFTER: Duration = Duration::from_secs(30);
+const CODEX_SANDBOX_SETUP_TIMEOUT: Duration = Duration::from_secs(180);
+const CODEX_INTERRUPT_RPC_GRACE: Duration = Duration::from_millis(500);
+const CODEX_INTERRUPT_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const RUNTIME_TOOL_STALLED_AFTER: Duration = Duration::from_secs(60);
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -123,7 +128,9 @@ enum SessionCmd {
         profile: PermissionProfile,
         responder: oneshot::Sender<Result<(), String>>,
     },
-    Interrupt,
+    Interrupt {
+        responder: Option<oneshot::Sender<Result<(), String>>>,
+    },
 }
 
 /// 会话模式（变更-04）：轮次级属性，随每条消息下发。
@@ -430,12 +437,14 @@ pub struct CodexSession {
     policy_cwd: Arc<Mutex<String>>,
     env: Vec<(String, String)>,
     running_pid: Arc<Mutex<Option<u32>>>,
+    readiness_process_id: Arc<Mutex<Option<String>>>,
     /// 每轮序列化进 prompt 的历史消息；检查点回溯会整体替换为截断后的清单（P2-5）
     history_messages: Arc<std::sync::Mutex<Vec<crate::sessions::SessionMessage>>>,
     /// 轮次互斥（变更-06）：与 Claude 的 busy CAS 对齐，防止前端状态失真时双进程并发同一会话
     busy: Arc<AtomicBool>,
     /// 用户中断标志（变更-09）：中断导致的进程退出不渲染为错误卡，与 Claude 路径对齐
     interrupted: Arc<AtomicBool>,
+    interrupt_notify: Arc<Notify>,
     /// 会话级停用的 MCP 服务器名单（变更-11）：API Key 模式下过滤临时 CODEX_HOME 配置
     disabled_mcp: Arc<std::sync::Mutex<Vec<String>>>,
     /// Codex CLI 原生 thread id；普通后续轮直接 `exec resume`，不再重复拼接完整历史。
@@ -445,6 +454,8 @@ pub struct CodexSession {
     /// Session 实际使用的 CODEX_HOME。API 接入指向受 Session 所有的快照；
     /// subscription 指向 Helm-owned 持久 Profile。
     effective_home: Arc<std::sync::Mutex<Option<PathBuf>>>,
+    /// 持久 EngineProfile revision；进入 SandboxIdentity，但不包含 Provider/Model/Key。
+    runtime_profile_revision: Arc<std::sync::Mutex<Option<String>>>,
     /// 回溯后下一轮必须丢弃旧 thread，并用截断历史新建一次 thread。
     force_history_rebuild: Arc<AtomicBool>,
     /// 每个 Helm Codex Session 持有一个 app-server；旧 exec 路径仅作回退。
@@ -455,7 +466,7 @@ pub struct CodexSession {
     /// app-server 文件审批请求不带路径，通过同 itemId 的通知关联。
     file_changes_by_item: Arc<Mutex<HashMap<String, Vec<String>>>>,
     /// Tool items must complete before a Codex Turn can be accepted as successful.
-    pending_tool_items: Arc<Mutex<HashSet<String>>>,
+    tool_item_facts: Arc<Mutex<HashMap<String, PendingCodexTool>>>,
     /// 通知循环向当前 Turn 等待者广播完成或协议错误。
     turn_completions: broadcast::Sender<Result<String, String>>,
     terminal_turns: Arc<Mutex<HashMap<String, Result<(), String>>>>,
@@ -467,6 +478,41 @@ pub struct CodexSession {
     permission_profile: Arc<std::sync::Mutex<PermissionProfile>>,
     full_access_lease: Arc<std::sync::Mutex<Option<FullAccessLease>>>,
     capability_snapshot: Arc<Mutex<crate::capability_registry::EngineCapabilitySnapshot>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingCodexToolStage {
+    WaitingApproval,
+    Executing,
+    WaitingResult,
+}
+
+impl PendingCodexToolStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::WaitingApproval => "waiting_approval",
+            Self::Executing => "executing",
+            Self::WaitingResult => "waiting_result",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingCodexTool {
+    queued_at: i64,
+    started_at: i64,
+    last_progress_at: i64,
+    ended_at: Option<i64>,
+    stage: PendingCodexToolStage,
+}
+
+fn pending_codex_tool_is_stalled(
+    tool: &PendingCodexTool,
+    now: i64,
+    stalled_after: Duration,
+) -> bool {
+    tool.ended_at.is_none()
+        && now.saturating_sub(tool.last_progress_at) >= stalled_after.as_millis() as i64
 }
 
 #[derive(Default)]
@@ -497,6 +543,424 @@ impl CodexTurnContextIndex {
 
 pub(crate) struct CodexAuthHome {
     pub(crate) path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexRuntimeProfile {
+    path: PathBuf,
+    revision: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexSandboxReadinessProof {
+    pub(crate) marker_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct PersistedCodexSandboxReadinessProof {
+    schema_version: u32,
+    sandbox_identity: String,
+    marker_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexSandboxReadinessFailure {
+    pub(crate) message: String,
+    pub(crate) failed_at: i64,
+}
+
+pub(crate) type CodexSandboxReadinessOutcome =
+    Result<CodexSandboxReadinessProof, CodexSandboxReadinessFailure>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeReadinessWait<T> {
+    Ready(T),
+    Interrupted,
+    TimedOut,
+}
+
+async fn wait_for_runtime_readiness<F, I, T, S>(
+    setup: F,
+    interrupted: I,
+    stalled_after: Duration,
+    total_timeout: Duration,
+    on_stalled: S,
+) -> RuntimeReadinessWait<T>
+where
+    F: Future<Output = T>,
+    I: Future<Output = ()>,
+    S: FnOnce(),
+{
+    tokio::pin!(setup);
+    tokio::pin!(interrupted);
+    let stalled = tokio::time::sleep(stalled_after);
+    let timeout = tokio::time::sleep(total_timeout);
+    tokio::pin!(stalled);
+    tokio::pin!(timeout);
+    tokio::select! {
+        result = &mut setup => return RuntimeReadinessWait::Ready(result),
+        _ = &mut interrupted => return RuntimeReadinessWait::Interrupted,
+        _ = &mut timeout => return RuntimeReadinessWait::TimedOut,
+        _ = &mut stalled => on_stalled(),
+    }
+    tokio::select! {
+        result = &mut setup => RuntimeReadinessWait::Ready(result),
+        _ = &mut interrupted => RuntimeReadinessWait::Interrupted,
+        _ = &mut timeout => RuntimeReadinessWait::TimedOut,
+    }
+}
+
+fn readiness_failure(message: String) -> CodexSandboxReadinessFailure {
+    CodexSandboxReadinessFailure {
+        message,
+        failed_at: now_millis(),
+    }
+}
+
+fn readiness_result(outcome: &CodexSandboxReadinessOutcome) -> Result<(), String> {
+    outcome
+        .as_ref()
+        .map(|_| ())
+        .map_err(|failure| failure.message.clone())
+}
+
+/// Helm-owned Codex API EngineProfile。目录只保存经过过滤的配置、扩展快照和
+/// Codex 自己生成的 sandbox 状态；Provider 凭据始终只通过子进程环境传入。
+#[derive(Clone)]
+pub struct CodexRuntimeProfileStore {
+    root: PathBuf,
+    history: SessionHistoryStore,
+    profile_lock: Arc<std::sync::Mutex<()>>,
+    authorized_workspaces: Arc<std::sync::Mutex<HashMap<String, BTreeSet<String>>>>,
+}
+
+impl CodexRuntimeProfileStore {
+    pub fn new(app_config_dir: PathBuf, history: SessionHistoryStore) -> Self {
+        Self {
+            root: app_config_dir.join("cli-profiles").join("codex-runtime"),
+            history,
+            profile_lock: Arc::new(std::sync::Mutex::new(())),
+            authorized_workspaces: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn api_profile(
+        &self,
+        env: &[(String, String)],
+        disabled_mcp: &[String],
+        workspace_root: &Path,
+    ) -> Result<Option<CodexRuntimeProfile>, String> {
+        if !env
+            .iter()
+            .any(|(key, value)| key == "OPENAI_API_KEY" && !value.trim().is_empty())
+        {
+            return Ok(None);
+        }
+        let source = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .ok()
+            .map(|home| PathBuf::from(home).join(".codex"));
+        self.api_profile_with_source(source.as_deref(), disabled_mcp, Some(workspace_root))
+            .map(Some)
+    }
+
+    fn api_profile_with_source(
+        &self,
+        source: Option<&Path>,
+        disabled_mcp: &[String],
+        workspace_root: Option<&Path>,
+    ) -> Result<CodexRuntimeProfile, String> {
+        let files = codex_engine_profile_files(source, disabled_mcp)?;
+        let engine_config = files
+            .iter()
+            .find(|(path, _)| path == Path::new("config.toml"))
+            .map(|(_, bytes)| bytes.clone())
+            .unwrap_or_default();
+        let inventory = files
+            .iter()
+            .map(|(path, bytes)| {
+                serde_json::json!({
+                    "path": path.to_string_lossy().replace('\\', "/"),
+                    "sha256": sha256_hex(bytes),
+                })
+            })
+            .collect::<Vec<_>>();
+        let revision = crate::turn_start::digest_json(&serde_json::json!({
+            "schema": 2,
+            "files": inventory,
+            "disabledMcp": disabled_mcp,
+        }))?;
+        let directory_name = revision.trim_start_matches("sha256:");
+        let path = self.root.join(directory_name);
+        let _guard = self
+            .profile_lock
+            .lock()
+            .map_err(|_| "Codex Runtime Profile 锁中毒".to_string())?;
+        let workspace_key = workspace_root.map(codex_project_key).transpose()?;
+        let persisted_workspaces = self
+            .history
+            .list_sessions()?
+            .into_iter()
+            .filter_map(|session| {
+                let path = Path::new(&session.cwd);
+                path.is_absolute()
+                    .then(|| normalize_codex_project_key(path))
+            })
+            .collect::<BTreeSet<_>>();
+        let authorized_workspaces = {
+            let mut by_revision = self
+                .authorized_workspaces
+                .lock()
+                .map_err(|_| "Codex Runtime Profile 工作区锁中毒".to_string())?;
+            let workspaces = by_revision.entry(revision.clone()).or_default();
+            workspaces.extend(persisted_workspaces);
+            if let Some(workspace_key) = workspace_key {
+                workspaces.insert(workspace_key);
+            }
+            workspaces.clone()
+        };
+        fs::create_dir_all(&path)
+            .map_err(|error| format!("创建 Codex Runtime Profile 失败：{error}"))?;
+        for (relative, bytes) in files {
+            let destination = if relative == Path::new("config.toml") {
+                path.join("engine-config.toml")
+            } else {
+                path.join(&relative)
+            };
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("创建 Codex Profile 继承目录失败：{error}"))?;
+            }
+            if destination.is_file() {
+                let existing = fs::read(&destination)
+                    .map_err(|error| format!("读取既有 Codex Runtime Profile 失败：{error}"))?;
+                if existing != bytes {
+                    return Err(format!(
+                        "[codex_runtime_profile_tampered] Codex Runtime Profile 文件与 revision 不一致：{}",
+                        relative.to_string_lossy()
+                    ));
+                }
+            } else {
+                fs::write(&destination, bytes)
+                    .map_err(|error| format!("写入 Codex Runtime Profile 失败：{error}"))?;
+            }
+        }
+        let engine_config_path = path.join("engine-config.toml");
+        if !engine_config_path.is_file() {
+            fs::write(&engine_config_path, &engine_config)
+                .map_err(|error| format!("写入 Codex EngineProfile 基线失败：{error}"))?;
+        }
+        let live_config = codex_runtime_config(&engine_config, &authorized_workspaces)?;
+        let live_config_path = path.join("config.toml");
+        if live_config_path.is_file() {
+            let existing = fs::read(&live_config_path)
+                .map_err(|error| format!("读取 Codex Runtime 配置失败：{error}"))?;
+            if existing != live_config {
+                validate_codex_runtime_config(&engine_config, &existing, &authorized_workspaces)?;
+                fs::write(&live_config_path, &live_config)
+                    .map_err(|error| format!("刷新 Codex Runtime 工作区配置失败：{error}"))?;
+            }
+        } else {
+            fs::write(&live_config_path, &live_config)
+                .map_err(|error| format!("写入 Codex Runtime 配置失败：{error}"))?;
+        }
+        let manifest = path.join(".helm-runtime-profile.json");
+        let manifest_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schemaVersion": 2,
+            "revision": revision,
+            "containsCredentials": false,
+        }))
+        .map_err(|error| format!("序列化 Codex Profile 清单失败：{error}"))?;
+        if manifest.is_file() {
+            if fs::read(&manifest)
+                .map_err(|error| format!("读取 Codex Profile 清单失败：{error}"))?
+                != manifest_bytes
+            {
+                return Err(
+                    "[codex_runtime_profile_tampered] Codex Runtime Profile 清单与 revision 不一致"
+                        .to_string(),
+                );
+            }
+        } else {
+            fs::write(&manifest, manifest_bytes)
+                .map_err(|error| format!("写入 Codex Profile 清单失败：{error}"))?;
+        }
+        if path.join("auth.json").exists() {
+            return Err("[codex_runtime_profile_secret_detected] 持久 Runtime Profile 中出现认证文件，已阻止启动".to_string());
+        }
+        Ok(CodexRuntimeProfile { path, revision })
+    }
+}
+
+fn codex_project_key(workspace_root: &Path) -> Result<String, String> {
+    let canonical = workspace_root
+        .canonicalize()
+        .map_err(|error| format!("Codex Runtime 工作目录不可用：{error}"))?;
+    Ok(normalize_codex_project_key(&canonical))
+}
+
+fn normalize_codex_project_key(workspace_root: &Path) -> String {
+    let path = workspace_root.to_string_lossy();
+    #[cfg(target_os = "windows")]
+    {
+        path.strip_prefix(r"\\?\")
+            .unwrap_or(&path)
+            .replace('/', r"\")
+            .to_lowercase()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        path.into_owned()
+    }
+}
+
+fn codex_runtime_config(
+    engine_config: &[u8],
+    authorized_workspaces: &BTreeSet<String>,
+) -> Result<Vec<u8>, String> {
+    let mut config = if engine_config.is_empty() {
+        toml::Value::Table(toml::map::Map::new())
+    } else {
+        toml::from_str::<toml::Value>(
+            std::str::from_utf8(engine_config)
+                .map_err(|error| format!("Codex EngineProfile 配置不是 UTF-8：{error}"))?,
+        )
+        .map_err(|error| format!("解析 Codex EngineProfile 配置失败：{error}"))?
+    };
+    let root = config
+        .as_table_mut()
+        .ok_or_else(|| "Codex EngineProfile config.toml 顶层不是表".to_string())?;
+    let projects = root
+        .entry("projects")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| "Codex EngineProfile projects 配置不是表".to_string())?;
+    for workspace in authorized_workspaces {
+        projects.entry(workspace.clone()).or_insert_with(|| {
+            toml::Value::Table(toml::map::Map::from_iter([(
+                "trust_level".to_string(),
+                toml::Value::String("trusted".to_string()),
+            )]))
+        });
+    }
+    toml::to_string_pretty(&config)
+        .map(|value| value.into_bytes())
+        .map_err(|error| format!("序列化 Codex Runtime 配置失败：{error}"))
+}
+
+fn validate_codex_runtime_config(
+    engine_config: &[u8],
+    existing: &[u8],
+    authorized_workspaces: &BTreeSet<String>,
+) -> Result<(), String> {
+    let baseline = codex_runtime_config(engine_config, &BTreeSet::new())?;
+    let baseline = toml::from_str::<toml::Value>(
+        std::str::from_utf8(&baseline)
+            .map_err(|error| format!("Codex Runtime 基线不是 UTF-8：{error}"))?,
+    )
+    .map_err(|error| format!("解析 Codex Runtime 基线失败：{error}"))?;
+    let mut actual = toml::from_str::<toml::Value>(
+        std::str::from_utf8(existing)
+            .map_err(|error| format!("Codex Runtime 配置不是 UTF-8：{error}"))?,
+    )
+    .map_err(|error| {
+        format!("[codex_runtime_profile_tampered] Codex Runtime config.toml 无法解析：{error}")
+    })?;
+    let baseline_projects = baseline
+        .get("projects")
+        .and_then(toml::Value::as_table)
+        .cloned()
+        .unwrap_or_default();
+    let actual_projects = actual
+        .get_mut("projects")
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| {
+            "[codex_runtime_profile_tampered] Codex Runtime projects 配置不是表".to_string()
+        })?;
+    let trusted = toml::Value::Table(toml::map::Map::from_iter([(
+        "trust_level".to_string(),
+        toml::Value::String("trusted".to_string()),
+    )]));
+    for workspace in authorized_workspaces {
+        if baseline_projects.contains_key(workspace) {
+            continue;
+        }
+        if let Some(value) = actual_projects.remove(workspace) {
+            if value != trusted {
+                return Err(format!(
+                    "[codex_runtime_profile_tampered] Codex Runtime 工作区信任状态非法：{}",
+                    sha256_hex(workspace.as_bytes())
+                ));
+            }
+        }
+    }
+    if actual != baseline {
+        return Err(
+            "[codex_runtime_profile_tampered] Codex Runtime config.toml 含未授权改动".to_string(),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn sandbox_marker_digest(path: &Path) -> Option<String> {
+    let mut marker = serde_json::from_slice::<serde_json::Value>(&fs::read(path).ok()?).ok()?;
+    marker.as_object_mut()?.remove("created_at");
+    crate::turn_start::digest_json(&marker).ok()
+}
+
+fn persisted_sandbox_readiness_path(runtime_home: &Path, identity: &str) -> PathBuf {
+    runtime_home
+        .join(".helm-sandbox-readiness")
+        .join(format!("{}.json", sha256_hex(identity.as_bytes())))
+}
+
+fn load_persisted_sandbox_readiness(
+    runtime_home: &Path,
+    identity: &str,
+    marker_path: &Path,
+) -> Option<CodexSandboxReadinessProof> {
+    let persisted = serde_json::from_slice::<PersistedCodexSandboxReadinessProof>(
+        &fs::read(persisted_sandbox_readiness_path(runtime_home, identity)).ok()?,
+    )
+    .ok()?;
+    if persisted.schema_version != 1 || persisted.sandbox_identity != identity {
+        return None;
+    }
+    let marker_digest = sandbox_marker_digest(marker_path)?;
+    if persisted.marker_digest != marker_digest {
+        return None;
+    }
+    Some(CodexSandboxReadinessProof { marker_digest })
+}
+
+fn persist_sandbox_readiness(
+    runtime_home: &Path,
+    identity: &str,
+    proof: &CodexSandboxReadinessProof,
+) -> Result<(), String> {
+    let path = persisted_sandbox_readiness_path(runtime_home, identity);
+    let parent = path.parent().ok_or_else(|| {
+        "[codex_sandbox_readiness_persist_failed] Codex readiness proof 路径无效".to_string()
+    })?;
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "[codex_sandbox_readiness_persist_failed] 创建 Codex readiness proof 目录失败：{error}"
+        )
+    })?;
+    let bytes = serde_json::to_vec_pretty(&PersistedCodexSandboxReadinessProof {
+        schema_version: 1,
+        sandbox_identity: identity.to_string(),
+        marker_digest: proof.marker_digest.clone(),
+    })
+    .map_err(|error| {
+        format!(
+            "[codex_sandbox_readiness_persist_failed] 序列化 Codex readiness proof 失败：{error}"
+        )
+    })?;
+    fs::write(path, bytes).map_err(|error| {
+        format!("[codex_sandbox_readiness_persist_failed] 写入 Codex readiness proof 失败：{error}")
+    })
 }
 
 impl Drop for CodexAuthHome {
@@ -749,26 +1213,42 @@ impl AgentSession {
         match self {
             AgentSession::Claude(session) => session
                 .tx
-                .send(SessionCmd::Interrupt)
+                .send(SessionCmd::Interrupt { responder: None })
                 .map_err(|_| "会话已结束，无法中断".to_string()),
-            AgentSession::Codex(session) => session.interrupt(),
+            AgentSession::Codex(session) => {
+                let session = session.clone();
+                spawn_agent_task(async move {
+                    let _ = session.interrupt_and_wait().await;
+                });
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn interrupt_and_wait(&self) -> Result<(), String> {
+        match self {
+            AgentSession::Claude(session) => {
+                let (responder, response) = oneshot::channel();
+                session
+                    .tx
+                    .send(SessionCmd::Interrupt {
+                        responder: Some(responder),
+                    })
+                    .map_err(|_| "会话已结束，无法中断".to_string())?;
+                response
+                    .await
+                    .map_err(|_| "Claude 中断协调器已结束，无法确认终态".to_string())?
+            }
+            AgentSession::Codex(session) => session.interrupt_and_wait().await,
         }
     }
 
     pub fn close(&self) {
         let _ = self.interrupt();
-        if let AgentSession::Codex(session) = self {
-            let app_server = session.app_server.clone();
-            spawn_agent_task(async move {
-                if let Some(process) = app_server.lock().await.take() {
-                    process.shutdown().await;
-                }
-            });
-        }
     }
 
     pub async fn shutdown(&self) {
-        let _ = self.interrupt();
+        let _ = self.interrupt_and_wait().await;
         if let AgentSession::Codex(session) = self {
             if let Some(process) = session.app_server.lock().await.take() {
                 process.shutdown().await;
@@ -828,10 +1308,25 @@ impl AgentSession {
                 if session.busy.load(Ordering::Acquire) {
                     return Err("轮次进行中，结束后才能更新 MCP 开关".to_string());
                 }
-                // API Key Session 只有在用户显式变更 MCP 开关时才重建临时 HOME；
-                // subscription 没有临时认证目录，继续复用现有 Helm Profile。
-                let replacement = create_codex_auth_home(&session.env, &disabled)?;
-                let replacement_path = replacement.as_ref().map(|home| home.path.clone());
+                // API Key Session 切换到对应不可变 EngineProfile snapshot；Key 仍只在 env。
+                // subscription 没有 API Runtime Profile，继续复用 Helm-owned 登录目录。
+                let runtime_profile = if session
+                    .env
+                    .iter()
+                    .any(|(key, value)| key == "OPENAI_API_KEY" && !value.trim().is_empty())
+                {
+                    Some(
+                        session
+                            .app
+                            .try_state::<CodexRuntimeProfileStore>()
+                            .ok_or_else(|| "Codex Runtime Profile Store 未启动".to_string())?
+                            .api_profile(&session.env, &disabled, Path::new(&session.cwd))?
+                            .ok_or_else(|| "Codex API Runtime Profile 未创建".to_string())?,
+                    )
+                } else {
+                    None
+                };
+                let replacement_path = runtime_profile.as_ref().map(|profile| profile.path.clone());
                 let existing_home = session
                     .effective_home
                     .lock()
@@ -842,11 +1337,16 @@ impl AgentSession {
                 *session
                     .auth_home
                     .lock()
-                    .map_err(|_| "Codex CODEX_HOME 锁中毒".to_string())? = replacement;
+                    .map_err(|_| "Codex CODEX_HOME 锁中毒".to_string())? = None;
                 *session
                     .effective_home
                     .lock()
                     .map_err(|_| "Codex CODEX_HOME 锁中毒".to_string())? = effective_home;
+                *session
+                    .runtime_profile_revision
+                    .lock()
+                    .map_err(|_| "Codex Runtime Profile revision 锁中毒".to_string())? =
+                    runtime_profile.map(|profile| profile.revision);
                 *session
                     .disabled_mcp
                     .lock()
@@ -1329,7 +1829,8 @@ pub(crate) fn codex_provider_config_args(env: &[(String, String)]) -> Vec<String
         "model_providers.helm.name=helm".to_string(),
         format!("model_providers.helm.base_url={base_url}"),
         format!("model_providers.helm.wire_api={wire_api}"),
-        "model_providers.helm.requires_openai_auth=true".to_string(),
+        "model_providers.helm.env_key=OPENAI_API_KEY".to_string(),
+        "model_providers.helm.requires_openai_auth=false".to_string(),
     ]
 }
 
@@ -1543,6 +2044,122 @@ fn copy_directory_recursive(source: &Path, destination: &Path) -> Result<(), Str
     Ok(())
 }
 
+fn collect_profile_tree(
+    source: &Path,
+    relative_root: &Path,
+    files: &mut Vec<(PathBuf, Vec<u8>)>,
+) -> Result<(), String> {
+    let mut entries = fs::read_dir(source)
+        .map_err(|error| format!("读取 Codex Profile 继承目录失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("读取 Codex Profile 继承目录项失败：{error}"))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let from = entry.path();
+        let relative = relative_root.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("读取 Codex Profile 继承类型失败：{error}"))?;
+        let resolved = if file_type.is_symlink() {
+            fs::canonicalize(&from).map_err(|error| {
+                format!(
+                    "解析 Codex Profile 继承链接失败（{}）：{error}",
+                    from.display()
+                )
+            })?
+        } else {
+            from
+        };
+        if resolved.is_dir() {
+            collect_profile_tree(&resolved, &relative, files)?;
+        } else if resolved.is_file() {
+            files.push((
+                relative,
+                fs::read(&resolved).map_err(|error| {
+                    format!(
+                        "读取 Codex Profile 继承文件失败（{}）：{error}",
+                        resolved.display()
+                    )
+                })?,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn codex_engine_profile_files(
+    source: Option<&Path>,
+    disabled_mcp: &[String],
+) -> Result<Vec<(PathBuf, Vec<u8>)>, String> {
+    let mut files = Vec::new();
+    let Some(source) = source else {
+        return Ok(files);
+    };
+    let config = source.join("config.toml");
+    if config.is_file() {
+        let raw =
+            fs::read_to_string(&config).map_err(|error| format!("读取 Codex 配置失败：{error}"))?;
+        let filtered = filter_codex_engine_config(&raw, disabled_mcp)?;
+        files.push((PathBuf::from("config.toml"), filtered.into_bytes()));
+    }
+    let prompts = source.join("prompts");
+    if prompts.is_dir() {
+        let mut prompt_files = fs::read_dir(&prompts)
+            .map_err(|error| format!("读取 Codex prompts 失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("读取 Codex prompt 失败：{error}"))?;
+        prompt_files.sort_by_key(|entry| entry.file_name());
+        for entry in prompt_files {
+            let from = entry.path();
+            if from.extension().and_then(|value| value.to_str()) == Some("md") && from.is_file() {
+                files.push((
+                    PathBuf::from("prompts").join(entry.file_name()),
+                    fs::read(&from).map_err(|error| format!("读取 Codex prompt 失败：{error}"))?,
+                ));
+            }
+        }
+    }
+    let skills = source.join("skills");
+    if skills.is_dir() {
+        collect_profile_tree(&skills, Path::new("skills"), &mut files)?;
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(files)
+}
+
+fn filter_codex_engine_config(raw: &str, disabled_mcp: &[String]) -> Result<String, String> {
+    let mut value: toml::Value =
+        toml::from_str(raw).map_err(|error| format!("解析 Codex 配置失败：{error}"))?;
+    let root = value
+        .as_table_mut()
+        .ok_or_else(|| "Codex config.toml 顶层不是表".to_string())?;
+
+    // Provider、模型和 Base URL 由冻结的 ProviderLaunchProfile 在启动时覆盖，
+    // 不能进入持久 EngineProfile，也不能让它们改变 sandbox revision。
+    root.remove("model");
+    root.remove("model_provider");
+    root.remove("model_providers");
+    if let Some(profiles) = root.get_mut("profiles").and_then(toml::Value::as_table_mut) {
+        for profile in profiles
+            .iter_mut()
+            .filter_map(|(_, value)| value.as_table_mut())
+        {
+            profile.remove("model");
+            profile.remove("model_provider");
+        }
+    }
+
+    if let Some(servers) = root
+        .get_mut("mcp_servers")
+        .and_then(toml::Value::as_table_mut)
+    {
+        for name in disabled_mcp {
+            servers.remove(name);
+        }
+    }
+    toml::to_string_pretty(&value).map_err(|error| format!("序列化 Codex 配置失败：{error}"))
+}
+
 /// 临时 CODEX_HOME 必须继承真实 ~/.codex 的 config.toml 与 prompts/，
 /// 否则用户已有的 MCP、模型配置、custom prompts 会在 API key 启动时全部丢失（变更-03 A.1）。
 /// disabled_mcp 非空时在继承的 config.toml 里剔除对应 `[mcp_servers.<name>]`（变更-11）。
@@ -1598,11 +2215,9 @@ fn create_codex_auth_home_with_source(
             copy_directory_recursive(&skills, &home.path.join("skills"))?;
         }
     }
-    // auth.json 最后写入：即使继承来源里有旧 auth 也以本次注入的 key 为准。
-    let auth_text = serde_json::to_string(&json!({ "OPENAI_API_KEY": api_key }))
-        .map_err(|e| format!("序列化 Codex 临时认证失败：{e}"))?;
-    fs::write(home.path.join("auth.json"), auth_text)
-        .map_err(|e| format!("写入 Codex 临时认证失败：{e}"))?;
+    // 自定义 Provider 通过 env_key 从子进程环境读取 API Key。临时探测 Profile 也不得
+    // 落 auth.json，避免能力发现或崩溃路径留下凭据。
+    let _ = api_key;
     Ok(Some(home))
 }
 
@@ -2131,8 +2746,8 @@ mod tests {
         rollback_prepared_approval_state, run_serialized_approval, should_process_claude_event,
         spawn_agent_task, terminal_turn_outcome, validate_engine_bin, wait_until_idle_and_begin,
         write_approval_state, AgentSession, ApprovalDecision, ApprovalState, AutoFallbackDecision,
-        ClaudeExitDisposition, ClaudeSession, PendingToolInfo, PermissionProfile, SessionCmd,
-        TurnMode,
+        ClaudeExitDisposition, ClaudeSession, CodexRuntimeProfileStore, PendingToolInfo,
+        PermissionProfile, SessionCmd, TurnMode,
     };
     use crate::codex_app_server::CodexApprovalPolicy;
     use crate::protocol::{AgentEvent, EngineId, Role, StopReason, ToolStatus};
@@ -2141,6 +2756,7 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;
+    use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -2538,6 +3154,35 @@ mod tests {
             .expect_err("调用方必须收到 manager 的真实失败");
 
         assert_eq!(error, "manager 记录审批失败");
+    }
+
+    #[tokio::test]
+    async fn claude_interrupt_waits_for_manager_terminal_acknowledgement() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = AgentSession::Claude(ClaudeSession {
+            tx,
+            cwd: "D:/repo".to_string(),
+            control: None,
+        });
+        let interrupt = tokio::spawn(async move { session.interrupt_and_wait().await });
+
+        let responder = match rx.recv().await {
+            Some(SessionCmd::Interrupt {
+                responder: Some(responder),
+            }) => responder,
+            _ => panic!("manager 应收到带终态回执的中断命令"),
+        };
+        assert!(
+            !interrupt.is_finished(),
+            "收到 manager 回执前不得报告 Stop 完成"
+        );
+        responder.send(Ok(())).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), interrupt)
+            .await
+            .expect("manager 回执后中断应立即完成")
+            .expect("中断等待任务不应崩溃")
+            .expect("中断回执应成功");
     }
 
     #[tokio::test]
@@ -3054,6 +3699,29 @@ mod tests {
             .expect("Codex Turn 等待任务不应崩溃");
     }
 
+    #[tokio::test]
+    async fn codex_interrupt_replaces_silent_stream_close_with_interrupted_terminal() {
+        let terminals = Mutex::new(HashMap::from([(
+            "turn-1".to_string(),
+            Err("Codex app-server notification stream closed".to_string()),
+        )]));
+        let emitted = AtomicBool::new(false);
+        finish_codex_interrupt_terminal(
+            &terminals,
+            &Notify::new(),
+            Some("turn-1".to_string()),
+            || {
+                emitted.store(true, Ordering::Release);
+            },
+        )
+        .await;
+        assert!(emitted.load(Ordering::Acquire));
+        assert_eq!(
+            terminal_turn_outcome(&terminals, "turn-1").await,
+            Some(Ok(()))
+        );
+    }
+
     #[test]
     fn codex_sandbox_for_mode_forces_read_only_on_plan_and_ask() {
         // 计划/询问强制只读（取更严值）；构建沿用设置映射，包括显式 full
@@ -3442,7 +4110,8 @@ mod tests {
                 "model_providers.helm.name=helm".to_string(),
                 "model_providers.helm.base_url=https://api.example.com/v1".to_string(),
                 "model_providers.helm.wire_api=chat".to_string(),
-                "model_providers.helm.requires_openai_auth=true".to_string(),
+                "model_providers.helm.env_key=OPENAI_API_KEY".to_string(),
+                "model_providers.helm.requires_openai_auth=false".to_string(),
             ]
         );
     }
@@ -3470,7 +4139,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_auth_home_uses_launch_env_api_key_and_cleans_up() {
+    fn codex_probe_home_uses_launch_env_without_writing_key_and_cleans_up() {
         let home = create_codex_auth_home(
             &[("OPENAI_API_KEY".to_string(), "helm-runtime-key".to_string())],
             &[],
@@ -3478,10 +4147,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let path = home.path.clone();
-        let auth_text = std::fs::read_to_string(path.join("auth.json")).unwrap();
-        let auth: serde_json::Value = serde_json::from_str(&auth_text).unwrap();
-
-        assert_eq!(auth["OPENAI_API_KEY"], "helm-runtime-key");
+        assert!(!path.join("auth.json").exists());
         drop(home);
         assert!(!path.exists());
     }
@@ -3538,10 +4204,7 @@ mod tests {
         assert!(home.path.join("skills/demo/references/guide.md").is_file());
         assert!(home.path.join("skills/demo/scripts/run.ps1").is_file());
         assert!(home.path.join("skills/demo/assets/example.txt").is_file());
-        let auth: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(home.path.join("auth.json")).unwrap())
-                .unwrap();
-        assert_eq!(auth["OPENAI_API_KEY"], "helm-runtime-key");
+        assert!(!home.path.join("auth.json").exists());
 
         let path = home.path.clone();
         drop(home);
@@ -3550,7 +4213,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_auth_home_without_source_dir_still_writes_auth() {
+    fn codex_probe_home_without_source_dir_still_keeps_key_off_disk() {
         let home = create_codex_auth_home_with_source(
             &[("OPENAI_API_KEY".to_string(), "helm-runtime-key".to_string())],
             None,
@@ -3558,7 +4221,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(home.path.join("auth.json").is_file());
+        assert!(!home.path.join("auth.json").exists());
         assert!(!home.path.join("config.toml").exists());
     }
 
@@ -3588,6 +4251,348 @@ mod tests {
         assert!(!config.contains("postgres"), "停用的服务器应被剔除");
         assert!(config.contains("gpt-5-codex"), "其余配置项应原样保留");
         let _ = fs::remove_dir_all(&source);
+    }
+
+    #[tokio::test]
+    async fn codex_runtime_profile_is_persistent_secret_free_and_readiness_is_singleflight() {
+        let root = std::env::temp_dir().join(format!(
+            "helm-test-codex-runtime-profile-{}-{}",
+            std::process::id(),
+            crate::util::now_millis()
+        ));
+        let source = root.join("source");
+        let workspace_a = root.join("workspace-a");
+        let workspace_b = root.join("workspace-b");
+        fs::create_dir_all(source.join("skills/demo")).unwrap();
+        fs::create_dir_all(&workspace_a).unwrap();
+        fs::create_dir_all(&workspace_b).unwrap();
+        fs::write(
+            source.join("config.toml"),
+            concat!(
+                "model = \"stale-model\"\n",
+                "model_provider = \"stale-provider\"\n",
+                "profile = \"work\"\n\n",
+                "[profiles.work]\n",
+                "model = \"profile-model\"\n",
+                "model_provider = \"profile-provider\"\n",
+                "sandbox_mode = \"workspace-write\"\n\n",
+                "[model_providers.stale-provider]\n",
+                "base_url = \"https://provider-secret.example/v1\"\n",
+                "wire_api = \"responses\"\n\n",
+                "[windows]\n",
+                "sandbox = \"elevated\"\n\n",
+                "[mcp_servers.demo]\n",
+                "command = \"demo\"\n",
+            ),
+        )
+        .unwrap();
+        fs::write(source.join("skills/demo/SKILL.md"), "# demo").unwrap();
+        fs::write(source.join("auth.json"), "global-secret-sentinel").unwrap();
+        let profile_history = SessionHistoryStore::new(root.join("profile.sqlite"));
+        for (id, cwd) in [("workspace-a", &workspace_a), ("workspace-b", &workspace_b)] {
+            profile_history
+                .create_session(NewSessionRecord {
+                    id: id.to_string(),
+                    engine: EngineId::Codex,
+                    model: "gpt-5".to_string(),
+                    cwd: cwd.to_string_lossy().to_string(),
+                    created_at: 1,
+                })
+                .unwrap();
+        }
+        let store = CodexRuntimeProfileStore::new(root.join("app-config"), profile_history.clone());
+        let readiness_registry = crate::runtime_registry::RuntimeRegistry::new(
+            SessionHistoryStore::new(root.join("readiness.sqlite")),
+        )
+        .unwrap();
+
+        let first = store
+            .api_profile_with_source(Some(&source), &[], Some(&workspace_a))
+            .unwrap();
+        assert!(first.path.join("config.toml").is_file());
+        assert!(first.path.join("engine-config.toml").is_file());
+        assert!(first.path.join("skills/demo/SKILL.md").is_file());
+        assert!(!first.path.join("auth.json").exists());
+        let engine_config = fs::read_to_string(first.path.join("engine-config.toml")).unwrap();
+        let engine_config = toml::from_str::<toml::Value>(&engine_config).unwrap();
+        assert!(engine_config.get("model").is_none());
+        assert!(engine_config.get("model_provider").is_none());
+        assert!(engine_config.get("model_providers").is_none());
+        assert!(engine_config["profiles"]["work"].get("model").is_none());
+        assert!(engine_config["profiles"]["work"]
+            .get("model_provider")
+            .is_none());
+        assert_eq!(
+            engine_config["windows"]["sandbox"].as_str(),
+            Some("elevated")
+        );
+        assert_eq!(
+            engine_config["mcp_servers"]["demo"]["command"].as_str(),
+            Some("demo")
+        );
+        let rerouted = fs::read_to_string(source.join("config.toml"))
+            .unwrap()
+            .replace("stale-model", "new-model")
+            .replace("profile-model", "new-profile-model")
+            .replace("stale-provider", "new-provider")
+            .replace("profile-provider", "new-profile-provider")
+            .replace("provider-secret.example", "provider-new.example");
+        fs::write(source.join("config.toml"), rerouted).unwrap();
+        let same_engine_profile = store
+            .api_profile_with_source(Some(&source), &[], Some(&workspace_a))
+            .unwrap();
+        assert_eq!(
+            same_engine_profile, first,
+            "Provider/Model 路由变化不得轮换持久 EngineProfile 或 sandbox identity"
+        );
+        let marker = first.path.join(".sandbox/setup_marker.json");
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(&marker, r#"{"version":5}"#).unwrap();
+
+        let warm = store
+            .api_profile_with_source(Some(&source), &[], Some(&workspace_a))
+            .unwrap();
+        assert_eq!(warm, first);
+        assert_eq!(fs::read_to_string(&marker).unwrap(), r#"{"version":5}"#);
+        let second_workspace = store
+            .api_profile_with_source(Some(&source), &[], Some(&workspace_b))
+            .unwrap();
+        assert_eq!(second_workspace, first);
+        let runtime_config = fs::read_to_string(first.path.join("config.toml")).unwrap();
+        let runtime_config = toml::from_str::<toml::Value>(&runtime_config).unwrap();
+        let projects = runtime_config["projects"].as_table().unwrap();
+        assert!(projects.contains_key(&super::codex_project_key(&workspace_a).unwrap()));
+        assert!(projects.contains_key(&super::codex_project_key(&workspace_b).unwrap()));
+
+        let clean_config = fs::read(first.path.join("config.toml")).unwrap();
+        fs::write(
+            first.path.join("config.toml"),
+            String::from_utf8(clean_config.clone())
+                .unwrap()
+                .replace("sandbox = \"elevated\"", "sandbox = \"danger-full-access\""),
+        )
+        .unwrap();
+        let tampered = store
+            .api_profile_with_source(Some(&source), &[], Some(&workspace_a))
+            .unwrap_err();
+        assert!(tampered.starts_with("[codex_runtime_profile_tampered]"));
+        fs::write(first.path.join("config.toml"), clean_config).unwrap();
+        let restarted_store =
+            CodexRuntimeProfileStore::new(root.join("app-config"), profile_history);
+        let restarted = restarted_store
+            .api_profile_with_source(Some(&source), &[], Some(&workspace_a))
+            .unwrap();
+        assert_eq!(restarted, first);
+        assert_eq!(fs::read_to_string(&marker).unwrap(), r#"{"version":5}"#);
+
+        let disabled = store
+            .api_profile_with_source(Some(&source), &["demo".to_string()], Some(&workspace_a))
+            .unwrap();
+        assert_ne!(disabled.revision, first.revision);
+        assert!(!fs::read_to_string(disabled.path.join("config.toml"))
+            .unwrap()
+            .contains("mcp_servers.demo"));
+
+        let first_waiter = readiness_registry
+            .codex_readiness_cell("identity-a", &marker)
+            .await;
+        let second_waiter = readiness_registry
+            .codex_readiness_cell("identity-a", &marker)
+            .await;
+        let invalidated = readiness_registry
+            .codex_readiness_cell("identity-b", &marker)
+            .await;
+        assert!(Arc::ptr_eq(&first_waiter, &second_waiter));
+        assert!(!Arc::ptr_eq(&first_waiter, &invalidated));
+        let proof = super::CodexSandboxReadinessProof {
+            marker_digest: super::sandbox_marker_digest(&marker).unwrap(),
+        };
+        let setup_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_count = setup_count.clone();
+        let first_proof = proof.clone();
+        let first_setup = first_waiter.get_or_init(|| async move {
+            first_count.fetch_add(1, Ordering::AcqRel);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok(first_proof)
+        });
+        let second_count = setup_count.clone();
+        let second_proof = proof.clone();
+        let second_setup = second_waiter.get_or_init(|| async move {
+            second_count.fetch_add(1, Ordering::AcqRel);
+            Ok(second_proof)
+        });
+        let _ = tokio::join!(first_setup, second_setup);
+        assert_eq!(setup_count.load(Ordering::Acquire), 1);
+        assert_eq!(second_waiter.get().cloned(), Some(Ok(proof)));
+        assert!(invalidated.get().is_none());
+        fs::write(&marker, r#"{"version":6}"#).unwrap();
+        let marker_invalidated = readiness_registry
+            .codex_readiness_cell("identity-a", &marker)
+            .await;
+        assert!(!Arc::ptr_eq(&first_waiter, &marker_invalidated));
+        assert!(marker_invalidated.get().is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sandbox_marker_digest_ignores_timestamp_but_not_contract_fields() {
+        let root = std::env::temp_dir().join(format!(
+            "helm-test-codex-marker-{}-{}",
+            std::process::id(),
+            crate::util::now_millis()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let marker = root.join("setup_marker.json");
+        fs::write(
+            &marker,
+            r#"{"version":5,"created_at":"first","proxy_ports":[7897]}"#,
+        )
+        .unwrap();
+        let first = super::sandbox_marker_digest(&marker).unwrap();
+        fs::write(
+            &marker,
+            r#"{"version":5,"created_at":"second","proxy_ports":[7897]}"#,
+        )
+        .unwrap();
+        assert_eq!(super::sandbox_marker_digest(&marker).unwrap(), first);
+        fs::write(
+            &marker,
+            r#"{"version":6,"created_at":"second","proxy_ports":[7897]}"#,
+        )
+        .unwrap();
+        assert_ne!(super::sandbox_marker_digest(&marker).unwrap(), first);
+        fs::write(&marker, b"not-json").unwrap();
+        assert!(super::sandbox_marker_digest(&marker).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persisted_sandbox_readiness_requires_exact_identity_and_marker() {
+        let root = std::env::temp_dir().join(format!(
+            "helm-test-codex-persisted-readiness-{}-{}",
+            std::process::id(),
+            crate::util::now_millis()
+        ));
+        let sandbox = root.join(".sandbox");
+        fs::create_dir_all(&sandbox).unwrap();
+        let marker = sandbox.join("setup_marker.json");
+        fs::write(
+            &marker,
+            r#"{"version":5,"created_at":"first","proxy_ports":[7897]}"#,
+        )
+        .unwrap();
+        let proof = super::CodexSandboxReadinessProof {
+            marker_digest: super::sandbox_marker_digest(&marker).unwrap(),
+        };
+        super::persist_sandbox_readiness(&root, "identity-a", &proof).unwrap();
+
+        assert_eq!(
+            super::load_persisted_sandbox_readiness(&root, "identity-a", &marker),
+            Some(proof.clone())
+        );
+        assert!(super::load_persisted_sandbox_readiness(&root, "identity-b", &marker).is_none());
+
+        fs::write(
+            &marker,
+            r#"{"version":5,"created_at":"second","proxy_ports":[7897]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            super::load_persisted_sandbox_readiness(&root, "identity-a", &marker),
+            Some(proof)
+        );
+
+        fs::write(
+            &marker,
+            r#"{"version":6,"created_at":"second","proxy_ports":[7897]}"#,
+        )
+        .unwrap();
+        assert!(super::load_persisted_sandbox_readiness(&root, "identity-a", &marker).is_none());
+
+        fs::write(
+            super::persisted_sandbox_readiness_path(&root, "identity-a"),
+            b"not-json",
+        )
+        .unwrap();
+        assert!(super::load_persisted_sandbox_readiness(&root, "identity-a", &marker).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn runtime_readiness_wait_uses_injected_stall_interrupt_and_timeout_bounds() {
+        let stalled_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stalled_observer = stalled_count.clone();
+        let ready = super::wait_for_runtime_readiness(
+            async {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+                7_u8
+            },
+            std::future::pending(),
+            Duration::from_millis(2),
+            Duration::from_millis(50),
+            move || {
+                stalled_observer.fetch_add(1, Ordering::AcqRel);
+            },
+        )
+        .await;
+        assert_eq!(ready, super::RuntimeReadinessWait::Ready(7));
+        assert_eq!(stalled_count.load(Ordering::Acquire), 1);
+
+        let interrupted = super::wait_for_runtime_readiness(
+            std::future::pending::<()>(),
+            async { tokio::time::sleep(Duration::from_millis(2)).await },
+            Duration::from_millis(20),
+            Duration::from_millis(50),
+            || panic!("interrupt should win before stalled"),
+        )
+        .await;
+        assert_eq!(interrupted, super::RuntimeReadinessWait::Interrupted);
+
+        let timed_out = super::wait_for_runtime_readiness(
+            std::future::pending::<()>(),
+            std::future::pending(),
+            Duration::from_millis(2),
+            Duration::from_millis(10),
+            || {},
+        )
+        .await;
+        assert_eq!(timed_out, super::RuntimeReadinessWait::TimedOut);
+    }
+
+    #[tokio::test]
+    #[ignore = "uses installed Codex app-server and an explicit isolated CODEX_HOME"]
+    async fn real_codex_app_server_command_exec_prepares_windows_sandbox() {
+        let profile = std::env::var("HELM_REAL_CODEX_PROFILE").expect("profile env is required");
+        let cwd = std::env::var("HELM_REAL_CODEX_CWD").expect("cwd env is required");
+        let mut command = super::build_codex_command("codex");
+        command.env("CODEX_HOME", &profile).current_dir(&cwd);
+        let process = super::spawn_codex_app_server(command).await.unwrap();
+        #[cfg(target_os = "windows")]
+        let command = vec![
+            std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string()),
+            "/D".to_string(),
+            "/S".to_string(),
+            "/C".to_string(),
+            "exit /b 0".to_string(),
+        ];
+        #[cfg(not(target_os = "windows"))]
+        let command = vec!["sh".to_string(), "-c".to_string(), "true".to_string()];
+        let outcome = process
+            .rpc
+            .prepare_sandbox(
+                "helm-real-readiness",
+                command,
+                &cwd,
+                "workspace-write",
+                false,
+            )
+            .await;
+        process.shutdown().await;
+        outcome.unwrap();
+        assert!(Path::new(&profile)
+            .join(".sandbox/setup_marker.json")
+            .is_file());
     }
 
     #[test]
@@ -3721,6 +4726,8 @@ pub(crate) fn classify_error(message: &str) -> Option<String> {
         || lower.contains("版本不兼容")
     {
         "version_incompatible"
+    } else if lower.contains("[codex_turn_pending_tools]") {
+        "tool_result_missing"
     } else if lower.contains("没有任何输出") || lower.contains("超时") {
         "timeout"
     } else if lower.contains("econnrefused")
@@ -4741,7 +5748,7 @@ async fn run_claude_turn(
     let watchdog_runtime = runtime.clone();
     let watchdog_activity = last_activity_ms.clone();
     let watchdog = tokio::spawn(async move {
-        const IDLE_WARN_MS: u64 = 300_000;
+        const IDLE_WARN_MS: u64 = 60_000;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             let idle =
@@ -5245,8 +6252,11 @@ pub async fn start_claude_with_resume_and_reasoning(
                         let _ = responder.send(Ok(()));
                     }
                 }
-                SessionCmd::Interrupt => {
+                SessionCmd::Interrupt { responder } => {
                     interrupt_running(manager_runtime.clone()).await;
+                    if let Some(responder) = responder {
+                        let _ = responder.send(Ok(()));
+                    }
                 }
             }
         }
@@ -5379,6 +6389,7 @@ fn spawn_codex_app_server_loops(session: CodexSession, process: Arc<CodexAppServ
             let action = actions.remove(0);
             let grant_display = crate::permissions::runtime_grant_display(&action);
             let approval_id = action.tool_call_id.clone();
+            let native_item_id = request.item_id().to_string();
             approval_session.pending_approvals.lock().await.insert(
                 approval_id.clone(),
                 CodexPendingApproval {
@@ -5386,6 +6397,15 @@ fn spawn_codex_app_server_loops(session: CodexSession, process: Arc<CodexAppServ
                     action: action.clone(),
                 },
             );
+            if let Some(tool) = approval_session
+                .tool_item_facts
+                .lock()
+                .await
+                .get_mut(&native_item_id)
+            {
+                tool.stage = PendingCodexToolStage::WaitingApproval;
+                tool.last_progress_at = now_millis();
+            }
             let session_id = approval_session
                 .thread_id
                 .lock()
@@ -5442,19 +6462,40 @@ fn spawn_codex_app_server_loops(session: CodexSession, process: Arc<CodexAppServ
                         .and_then(serde_json::Value::as_str);
                     if let Some(id) = item.get("id").and_then(serde_json::Value::as_str) {
                         if method == Some("item/started")
-                            && matches!(item_type, Some("commandExecution" | "fileChange"))
+                            && matches!(
+                                item_type,
+                                Some(
+                                    "commandExecution"
+                                        | "fileChange"
+                                        | "webSearch"
+                                        | "mcpToolCall"
+                                        | "dynamicToolCall"
+                                )
+                            )
                         {
-                            notification_session
-                                .pending_tool_items
-                                .lock()
-                                .await
-                                .insert(id.to_string());
+                            let now = now_millis();
+                            notification_session.tool_item_facts.lock().await.insert(
+                                id.to_string(),
+                                PendingCodexTool {
+                                    queued_at: now,
+                                    started_at: now,
+                                    last_progress_at: now,
+                                    ended_at: None,
+                                    stage: PendingCodexToolStage::Executing,
+                                },
+                            );
                         } else if method == Some("item/completed") {
-                            notification_session
-                                .pending_tool_items
+                            if let Some(tool) = notification_session
+                                .tool_item_facts
                                 .lock()
                                 .await
-                                .remove(id);
+                                .get_mut(id)
+                            {
+                                let now = now_millis();
+                                tool.last_progress_at = now;
+                                tool.ended_at = Some(now);
+                                tool.stage = PendingCodexToolStage::WaitingResult;
+                            }
                         }
                     }
                     if item_type == Some("fileChange") {
@@ -5482,17 +6523,45 @@ fn spawn_codex_app_server_loops(session: CodexSession, process: Arc<CodexAppServ
                     }
                 }
             }
-            let pending_tool_count = if notification
+            if let Some(item_id) = notification
+                .pointer("/params/itemId")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    notification
+                        .pointer("/params/item/id")
+                        .and_then(serde_json::Value::as_str)
+                })
+            {
+                if let Some(tool) = notification_session
+                    .tool_item_facts
+                    .lock()
+                    .await
+                    .get_mut(item_id)
+                {
+                    tool.last_progress_at = now_millis();
+                    if notification
+                        .get("method")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|method| method.contains("output") || method.contains("delta"))
+                    {
+                        tool.stage = PendingCodexToolStage::WaitingResult;
+                    }
+                }
+            }
+            let pending_tool_summary = if notification
                 .get("method")
                 .and_then(serde_json::Value::as_str)
                 == Some("turn/completed")
             {
-                notification_session.pending_tool_items.lock().await.len()
+                let tools = notification_session.tool_item_facts.lock().await;
+                summarize_pending_codex_tools(&tools)
             } else {
-                0
+                None
             };
-            let terminal_outcome =
-                codex_app_server_terminal_outcome_with_pending(&notification, pending_tool_count);
+            let terminal_outcome = codex_app_server_terminal_outcome_with_pending(
+                &notification,
+                pending_tool_summary.as_deref(),
+            );
             if let Some((turn_id, outcome)) = &terminal_outcome {
                 let inserted = {
                     let mut terminal_turns = notification_session.terminal_turns.lock().await;
@@ -5581,6 +6650,187 @@ async fn fail_codex_active_turn(session: &CodexSession, error: &str) {
 }
 
 impl CodexSession {
+    fn emit_stage(&self, stage: TurnStage) {
+        let session_id = self
+            .thread_id
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .unwrap_or_else(|| self.history_session_id.clone());
+        emit_agent_event(
+            &self.app,
+            &self.history_session_id,
+            &AgentEvent::TurnStage {
+                session_id,
+                stage,
+                ts: now_millis(),
+                engine_reported_ttft_ms: None,
+                retry_attempt: None,
+            },
+        );
+    }
+
+    fn sandbox_identity(&self, sandbox: &str, network_allowed: bool) -> Result<String, String> {
+        let profile_revision = self
+            .runtime_profile_revision
+            .lock()
+            .map_err(|_| "Codex Runtime Profile revision 锁中毒".to_string())?
+            .clone()
+            .or_else(|| {
+                self.effective_home
+                    .lock()
+                    .ok()
+                    .and_then(|home| home.clone())
+                    .map(|path| {
+                        format!(
+                            "profile-path:{}",
+                            sha256_hex(path.to_string_lossy().as_bytes())
+                        )
+                    })
+            })
+            .unwrap_or_else(|| "profile:default".to_string());
+        crate::turn_start::digest_json(&serde_json::json!({
+            "schema": 1,
+            "binaryIdentity": crate::capability_registry::binary_identity(&self.bin)?,
+            "windowsSandboxMode": sandbox,
+            "networkAllowed": network_allowed,
+            "sandboxMarkerContract": "codex-app-server-command-exec-v1",
+            "workspaceCeiling": sha256_hex(self.cwd.as_bytes()),
+            "runtimeProfileRevision": profile_revision,
+        }))
+    }
+
+    async fn run_sandbox_setup(
+        &self,
+        process: &CodexAppServerProcess,
+        sandbox: &str,
+        network_allowed: bool,
+    ) -> Result<CodexSandboxReadinessProof, String> {
+        #[cfg(target_os = "windows")]
+        let command = vec![
+            std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string()),
+            "/D".to_string(),
+            "/S".to_string(),
+            "/C".to_string(),
+            "exit /b 0".to_string(),
+        ];
+        #[cfg(not(target_os = "windows"))]
+        let command = vec!["sh".to_string(), "-c".to_string(), "true".to_string()];
+        if self.interrupted.load(Ordering::Acquire) {
+            return Err(
+                "[codex_sandbox_setup_interrupted] Codex Windows 沙箱准备已停止".to_string(),
+            );
+        }
+        let process_id = format!("helm-readiness-{:032x}", rand::random::<u128>());
+        *self.readiness_process_id.lock().await = Some(process_id.clone());
+        let result = process
+            .rpc
+            .prepare_sandbox(&process_id, command, &self.cwd, sandbox, network_allowed)
+            .await;
+        *self.readiness_process_id.lock().await = None;
+        result?;
+        let marker_path = self.sandbox_marker_path()?;
+        let marker_digest = sandbox_marker_digest(&marker_path).ok_or_else(|| {
+            "[codex_sandbox_setup_failed] Codex 沙箱准备结束但缺少 setup marker".to_string()
+        })?;
+        Ok(CodexSandboxReadinessProof { marker_digest })
+    }
+
+    fn sandbox_marker_path(&self) -> Result<PathBuf, String> {
+        self.effective_home
+            .lock()
+            .map_err(|_| "Codex CODEX_HOME 锁中毒".to_string())?
+            .clone()
+            .map(|home| home.join(".sandbox").join("setup_marker.json"))
+            .ok_or_else(|| {
+                "[codex_sandbox_setup_failed] Codex Runtime 缺少隔离 CODEX_HOME".to_string()
+            })
+    }
+
+    async fn prepare_runtime_readiness(
+        &self,
+        process: Arc<CodexAppServerProcess>,
+        sandbox: &str,
+        network_allowed: bool,
+    ) -> Result<(), String> {
+        if self.interrupted.load(Ordering::Acquire) {
+            return Err("[codex_sandbox_setup_interrupted] Codex Runtime 准备已停止".to_string());
+        }
+        if sandbox == "danger-full-access" {
+            return Ok(());
+        }
+        self.emit_stage(TurnStage::PreparingSandbox);
+        let identity = self.sandbox_identity(sandbox, network_allowed)?;
+        let registry = self
+            .app
+            .try_state::<crate::runtime_registry::RuntimeRegistry>()
+            .ok_or_else(|| "RuntimeRegistry 未启动，无法准备 Codex 沙箱".to_string())?;
+        let marker_path = self.sandbox_marker_path()?;
+        let runtime_home = marker_path
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| {
+                "[codex_sandbox_setup_failed] Codex Runtime readiness 路径无效".to_string()
+            })?
+            .to_path_buf();
+        let cell = registry.codex_readiness_cell(&identity, &marker_path).await;
+        if cell.get().is_none() {
+            if let Some(proof) =
+                load_persisted_sandbox_readiness(&runtime_home, &identity, &marker_path)
+            {
+                let _ = cell.set(Ok(proof));
+            }
+        }
+        let setup_gate = registry.codex_setup_gate();
+        let setup = cell.get_or_init(|| async {
+            let _setup_guard = setup_gate.lock().await;
+            let proof = self
+                .run_sandbox_setup(&process, sandbox, network_allowed)
+                .await
+                .map_err(readiness_failure)?;
+            persist_sandbox_readiness(&runtime_home, &identity, &proof)
+                .map_err(readiness_failure)?;
+            Ok(proof)
+        });
+        if self.interrupted.load(Ordering::Acquire) {
+            return Err(
+                "[codex_sandbox_setup_interrupted] Codex Windows 沙箱准备已停止".to_string(),
+            );
+        }
+        match wait_for_runtime_readiness(
+            setup,
+            self.interrupt_notify.notified(),
+            CODEX_SANDBOX_SETUP_STALLED_AFTER,
+            CODEX_SANDBOX_SETUP_TIMEOUT,
+            || {
+                self.emit_stage(TurnStage::Stalled);
+                emit_agent_event(
+                    &self.app,
+                    &self.history_session_id,
+                    &AgentEvent::Error {
+                        session_id: Some(self.history_session_id.clone()),
+                        message: "[codex_sandbox_setup_stalled] Codex Windows 沙箱准备 30 秒没有完成，可继续等待或停止".to_string(),
+                        recoverable: true,
+                        kind: Some("runtime_preparation_stalled".to_string()),
+                    },
+                );
+            },
+        )
+        .await
+        {
+            RuntimeReadinessWait::Ready(result) => readiness_result(result),
+            RuntimeReadinessWait::Interrupted => Err(
+                "[codex_sandbox_setup_interrupted] Codex Windows 沙箱准备已停止".to_string(),
+            ),
+            RuntimeReadinessWait::TimedOut => {
+                if let Some(process_id) = self.readiness_process_id.lock().await.take() {
+                    let _ = process.rpc.terminate_sandbox_preparation(&process_id).await;
+                }
+                Err("[codex_sandbox_setup_timeout] Codex Windows 沙箱准备超过 180 秒".to_string())
+            }
+        }
+    }
+
     async fn ensure_app_server(&self) -> Result<Arc<CodexAppServerProcess>, String> {
         let mut slot = self.app_server.lock().await;
         if let Some(process) = slot.as_ref() {
@@ -5660,7 +6910,6 @@ impl CodexSession {
         } else {
             None
         };
-        let process = self.ensure_app_server().await?;
         let mut permission_profile = *self
             .permission_profile
             .lock()
@@ -5684,11 +6933,29 @@ impl CodexSession {
         }
         let (sandbox, native_network_allowed, approval_policy) =
             codex_runtime_profile_policy(mode, permission_profile);
+        self.emit_stage(TurnStage::PreparingRuntime);
+        let process = self.ensure_app_server().await?;
+        self.prepare_runtime_readiness(process.clone(), sandbox, native_network_allowed)
+            .await?;
+        if self.interrupted.load(Ordering::Acquire) {
+            return Err("[codex_sandbox_setup_interrupted] Codex Runtime 准备已停止".to_string());
+        }
+        self.emit_stage(TurnStage::WaitingModel);
         let prompt = prompt_with_attachments(&prompt, &attachments);
         let prompt = if mode == TurnMode::Plan {
             format!("{CODEX_PLAN_PROMPT_PREFIX}\n\n{prompt}")
         } else {
             prompt
+        };
+        let runtime_capabilities = self.capability_snapshot.lock().await.runtime_projection();
+        let prompt = match runtime_capabilities.web_search {
+            RuntimeCapabilityAvailability::Available => prompt,
+            RuntimeCapabilityAvailability::Unknown => format!(
+                "[Helm Runtime 能力约束]\n联网搜索能力尚未证明。需要联网时最多尝试一次真实原生 WebSearch；读取 Skill 不代表搜索可用，不得用 shell、Get-Location 或重复读取 Skill 探测网络。原生搜索缺失时返回 [runtime_web_search_unavailable]。\n\n{prompt}"
+            ),
+            RuntimeCapabilityAvailability::Unavailable => format!(
+                "[Helm Runtime 能力约束]\n当前 Runtime 已证明不提供联网搜索。不得用 shell、Get-Location 或 Skill 读取探测网络；需要联网的请求直接返回 [runtime_web_search_unavailable]。\n\n{prompt}"
+            ),
         };
         let existing_thread = self.thread_id.lock().ok().and_then(|guard| guard.clone());
         let force_rebuild = self.force_history_rebuild.load(Ordering::Acquire);
@@ -5804,7 +7071,7 @@ impl CodexSession {
                 capabilities: Some(self.capability_snapshot.lock().await.runtime_projection()),
             },
         );
-        self.pending_tool_items.lock().await.clear();
+        self.tool_item_facts.lock().await.clear();
         let native_turn_id = process
             .rpc
             .start_turn_with_context_policy(
@@ -5825,6 +7092,10 @@ impl CodexSession {
             spec.turn_epoch,
         );
         *self.current_app_server_turn_id.lock().await = Some(native_turn_id.clone());
+        let terminal_wait_started = tokio::time::Instant::now();
+        let mut tool_stall_reported = false;
+        let mut turn_stall_reported = false;
+        let mut pending_terminal_failure = false;
         loop {
             let notified = self.terminal_notify.notified();
             if let Some(outcome) =
@@ -5832,28 +7103,61 @@ impl CodexSession {
             {
                 match outcome {
                     Ok(()) => break,
-                    Err(error) if error.starts_with(CODEX_TURN_FAILED_PREFIX) => break,
+                    Err(error) if error.starts_with(CODEX_TURN_FAILED_PREFIX) => {
+                        pending_terminal_failure = error.contains("[codex_turn_pending_tools]");
+                        break;
+                    }
                     Err(error) => return Err(error),
                 }
             }
-            if tokio::time::timeout(std::time::Duration::from_secs(300), notified)
+            if tokio::time::timeout(std::time::Duration::from_secs(1), notified)
                 .await
                 .is_err()
             {
-                emit_agent_event(
-                    &self.app,
-                    &self.history_session_id,
-                    &AgentEvent::TurnStage {
-                        session_id: thread_id.clone(),
-                        stage: TurnStage::Stalled,
-                        ts: now_millis(),
-                        engine_reported_ttft_ms: None,
-                        retry_attempt: None,
-                    },
-                );
+                let now = now_millis();
+                let stalled_tools = {
+                    let tools = self.tool_item_facts.lock().await;
+                    tools
+                        .values()
+                        .any(|tool| {
+                            pending_codex_tool_is_stalled(tool, now, RUNTIME_TOOL_STALLED_AFTER)
+                        })
+                        .then(|| summarize_pending_codex_tools(&tools))
+                        .flatten()
+                };
+                if !tool_stall_reported && stalled_tools.is_some() {
+                    tool_stall_reported = true;
+                    self.emit_stage(TurnStage::Stalled);
+                    emit_agent_event(
+                        &self.app,
+                        &self.history_session_id,
+                        &AgentEvent::Error {
+                            session_id: Some(thread_id.clone()),
+                            message: format!(
+                                "[runtime_tool_stalled] Codex 工具 60 秒没有新进展：{}",
+                                stalled_tools.unwrap_or_default()
+                            ),
+                            recoverable: true,
+                            kind: Some("tool_stalled".to_string()),
+                        },
+                    );
+                } else if !turn_stall_reported
+                    && terminal_wait_started.elapsed() >= Duration::from_secs(300)
+                {
+                    turn_stall_reported = true;
+                    self.emit_stage(TurnStage::Stalled);
+                }
             }
         }
         *self.current_app_server_turn_id.lock().await = None;
+        if pending_terminal_failure {
+            if let Some(stale_process) = self.app_server.lock().await.take() {
+                stale_process.shutdown().await;
+            }
+            self.app_server_thread_ready.store(false, Ordering::Release);
+            self.pending_approvals.lock().await.clear();
+            self.tool_item_facts.lock().await.clear();
+        }
         Ok(())
     }
 
@@ -5887,6 +7191,15 @@ impl CodexSession {
             ApprovalDecision::Always => CodexUserDecision::Always,
         };
         apply_codex_user_decision(&history_store, &process.rpc, &pending, decision).await?;
+        if let Some(tool) = self
+            .tool_item_facts
+            .lock()
+            .await
+            .get_mut(pending.request.item_id())
+        {
+            tool.stage = PendingCodexToolStage::Executing;
+            tool.last_progress_at = now_millis();
+        }
         self.pending_approvals.lock().await.remove(&request_id);
         Ok(())
     }
@@ -5902,6 +7215,11 @@ impl CodexSession {
         self.interrupted.store(false, Ordering::Release);
         spawn_agent_task(async move {
             if let Err(error) = session.run_app_server_turn(text, attachments, spec).await {
+                if session.interrupted.load(Ordering::Acquire) {
+                    busy.store(false, Ordering::Release);
+                    return;
+                }
+                let error_kind = codex_error_kind(&error).to_string();
                 emit_agent_event(
                     &session.app,
                     &session.history_session_id,
@@ -5913,7 +7231,7 @@ impl CodexSession {
                             .and_then(|guard| guard.clone()),
                         message: error,
                         recoverable: true,
-                        kind: Some("process_crash".to_string()),
+                        kind: Some(error_kind),
                     },
                 );
                 let session_id = session
@@ -5935,7 +7253,7 @@ impl CodexSession {
         });
     }
 
-    fn interrupt(&self) -> Result<(), String> {
+    async fn interrupt_and_wait(&self) -> Result<(), String> {
         let process = self.app_server.clone();
         let app = self.app.clone();
         let history_session_id = self.history_session_id.clone();
@@ -5944,48 +7262,69 @@ impl CodexSession {
         let terminal_turns = self.terminal_turns.clone();
         let terminal_notify = self.terminal_notify.clone();
         let running_pid = self.running_pid.clone();
+        let readiness_process_id = self.readiness_process_id.clone();
+        let app_server_thread_ready = self.app_server_thread_ready.clone();
         // 先立标志再杀进程：app-server 轮次收尾时据此改发 TurnComplete{Interrupted}
         self.interrupted.store(true, Ordering::Release);
-        spawn_agent_task(async move {
-            if let (Some(process), Some(thread_id), Some(turn_id)) = (
-                process.lock().await.as_ref().cloned(),
-                thread_id.lock().ok().and_then(|guard| guard.clone()),
-                turn_id.lock().await.clone(),
-            ) {
-                let _ = process
-                    .rpc
-                    .request(
-                        "turn/interrupt",
-                        serde_json::json!({"threadId":thread_id,"turnId":turn_id}),
-                    )
-                    .await;
-            }
-            let pid = *running_pid.lock().await;
-            kill_tree(pid).await;
-            set_running_pid(&running_pid, None).await;
-            let active_turn_id = turn_id.lock().await.clone();
-            finish_codex_interrupt_terminal(
-                &terminal_turns,
-                &terminal_notify,
-                active_turn_id,
-                || {
-                    let session_id = thread_id
-                        .lock()
-                        .ok()
-                        .and_then(|guard| guard.clone())
-                        .unwrap_or_else(|| history_session_id.clone());
-                    emit_agent_event(
-                        &app,
-                        &history_session_id,
-                        &AgentEvent::TurnComplete {
-                            session_id,
-                            stop_reason: StopReason::Interrupted,
-                        },
-                    );
-                },
+        self.interrupt_notify.notify_waiters();
+        let live_process = process.lock().await.as_ref().cloned();
+        if let (Some(process), Some(thread_id), Some(turn_id)) = (
+            live_process.as_ref(),
+            thread_id.lock().ok().and_then(|guard| guard.clone()),
+            turn_id.lock().await.clone(),
+        ) {
+            let _ = tokio::time::timeout(
+                CODEX_INTERRUPT_RPC_GRACE,
+                process.rpc.request(
+                    "turn/interrupt",
+                    serde_json::json!({"threadId":thread_id,"turnId":turn_id}),
+                ),
             )
             .await;
-        });
+        }
+        if let (Some(process), Some(process_id)) = (
+            live_process.as_ref(),
+            readiness_process_id.lock().await.take(),
+        ) {
+            let _ = tokio::time::timeout(
+                CODEX_INTERRUPT_RPC_GRACE,
+                process.rpc.terminate_sandbox_preparation(&process_id),
+            )
+            .await;
+        }
+        let pid = *running_pid.lock().await;
+        kill_tree(pid).await;
+        set_running_pid(&running_pid, None).await;
+        if let Some(stale_process) = process.lock().await.take() {
+            stale_process.shutdown().await;
+        }
+        app_server_thread_ready.store(false, Ordering::Release);
+        let active_turn_id = turn_id.lock().await.clone();
+        finish_codex_interrupt_terminal(&terminal_turns, &terminal_notify, active_turn_id, || {
+            let session_id = thread_id
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+                .unwrap_or_else(|| history_session_id.clone());
+            emit_agent_event(
+                &app,
+                &history_session_id,
+                &AgentEvent::TurnComplete {
+                    session_id,
+                    stop_reason: StopReason::Interrupted,
+                },
+            );
+        })
+        .await;
+        tokio::time::timeout(CODEX_INTERRUPT_TASK_DRAIN_TIMEOUT, async {
+            while self.busy.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            "[codex_interrupt_cleanup_timeout] Codex Stop 后轮次任务未在 1 秒内释放".to_string()
+        })?;
         Ok(())
     }
 }
@@ -6011,7 +7350,26 @@ pub(crate) fn start_codex_with_reasoning(
         .to_string_lossy()
         .to_string();
     let (turn_completions, _) = broadcast::channel(32);
-    let session_home = auth_home.as_ref().map(|home| home.path.clone());
+    let runtime_profile = if env
+        .iter()
+        .any(|(key, value)| key == "OPENAI_API_KEY" && !value.trim().is_empty())
+    {
+        app.try_state::<CodexRuntimeProfileStore>()
+            .map(|store| store.api_profile(&env, &[], Path::new(&canonical_cwd)))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    if runtime_profile.is_some() && auth_home.is_some() {
+        return Err(
+            "Codex API Runtime 不得同时持有临时认证 Profile 与持久 EngineProfile".to_string(),
+        );
+    }
+    let session_home = runtime_profile
+        .as_ref()
+        .map(|profile| profile.path.clone())
+        .or_else(|| auth_home.as_ref().map(|home| home.path.clone()));
     let effective_home =
         select_effective_codex_home(session_home.as_ref(), subscription_home.as_ref());
     Ok(AgentSession::Codex(CodexSession {
@@ -6024,19 +7382,24 @@ pub(crate) fn start_codex_with_reasoning(
         policy_cwd: Arc::new(Mutex::new(canonical_cwd)),
         env,
         running_pid: Arc::new(Mutex::new(None)),
+        readiness_process_id: Arc::new(Mutex::new(None)),
         history_messages: Arc::new(std::sync::Mutex::new(history_messages)),
         busy: Arc::new(AtomicBool::new(false)),
         interrupted: Arc::new(AtomicBool::new(false)),
+        interrupt_notify: Arc::new(Notify::new()),
         disabled_mcp: Arc::new(std::sync::Mutex::new(Vec::new())),
         thread_id: Arc::new(std::sync::Mutex::new(native_thread_id)),
         auth_home: Arc::new(std::sync::Mutex::new(auth_home)),
         effective_home: Arc::new(std::sync::Mutex::new(effective_home)),
+        runtime_profile_revision: Arc::new(std::sync::Mutex::new(
+            runtime_profile.map(|profile| profile.revision),
+        )),
         force_history_rebuild: Arc::new(AtomicBool::new(false)),
         app_server: Arc::new(Mutex::new(None)),
         app_server_thread_ready: Arc::new(AtomicBool::new(false)),
         pending_approvals: Arc::new(Mutex::new(HashMap::new())),
         file_changes_by_item: Arc::new(Mutex::new(HashMap::new())),
-        pending_tool_items: Arc::new(Mutex::new(HashSet::new())),
+        tool_item_facts: Arc::new(Mutex::new(HashMap::new())),
         turn_completions,
         terminal_turns: Arc::new(Mutex::new(HashMap::new())),
         terminal_notify: Arc::new(Notify::new()),
@@ -6050,6 +7413,16 @@ pub(crate) fn start_codex_with_reasoning(
 }
 
 const CODEX_TURN_FAILED_PREFIX: &str = "[codex_turn_failed]";
+
+fn codex_error_kind(error: &str) -> &'static str {
+    if error.starts_with("[codex_sandbox_setup_") {
+        "runtime_preparation"
+    } else if error.starts_with("[codex_turn_pending_tools]") {
+        "tool_result_missing"
+    } else {
+        "process_crash"
+    }
+}
 
 fn codex_app_server_terminal_outcome(
     notification: &serde_json::Value,
@@ -6081,18 +7454,51 @@ fn codex_app_server_terminal_outcome(
 
 fn codex_app_server_terminal_outcome_with_pending(
     notification: &serde_json::Value,
-    pending_tool_count: usize,
+    pending_tool_summary: Option<&str>,
 ) -> Option<(String, Result<(), String>)> {
     let (turn_id, outcome) = codex_app_server_terminal_outcome(notification)?;
-    if outcome.is_ok() && pending_tool_count > 0 {
+    if outcome.is_ok() && pending_tool_summary.is_some() {
         return Some((
             turn_id,
             Err(format!(
-                "{CODEX_TURN_FAILED_PREFIX} Codex turn completed with {pending_tool_count} unfinished tool item(s)"
+                "{CODEX_TURN_FAILED_PREFIX} [codex_turn_pending_tools] Codex Turn 已结束，但仍有未完成工具：{}",
+                pending_tool_summary.unwrap_or_default()
             )),
         ));
     }
     Some((turn_id, outcome))
+}
+
+fn summarize_pending_codex_tools(tools: &HashMap<String, PendingCodexTool>) -> Option<String> {
+    let pending = tools
+        .values()
+        .filter(|tool| tool.ended_at.is_none())
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return None;
+    }
+    let mut stages = HashMap::<&'static str, usize>::new();
+    let mut oldest_queued_at = i64::MAX;
+    let mut oldest_started_at = i64::MAX;
+    for tool in &pending {
+        *stages.entry(tool.stage.as_str()).or_default() += 1;
+        oldest_queued_at = oldest_queued_at.min(tool.queued_at);
+        oldest_started_at = oldest_started_at.min(tool.started_at);
+    }
+    let mut stage_counts = stages.into_iter().collect::<Vec<_>>();
+    stage_counts.sort_by_key(|(stage, _)| *stage);
+    let stages = stage_counts
+        .into_iter()
+        .map(|(stage, count)| format!("{stage}={count}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(format!(
+        "count={}, stages={}, oldestQueuedMs={}, oldestStartedMs={}",
+        pending.len(),
+        stages,
+        now_millis().saturating_sub(oldest_queued_at),
+        now_millis().saturating_sub(oldest_started_at),
+    ))
 }
 
 fn codex_notification_for_terminal_outcome(
@@ -6153,7 +7559,14 @@ async fn finish_codex_interrupt_terminal<F>(
 {
     let should_emit = if let Some(active_turn_id) = active_turn_id.as_ref() {
         let mut terminal_turns = terminal_turns.lock().await;
-        record_codex_terminal_once(&mut terminal_turns, active_turn_id.clone(), Ok(()))
+        match terminal_turns.get(active_turn_id) {
+            Some(Err(error)) if error == "Codex app-server notification stream closed" => {
+                terminal_turns.insert(active_turn_id.clone(), Ok(()));
+                true
+            }
+            Some(_) => false,
+            None => record_codex_terminal_once(&mut terminal_turns, active_turn_id.clone(), Ok(())),
+        }
     } else {
         true
     };
@@ -6189,6 +7602,14 @@ pub(crate) fn codex_app_server_failure_message(notification: &serde_json::Value)
         .pointer("/params/turn/error/codexErrorInfo")
         .map(serde_json::Value::to_string)
         .unwrap_or_default();
+    if message.starts_with(CODEX_TURN_FAILED_PREFIX)
+        && message.contains("[codex_turn_pending_tools]")
+    {
+        return crate::redaction::redact_text(message)
+            .chars()
+            .take(1000)
+            .collect();
+    }
     let raw = format!("{message}\n{additional_details}\n{error_info}").to_ascii_lowercase();
     if raw.contains("unfinished tool") || raw.contains("missing tool result") {
         "Codex 工具执行未返回结果，已阻止本轮伪成功；请检查当前 Codex 版本的命令执行能力。"
@@ -6381,6 +7802,60 @@ fn codex_app_server_started_item(session_id: &str, item: &serde_json::Value) -> 
             }
             events
         }
+        Some("webSearch") => {
+            let mut events = vec![codex_turn_stage(session_id, TurnStage::UsingTool)];
+            if let Some(id) = codex_item_id(item) {
+                events.push(AgentEvent::ToolCall {
+                    session_id: session_id.to_string(),
+                    id,
+                    name: "WebSearch".to_string(),
+                    input: serde_json::json!({
+                        "query": item.get("query").cloned().unwrap_or_default(),
+                        "action": item.get("action").cloned().unwrap_or_default(),
+                    }),
+                    status: CallStatus::Pending,
+                });
+            }
+            events
+        }
+        Some("mcpToolCall") => {
+            let mut events = vec![codex_turn_stage(session_id, TurnStage::UsingTool)];
+            if let Some(id) = codex_item_id(item) {
+                let server = item
+                    .get("server")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("MCP");
+                let tool = item
+                    .get("tool")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("tool");
+                events.push(AgentEvent::ToolCall {
+                    session_id: session_id.to_string(),
+                    id,
+                    name: format!("{server}/{tool}"),
+                    input: item.get("arguments").cloned().unwrap_or_default(),
+                    status: CallStatus::Pending,
+                });
+            }
+            events
+        }
+        Some("dynamicToolCall") => {
+            let mut events = vec![codex_turn_stage(session_id, TurnStage::UsingTool)];
+            if let Some(id) = codex_item_id(item) {
+                events.push(AgentEvent::ToolCall {
+                    session_id: session_id.to_string(),
+                    id,
+                    name: item
+                        .get("tool")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("DynamicTool")
+                        .to_string(),
+                    input: item.get("arguments").cloned().unwrap_or_default(),
+                    status: CallStatus::Pending,
+                });
+            }
+            events
+        }
         _ => Vec::new(),
     }
 }
@@ -6504,6 +7979,63 @@ fn codex_app_server_completed_item(session_id: &str, item: &serde_json::Value) -
                 } else {
                     None
                 },
+                native_denial_code: None,
+            }]
+        }
+        Some("webSearch") => {
+            let Some(id) = codex_item_id(item) else {
+                return Vec::new();
+            };
+            let output = item
+                .get("results")
+                .filter(|value| !value.is_null())
+                .and_then(|value| serde_json::to_string(value).ok());
+            vec![AgentEvent::ToolResult {
+                session_id: session_id.to_string(),
+                id,
+                status: ToolStatus::Success,
+                output: output.clone(),
+                diff: None,
+                outcome: Some(crate::protocol::ToolOutcomeKind::ToolSucceeded),
+                started: Some(true),
+                has_output: Some(output.is_some()),
+                retryable: Some(false),
+                denial_source: None,
+                native_denial_code: None,
+            }]
+        }
+        Some("mcpToolCall" | "dynamicToolCall") => {
+            let Some(id) = codex_item_id(item) else {
+                return Vec::new();
+            };
+            let failed = item.get("status").and_then(serde_json::Value::as_str) == Some("failed")
+                || item.get("success").and_then(serde_json::Value::as_bool) == Some(false)
+                || item.get("error").is_some_and(|value| !value.is_null());
+            let output_value = item
+                .get("result")
+                .filter(|value| !value.is_null())
+                .or_else(|| item.get("contentItems").filter(|value| !value.is_null()))
+                .or_else(|| item.get("error").filter(|value| !value.is_null()));
+            let output = output_value.and_then(|value| serde_json::to_string(value).ok());
+            vec![AgentEvent::ToolResult {
+                session_id: session_id.to_string(),
+                id,
+                status: if failed {
+                    ToolStatus::Error
+                } else {
+                    ToolStatus::Success
+                },
+                output: output.clone(),
+                diff: None,
+                outcome: Some(if failed {
+                    crate::protocol::ToolOutcomeKind::ToolFailed
+                } else {
+                    crate::protocol::ToolOutcomeKind::ToolSucceeded
+                }),
+                started: Some(true),
+                has_output: Some(output.is_some()),
+                retryable: Some(false),
+                denial_source: failed.then_some(crate::protocol::ToolDenialSource::Tool),
                 native_denial_code: None,
             }]
         }
@@ -7052,11 +8584,14 @@ mod turn_stage_tests {
             "method": "turn/completed",
             "params": {"turn": {"id": "turn-1", "status": "completed"}}
         });
-        let (_, outcome) = super::codex_app_server_terminal_outcome_with_pending(&notification, 1)
-            .expect("turn completion should be recognized");
+        let (_, outcome) = super::codex_app_server_terminal_outcome_with_pending(
+            &notification,
+            Some("count=1, stages=executing=1"),
+        )
+        .expect("turn completion should be recognized");
         let error = outcome.expect_err("unfinished tool must fail closed");
         assert!(error.starts_with(super::CODEX_TURN_FAILED_PREFIX));
-        assert!(error.contains("unfinished tool"));
+        assert!(error.contains("[codex_turn_pending_tools]"));
         let adjusted =
             super::codex_notification_for_terminal_outcome(&notification, Some(&Err(error)));
         let events = parse_codex_app_server_notification("codex-session", &adjusted)
@@ -7064,12 +8599,58 @@ mod turn_stage_tests {
             .map(|event| serde_json::to_value(event).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(events[0]["type"], "error");
-        assert!(events[0]["message"]
-            .as_str()
-            .unwrap()
-            .contains("工具执行未返回结果"));
+        let message = events[0]["message"].as_str().unwrap();
+        assert!(message.contains("[codex_turn_pending_tools]"));
+        assert!(message.contains("stages=executing=1"));
+        assert_eq!(events[0]["kind"], "tool_result_missing");
         assert_eq!(events[1]["type"], "turn_complete");
         assert_eq!(events[1]["stopReason"], "error");
+    }
+
+    #[test]
+    fn codex_tool_fact_summary_only_counts_items_without_ended_at() {
+        let now = crate::util::now_millis();
+        let mut tools = HashMap::new();
+        tools.insert(
+            "done".to_string(),
+            super::PendingCodexTool {
+                queued_at: now - 20,
+                started_at: now - 10,
+                last_progress_at: now,
+                ended_at: Some(now),
+                stage: super::PendingCodexToolStage::WaitingResult,
+            },
+        );
+        assert_eq!(super::summarize_pending_codex_tools(&tools), None);
+        tools.insert(
+            "pending".to_string(),
+            super::PendingCodexTool {
+                queued_at: now - 30,
+                started_at: now - 25,
+                last_progress_at: now - 5,
+                ended_at: None,
+                stage: super::PendingCodexToolStage::WaitingApproval,
+            },
+        );
+        let summary = super::summarize_pending_codex_tools(&tools).unwrap();
+        assert!(summary.contains("count=1"));
+        assert!(summary.contains("waiting_approval=1"));
+        let pending = tools.get("pending").unwrap();
+        assert!(!super::pending_codex_tool_is_stalled(
+            pending,
+            now,
+            std::time::Duration::from_millis(10)
+        ));
+        assert!(super::pending_codex_tool_is_stalled(
+            pending,
+            now,
+            std::time::Duration::from_millis(4)
+        ));
+        assert!(!super::pending_codex_tool_is_stalled(
+            tools.get("done").unwrap(),
+            now + 100,
+            std::time::Duration::from_millis(1)
+        ));
     }
 
     #[test]
@@ -7089,6 +8670,63 @@ mod turn_stage_tests {
         assert_eq!(responding.len(), 1);
         assert_eq!(responding[0]["type"], "turn_stage");
         assert_eq!(responding[0]["stage"], "responding");
+    }
+
+    #[test]
+    fn codex_native_network_and_extension_tools_have_visible_lifecycles() {
+        for (item, expected_name) in [
+            (
+                serde_json::json!({
+                    "id":"search-1","type":"webSearch","query":"上海天气",
+                    "action":{"type":"search","query":"上海天气"},"results":null
+                }),
+                "WebSearch",
+            ),
+            (
+                serde_json::json!({
+                    "id":"mcp-1","type":"mcpToolCall","server":"weather","tool":"lookup",
+                    "status":"inProgress","arguments":{"city":"上海"},"result":null,"error":null
+                }),
+                "weather/lookup",
+            ),
+            (
+                serde_json::json!({
+                    "id":"dynamic-1","type":"dynamicToolCall","namespace":"demo","tool":"fetch",
+                    "status":"inProgress","arguments":{"url":"https://example.invalid"},
+                    "contentItems":null,"success":null
+                }),
+                "fetch",
+            ),
+        ] {
+            let events = parse_codex_app_server_notification(
+                "codex-session",
+                &serde_json::json!({
+                    "method":"item/started",
+                    "params":{"threadId":"thread-1","turnId":"turn-1","item":item}
+                }),
+            );
+            assert!(events.iter().any(|event| matches!(
+                event,
+                super::AgentEvent::ToolCall { name, .. } if name == expected_name
+            )));
+        }
+
+        let completed = parse_codex_app_server_notification(
+            "codex-session",
+            &serde_json::json!({
+                "method":"item/completed",
+                "params":{"threadId":"thread-1","turnId":"turn-1","item":{
+                    "id":"search-1","type":"webSearch","query":"上海天气",
+                    "action":{"type":"search","query":"上海天气"},
+                    "results":[{"title":"上海天气","url":"https://example.invalid/weather"}]
+                }}
+            }),
+        );
+        assert!(completed.iter().any(|event| matches!(
+            event,
+            super::AgentEvent::ToolResult { id, status: crate::protocol::ToolStatus::Success, output: Some(output), .. }
+                if id == "search-1" && output.contains("上海天气")
+        )));
     }
 
     #[test]

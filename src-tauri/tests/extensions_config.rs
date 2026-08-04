@@ -1,13 +1,13 @@
 use helm_lib::extensions::{
-    list_plugin_skills_from_dir,
     delete_hook_from_settings_path, delete_mcp_server_from_codex_config_path,
     delete_mcp_server_from_settings_path, delete_slash_command_from_dir, delete_subagent_from_dir,
     list_hooks_from_settings_path, list_mcp_servers_from_codex_config_path,
-    list_mcp_servers_from_settings_path, list_skills_from_dir, list_slash_commands_from_dir,
-    list_slash_commands_from_sources, list_subagents_from_dir, save_hook_to_settings_path,
-    save_mcp_server_to_codex_config_path, save_mcp_server_to_settings_path,
-    save_slash_command_to_dir, save_subagent_to_dir, toggle_skill_in_dir, CommandSource, Hook,
-    HookEvent, McpServer, McpStatus, McpTransport, SkillScope, SlashCommand, Subagent,
+    list_mcp_servers_from_settings_path, list_plugin_skills_from_dir, list_skills_from_dir,
+    list_slash_commands_from_dir, list_slash_commands_from_sources, list_subagents_from_dir,
+    save_hook_to_settings_path, save_mcp_server_to_codex_config_path,
+    save_mcp_server_to_settings_path, save_slash_command_to_dir, save_subagent_to_dir,
+    toggle_skill_in_dir, CommandSource, Hook, HookEvent, McpServer, McpStatus, McpTransport,
+    SkillScope, SlashCommand, Subagent,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -1037,7 +1037,10 @@ fn plugin_skills_discovered_from_marketplace_directory() {
     .unwrap();
 
     // 插件 caveman：skills/caveman-commit/SKILL.md
-    let commit_skill = marketplaces.join("caveman").join("skills").join("caveman-commit");
+    let commit_skill = marketplaces
+        .join("caveman")
+        .join("skills")
+        .join("caveman-commit");
     fs::create_dir_all(&commit_skill).unwrap();
     fs::write(
         commit_skill.join("SKILL.md"),
@@ -1046,12 +1049,18 @@ fn plugin_skills_discovered_from_marketplace_directory() {
     .unwrap();
 
     // 带点号的目录应跳过
-    let hidden = marketplaces.join(".hidden-plugin").join("skills").join("test");
+    let hidden = marketplaces
+        .join(".hidden-plugin")
+        .join("skills")
+        .join("test");
     fs::create_dir_all(&hidden).unwrap();
     fs::write(hidden.join("SKILL.md"), "# Hidden").unwrap();
 
     // 没有 SKILL.md 的子目录应跳过
-    let no_skill = marketplaces.join("empty-plugin").join("skills").join("noskill");
+    let no_skill = marketplaces
+        .join("empty-plugin")
+        .join("skills")
+        .join("noskill");
     fs::create_dir_all(&no_skill).unwrap();
 
     let skills = list_plugin_skills_from_dir(&marketplaces).unwrap();
@@ -1060,11 +1069,20 @@ fn plugin_skills_discovered_from_marketplace_directory() {
     assert_eq!(skills.len(), 2);
 
     let ids: Vec<&str> = skills.iter().map(|s| s.id.as_str()).collect();
-    assert!(ids.contains(&"plugin:caveman:caveman"), "应包含 plugin:caveman:caveman，实际: {ids:?}");
-    assert!(ids.contains(&"plugin:caveman:caveman-commit"), "应包含 plugin:caveman:caveman-commit，实际: {ids:?}");
+    assert!(
+        ids.contains(&"plugin:caveman:caveman"),
+        "应包含 plugin:caveman:caveman，实际: {ids:?}"
+    );
+    assert!(
+        ids.contains(&"plugin:caveman:caveman-commit"),
+        "应包含 plugin:caveman:caveman-commit，实际: {ids:?}"
+    );
 
     // 验证 trigger 格式
-    let caveman = skills.iter().find(|s| s.id == "plugin:caveman:caveman").unwrap();
+    let caveman = skills
+        .iter()
+        .find(|s| s.id == "plugin:caveman:caveman")
+        .unwrap();
     assert_eq!(caveman.trigger, "/caveman:caveman");
     assert_eq!(caveman.engine, "claude-code");
     assert_eq!(caveman.source, helm_lib::extensions::SkillSource::Plugin);

@@ -657,7 +657,10 @@ mod tests {
         let events = parse_claude_line(&raw.to_string());
         assert!(events.iter().any(|event| matches!(
             event,
-            AgentEvent::TurnComplete { stop_reason: StopReason::Error, .. }
+            AgentEvent::TurnComplete {
+                stop_reason: StopReason::Error,
+                ..
+            }
         )));
         // 正常成功的 result 行仍映射为 End
         let ok_raw = serde_json::json!({
@@ -669,7 +672,10 @@ mod tests {
         let ok_events = parse_claude_line(&ok_raw.to_string());
         assert!(ok_events.iter().any(|event| matches!(
             event,
-            AgentEvent::TurnComplete { stop_reason: StopReason::End, .. }
+            AgentEvent::TurnComplete {
+                stop_reason: StopReason::End,
+                ..
+            }
         )));
     }
 

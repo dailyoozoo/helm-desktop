@@ -127,6 +127,10 @@ pub fn run() {
             let pricing_store = PricingCatalogStore::new(config_dir.clone());
             app.manage(pricing_store.clone());
             let history_store = SessionHistoryStore::new(config_dir.join("sessions.sqlite"));
+            app.manage(adapter::CodexRuntimeProfileStore::new(
+                config_dir.clone(),
+                history_store.clone(),
+            ));
             app.manage(EngineCapabilityRegistry::new(history_store.clone()));
             let permission_service =
                 tauri::async_runtime::block_on(PermissionService::start(history_store.clone()))

@@ -37,6 +37,12 @@ export function activityPresentationParts(
     case 'preparing':
       text = '正在准备本轮…';
       break;
+    case 'preparing_runtime':
+      text = '正在准备 Runtime…';
+      break;
+    case 'preparing_sandbox':
+      text = '正在配置 Codex Windows 沙箱…';
+      break;
     case 'starting_engine':
       text = `正在启动 ${state.engine === 'codex' ? 'Codex' : 'Claude Code'}…`;
       break;

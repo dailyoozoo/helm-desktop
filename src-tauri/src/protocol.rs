@@ -28,6 +28,8 @@ pub enum Role {
 #[serde(rename_all = "snake_case")]
 pub enum TurnStage {
     Preparing,
+    PreparingRuntime,
+    PreparingSandbox,
     StartingEngine,
     RestoringSession,
     WaitingModel,

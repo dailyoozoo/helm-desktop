@@ -282,8 +282,8 @@ fn scan_skills_in_plugin_dir(
     // 某些插件（如 claude-plugins-official）有嵌套的 plugins/<name>/skills/
     let plugins_dir = dir.join("plugins");
     if plugins_dir.exists() {
-        let entries = std::fs::read_dir(&plugins_dir)
-            .map_err(|e| format!("读取嵌套插件目录失败: {}", e))?;
+        let entries =
+            std::fs::read_dir(&plugins_dir).map_err(|e| format!("读取嵌套插件目录失败: {}", e))?;
         for entry in entries {
             let entry = entry.map_err(|e| format!("读取嵌套插件目录项失败: {}", e))?;
             if entry.path().is_dir() {

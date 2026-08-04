@@ -9,6 +9,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 const MAX_PENDING_REQUESTS: usize = 256;
+const CODEX_SANDBOX_SETUP_TIMEOUT_MS: u64 = 180_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -79,6 +80,14 @@ impl CodexApprovalRequest {
             Self::Command(request) => &request.turn_id,
             Self::FileChange(request) => &request.turn_id,
             Self::Permissions(request) => &request.turn_id,
+        }
+    }
+
+    pub(crate) fn item_id(&self) -> &str {
+        match self {
+            Self::Command(request) => &request.item_id,
+            Self::FileChange(request) => &request.item_id,
+            Self::Permissions(request) => &request.item_id,
         }
     }
 }
@@ -729,6 +738,59 @@ pub async fn spawn_codex_app_server(mut command: Command) -> Result<CodexAppServ
 }
 
 impl CodexRpcClient {
+    pub async fn prepare_sandbox(
+        &self,
+        process_id: &str,
+        command: Vec<String>,
+        cwd: &str,
+        sandbox: &str,
+        network_allowed: bool,
+    ) -> Result<(), String> {
+        let sandbox_policy = match sandbox {
+            "read-only" => serde_json::json!({"type":"readOnly","networkAccess":false}),
+            "workspace-write" => serde_json::json!({
+                "type":"workspaceWrite",
+                "writableRoots":[cwd],
+                "networkAccess":network_allowed
+            }),
+            other => return Err(format!("unsupported Helm Codex sandbox ceiling: {other}")),
+        };
+        let response = self
+            .request(
+                "command/exec",
+                serde_json::json!({
+                    "command": command,
+                    "processId": process_id,
+                    "tty": false,
+                    "streamStdin": false,
+                    "streamStdoutStderr": false,
+                    "timeoutMs": CODEX_SANDBOX_SETUP_TIMEOUT_MS,
+                    "cwd": cwd,
+                    "sandboxPolicy": sandbox_policy
+                }),
+            )
+            .await?;
+        let exit_code = response
+            .get("exitCode")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| "command/exec response missing exitCode".to_string())?;
+        if exit_code != 0 {
+            return Err(format!(
+                "[codex_sandbox_setup_failed] Codex sandbox readiness command exit code {exit_code}"
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn terminate_sandbox_preparation(&self, process_id: &str) -> Result<(), String> {
+        self.request(
+            "command/exec/terminate",
+            serde_json::json!({"processId": process_id}),
+        )
+        .await
+        .map(|_| ())
+    }
+
     pub async fn model_list(&self, cursor: Option<&str>) -> Result<serde_json::Value, String> {
         self.model_list_with_visibility(cursor, true).await
     }
@@ -1215,6 +1277,67 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), shutdown_rpc_tasks(tasks))
             .await
             .expect("tracked RPC tasks must stop within the shutdown bound");
+    }
+
+    #[tokio::test]
+    async fn command_exec_prepares_and_terminates_windows_sandbox_without_output_cap() {
+        let (client_stream, server_stream) = tokio::io::duplex(16 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_stream);
+        let (server_read, mut server_write) = tokio::io::split(server_stream);
+        let client = start_rpc_transport(client_read, client_write);
+        let mut server_lines = BufReader::new(server_read).lines();
+
+        let prepare_client = client.clone();
+        let prepare = tokio::spawn(async move {
+            prepare_client
+                .prepare_sandbox(
+                    "helm-readiness-1",
+                    vec!["cmd.exe".into(), "/C".into(), "exit /b 0".into()],
+                    "D:/repo",
+                    "workspace-write",
+                    false,
+                )
+                .await
+        });
+        let request: serde_json::Value =
+            serde_json::from_str(&server_lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(request["method"], "command/exec");
+        assert_eq!(request["params"]["processId"], "helm-readiness-1");
+        assert_eq!(request["params"]["cwd"], "D:/repo");
+        assert_eq!(
+            request["params"]["timeoutMs"],
+            super::CODEX_SANDBOX_SETUP_TIMEOUT_MS
+        );
+        assert_eq!(request["params"]["sandboxPolicy"]["type"], "workspaceWrite");
+        assert_eq!(request["params"]["sandboxPolicy"]["networkAccess"], false);
+        assert!(request["params"].get("outputBytesCap").is_none());
+        server_write
+            .write_all(
+                format!(
+                    "{{\"id\":{},\"result\":{{\"exitCode\":0}}}}\n",
+                    request["id"]
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        prepare.await.unwrap().unwrap();
+
+        let terminate_client = client.clone();
+        let terminate = tokio::spawn(async move {
+            terminate_client
+                .terminate_sandbox_preparation("helm-readiness-1")
+                .await
+        });
+        let request: serde_json::Value =
+            serde_json::from_str(&server_lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(request["method"], "command/exec/terminate");
+        assert_eq!(request["params"]["processId"], "helm-readiness-1");
+        server_write
+            .write_all(format!("{{\"id\":{},\"result\":{{}}}}\n", request["id"]).as_bytes())
+            .await
+            .unwrap();
+        terminate.await.unwrap().unwrap();
     }
 
     #[test]
