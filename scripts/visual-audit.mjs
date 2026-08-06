@@ -1,14 +1,18 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import fsPromises from 'node:fs/promises';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import react from '@vitejs/plugin-react';
+import { build as viteBuild } from 'vite';
 
 const root = path.resolve(import.meta.dirname, '..');
 const port = Number(process.env.HELM_VISUAL_PORT || 4187);
 const debugPort = port + 1000;
 const outputDir = process.env.HELM_VISUAL_OUTPUT || path.join(os.tmpdir(), 'helm-ui-audit');
+const siteDir = path.join(outputDir, 'site');
 const pageSpecs = [
   {
     id: 'workspace',
@@ -97,12 +101,29 @@ async function connectCdp() {
     socket.addEventListener('error', reject, { once: true });
   });
   let sequence = 0;
+  const diagnostics = [];
+  socket.addEventListener('message', (event) => {
+    const message = JSON.parse(event.data);
+    if (message.id) return;
+    if (
+      message.method === 'Network.loadingFailed' ||
+      message.method === 'Runtime.exceptionThrown' ||
+      message.method === 'Log.entryAdded'
+    ) {
+      diagnostics.push({ method: message.method, params: message.params });
+    }
+  });
   const call = (method, params = {}) =>
     new Promise((resolve, reject) => {
       const id = ++sequence;
+      const timer = setTimeout(() => {
+        socket.removeEventListener('message', onMessage);
+        reject(new Error(`CDP 调用超时：${method}`));
+      }, 30_000);
       const onMessage = (event) => {
         const message = JSON.parse(event.data);
         if (message.id !== id) return;
+        clearTimeout(timer);
         socket.removeEventListener('message', onMessage);
         if (message.error) reject(new Error(message.error.message));
         else resolve(message.result);
@@ -110,7 +131,10 @@ async function connectCdp() {
       socket.addEventListener('message', onMessage);
       socket.send(JSON.stringify({ id, method, params }));
     });
-  return { socket, call };
+  await call('Network.enable');
+  await call('Runtime.enable');
+  await call('Log.enable');
+  return { socket, call, diagnostics };
 }
 
 async function evaluate(call, expression) {
@@ -172,18 +196,54 @@ async function pageOverflow(call) {
   );
 }
 
-const preview = spawn(
-  process.execPath,
-  [
-    path.join(root, 'node_modules', 'vite', 'bin', 'vite.js'),
-    '--host',
-    '127.0.0.1',
-    '--port',
-    String(port),
-    '--strictPort',
-  ],
-  { cwd: root, stdio: 'ignore', windowsHide: true },
-);
+await fsPromises.mkdir(outputDir, { recursive: true });
+await viteBuild({
+  root,
+  configFile: false,
+  plugins: [react()],
+  resolve: {
+    alias: {
+      '@helm/protocol': path.join(root, 'packages', 'protocol', 'src', 'index.ts'),
+    },
+  },
+  build: {
+    outDir: siteDir,
+    emptyOutDir: true,
+    rollupOptions: { input: path.join(root, 'visual-audit.html') },
+  },
+});
+console.log(`视觉测试入口构建完成：${siteDir}`);
+
+let previewOutput = '';
+const preview = http.createServer(async (request, response) => {
+  try {
+    const pathname = decodeURIComponent(new URL(request.url || '/', 'http://127.0.0.1').pathname);
+    const relativePath = pathname === '/' ? 'visual-audit.html' : pathname.replace(/^\/+/, '');
+    const filePath = path.resolve(siteDir, relativePath);
+    if (filePath !== siteDir && !filePath.startsWith(`${siteDir}${path.sep}`)) {
+      response.writeHead(403).end('Forbidden');
+      return;
+    }
+    const body = await fsPromises.readFile(filePath);
+    const contentType =
+      {
+        '.css': 'text/css',
+        '.html': 'text/html; charset=utf-8',
+        '.js': 'text/javascript',
+        '.png': 'image/png',
+        '.svg': 'image/svg+xml',
+        '.woff2': 'font/woff2',
+      }[path.extname(filePath)] || 'application/octet-stream';
+    response.writeHead(200, { 'Content-Type': contentType, 'Cache-Control': 'no-store' }).end(body);
+  } catch (error) {
+    previewOutput = `${previewOutput}\n${error?.stack || error}`.slice(-16_384);
+    response.writeHead(404).end('Not found');
+  }
+});
+await new Promise((resolve, reject) => {
+  preview.once('error', reject);
+  preview.listen(port, '127.0.0.1', resolve);
+});
 const browser = spawn(
   chrome,
   [
@@ -200,12 +260,8 @@ const browser = spawn(
 );
 
 try {
-  await fsPromises.mkdir(outputDir, { recursive: true });
-  // Windows 上冷启动 Vite 可能需要先完成依赖优化，给服务 60 秒而不是误报启动失败。
-  await waitFor(`http://127.0.0.1:${port}`, 60_000);
-  // 先触发 Vite 对视觉入口的依赖转换，避免冷启动时浏览器拿到 HTML 后模块仍在优化而空白。
-  await waitFor(`http://127.0.0.1:${port}/src/visualAuditMain.ts`, 120_000);
-  const { socket, call } = await connectCdp();
+  await waitFor(`http://127.0.0.1:${port}/visual-audit.html`, 15_000);
+  const { socket, call, diagnostics } = await connectCdp();
   const prepareWorkspace = async () => {
     if (await evaluate(call, `Boolean(document.querySelector('.turn-process'))`)) return;
     await waitForExpression(
@@ -220,7 +276,17 @@ try {
     );
   };
   await call('Page.navigate', { url: `http://127.0.0.1:${port}/visual-audit.html` });
-  await ensureVisualBoot(call);
+  try {
+    await ensureVisualBoot(call);
+  } catch (error) {
+    const resources = await evaluate(
+      call,
+      `performance.getEntriesByType('resource').map((entry) => ({ name: entry.name, duration: entry.duration, transferSize: entry.transferSize }))`,
+    );
+    throw new Error(
+      `${error.message}\n浏览器诊断：${JSON.stringify(diagnostics)}\n资源：${JSON.stringify(resources)}\nVite：${previewOutput}`,
+    );
+  }
   await evaluate(call, `document.querySelector('button[aria-label="总览"]')?.click()`);
   await waitForExpression(call, `document.querySelectorAll('.cards .scard').length === 6`);
   const react = await evaluate(
@@ -290,6 +356,7 @@ try {
       mobile: false,
     });
     for (const theme of themes) {
+      console.log(`检查 React 页面矩阵：${viewport.width}x${viewport.height} ${theme}`);
       await evaluate(call, `document.documentElement.dataset.theme = ${JSON.stringify(theme)}`);
       for (const spec of allPageSpecs) {
         await evaluate(
@@ -354,6 +421,7 @@ try {
       mobile: false,
     });
     for (const theme of themes) {
+      console.log(`检查原型页面矩阵：${viewport.width}x${viewport.height} ${theme}`);
       for (const spec of allPageSpecs) {
         await call('Page.navigate', {
           url: pathToFileURL(path.join(root, 'prototype', spec.prototype)).href,
@@ -400,5 +468,14 @@ try {
   );
 } finally {
   browser.kill();
-  preview.kill();
+  await new Promise((resolve) => {
+    let timer;
+    const finish = () => {
+      if (timer) clearTimeout(timer);
+      resolve();
+    };
+    timer = setTimeout(finish, 5_000);
+    preview.close(finish);
+    preview.closeAllConnections?.();
+  });
 }

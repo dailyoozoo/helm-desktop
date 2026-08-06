@@ -5,8 +5,9 @@
 //! 注意：JS 侧用 camelCase 参数（`handleId`），Tauri 会自动映射到 Rust 的 snake_case（`handle_id`）。
 
 use crate::adapter::{
-    agent_environment_from_settings, apply_inherited_agent_environment, build_codex_command,
-    build_command, codex_provider_config_args, create_codex_auth_home,
+    agent_environment_from_settings, apply_codex_native_search, apply_codex_search_catalog,
+    apply_inherited_agent_environment, build_codex_command, build_command,
+    codex_native_search_enabled, codex_provider_config_args, create_codex_auth_home,
     start_claude_with_resume_and_reasoning, start_codex_with_reasoning, ApprovalDecision, TurnMode,
 };
 use crate::capability_registry::{
@@ -45,6 +46,80 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::io::AsyncReadExt;
+
+const CODEX_MODEL_CATALOG_OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
+const CODEX_SEARCH_CATALOG_JSON_ENV: &str = "HELM_CODEX_MODEL_CATALOG_JSON";
+const CODEX_SEARCH_CATALOG_DIGEST_ENV: &str = "HELM_CODEX_MODEL_CATALOG_DIGEST";
+const CODEX_SEARCH_TRANSPORT_ENV: &str = "HELM_CODEX_SEARCH_TRANSPORT";
+const CODEX_BINARY_IDENTITY_ENV: &str = "HELM_CODEX_BINARY_IDENTITY";
+
+fn codex_bundled_catalog_cache() -> &'static Mutex<HashMap<String, Vec<u8>>> {
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<String, Vec<u8>>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CodexSearchCatalogPlan {
+    Unavailable,
+    HostedResponses,
+    HostedResponsesCompatibility(Vec<u8>),
+}
+
+fn codex_search_catalog_plan(
+    raw_catalog: &[u8],
+    model: &str,
+) -> Result<CodexSearchCatalogPlan, String> {
+    let mut catalog: serde_json::Value = serde_json::from_slice(raw_catalog)
+        .map_err(|error| format!("[codex_search_catalog_invalid] 模型目录 JSON 无效：{error}"))?;
+    let models = catalog
+        .get_mut("models")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| {
+            "[codex_search_catalog_schema] 模型目录缺少 models 数组，已阻止启动".to_string()
+        })?;
+    let entry = models
+        .iter_mut()
+        .find(|entry| entry.get("slug").and_then(serde_json::Value::as_str) == Some(model))
+        .ok_or_else(|| {
+            format!("[codex_search_catalog_model_missing] bundled 目录中找不到模型 {model}")
+        })?;
+    let supports_search = entry
+        .get("supports_search_tool")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            "[codex_search_catalog_schema] 模型缺少 supports_search_tool 布尔字段".to_string()
+        })?;
+    let use_responses_lite = entry
+        .get("use_responses_lite")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            "[codex_search_catalog_schema] 模型缺少 use_responses_lite 布尔字段".to_string()
+        })?;
+    if !supports_search {
+        return Ok(CodexSearchCatalogPlan::Unavailable);
+    }
+    if entry
+        .get("web_search_tool_type")
+        .and_then(serde_json::Value::as_str)
+        .is_none()
+    {
+        return Err("[codex_search_catalog_schema] 搜索模型缺少 web_search_tool_type".to_string());
+    }
+    if !use_responses_lite {
+        return Ok(CodexSearchCatalogPlan::HostedResponses);
+    }
+    entry["use_responses_lite"] = serde_json::Value::Bool(false);
+    let encoded = serde_json::to_vec(&catalog)
+        .map_err(|error| format!("序列化 Codex 搜索兼容目录失败：{error}"))?;
+    if encoded.len() > CODEX_MODEL_CATALOG_OUTPUT_LIMIT {
+        return Err(
+            "[codex_search_catalog_output_limit] Codex 搜索兼容目录超过写入上限".to_string(),
+        );
+    }
+    Ok(CodexSearchCatalogPlan::HostedResponsesCompatibility(
+        encoded,
+    ))
+}
 
 /// 进程会话表：handleId → 会话句柄。
 /// handleId 是 Helm 内部句柄，区别于 claude 自己的 sessionId（后者来自 session_started 事件）。
@@ -204,7 +279,13 @@ pub(crate) async fn resolve_engine_capability_snapshot(
     subscription_home: Option<std::path::PathBuf>,
 ) -> Result<EngineCapabilitySnapshot, String> {
     let profile_identity = launch_profile_identity(route, subscription_home.as_deref())?;
-    let identity = CapabilityIdentity::from_route(route, binary_identity(bin)?, profile_identity);
+    let runtime_binary_identity = env
+        .iter()
+        .find(|(key, value)| key == CODEX_BINARY_IDENTITY_ENV && !value.trim().is_empty())
+        .map(|(_, value)| value.clone())
+        .map(Ok)
+        .unwrap_or_else(|| binary_identity(bin))?;
+    let identity = CapabilityIdentity::from_route(route, runtime_binary_identity, profile_identity);
     let engine = route.engine_id.clone();
     let model = route.model_id.clone();
     let bin = bin.to_string();
@@ -243,9 +324,11 @@ pub(crate) async fn resolve_engine_capability_snapshot(
                     for value in codex_provider_config_args(&env) {
                         command.arg("-c").arg(value);
                     }
-                    if let Some(path) = codex_home {
+                    apply_codex_native_search(&mut command, &env);
+                    if let Some(path) = codex_home.as_ref() {
                         command.env("CODEX_HOME", path);
                     }
+                    apply_codex_search_catalog(&mut command, &env, codex_home.as_deref())?;
                     for (key, value) in &env {
                         if !key.starts_with("HELM_") {
                             command.env(key, value);
@@ -253,6 +336,13 @@ pub(crate) async fn resolve_engine_capability_snapshot(
                     }
                     command.current_dir(std::env::temp_dir()).kill_on_drop(true);
                     let process = spawn_codex_app_server(command).await?;
+                    let provider_capabilities = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        process.rpc.model_provider_capabilities(),
+                    )
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
                     let model_list =
                         tokio::time::timeout(Duration::from_secs(10), process.rpc.model_list(None))
                             .await
@@ -266,7 +356,18 @@ pub(crate) async fn resolve_engine_capability_snapshot(
                     } else {
                         let reasoning = codex_reasoning_capability(&model, &model_list);
                         Ok((
-                            codex_capabilities_from_handshake(&model, &model_list, &reasoning),
+                            codex_capabilities_from_handshake(
+                                &model,
+                                &model_list,
+                                &reasoning,
+                                codex_native_search_enabled(&env),
+                                provider_capabilities.as_ref().and_then(|value| {
+                                    value
+                                        .get("webSearch")
+                                        .or_else(|| value.get("web_search"))
+                                        .and_then(serde_json::Value::as_bool)
+                                }),
+                            ),
                             "codex_initialize_model_list".to_string(),
                         ))
                     };
@@ -367,6 +468,150 @@ async fn run_bounded_probe_command(
         return Err(format!("{engine_label} capability 握手失败：{output}"));
     }
     Ok(output)
+}
+
+async fn prepare_codex_search_launch(
+    engine: &str,
+    bin: &str,
+    model: &str,
+    env: &mut Vec<(String, String)>,
+) -> Result<(), String> {
+    if engine != "codex" || !codex_native_search_enabled(env) {
+        return Ok(());
+    }
+    env.retain(|(key, _)| {
+        key != CODEX_SEARCH_CATALOG_JSON_ENV
+            && key != CODEX_SEARCH_CATALOG_DIGEST_ENV
+            && key != CODEX_SEARCH_TRANSPORT_ENV
+            && key != CODEX_BINARY_IDENTITY_ENV
+    });
+    let catalog_binary_identity = binary_identity(bin)?;
+    env.push((
+        CODEX_BINARY_IDENTITY_ENV.to_string(),
+        catalog_binary_identity.clone(),
+    ));
+    // 官方 subscription Provider 自己拥有 hosted/standalone 路由；兼容目录只用于
+    // Helm custom Responses Provider，避免改变官方账号目录的模型合同。
+    if !env
+        .iter()
+        .any(|(key, value)| key == "OPENAI_BASE_URL" && !value.trim().is_empty())
+    {
+        env.push((
+            CODEX_SEARCH_TRANSPORT_ENV.to_string(),
+            "runtime_managed".to_string(),
+        ));
+        return Ok(());
+    }
+
+    let cached_catalog = codex_bundled_catalog_cache()
+        .lock()
+        .map_err(|_| "Codex bundled model catalog 缓存锁中毒".to_string())?
+        .get(&catalog_binary_identity)
+        .cloned();
+    let stdout = if let Some(catalog) = cached_catalog {
+        catalog
+    } else {
+        let mut command = build_codex_command(bin);
+        apply_inherited_agent_environment(&mut command);
+        command
+            .arg("debug")
+            .arg("models")
+            .arg("--bundled")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("启动 Codex bundled model catalog 读取失败：{error}"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Codex bundled model catalog stdout 不可用".to_string())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "Codex bundled model catalog stderr 不可用".to_string())?;
+        let stdout_task = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            stdout
+                .take((CODEX_MODEL_CATALOG_OUTPUT_LIMIT + 1) as u64)
+                .read_to_end(&mut bytes)
+                .await
+                .map(|_| bytes)
+        });
+        let stderr_task = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            stderr
+                .take((CAPABILITY_PROBE_OUTPUT_LIMIT + 1) as u64)
+                .read_to_end(&mut bytes)
+                .await
+                .map(|_| bytes)
+        });
+        let status = match tokio::time::timeout(Duration::from_secs(15), child.wait()).await {
+            Ok(result) => {
+                result.map_err(|error| format!("等待 Codex bundled model catalog 失败：{error}"))?
+            }
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(
+                    "[codex_search_catalog_timeout] Codex bundled model catalog 读取超时"
+                        .to_string(),
+                );
+            }
+        };
+        let stdout = stdout_task
+            .await
+            .map_err(|error| format!("读取 Codex bundled model catalog stdout 失败：{error}"))?
+            .map_err(|error| format!("读取 Codex bundled model catalog stdout 失败：{error}"))?;
+        let stderr = stderr_task
+            .await
+            .map_err(|error| format!("读取 Codex bundled model catalog stderr 失败：{error}"))?
+            .map_err(|error| format!("读取 Codex bundled model catalog stderr 失败：{error}"))?;
+        if stdout.len() > CODEX_MODEL_CATALOG_OUTPUT_LIMIT
+            || stderr.len() > CAPABILITY_PROBE_OUTPUT_LIMIT
+        {
+            return Err(
+                "[codex_search_catalog_output_limit] Codex bundled model catalog 超过读取上限"
+                    .to_string(),
+            );
+        }
+        if !status.success() {
+            return Err(format!(
+                "[codex_search_catalog_failed] Codex bundled model catalog 读取失败：{}",
+                String::from_utf8_lossy(&stderr)
+            ));
+        }
+        codex_bundled_catalog_cache()
+            .lock()
+            .map_err(|_| "Codex bundled model catalog 缓存锁中毒".to_string())?
+            .insert(catalog_binary_identity, stdout.clone());
+        stdout
+    };
+
+    match codex_search_catalog_plan(&stdout, model)? {
+        CodexSearchCatalogPlan::Unavailable => env.push((
+            CODEX_SEARCH_TRANSPORT_ENV.to_string(),
+            "unavailable".to_string(),
+        )),
+        CodexSearchCatalogPlan::HostedResponses => env.push((
+            CODEX_SEARCH_TRANSPORT_ENV.to_string(),
+            "hosted_responses".to_string(),
+        )),
+        CodexSearchCatalogPlan::HostedResponsesCompatibility(encoded) => {
+            let digest = format!("sha256:{}", crate::util::sha256_hex(&encoded));
+            let encoded = String::from_utf8(encoded)
+                .map_err(|error| format!("Codex 搜索兼容目录不是 UTF-8：{error}"))?;
+            env.push((
+                CODEX_SEARCH_TRANSPORT_ENV.to_string(),
+                "hosted_responses".to_string(),
+            ));
+            env.push((CODEX_SEARCH_CATALOG_JSON_ENV.to_string(), encoded));
+            env.push((CODEX_SEARCH_CATALOG_DIGEST_ENV.to_string(), digest));
+        }
+    }
+    Ok(())
 }
 
 fn ensure_discovered_binding_model(
@@ -644,6 +889,7 @@ pub async fn create_session(
         .filter(|bin| !bin.is_empty())
         .unwrap_or(if engine == "codex" { "codex" } else { "claude" })
         .to_string();
+    prepare_codex_search_launch(&engine, &bin, &model, &mut env).await?;
     let pricing_profile = config
         .models
         .iter()
@@ -1017,6 +1263,7 @@ pub async fn resume_session(
         .filter(|bin| !bin.is_empty())
         .unwrap_or(if engine == "codex" { "codex" } else { "claude" })
         .to_string();
+    prepare_codex_search_launch(&engine, &bin, &model, &mut env).await?;
     let pricing_profile = config
         .models
         .iter()
@@ -1369,6 +1616,7 @@ pub async fn get_reasoning_effort_capability(
     env.extend(agent_environment_from_settings(
         &load_app_settings_from_store(&history_store)?,
     ));
+    prepare_codex_search_launch(&engine, &bin, &model, &mut env).await?;
     let route = build_runtime_route(
         &config,
         &launch_binding,
@@ -1518,6 +1766,7 @@ pub async fn send_message(
         let requested_effort = requested_reasoning_effort
             .or(binding.reasoning_effort)
             .unwrap_or_default();
+        prepare_codex_search_launch(&engine, &bin, &routed_model, &mut env).await?;
         let mut turn_route = build_runtime_route(
             &candidate.config,
             &launch_binding,
@@ -2621,12 +2870,13 @@ pub async fn set_budget(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_approval_response, codex_subscription_models_from_response,
-        ensure_budget_allows_turn, ensure_discovered_binding_model,
-        ensure_ledger_fits_context_window, ensure_pricing_allows_turn,
-        normalize_manual_deny_operation, requested_model_for_binding, resolve_binding_model,
-        resolve_routed_effort, resolve_turn_pricing_basis, rollback_failed_session_creation,
-        subscription_profile_for_binding, ApprovalLedger,
+        apply_approval_response, codex_search_catalog_plan,
+        codex_subscription_models_from_response, ensure_budget_allows_turn,
+        ensure_discovered_binding_model, ensure_ledger_fits_context_window,
+        ensure_pricing_allows_turn, normalize_manual_deny_operation, requested_model_for_binding,
+        resolve_binding_model, resolve_routed_effort, resolve_turn_pricing_basis,
+        rollback_failed_session_creation, subscription_profile_for_binding, ApprovalLedger,
+        CodexSearchCatalogPlan,
     };
     use crate::adapter::ApprovalDecision;
     use crate::capability_registry::{CapabilityIdentity, CapabilitySet, EngineCapabilitySnapshot};
@@ -2637,6 +2887,80 @@ mod tests {
     };
     use crate::reasoning::ReasoningEffort;
     use crate::sessions::{Budget, NewSessionRecord, SessionHistoryStore};
+
+    #[test]
+    fn codex_search_catalog_only_disables_responses_lite_for_the_target_model() {
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "models": [
+                {
+                    "slug": "gpt-target",
+                    "supports_search_tool": true,
+                    "use_responses_lite": true,
+                    "web_search_tool_type": "text_and_image",
+                    "tool_mode": "code_mode_only",
+                    "unknown_future_field": {"kept": true}
+                },
+                {
+                    "slug": "gpt-other",
+                    "supports_search_tool": true,
+                    "use_responses_lite": true,
+                    "web_search_tool_type": "text"
+                }
+            ],
+            "catalog_future_field": [1, 2, 3]
+        }))
+        .unwrap();
+        let CodexSearchCatalogPlan::HostedResponsesCompatibility(encoded) =
+            codex_search_catalog_plan(&raw, "gpt-target").unwrap()
+        else {
+            panic!("Lite hosted model should require a compatibility catalog");
+        };
+        let catalog: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        let models = catalog["models"].as_array().unwrap();
+        assert_eq!(models[0]["use_responses_lite"], false);
+        assert_eq!(models[0]["unknown_future_field"]["kept"], true);
+        assert_eq!(models[1]["use_responses_lite"], true);
+        assert_eq!(
+            catalog["catalog_future_field"],
+            serde_json::json!([1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn codex_search_catalog_fails_closed_on_missing_or_drifted_model_contract() {
+        let hosted = serde_json::to_vec(&serde_json::json!({
+            "models": [{
+                "slug": "gpt-hosted",
+                "supports_search_tool": true,
+                "use_responses_lite": false,
+                "web_search_tool_type": "text"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            codex_search_catalog_plan(&hosted, "gpt-hosted").unwrap(),
+            CodexSearchCatalogPlan::HostedResponses
+        );
+        assert!(codex_search_catalog_plan(&hosted, "missing")
+            .unwrap_err()
+            .starts_with("[codex_search_catalog_model_missing]"));
+
+        let unavailable = serde_json::to_vec(&serde_json::json!({
+            "models": [{
+                "slug": "gpt-offline",
+                "supports_search_tool": false,
+                "use_responses_lite": true
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            codex_search_catalog_plan(&unavailable, "gpt-offline").unwrap(),
+            CodexSearchCatalogPlan::Unavailable
+        );
+        assert!(codex_search_catalog_plan(br#"{"models": {}}"#, "gpt")
+            .unwrap_err()
+            .starts_with("[codex_search_catalog_schema]"));
+    }
     use crate::settings::AppSettings;
     use crate::subscription_profiles::SubscriptionProfileStore;
     use crate::turn_supervisor::TurnSupervisor;

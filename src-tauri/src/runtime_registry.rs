@@ -1,7 +1,4 @@
-use crate::adapter::{
-    sandbox_marker_digest, AgentSession, ApprovalDecision, CodexSandboxReadinessOutcome,
-    PermissionProfile,
-};
+use crate::adapter::{AgentSession, ApprovalDecision, PermissionProfile};
 use crate::budget::{BudgetDimension, TurnBudgetSnapshot};
 use crate::operations::{
     ModelOnlyOperationOutput, ModelOnlyOperationPolicy, OperationExecutionSpec,
@@ -14,7 +11,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
-use tokio::sync::{Mutex, OnceCell, RwLock};
+use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
@@ -180,8 +177,6 @@ pub struct RuntimeRegistry {
     history: SessionHistoryStore,
     recovery_inputs: Arc<Vec<TurnRecoveryInput>>,
     supervisor: Option<crate::turn_supervisor::TurnSupervisor>,
-    codex_readiness: Arc<Mutex<HashMap<String, Arc<OnceCell<CodexSandboxReadinessOutcome>>>>>,
-    codex_setup_gate: Arc<Mutex<()>>,
 }
 
 impl RuntimeRegistry {
@@ -193,8 +188,6 @@ impl RuntimeRegistry {
             history,
             recovery_inputs: Arc::new(recovery_inputs),
             supervisor: None,
-            codex_readiness: Arc::new(Mutex::new(HashMap::new())),
-            codex_setup_gate: Arc::new(Mutex::new(())),
         })
     }
 
@@ -209,37 +202,6 @@ impl RuntimeRegistry {
 
     pub fn recovery_inputs(&self) -> &[TurnRecoveryInput] {
         self.recovery_inputs.as_slice()
-    }
-
-    pub(crate) async fn codex_readiness_cell(
-        &self,
-        identity: &str,
-        marker_path: &Path,
-    ) -> Arc<OnceCell<CodexSandboxReadinessOutcome>> {
-        let mut readiness = self.codex_readiness.lock().await;
-        let stale = readiness
-            .get(identity)
-            .and_then(|cell| cell.get())
-            .is_some_and(|outcome| match outcome {
-                Ok(proof) => {
-                    sandbox_marker_digest(marker_path).as_deref()
-                        != Some(proof.marker_digest.as_str())
-                }
-                Err(failure) => {
-                    crate::util::now_millis().saturating_sub(failure.failed_at) >= 30_000
-                }
-            });
-        if stale {
-            readiness.remove(identity);
-        }
-        readiness
-            .entry(identity.to_string())
-            .or_insert_with(|| Arc::new(OnceCell::new()))
-            .clone()
-    }
-
-    pub(crate) fn codex_setup_gate(&self) -> Arc<Mutex<()>> {
-        self.codex_setup_gate.clone()
     }
 
     pub async fn contains(&self, owner: &RuntimeOwnerRef) -> bool {
@@ -725,11 +687,10 @@ impl RuntimeRegistry {
                 session.release_turn_reservation();
                 return Err("RuntimeGeneration 在路由切换期间发生并发变化".to_string());
             }
-            if let Err(error) = self.history.rotate_runtime_generation(
-                &current.generation.id,
-                &generation,
-                "route_changed",
-            ) {
+            if let Err(error) = self
+                .history
+                .rotate_runtime_generation(&current.generation.id, &generation)
+            {
                 session.release_turn_reservation();
                 return Err(error);
             }
@@ -968,7 +929,7 @@ impl RuntimeRegistry {
         }
         match self
             .history
-            .rotate_runtime_generation(&entry.generation.id, &generation, "closed")
+            .rotate_runtime_generation(&entry.generation.id, &generation)
         {
             Ok(()) => {
                 current.generation = generation;

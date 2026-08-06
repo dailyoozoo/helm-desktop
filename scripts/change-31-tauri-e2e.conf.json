@@ -1,0 +1,14 @@
+{
+  "identifier": "com.helm.desktop.e2e.change31",
+  "build": {
+    "devUrl": "http://127.0.0.1:1431",
+    "beforeDevCommand": "npm run build && node node_modules/vite/bin/vite.js preview --host 127.0.0.1 --port 1431"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Helm Change 31 E2E"
+      }
+    ]
+  }
+}

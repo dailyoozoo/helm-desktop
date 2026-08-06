@@ -24,7 +24,6 @@ function isTurnStage(x: unknown): x is TurnStage {
   return (
     x === 'preparing' ||
     x === 'preparing_runtime' ||
-    x === 'preparing_sandbox' ||
     x === 'starting_engine' ||
     x === 'restoring_session' ||
     x === 'waiting_model' ||

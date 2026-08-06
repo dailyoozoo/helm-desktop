@@ -23,7 +23,6 @@ export interface RuntimeCapabilitySnapshot {
 export type TurnStage =
   | 'preparing'
   | 'preparing_runtime'
-  | 'preparing_sandbox'
   | 'starting_engine'
   | 'restoring_session'
   | 'waiting_model'

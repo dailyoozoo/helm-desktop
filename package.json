@@ -1,6 +1,6 @@
 {
   "name": "helm",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "workspaces": [
@@ -17,12 +17,14 @@
     "format:check": "prettier --check .",
     "format:write": "prettier --write .",
     "test": "vitest run",
+    "test:agent-evidence": "node --test scripts/agent-evidence.test.mjs",
     "check": "npm run typecheck && npm run lint && npm run format:check && npm run test",
     "check:version": "node scripts/check-version.mjs",
     "pricing:validate": "node scripts/pricing-catalog.mjs --validate",
     "pricing:check-upstream": "node scripts/pricing-catalog.mjs --check-upstream",
     "pricing:sign": "tauri signer sign src-tauri/assets/pricing-catalog.json",
     "release:audit": "node scripts/change-27l-release-audit.mjs",
+    "agent:evidence": "node scripts/agent-evidence.mjs",
     "verify:27l": "node scripts/change-27l-release-audit.mjs --with-migrations",
     "verify": "npm run check && npm run check:version && npm run pricing:validate && cargo test --manifest-path src-tauri/Cargo.toml && npm run build && npm run release:audit",
     "visual:audit": "npm run build && node scripts/visual-audit.mjs",

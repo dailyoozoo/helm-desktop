@@ -1731,11 +1731,9 @@ fn change_27e_generation_rotation_is_atomic_and_owner_scoped() {
         created_at: 20,
         ..first.clone()
     };
-    store
-        .rotate_runtime_generation(&first.id, &second, "closed")
-        .unwrap();
+    store.rotate_runtime_generation(&first.id, &second).unwrap();
     assert!(store
-        .rotate_runtime_generation(&first.id, &second, "closed")
+        .rotate_runtime_generation(&first.id, &second)
         .unwrap_err()
         .contains("失效"));
 

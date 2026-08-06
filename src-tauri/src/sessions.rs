@@ -3264,7 +3264,7 @@ impl SessionHistoryStore {
         })
     }
 
-    fn persist_runtime_capabilities(
+    pub(crate) fn persist_runtime_capabilities(
         &self,
         session_id: &str,
         capabilities: Option<&RuntimeCapabilitySnapshot>,
@@ -6263,7 +6263,6 @@ impl SessionHistoryStore {
         &self,
         previous_generation_id: &str,
         generation: &crate::runtime_registry::RuntimeGeneration,
-        previous_status: &str,
     ) -> Result<(), String> {
         let _guard = self.write_guard()?;
         let mut conn = self.open()?;
@@ -6276,7 +6275,7 @@ impl SessionHistoryStore {
                  SET status = ?1, ended_at = ?2
                  WHERE id = ?3 AND owner_kind = ?4 AND owner_id = ?5 AND status = 'active'",
                 params![
-                    previous_status,
+                    "closed",
                     generation.created_at,
                     previous_generation_id,
                     generation.owner.kind(),

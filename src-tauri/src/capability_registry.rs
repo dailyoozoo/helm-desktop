@@ -108,9 +108,14 @@ impl CapabilityIdentity {
         binary_identity: String,
         launch_profile_identity: String,
     ) -> Self {
+        let adapter_version = if route.engine_id == "codex" {
+            format!("{}+codex-search-v3", env!("CARGO_PKG_VERSION"))
+        } else {
+            env!("CARGO_PKG_VERSION").to_string()
+        };
         Self {
             engine_id: route.engine_id.clone(),
-            adapter_version: env!("CARGO_PKG_VERSION").to_string(),
+            adapter_version,
             binary_identity,
             engine_profile_digest: route.engine_profile_digest.clone(),
             provider_launch_profile_ref: route.provider_launch_profile_ref.clone(),
@@ -286,6 +291,49 @@ impl EngineCapabilityRegistry {
             .insert(cache_key, updated.clone());
         Ok(updated)
     }
+
+    pub fn record_web_search_native(
+        &self,
+        snapshot: &EngineCapabilitySnapshot,
+    ) -> Result<EngineCapabilitySnapshot, String> {
+        let cache_key = snapshot.identity.cache_key()?;
+        let mut updated = snapshot.clone();
+        updated.capabilities.search = CapabilityEvidence::new(
+            CapabilitySupport::Supported,
+            "codex_runtime_observation",
+            "codex_native_web_search_item_observed",
+        );
+        updated.probed_at = crate::util::now_millis();
+        self.history
+            .update_capability_snapshot(&cache_key, &updated)?;
+        self.memory
+            .lock()
+            .map_err(|_| "Capability Registry 内存缓存锁中毒".to_string())?
+            .insert(cache_key, updated.clone());
+        Ok(updated)
+    }
+
+    pub fn record_web_search_unavailable(
+        &self,
+        snapshot: &EngineCapabilitySnapshot,
+        diagnostic: &str,
+    ) -> Result<EngineCapabilitySnapshot, String> {
+        let cache_key = snapshot.identity.cache_key()?;
+        let mut updated = snapshot.clone();
+        updated.capabilities.search = CapabilityEvidence::new(
+            CapabilitySupport::Unsupported,
+            "codex_runtime_observation",
+            diagnostic,
+        );
+        updated.probed_at = crate::util::now_millis();
+        self.history
+            .update_capability_snapshot(&cache_key, &updated)?;
+        self.memory
+            .lock()
+            .map_err(|_| "Capability Registry 内存缓存锁中毒".to_string())?
+            .insert(cache_key, updated.clone());
+        Ok(updated)
+    }
 }
 
 pub fn binary_identity(configured_bin: &str) -> Result<String, String> {
@@ -321,7 +369,10 @@ pub fn launch_profile_identity(
     profile_home: Option<&Path>,
 ) -> Result<String, String> {
     let Some(profile_home) = profile_home else {
-        return Ok(route.provider_launch_profile_ref.clone());
+        return digest_json(&(
+            &route.provider_launch_profile_ref,
+            &route.launch_config_digest,
+        ));
     };
     let mut evidence = Vec::new();
     for name in [
@@ -344,6 +395,7 @@ pub fn launch_profile_identity(
     }
     digest_json(&(
         &route.provider_launch_profile_ref,
+        &route.launch_config_digest,
         profile_home.to_string_lossy(),
         evidence,
     ))
@@ -471,6 +523,8 @@ pub fn codex_capabilities_from_handshake(
     model: &str,
     model_list: &serde_json::Value,
     reasoning: &ReasoningEffortCapability,
+    native_search_enabled: bool,
+    provider_search_capability: Option<bool>,
 ) -> CapabilitySet {
     let model_entry = model_list
         .get("data")
@@ -532,11 +586,47 @@ pub fn codex_capabilities_from_handshake(
             "codex_app_server_handshake",
             "codex_server_request_requires_live_observation",
         ),
-        search: optional_bool(
-            "supportsWebSearch",
-            "supports_web_search",
-            "codex_web_search",
-        ),
+        search: if provider_search_capability == Some(false) {
+            CapabilityEvidence::new(
+                CapabilitySupport::Unsupported,
+                "codex_model_provider_capabilities",
+                "codex_provider_web_search_disabled",
+            )
+        } else {
+            model_entry
+                .and_then(|entry| {
+                    entry
+                        .get("supportsWebSearch")
+                        .or_else(|| entry.get("supports_web_search"))
+                })
+                .and_then(serde_json::Value::as_bool)
+                .map(|available| {
+                    CapabilityEvidence::new(
+                        if available {
+                            CapabilitySupport::Supported
+                        } else {
+                            CapabilitySupport::Unsupported
+                        },
+                        "codex_model_list",
+                        "codex_web_search",
+                    )
+                })
+                .unwrap_or_else(|| {
+                    if native_search_enabled {
+                        CapabilityEvidence::new(
+                            CapabilitySupport::Degraded,
+                            "codex_search_launch_flag",
+                            "codex_web_search_enabled_requires_runtime_observation",
+                        )
+                    } else {
+                        CapabilityEvidence::new(
+                            CapabilitySupport::Unknown,
+                            "codex_model_list",
+                            "codex_web_search_not_enabled",
+                        )
+                    }
+                })
+        },
         fetch: optional_bool("supportsWebFetch", "supports_web_fetch", "codex_web_fetch"),
         usage: supported("codex_turn_usage_events"),
         interrupt: supported("codex_turn_interrupt_rpc"),
@@ -644,13 +734,37 @@ mod tests {
             {"model":"gpt-a","supportedReasoningEfforts":[{"reasoningEffort":"high"}]},
             {"model":"gpt-b","supportsWebSearch":false}
         ]});
-        let a = codex_capabilities_from_handshake("gpt-a", &response, &reasoning());
-        let b = codex_capabilities_from_handshake("gpt-b", &response, &reasoning());
+        let a = codex_capabilities_from_handshake("gpt-a", &response, &reasoning(), false, None);
+        let b = codex_capabilities_from_handshake("gpt-b", &response, &reasoning(), false, None);
         assert_eq!(a.search.support, CapabilitySupport::Unknown);
         assert_eq!(b.search.support, CapabilitySupport::Unsupported);
         assert_eq!(
             b.model_only_operation.support,
             CapabilitySupport::Unsupported
+        );
+    }
+
+    #[test]
+    fn codex_search_launch_flag_is_degraded_until_runtime_observation() {
+        let response = serde_json::json!({"data":[{"model":"gpt-a"}]});
+        let capabilities =
+            codex_capabilities_from_handshake("gpt-a", &response, &reasoning(), true, Some(true));
+        assert_eq!(capabilities.search.support, CapabilitySupport::Degraded);
+        assert_eq!(
+            capabilities.search.diagnostic,
+            "codex_web_search_enabled_requires_runtime_observation"
+        );
+    }
+
+    #[test]
+    fn codex_provider_capability_can_explicitly_disable_search() {
+        let response = serde_json::json!({"data":[{"model":"gpt-a"}]});
+        let capabilities =
+            codex_capabilities_from_handshake("gpt-a", &response, &reasoning(), true, Some(false));
+        assert_eq!(capabilities.search.support, CapabilitySupport::Unsupported);
+        assert_eq!(
+            capabilities.search.source,
+            "codex_model_provider_capabilities"
         );
     }
 
@@ -786,6 +900,52 @@ mod tests {
         assert_eq!(
             restored.capabilities.auto_approval.support,
             CapabilitySupport::Degraded
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn observed_codex_web_search_is_persisted_for_the_same_identity() {
+        let path = std::env::temp_dir().join(format!(
+            "helm-search-capability-{}-{}.sqlite",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let store = SessionHistoryStore::new(path.clone());
+        let registry = EngineCapabilityRegistry::new(store.clone());
+        let identity = CapabilityIdentity {
+            engine_id: "codex".into(),
+            adapter_version: "test".into(),
+            binary_identity: "codex:sha256:a".into(),
+            engine_profile_digest: "sha256:engine".into(),
+            provider_launch_profile_ref: "provider:a:api".into(),
+            provider_launch_profile_digest: "sha256:provider".into(),
+            launch_profile_identity: "sha256:launch".into(),
+            model_capability_key: "gpt-a".into(),
+        };
+        let initial = registry
+            .resolve(identity.clone(), || async {
+                Ok((CapabilitySet::unknown("fixture"), "fixture".into()))
+            })
+            .await
+            .unwrap();
+        let observed = registry.record_web_search_native(&initial).unwrap();
+        assert_eq!(
+            observed.capabilities.search.support,
+            CapabilitySupport::Supported
+        );
+
+        let restored = EngineCapabilityRegistry::new(store)
+            .resolve(identity, || async {
+                panic!("observed search evidence must be persisted");
+                #[allow(unreachable_code)]
+                Ok((CapabilitySet::unknown("miss"), "fixture".into()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.capabilities.search.support,
+            CapabilitySupport::Supported
         );
         let _ = std::fs::remove_file(path);
     }

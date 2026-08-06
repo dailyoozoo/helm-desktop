@@ -37,7 +37,6 @@ describe('activityPresentationParts', () => {
   it.each([
     ['preparing', '正在准备本轮…'],
     ['preparing_runtime', '正在准备 Runtime…'],
-    ['preparing_sandbox', '正在配置 Codex Windows 沙箱…'],
     ['restoring_session', '正在恢复会话…'],
     ['waiting_model', '已连接引擎，等待模型响应…'],
     ['reasoning', '正在分析…'],
