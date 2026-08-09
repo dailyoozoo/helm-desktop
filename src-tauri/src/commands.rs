@@ -831,7 +831,6 @@ pub async fn create_session(
     reasoning_effort: Option<String>,
     mode: Option<String>,
     permission_profile: Option<String>,
-    folder_id: Option<String>,
 ) -> Result<String, String> {
     let _initial_mode = TurnMode::parse(mode.as_deref());
     // 预算护栏：检查是否超预算
@@ -940,7 +939,7 @@ pub async fn create_session(
             cwd: cwd.clone(),
             created_at: unix_timestamp_seconds()?,
         },
-        folder_id.as_deref(),
+        None,
     )?;
     if let Err(error) = history_store.set_safe_permission_profile(
         &handle,
@@ -1105,40 +1104,6 @@ pub fn list_folders(
     history_store: State<'_, SessionHistoryStore>,
 ) -> Result<Vec<SessionFolder>, String> {
     history_store.list_folders()
-}
-
-#[tauri::command]
-pub fn create_folder(
-    history_store: State<'_, SessionHistoryStore>,
-    name: String,
-) -> Result<SessionFolder, String> {
-    history_store.create_folder(&name)
-}
-
-#[tauri::command]
-pub fn rename_folder(
-    history_store: State<'_, SessionHistoryStore>,
-    folder_id: String,
-    name: String,
-) -> Result<(), String> {
-    history_store.rename_folder(&folder_id, &name)
-}
-
-#[tauri::command]
-pub fn delete_folder(
-    history_store: State<'_, SessionHistoryStore>,
-    folder_id: String,
-) -> Result<(), String> {
-    history_store.delete_folder(&folder_id)
-}
-
-#[tauri::command]
-pub fn set_session_folder(
-    history_store: State<'_, SessionHistoryStore>,
-    session_id: String,
-    folder_id: String,
-) -> Result<(), String> {
-    history_store.set_session_folder(&session_id, &folder_id)
 }
 
 #[tauri::command]

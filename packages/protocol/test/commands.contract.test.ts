@@ -21,7 +21,6 @@ describe('Tauri command contract', () => {
       cwd: 'C:/workspace',
       mode,
       permissionProfile: 'auto',
-      folderId: 'folder-test',
     } satisfies CreateSessionArgs;
     const send = {
       handleId: 'handle-test',
@@ -44,7 +43,7 @@ describe('Tauri command contract', () => {
 
     const rust = readFileSync(resolve(root, 'src-tauri/src/commands.rs'), 'utf8');
     expect(rust).toMatch(
-      /pub async fn create_session[\s\S]*mode: Option<String>[\s\S]*permission_profile: Option<String>[\s\S]*folder_id: Option<String>/,
+      /pub async fn create_session[\s\S]*mode: Option<String>[\s\S]*permission_profile: Option<String>/,
     );
     expect(rust).toMatch(
       /pub async fn send_message[\s\S]*handle_id: String[\s\S]*display_text: Option<String>[\s\S]*mode: Option<String>[\s\S]*model: Option<String>[\s\S]*reasoning_effort: Option<String>/,
@@ -60,9 +59,7 @@ describe('Tauri command contract', () => {
     if (existsSync(docsPath)) {
       const docs = readFileSync(docsPath, 'utf8');
       expect(docs).toContain("export type TurnMode = 'build' | 'plan' | 'ask'");
-      expect(docs).toMatch(
-        /create_session[^\n]*folderId\?: string[^\n]*permissionProfile\?: PermissionProfile/,
-      );
+      expect(docs).toMatch(/create_session[^\n]*permissionProfile\?: PermissionProfile/);
       expect(docs).toMatch(
         /send_message[\s\S]*mode\?: TurnMode[\s\S]*permissionProfile\?: PermissionProfile/,
       );

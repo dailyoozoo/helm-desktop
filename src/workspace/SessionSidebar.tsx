@@ -49,12 +49,7 @@ export function SessionSidebar({
   runningIds,
   approvalIds = [],
   onNew,
-  onCreateFolder,
   onToggleFolder,
-  onMoveSession,
-  onCreateFolderForSession,
-  onRenameFolder,
-  onDeleteFolder,
   onOpenSession,
   onRenameSession,
   onDeleteSession,
@@ -71,13 +66,8 @@ export function SessionSidebar({
   runningIds: string[];
   /** 有待处理审批的会话（变更-12：黄色徽标） */
   approvalIds?: string[];
-  onNew: (folderId?: string) => void;
-  onCreateFolder: () => void;
+  onNew: () => void;
   onToggleFolder: (folder: SessionFolder) => void;
-  onMoveSession: (session: SessionSummary, folderId: string) => void;
-  onCreateFolderForSession: (session: SessionSummary) => void;
-  onRenameFolder: (folder: SessionFolder) => void;
-  onDeleteFolder: (folder: SessionFolder) => void;
   onOpenSession: (sessionId: string) => void;
   onRenameSession?: (session: SessionSummary) => void;
   onDeleteSession?: (session: SessionSummary) => void;
@@ -86,7 +76,6 @@ export function SessionSidebar({
 }) {
   const [query, setQuery] = useState('');
   const [menu, setMenu] = useState<SessionMenuState | null>(null);
-  const [folderMenuId, setFolderMenuId] = useState<string | null>(null);
   const started = state.sessionId !== null || state.items.length > 0;
   const currentSessionInHistory = sessions.some(isSessionActive);
   const engineLabel =
@@ -103,11 +92,8 @@ export function SessionSidebar({
 
   // 右键菜单：点击任意处 / Esc 关闭
   useEffect(() => {
-    if (!menu && !folderMenuId) return;
-    const close = () => {
-      setMenu(null);
-      setFolderMenuId(null);
-    };
+    if (!menu) return;
+    const close = () => setMenu(null);
     const onKey = (event: KeyboardEvent) => {
       if (event.key === 'Escape') close();
     };
@@ -119,7 +105,7 @@ export function SessionSidebar({
       window.removeEventListener('contextmenu', close);
       window.removeEventListener('keydown', onKey);
     };
-  }, [folderMenuId, menu]);
+  }, [menu]);
 
   const menuSession = menu ? sessions.find((session) => session.id === menu.sessionId) : undefined;
 
@@ -245,14 +231,7 @@ export function SessionSidebar({
             const collapsed = folder.collapsed && !query.trim();
             return (
               <section className="ws-folder" key={folder.id}>
-                <div
-                  className="ws-folder__head"
-                  onContextMenu={(event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    setFolderMenuId(folder.id);
-                  }}
-                >
+                <div className="ws-folder__head">
                   <button
                     className="ws-folder__toggle"
                     type="button"
@@ -265,47 +244,6 @@ export function SessionSidebar({
                     <span>{folder.name}</span>
                     <small>{items.length}</small>
                   </button>
-                  <button
-                    className="btn-icon sm ws-folder__action"
-                    type="button"
-                    title={`在${folder.name}中新建会话`}
-                    aria-label={`在${folder.name}中新建会话`}
-                    onClick={() => onNew(folder.id)}
-                  >
-                    <Icon name="plus" />
-                  </button>
-                  <div className="menu-wrap ws-folder__action">
-                    <button
-                      className="btn-icon sm"
-                      type="button"
-                      aria-label={`管理文件夹 ${folder.name}`}
-                      onClick={() =>
-                        setFolderMenuId((current) => (current === folder.id ? null : folder.id))
-                      }
-                    >
-                      <Icon name="more" />
-                    </button>
-                    <div
-                      className={
-                        'menu ws-folder-menu' + (folderMenuId === folder.id ? ' open' : '')
-                      }
-                    >
-                      <button type="button" onClick={() => onRenameFolder(folder)}>
-                        <Icon name="edit" />
-                        重命名
-                      </button>
-                      {!folder.locked ? (
-                        <button
-                          className="is-danger"
-                          type="button"
-                          onClick={() => onDeleteFolder(folder)}
-                        >
-                          <Icon name="x" />
-                          删除文件夹
-                        </button>
-                      ) : null}
-                    </div>
-                  </div>
                 </div>
                 {!collapsed ? (
                   items.length ? (
@@ -322,11 +260,6 @@ export function SessionSidebar({
         ) : null}
         {sessions.length > 0 && folderEntries.length === 0 ? (
           <div className="sbar-empty">没有匹配的会话</div>
-        ) : null}
-        {!query.trim() ? (
-          <button className="ws-folder-create" type="button" onClick={onCreateFolder}>
-            <Icon name="plus" /> 新建文件夹
-          </button>
         ) : null}
       </div>
       {menu && menuSession ? (
@@ -348,34 +281,6 @@ export function SessionSidebar({
             <Icon name="flag" /> {menu.pinned ? '取消置顶' : '置顶'}
           </button>
           <div className="menu__sep" />
-          <div className="menu__label">移动到文件夹</div>
-          {folders
-            .filter((folder) => folder.id !== menuSession.folderId)
-            .map((folder) => (
-              <button
-                key={folder.id}
-                type="button"
-                className="menu__item"
-                role="menuitem"
-                onClick={() => {
-                  setMenu(null);
-                  onMoveSession(menuSession, folder.id);
-                }}
-              >
-                <Icon name="folder" /> {folder.name}
-              </button>
-            ))}
-          <button
-            type="button"
-            className="menu__item"
-            role="menuitem"
-            onClick={() => {
-              setMenu(null);
-              onCreateFolderForSession(menuSession);
-            }}
-          >
-            <Icon name="folderopen" /> 新建文件夹并移入…
-          </button>
           <button
             type="button"
             className="menu__item"

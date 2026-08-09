@@ -272,20 +272,15 @@ impl ApprovalDecision {
 pub(crate) fn available_approval_decisions(
     action: Option<&crate::permissions::ActionDescriptor>,
 ) -> Vec<ApprovalDecisionOption> {
+    // 弹窗只提供当次允许 / 本会话(总是)允许 / 拒绝；项目与全局持久范围不再从可用集下发。
+    // 底层枚举与规则构成保留，以支持既有 project/global 记录在设置页展示与撤销。
     let mut decisions = vec![ApprovalDecisionOption::Allow];
     if let Some(action) =
         action.filter(|action| crate::permissions::runtime_grant_display(action).is_some())
     {
-        if !action.turn_id.is_empty() && !action.session_id.is_empty() {
-            decisions.push(ApprovalDecisionOption::Turn);
-        }
         if !action.session_id.is_empty() {
             decisions.push(ApprovalDecisionOption::Session);
         }
-        if action.cwd.as_deref().is_some_and(|cwd| !cwd.is_empty()) {
-            decisions.push(ApprovalDecisionOption::Project);
-        }
-        decisions.push(ApprovalDecisionOption::Always);
     }
     decisions.push(ApprovalDecisionOption::Deny);
     decisions
@@ -513,6 +508,19 @@ fn pending_codex_tool_is_stalled(
 ) -> bool {
     tool.ended_at.is_none()
         && now.saturating_sub(tool.last_progress_at) >= stalled_after.as_millis() as i64
+}
+
+fn stalled_codex_tool_kind(tools: &HashMap<String, PendingCodexTool>) -> Option<&'static str> {
+    let stalled: Vec<_> = tools
+        .values()
+        .filter(|tool| {
+            tool.ended_at.is_none() && tool.stage == PendingCodexToolStage::WaitingApproval
+        })
+        .collect();
+    if stalled.is_empty() {
+        return None;
+    }
+    Some("waiting_approval")
 }
 
 #[derive(Default)]
@@ -3005,6 +3013,7 @@ mod tests {
                 message: "launch failed".to_string(),
                 recoverable: false,
                 kind: None,
+                stalled_kind: None,
             }
         ));
     }
@@ -3394,25 +3403,14 @@ mod tests {
             super::available_approval_decisions(Some(&action)),
             vec![
                 crate::protocol::ApprovalDecisionOption::Allow,
-                crate::protocol::ApprovalDecisionOption::Turn,
                 crate::protocol::ApprovalDecisionOption::Session,
-                crate::protocol::ApprovalDecisionOption::Project,
-                crate::protocol::ApprovalDecisionOption::Always,
                 crate::protocol::ApprovalDecisionOption::Deny,
             ]
         );
 
-        action.turn_id.clear();
-        assert!(!super::available_approval_decisions(Some(&action))
-            .contains(&crate::protocol::ApprovalDecisionOption::Turn));
         action.session_id.clear();
         assert!(!super::available_approval_decisions(Some(&action))
             .contains(&crate::protocol::ApprovalDecisionOption::Session));
-        action.cwd = None;
-        assert!(!super::available_approval_decisions(Some(&action))
-            .contains(&crate::protocol::ApprovalDecisionOption::Project));
-        assert!(super::available_approval_decisions(Some(&action))
-            .contains(&crate::protocol::ApprovalDecisionOption::Always));
     }
 
     #[test]
@@ -4259,6 +4257,57 @@ mod tests {
     }
 
     #[test]
+    fn codex_file_change_add_output_produces_diff() {
+        let output = "[{\"diff\":\"test1234\\n\",\"kind\":{\"type\":\"add\"},\"path\":\"D:\\\\repo\\\\test.txt\"}]";
+        let diff = super::parse_codex_file_change_output(output).unwrap();
+        assert_eq!(diff.path, "D:\\repo\\test.txt");
+        assert_eq!(diff.hunks.len(), 1);
+        assert_eq!(
+            diff.hunks[0].lines[0],
+            super::DiffLine {
+                kind: super::DiffKind::Add,
+                text: "test1234".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn codex_file_change_update_output_produces_diff() {
+        let output =
+            "[{\"diff\":\"@@ -1 +1 @@\\n-test\\n+test123\\n\",\"kind\":{\"move_path\":null,\"type\":\"update\"},\"path\":\"D:\\\\repo\\\\test.txt\"}]";
+        let diff = super::parse_codex_file_change_output(output).unwrap();
+        assert_eq!(diff.path, "D:\\repo\\test.txt");
+        assert_eq!(diff.hunks.len(), 1);
+        let kinds: Vec<_> = diff.hunks[0].lines.iter().map(|l| l.kind).collect();
+        assert!(kinds.contains(&super::DiffKind::Del));
+        assert!(kinds.contains(&super::DiffKind::Add));
+    }
+
+    #[test]
+    fn codex_file_change_non_json_output_returns_none() {
+        assert!(
+            super::parse_codex_file_change_output("File created successfully at: C:\\x.txt")
+                .is_none()
+        );
+        assert!(super::parse_codex_file_change_output("plain text").is_none());
+    }
+
+    #[test]
+    fn codex_tool_result_from_item_carries_structured_diff() {
+        let item = serde_json::json!({
+            "type": "tool_call_output",
+            "call_id": "call_x",
+            "output": r#"[{"diff":"hello\n","kind":{"type":"add"},"path":"C:\\repo\\a.txt"}]"#,
+        });
+        let events = super::codex_events_from_completed_item("s-1", &item);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            super::AgentEvent::ToolResult { id, diff: Some(diff), .. }
+                if id == "call_x" && diff.path == "C:\\repo\\a.txt"
+        )));
+    }
+
+    #[test]
     fn builds_codex_provider_overrides_from_openai_binding_env() {
         let args = codex_provider_config_args(&[
             (
@@ -4859,6 +4908,7 @@ async fn emit_error(runtime: &SessionRuntime, message: String, recoverable: bool
             message,
             recoverable,
             kind,
+            stalled_kind: None,
         },
     );
 }
@@ -5584,6 +5634,7 @@ async fn run_claude_turn(
                                                 ),
                                                 recoverable: false,
                                                 kind: Some("checkpoint_failed".to_string()),
+                                                stalled_kind: None,
                                             },
                                         );
                                         let pid = *stdout_runtime.running_pid.lock().await;
@@ -5601,6 +5652,7 @@ async fn run_claude_turn(
                                             ),
                                             recoverable: false,
                                             kind: Some("checkpoint_failed".to_string()),
+                                            stalled_kind: None,
                                         },
                                     );
                                     let pid = *stdout_runtime.running_pid.lock().await;
@@ -5775,6 +5827,7 @@ async fn run_claude_turn(
                             message,
                             recoverable: false,
                             kind: Some("permission_audit_failed".to_string()),
+                            stalled_kind: None,
                         },
                     );
                 }
@@ -6853,11 +6906,14 @@ impl CodexSession {
         }
         validate_cwd(&self.cwd)?;
         validate_engine_bin(&self.bin)?;
-        let canonical_cwd = std::path::Path::new(&self.cwd)
-            .canonicalize()
-            .map_err(|error| format!("工作目录不可用：{error}"))?;
-        *self.execution_cwd.lock().await = Some(canonical_cwd.display().to_string());
-        *self.policy_cwd.lock().await = canonical_cwd.display().to_string();
+        let canonical_cwd = crate::sessions::strip_extended_path_prefix(
+            &std::path::Path::new(&self.cwd)
+                .canonicalize()
+                .map_err(|error| format!("工作目录不可用：{error}"))?
+                .to_string_lossy(),
+        );
+        *self.execution_cwd.lock().await = Some(canonical_cwd.clone());
+        *self.policy_cwd.lock().await = canonical_cwd.clone();
         let configure_command = |command: &mut Command| {
             apply_inherited_agent_environment(command);
             for value in codex_provider_config_args(&self.env) {
@@ -7039,6 +7095,7 @@ impl CodexSession {
                                     ),
                                         recoverable: true,
                                         kind: Some("thread_missing".to_string()),
+                                        stalled_kind: None,
                                     },
                                 );
                                 emit_agent_event(
@@ -7146,17 +7203,26 @@ impl CodexSession {
                 if !tool_stall_reported && stalled_tools.is_some() {
                     tool_stall_reported = true;
                     self.emit_stage(TurnStage::Stalled);
+                    let stalled_kind = {
+                        let tools = self.tool_item_facts.lock().await;
+                        stalled_codex_tool_kind(&tools)
+                    };
                     emit_agent_event(
                         &self.app,
                         &self.history_session_id,
                         &AgentEvent::Error {
                             session_id: Some(thread_id.clone()),
-                            message: format!(
-                                "[runtime_tool_stalled] Codex 工具 60 秒没有新进展：{}",
-                                stalled_tools.unwrap_or_default()
-                            ),
+                            message: if stalled_kind == Some("waiting_approval") {
+                                "[runtime_tool_stalled] 有一项操作正在等待你的确认".to_string()
+                            } else {
+                                format!(
+                                    "[runtime_tool_stalled] Codex 工具 60 秒没有新进展：{}",
+                                    stalled_tools.unwrap_or_default()
+                                )
+                            },
                             recoverable: true,
                             kind: Some("tool_stalled".to_string()),
+                            stalled_kind: stalled_kind.map(str::to_string),
                         },
                     );
                 } else if !turn_stall_reported
@@ -7251,6 +7317,7 @@ impl CodexSession {
                         message: error,
                         recoverable: true,
                         kind: Some(error_kind),
+                        stalled_kind: None,
                     },
                 );
                 let session_id = session
@@ -7365,11 +7432,12 @@ pub(crate) fn start_codex_with_reasoning(
     capability_snapshot: crate::capability_registry::EngineCapabilitySnapshot,
     _reasoning_effort: ReasoningEffort,
 ) -> Result<AgentSession, String> {
-    let canonical_cwd = std::path::Path::new(&cwd)
-        .canonicalize()
-        .map_err(|error| format!("工作目录不可用：{error}"))?
-        .to_string_lossy()
-        .to_string();
+    let canonical_cwd = crate::sessions::strip_extended_path_prefix(
+        &std::path::Path::new(&cwd)
+            .canonicalize()
+            .map_err(|error| format!("工作目录不可用：{error}"))?
+            .to_string_lossy(),
+    );
     let (turn_completions, _) = broadcast::channel(32);
     let runtime_profile = if env
         .iter()
@@ -7772,6 +7840,7 @@ fn parse_codex_app_server_notification(
                     kind: classify_error(&message),
                     message,
                     recoverable: true,
+                    stalled_kind: None,
                 });
             }
             events.push(AgentEvent::TurnComplete {
@@ -7994,6 +8063,10 @@ fn codex_app_server_completed_item(session_id: &str, item: &serde_json::Value) -
                 item.get("status").and_then(serde_json::Value::as_str),
                 Some("failed" | "declined")
             );
+            let output = item
+                .get("changes")
+                .and_then(|changes| serde_json::to_string(changes).ok());
+            let diff = output.as_deref().and_then(parse_codex_file_change_output);
             vec![AgentEvent::ToolResult {
                 session_id: session_id.to_string(),
                 id,
@@ -8002,10 +8075,8 @@ fn codex_app_server_completed_item(session_id: &str, item: &serde_json::Value) -
                 } else {
                     ToolStatus::Success
                 },
-                output: item
-                    .get("changes")
-                    .and_then(|changes| serde_json::to_string(changes).ok()),
-                diff: None,
+                output,
+                diff,
                 outcome: Some(if failed {
                     crate::protocol::ToolOutcomeKind::ToolFailed
                 } else {
@@ -8155,6 +8226,7 @@ fn parse_codex_line(session_id: &str, raw: &str) -> Vec<AgentEvent> {
                     kind: classify_error(&message),
                     message,
                     recoverable: false,
+                    stalled_kind: None,
                 },
                 AgentEvent::TurnComplete {
                     session_id: session_id.to_string(),
@@ -8282,6 +8354,7 @@ fn codex_tool_result_from_item(session_id: &str, item: &serde_json::Value) -> Op
     let diff = item
         .get("diff")
         .and_then(|value| serde_json::from_value::<Diff>(value.clone()).ok())
+        .or_else(|| output.as_deref().and_then(parse_codex_file_change_output))
         .or_else(|| output.as_deref().and_then(parse_unified_diff));
 
     Some(AgentEvent::ToolResult {
@@ -8386,7 +8459,80 @@ fn codex_reasoning_text(item: &serde_json::Value) -> Option<String> {
         })
 }
 
+/// 解析 Codex Write/Edit 工具的 fileChange 结构化输出为 Diff。
+///
+/// Codex 对 `write_file`/`edit_file` 的工具结果 output 是 JSON 数组，例如：
+/// ```json
+/// [{"diff":"test1234\n","kind":{"type":"add"},"path":"D:\\repo\\test.txt"}]
+/// [{"diff":"@@ -1 +1 @@\n-old\n+new","kind":{"type":"update"},"path":"D:\\repo\\test.txt"}]
+/// ```
+/// - `type=add`：diff 是文件全量新内容（无 hunk 头），按新增整文件构造 hunk。
+/// - `type=update`：diff 是 unified diff 文本，交给 `parse_unified_diff` 但路径取自外层 `path` 字段。
+fn parse_codex_file_change_output(output: &str) -> Option<Diff> {
+    let value: serde_json::Value = serde_json::from_str(output).ok()?;
+    let entries = match value {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::Object(_) => vec![value],
+        _ => return None,
+    };
+    let mut result: Option<Diff> = None;
+    for entry in entries {
+        let Some(path) = entry.get("path").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let diff_text = entry
+            .get("diff")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if diff_text.is_empty() {
+            continue;
+        }
+        let kind = entry
+            .get("kind")
+            .and_then(|kind| kind.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("update");
+        if kind == "add" {
+            let mut lines: Vec<DiffLine> = Vec::new();
+            if diff_text.is_empty() {
+                continue;
+            }
+            for line in diff_text.lines() {
+                lines.push(DiffLine {
+                    kind: DiffKind::Add,
+                    text: line.to_string(),
+                });
+            }
+            if lines.is_empty() {
+                lines.push(DiffLine {
+                    kind: DiffKind::Add,
+                    text: String::new(),
+                });
+            }
+            result = Some(Diff {
+                path: path.to_string(),
+                hunks: vec![DiffHunk {
+                    old_start: 0,
+                    new_start: 1,
+                    lines,
+                }],
+            });
+        } else {
+            if let Some(parsed) = parse_unified_diff_with_fallback(diff_text, Some(path)) {
+                result = Some(parsed);
+            }
+        }
+    }
+    result
+}
+
 fn parse_unified_diff(text: &str) -> Option<Diff> {
+    parse_unified_diff_with_fallback(text, None)
+}
+
+/// 解析 unified diff 文本；若文本缺 `+++` 头（Codex update 输出格式不含文件头），
+/// 使用 `fallback_path` 作为 path。
+fn parse_unified_diff_with_fallback(text: &str, fallback_path: Option<&str>) -> Option<Diff> {
     let mut path = String::new();
     let mut hunks: Vec<DiffHunk> = Vec::new();
     let mut current: Option<DiffHunk> = None;
@@ -8440,6 +8586,9 @@ fn parse_unified_diff(text: &str) -> Option<Diff> {
         }
     }
 
+    if path.is_empty() {
+        path = fallback_path.unwrap_or("").trim().to_string();
+    }
     if path.is_empty() || hunks.is_empty() {
         return None;
     }
@@ -8730,6 +8879,37 @@ mod turn_stage_tests {
     }
 
     #[test]
+    fn stalled_codex_tool_kind_reports_waiting_approval_when_an_approval_is_pending() {
+        let now = crate::util::now_millis();
+        let mut tools = HashMap::new();
+        tools.insert(
+            "done".to_string(),
+            super::PendingCodexTool {
+                queued_at: now - 20,
+                started_at: now - 10,
+                last_progress_at: now,
+                ended_at: Some(now),
+                stage: super::PendingCodexToolStage::WaitingResult,
+            },
+        );
+        assert_eq!(super::stalled_codex_tool_kind(&tools), None);
+        tools.insert(
+            "waiting".to_string(),
+            super::PendingCodexTool {
+                queued_at: now - 30,
+                started_at: now - 25,
+                last_progress_at: now - 5,
+                ended_at: None,
+                stage: super::PendingCodexToolStage::WaitingApproval,
+            },
+        );
+        assert_eq!(
+            super::stalled_codex_tool_kind(&tools),
+            Some("waiting_approval")
+        );
+    }
+
+    #[test]
     fn codex_reasoning_and_message_item_started_map_to_truthful_stages() {
         let reasoning = serialized_events(serde_json::json!({
             "type": "item.started",
@@ -8895,6 +9075,24 @@ mod turn_stage_tests {
             event,
             super::AgentEvent::ToolCall { id, name, input, .. }
                 if id == "file-1" && name == "Write" && input["paths"][0] == "src/main.rs"
+        )));
+
+        let completed = parse_codex_app_server_notification(
+            "codex-session",
+            &serde_json::json!({
+                "method":"item/completed",
+                "params":{"threadId":"thread-1","turnId":"turn-1","item":{
+                    "id":"file-1","type":"fileChange","status":"completed","changes":[
+                        {"path":"src/main.rs","diff":"@@ -1 +1 @@\n-old\n+new","kind":{"type":"update"}}
+                    ]
+                }}
+            }),
+        );
+        assert!(completed.iter().any(|event| matches!(
+            event,
+            super::AgentEvent::ToolResult { id, status: super::ToolStatus::Success, diff: Some(diff), .. }
+                if id == "file-1" && diff.path == "src/main.rs"
+                    && diff.hunks.iter().any(|h| h.lines.iter().any(|l| l.kind == super::DiffKind::Del))
         )));
 
         let completed = parse_codex_app_server_notification(

@@ -508,7 +508,37 @@ fn trace_outbound(value: &serde_json::Value) {
     }
     let id = value.get("id").map(ToString::to_string).unwrap_or_default();
     if let Some(method) = value.get("method").and_then(serde_json::Value::as_str) {
-        eprintln!("[codex-trace] outbound request id={id} method={method}");
+        let mut detail = String::new();
+        if matches!(method, "thread/start" | "turn/start") {
+            if let Some(cwd) = value.pointer("/params/cwd").and_then(serde_json::Value::as_str) {
+                detail.push_str(&format!(" cwd={cwd:?}"));
+            }
+            if let Some(policy) = value.pointer("/params/sandboxPolicy") {
+                if let Some(r#type) = policy.get("type").and_then(serde_json::Value::as_str) {
+                    detail.push_str(&format!(" sandboxPolicy.type={:?}", r#type));
+                }
+                if let Some(roots) = policy.get("writableRoots").and_then(serde_json::Value::as_array) {
+                    let roots: Vec<&str> = roots
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect();
+                    detail.push_str(&format!(" writableRoots={roots:?}"));
+                }
+            }
+            if let Some(approval_policy) =
+                value.pointer("/params/approvalPolicy").and_then(serde_json::Value::as_str)
+            {
+                detail.push_str(&format!(" approvalPolicy={approval_policy:?}"));
+            }
+        } else if let Some(command) = value.get("params").and_then(|params| {
+            params.get("command").and_then(serde_json::Value::as_str)
+        }) {
+            detail.push_str(&format!(
+                " command_len={}",
+                command.chars().count()
+            ));
+        }
+        eprintln!("[codex-trace] outbound request id={id} method={method}{detail}");
     } else if value.get("result").is_some() {
         let decision = value
             .pointer("/result/decision")
@@ -549,8 +579,38 @@ fn trace_inbound(value: &serde_json::Value) {
                 .or_else(|| value.pointer("/params/item/status"))
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("none");
+            let mut detail = String::new();
+            if item_type == "requestApproval" {
+                if let Some(action) = value
+                    .pointer("/params/item/action")
+                    .and_then(serde_json::Value::as_object)
+                {
+                    let action_type = action
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    detail.push_str(&format!(" action.type={action_type:?}"));
+                    if let Some(files) = action.get("files").and_then(serde_json::Value::as_array) {
+                        detail.push_str(&format!(" files={files:?}"));
+                    }
+                }
+                if let Some(additional) = value
+                    .pointer("/params/item/additionalPermissions")
+                    .and_then(serde_json::Value::as_object)
+                {
+                    detail.push_str(&format!(
+                        " additionalPermissions.keys={:?}",
+                        additional.keys().collect::<Vec<_>>()
+                    ));
+                    if let Some(fs) =
+                        additional.get("fileSystem").and_then(serde_json::Value::as_object)
+                    {
+                        detail.push_str(&format!(" fileSystem={fs:?}"));
+                    }
+                }
+            }
             eprintln!(
-                "[codex-trace] inbound notification method={method} item={item_type} status={status}"
+                "[codex-trace] inbound notification method={method} item={item_type} status={status}{detail}"
             );
         }
     } else if value.get("result").is_some() {

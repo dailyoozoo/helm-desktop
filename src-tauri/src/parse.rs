@@ -298,6 +298,7 @@ fn parse_assistant(obj: &Value, session_id: &str) -> Vec<AgentEvent> {
                             message: text.to_string(),
                             recoverable: false,
                             kind: Some("model_unavailable".to_string()),
+                            stalled_kind: None,
                         });
                         continue;
                     }

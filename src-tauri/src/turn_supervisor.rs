@@ -762,6 +762,7 @@ impl TurnSupervisor {
                             message: format!("预算超限：{}", trigger.dimension.as_str()),
                             recoverable: false,
                             kind: Some("budget_exceeded".to_string()),
+                            stalled_kind: None,
                         },
                     };
                     supervisor.record_budget_trigger(&candidate, &trigger);
@@ -1382,6 +1383,7 @@ mod tests {
                 message: "process crashed".into(),
                 recoverable: false,
                 kind: Some("process_crashed".into()),
+                stalled_kind: None,
             },
         ));
         assert!(!supervisor.accept_event(

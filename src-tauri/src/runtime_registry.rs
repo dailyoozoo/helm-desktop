@@ -770,6 +770,7 @@ impl RuntimeRegistry {
                             message: error.clone(),
                             recoverable: false,
                             kind: Some("dispatch_rejected".to_string()),
+                            stalled_kind: None,
                         },
                     )
                 });

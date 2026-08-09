@@ -156,7 +156,15 @@ export type AgentEvent =
       contextWindow?: number;
     }
   | { type: 'turn_complete'; sessionId: string; stopReason: 'end' | 'interrupted' | 'error' }
-  | { type: 'error'; sessionId?: string; message: string; recoverable: boolean; kind?: ErrorKind };
+  | {
+      type: 'error';
+      sessionId?: string;
+      message: string;
+      recoverable: boolean;
+      kind?: ErrorKind;
+      /** kind 为 tool_stalled 时的细分：waiting_approval（有审批等用户）| executing | waiting_result。 */
+      stalledKind?: 'waiting_approval' | 'executing' | 'waiting_result' | string;
+    };
 
 /**
  * 错误分类：前端据此渲染人话文案与修复动作（去安装 / 去配置 / 选目录…）。

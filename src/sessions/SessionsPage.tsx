@@ -1,12 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { EngineId } from '@helm/protocol';
-import {
-  getSessionHistory,
-  listFolders,
-  listSessions,
-  resumeSession,
-  setSessionFolder,
-} from './api';
+import { getSessionHistory, listFolders, listSessions, resumeSession } from './api';
 import { deleteSession, renameSession, setSessionPinned } from './api';
 import { liveSessionHandle } from '../engine/useSession';
 import { Chip } from '../components/Chip';
@@ -187,23 +181,6 @@ export function SessionsPage({ onOpenWorkspace, onNewSession }: SessionsPageProp
         [deleteTarget.id]: err instanceof Error ? err.message : '删除会话失败',
       }));
       setDeleteTarget(null);
-    }
-  };
-
-  const moveSession = async (session: SessionSummary, nextFolderId: string) => {
-    setMenuSessionId(null);
-    try {
-      await setSessionFolder(session.id, nextFolderId);
-      setSessions((current) =>
-        current.map((item) =>
-          item.id === session.id ? { ...item, folderId: nextFolderId } : item,
-        ),
-      );
-    } catch (err) {
-      setRowErrors((current) => ({
-        ...current,
-        [session.id]: err instanceof Error ? err.message : '移动会话失败',
-      }));
     }
   };
 
@@ -474,19 +451,6 @@ export function SessionsPage({ onOpenWorkspace, onNewSession }: SessionsPageProp
                                 >
                                   <Icon name="edit" /> 重命名
                                 </button>
-                                <div className="menu__sep" />
-                                <div className="menu__label">移动到文件夹</div>
-                                {folders
-                                  .filter((folder) => folder.id !== session.folderId)
-                                  .map((folder) => (
-                                    <button
-                                      key={folder.id}
-                                      type="button"
-                                      onClick={() => void moveSession(session, folder.id)}
-                                    >
-                                      <Icon name="folder" /> {folder.name}
-                                    </button>
-                                  ))}
                                 <button
                                   className="is-danger"
                                   type="button"

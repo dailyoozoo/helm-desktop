@@ -4510,6 +4510,9 @@ impl SessionHistoryStore {
             Capability::FileRead | Capability::DirectoryList
         ) {
             safe_read_effect(action)
+        } else if action.capability == Capability::FileWrite {
+            let safe_profile = self.session_safe_profile_on_conn(&tx, &action.session_id)?;
+            safe_file_write_effect(action, &safe_profile, &tx)?
         } else {
             PermissionEffect::Ask
         };
@@ -5885,6 +5888,21 @@ impl SessionHistoryStore {
             providers.insert(local_id, provider_id.clone());
         }
         Ok(provider_id)
+    }
+
+    /// 读取会话的 safe permission profile（不含触发 refresh，审批热路径用）。
+    fn session_safe_profile_on_conn(
+        &self,
+        conn: &Connection,
+        session_id: &str,
+    ) -> Result<String, String> {
+        let local_id = self.resolve_local_id(conn, session_id)?;
+        conn.query_row(
+            "SELECT safe_permission_profile FROM session WHERE id = ?1",
+            params![local_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(db_err)
     }
 
     /// 是否需要自动起标题（P3-5）：摘要还没生成，且已有至少一轮完整对话
@@ -8983,7 +9001,7 @@ fn canonical_folder_cwd(cwd: &str) -> Result<(String, String), String> {
     Ok((display, key))
 }
 
-fn strip_extended_path_prefix(value: &str) -> String {
+pub(crate) fn strip_extended_path_prefix(value: &str) -> String {
     let normalized = value.replace('\\', "/");
     if let Some(rest) = normalized.strip_prefix("//?/") {
         if rest
@@ -9183,6 +9201,35 @@ fn safe_read_effect(action: &ActionDescriptor) -> PermissionEffect {
         };
     }
     PermissionEffect::Deny
+}
+
+/// auto 档对工作区内结构化写（fileChange）的固定自动放行（术语表「自动执行」）。
+/// 仅当会话 safe profile 为 `auto`、且所有写目标可证明落在 session workspace 根内
+/// 且非敏感时返回 Allow；越界/敏感 fail-closed 返回 Deny；其余档位统一 Ask（保持现状）。
+/// 显式 Deny 由 Kernel 优先于本固定 Allow（参见 evaluate_permission_action_inner 顺序）。
+fn safe_file_write_effect(
+    action: &ActionDescriptor,
+    safe_profile: &str,
+    conn: &Connection,
+) -> Result<PermissionEffect, String> {
+    if action.capability != Capability::FileWrite || safe_profile != "auto" {
+        return Ok(PermissionEffect::Ask);
+    }
+    let session_cwd = conn
+        .query_row("SELECT cwd FROM session WHERE id = ?1", params![action.session_id], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()
+        .map_err(db_err)?;
+    let Some(session_cwd) = session_cwd.filter(|root| !root.is_empty()) else {
+        return Ok(PermissionEffect::Ask);
+    };
+    let eligible = crate::permissions::safe_file_write_resources_within(action, &session_cwd);
+    Ok(if eligible {
+        PermissionEffect::Allow
+    } else {
+        PermissionEffect::Deny
+    })
 }
 
 fn permission_policy_version_on_conn(conn: &Connection) -> Result<u64, String> {
@@ -9544,3 +9591,33 @@ fn title_from_text(text: &str) -> String {
 
 // message/tool_call 的 ts 单位（变更-07）：毫秒（now_millis），与 checkpoint.ts 同单位。
 // session.created_at/updated_at 与 usage.ts 维持秒（now_seconds，用量按 date(ts,'unixepoch') 聚合）。
+
+#[cfg(test)]
+mod path_prefix_tests {
+    use super::strip_extended_path_prefix;
+
+    #[test]
+    fn strips_windows_verbatim_drive_prefix() {
+        assert_eq!(
+            strip_extended_path_prefix(r"\\?\D:\projects\迁移工作区"),
+            r"D:\projects\迁移工作区"
+        );
+    }
+
+    #[test]
+    fn leaves_plain_windows_path_untouched() {
+        assert_eq!(
+            strip_extended_path_prefix(r"D:\other\projects\workspace"),
+            r"D:\other\projects\workspace"
+        );
+    }
+
+    #[test]
+    fn restores_unc_from_verbatim_form() {
+        assert_eq!(
+            strip_extended_path_prefix(r"\\?\UNC\server\share\dir"),
+            r"\\server\share\dir"
+        );
+    }
+}
+

@@ -3,15 +3,11 @@ import { Icon } from '../shell/icons';
 import type { EngineId, ReasoningEffort, ReasoningEffortCapability } from '@helm/protocol';
 import type { WorkspaceEngineOption } from './workspaceViewModel';
 import { reasoningEffortLabel } from '../reasoning';
-import type { SessionFolder } from '../sessions/sessionTypes';
 
-type HeadMenuId = 'folder' | 'engine' | 'model';
+type HeadMenuId = 'engine' | 'model';
 
 export function ThreadHead({
   title,
-  folders,
-  folderId,
-  onSelectFolder,
   engineOptions,
   activeOption,
   model,
@@ -31,9 +27,6 @@ export function ThreadHead({
 }: {
   /** 会话标题（变更-10）：接真实数据，新会话/未命名回落「未命名会话」 */
   title?: string | null;
-  folders: SessionFolder[];
-  folderId: string | null;
-  onSelectFolder: (folderId: string) => void;
   engineOptions: WorkspaceEngineOption[];
   activeOption?: WorkspaceEngineOption;
   model: string;
@@ -58,13 +51,10 @@ export function ThreadHead({
   const providerLabel = activeOption?.provider?.name ?? '未绑定服务商';
   const engineLabel = activeOption?.engine.name ?? '未配置引擎';
   const engineIcon = activeOption?.engine.id === 'codex' ? 'cpu' : 'zap';
-  const folder = folderId ? folders.find((item) => item.id === folderId) : undefined;
-  const folderLabel = folder?.name ?? (folderId ? '默认' : '按工作目录自动归类');
 
   // 头部菜单点击开合（B1-1）：对齐 prototype data-menu——同刻至多一个打开、选后关闭、
   // 外点/Esc 关闭且 Esc 把焦点归还触发钮；不再用 CSS hover/focus-within 驱动。
   const [openMenu, setOpenMenu] = useState<HeadMenuId | null>(null);
-  const folderBtnRef = useRef<HTMLButtonElement | null>(null);
   const engineBtnRef = useRef<HTMLButtonElement | null>(null);
   const modelBtnRef = useRef<HTMLButtonElement | null>(null);
 
@@ -77,8 +67,7 @@ export function ThreadHead({
     };
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
-      const trigger =
-        openMenu === 'folder' ? folderBtnRef : openMenu === 'engine' ? engineBtnRef : modelBtnRef;
+      const trigger = openMenu === 'engine' ? engineBtnRef : modelBtnRef;
       trigger.current?.focus();
       setOpenMenu(null);
     };
@@ -111,46 +100,6 @@ export function ThreadHead({
           {cost?.costUsd != null && cost.costUsd > 0 ? (
             <span className="thread__cost"> · ${cost.costUsd.toFixed(4)}</span>
           ) : null}
-        </div>
-      </div>
-
-      <div className="menu-wrap ws-folder-chip-wrap">
-        <button
-          className="btn btn--subtle btn--sm ws-folder-chip"
-          type="button"
-          ref={folderBtnRef}
-          aria-haspopup="menu"
-          aria-expanded={openMenu === 'folder'}
-          title={folder?.cwd ?? folderLabel}
-          onClick={() => toggleMenu('folder')}
-        >
-          <Icon name="folder" />
-          <span>{folderLabel}</span>
-          <Icon name="down" style={{ width: 13, height: 13 }} />
-        </button>
-        <div
-          className={'menu ws-menu ws-folder-picker' + (openMenu === 'folder' ? ' open' : '')}
-          role="menu"
-        >
-          <div className="menu__label">移动到文件夹</div>
-          {folders.map((item) => (
-            <button
-              key={item.id}
-              className={'menu__item' + (item.id === folderId ? ' is-on' : '')}
-              type="button"
-              role="menuitem"
-              onClick={() => {
-                setOpenMenu(null);
-                onSelectFolder(item.id);
-              }}
-            >
-              <Icon name="folder" />
-              <span className="ws-menu__text">{item.name}</span>
-              <span className="check">
-                <Icon name="check" />
-              </span>
-            </button>
-          ))}
         </div>
       </div>
 

@@ -7,6 +7,7 @@ import type { McpServer, Skill } from '../extensions/extensionsApi';
 import type { PermissionProfile, RuntimeCapabilityAvailability } from '@helm/protocol';
 import { activityLogGroups } from './activityLog';
 import { getGitStatus, getGitStaged, type GitStatus, type StagedFile } from '../engine/transport';
+import { openPathInSystem, readFilePreview, type FilePreview } from '../engine/transport';
 import { open } from '@tauri-apps/plugin-dialog';
 import {
   addSessionContext,
@@ -18,6 +19,109 @@ import {
 type Tab = 'files' | 'log' | 'context' | 'tools';
 
 const panelStyle = { display: 'flex', flexDirection: 'column', gap: 20 } as const;
+
+/** 把相对 cwd 的路径拼成绝对路径；已是绝对/盘符路径则原样返回。 */
+export function joinPath(cwd: string, relative: string): string {
+  const trimmed = relative.trim();
+  if (!trimmed) return trimmed;
+  if (/^[a-zA-Z]:[\\/]/.test(trimmed) || trimmed.startsWith('\\\\') || trimmed.startsWith('~'))
+    return trimmed;
+  return `${cwd.replace(/[\\/]$/, '')}/${trimmed.replace(/^[\\/]+/, '')}`;
+}
+
+/** 变更-33：文件/附件预览面板（ContextPanel 内嵌）。 */
+type PreviewState =
+  | { path: string; label: string; data: FilePreview }
+  | { path: string; label: string; error: string };
+
+function FilePreviewPanel({
+  preview,
+  busy,
+  onClose,
+  onOpenSystem,
+}: {
+  preview: PreviewState;
+  busy: boolean;
+  onClose: () => void;
+  onOpenSystem: () => void;
+}) {
+  if ('error' in preview) {
+    return (
+      <div className="fpv">
+        <div className="fpv__head">
+          <span className="fpv__title" title={preview.path}>
+            {preview.label}
+          </span>
+          <span style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            <button
+              type="button"
+              className="btn-icon"
+              onClick={onOpenSystem}
+              title="用系统默认程序打开"
+            >
+              ↗
+            </button>
+            <button type="button" className="btn-icon" onClick={onClose} title="关闭预览">
+              ✕
+            </button>
+          </span>
+        </div>
+        <div className="fv__err">预览失败：{preview.error}</div>
+      </div>
+    );
+  }
+  const data = preview.data;
+  return (
+    <div className="fpv">
+      <div className="fpv__head">
+        <span className="fpv__title" title={preview.path}>
+          {preview.label}
+        </span>
+        <span style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          {data.kind === 'binary' ? (
+            <button type="button" className="btn btn--sm" onClick={onOpenSystem}>
+              用系统默认程序打开
+            </button>
+          ) : null}
+          <button type="button" className="btn-icon" onClick={onClose} title="关闭预览">
+            ✕
+          </button>
+        </span>
+      </div>
+      <div className="fpv__body">
+        {busy ? (
+          <div className="fpv__hint">读取中…</div>
+        ) : data.kind === 'image' ? (
+          data.content && !data.truncated ? (
+            <img
+              className="fpv__img"
+              src={`data:${data.mime ?? 'image/png'};base64,${data.content}`}
+              alt={preview.label}
+            />
+          ) : (
+            <div className="fpv__hint">
+              {data.truncated
+                ? `图片过大（${(data.size / 1024 / 1024).toFixed(1)} MB），无法内嵌预览。`
+                : '无法内嵌预览。'}
+              <button type="button" className="btn btn--sm" onClick={onOpenSystem}>
+                用系统默认程序打开
+              </button>
+            </div>
+          )
+        ) : data.kind === 'binary' ? (
+          <div className="fpv__hint">
+            二进制文件（{(data.size / 1024).toFixed(1)} KB），无法内嵌预览。
+            <button type="button" className="btn btn--sm" onClick={onOpenSystem}>
+              用系统默认程序打开
+            </button>
+          </div>
+        ) : (
+          <pre className="fpv__text">{data.content}</pre>
+        )}
+      </div>
+    </div>
+  );
+}
 const hintStyle = { color: 'var(--fg-4)', fontSize: 12.5, lineHeight: 1.6 } as const;
 const listStyle = { display: 'flex', flexDirection: 'column', gap: 2 } as const;
 
@@ -31,6 +135,11 @@ function statusText(status: 'pending' | 'success' | 'error') {
 function toolTargetShort(item: Extract<SessionState['items'][number], { kind: 'tool' }>): string {
   const target = toolTarget(item.name, item.input).trim().split(/\r?\n/, 1)[0];
   return target.length > 48 ? `${target.slice(0, 47)}…` : target;
+}
+
+/** 从路径取最后一个片段作为展示名。 */
+function attachmentLabel(path: string): string {
+  return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
 }
 
 function toolLogMeta(item: Extract<SessionState['items'][number], { kind: 'tool' }>): string {
@@ -95,6 +204,38 @@ export function ContextPanel({
   const [sessionContexts, setSessionContexts] = useState<SessionContextRecord[]>([]);
   const [contextError, setContextError] = useState<string | null>(null);
   const [contextBusy, setContextBusy] = useState(false);
+  // 变更-33：文件/附件预览
+  const [preview, setPreview] = useState<PreviewState | null>(null);
+  const [previewBusy, setPreviewBusy] = useState(false);
+
+  const previewFile = useCallback(
+    async (rawPath: string, label: string, needsCwd: boolean) => {
+      setPreviewBusy(true);
+      try {
+        const path = needsCwd && state.cwd ? joinPath(state.cwd, rawPath) : rawPath;
+        const data = await readFilePreview(path);
+        setPreview({ path, label, data });
+      } catch (error) {
+        setPreview({ path: rawPath, label, error: String(error) });
+      } finally {
+        setPreviewBusy(false);
+      }
+    },
+    [state.cwd],
+  );
+
+  const openInSystem = useCallback(
+    async (rawPath: string, needsCwd: boolean) => {
+      const path = needsCwd && state.cwd ? joinPath(state.cwd, rawPath) : rawPath;
+      try {
+        await openPathInSystem(path);
+      } catch (error) {
+        // 静默展示：由系统打开失败时不强刷 UI，仅保留该路径信息
+        setPreview({ path, label: rawPath, error: String(error) });
+      }
+    },
+    [state.cwd],
+  );
 
   const loadSessionContexts = useCallback(async () => {
     if (!state.historyId) {
@@ -291,10 +432,25 @@ export function ContextPanel({
                 </div>
                 <div style={listStyle}>
                   {stagedFiles.map((file) => (
-                    <div className="filerow" key={file.path}>
+                    <button
+                      type="button"
+                      className="filerow fpv-row"
+                      key={file.path}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        background: 'none',
+                        border: 'none',
+                        padding: '4px 0',
+                        textAlign: 'left',
+                        cursor: 'pointer',
+                      }}
+                      onClick={() => void previewFile(file.path, file.path, true)}
+                      title={`预览 ${file.path}`}
+                    >
                       <span className="st a">{file.status.charAt(0)}</span>
                       <span className="nm">{file.path}</span>
-                    </div>
+                    </button>
                   ))}
                 </div>
               </div>
@@ -308,29 +464,55 @@ export function ContextPanel({
                 <div style={listStyle}>
                   {data.changeFiles.map((file) => (
                     <div key={file.path}>
-                      <button
-                        type="button"
+                      <div
                         className="filerow"
                         style={{
-                          cursor: 'pointer',
                           display: 'flex',
                           alignItems: 'center',
                           width: '100%',
-                          background: 'none',
-                          border: 'none',
                           padding: '4px 0',
-                          textAlign: 'left',
                         }}
-                        onClick={() => toggleExpand(file.path)}
                         title={`${file.path}（${file.added} 新增，${file.removed} 删除）`}
                       >
-                        <span className="st m">{expandedFiles.has(file.path) ? '▼' : '▶'}</span>
-                        <span className="nm">{file.path}</span>
+                        <button
+                          type="button"
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            background: 'none',
+                            border: 'none',
+                            padding: 0,
+                            cursor: 'pointer',
+                          }}
+                          onClick={() => toggleExpand(file.path)}
+                          aria-label="展开/折叠变更"
+                        >
+                          <span className="st m">{expandedFiles.has(file.path) ? '▼' : '▶'}</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="nm"
+                          style={{
+                            flex: 1,
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            whiteSpace: 'nowrap',
+                            background: 'none',
+                            border: 'none',
+                            textAlign: 'left',
+                            cursor: 'pointer',
+                            padding: '4px 0',
+                          }}
+                          onClick={() => void previewFile(file.path, file.path, true)}
+                          title={`预览 ${file.path}`}
+                        >
+                          {file.path}
+                        </button>
                         <span className="pm">
                           <span className="a">+{file.added}</span>
                           <span className="d">-{file.removed}</span>
                         </span>
-                      </button>
+                      </div>
                       {expandedFiles.has(file.path) && (
                         <div
                           style={{
@@ -519,13 +701,43 @@ export function ContextPanel({
                       key={context.id}
                       title={context.canonicalPath}
                     >
-                      <span className={`st ${context.status === 'ready' ? 'a' : 'd'}`}>
-                        {context.kind === 'directory' ? 'D' : 'F'}
-                      </span>
-                      <span className="nm mono">
-                        {context.displayName}
-                        {context.status !== 'ready' ? ` · ${context.statusDetail ?? '不可用'}` : ''}
-                      </span>
+                      <button
+                        type="button"
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 6,
+                          flex: 1,
+                          overflow: 'hidden',
+                          background: 'none',
+                          border: 'none',
+                          padding: 0,
+                          textAlign: 'left',
+                          cursor: context.kind === 'directory' ? 'default' : 'pointer',
+                        }}
+                        onClick={() => {
+                          if (context.kind === 'directory') {
+                            void openInSystem(context.canonicalPath, false);
+                          } else {
+                            void previewFile(context.canonicalPath, context.displayName, false);
+                          }
+                        }}
+                        title={
+                          context.kind === 'directory'
+                            ? `在资源管理器中打开 ${context.canonicalPath}`
+                            : `预览 ${context.canonicalPath}`
+                        }
+                      >
+                        <span className={`st ${context.status === 'ready' ? 'a' : 'd'}`}>
+                          {context.kind === 'directory' ? 'D' : 'F'}
+                        </span>
+                        <span className="nm mono">
+                          {context.displayName}
+                          {context.status !== 'ready'
+                            ? ` · ${context.statusDetail ?? '不可用'}`
+                            : ''}
+                        </span>
+                      </button>
                       <button
                         type="button"
                         className="btn-icon"
@@ -554,10 +766,25 @@ export function ContextPanel({
               {data.historicalAttachments.length ? (
                 <div style={listStyle}>
                   {data.historicalAttachments.map((path) => (
-                    <div className="filerow" key={path} title="已发送附件，只读历史">
+                    <button
+                      type="button"
+                      className="filerow"
+                      key={path}
+                      title="已发送附件，只读历史；点击预览"
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        background: 'none',
+                        border: 'none',
+                        padding: '4px 0',
+                        textAlign: 'left',
+                        cursor: 'pointer',
+                      }}
+                      onClick={() => void previewFile(path, attachmentLabel(path), false)}
+                    >
                       <span className="st m">A</span>
                       <span className="nm mono">{path}</span>
-                    </div>
+                    </button>
                   ))}
                 </div>
               ) : (
@@ -802,6 +1029,14 @@ export function ContextPanel({
           </div>
         )}
       </div>
+      {preview ? (
+        <FilePreviewPanel
+          preview={preview}
+          busy={previewBusy}
+          onClose={() => setPreview(null)}
+          onOpenSystem={() => void openInSystem(preview.path, false)}
+        />
+      ) : null}
     </aside>
   );
 }

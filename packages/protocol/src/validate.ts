@@ -151,7 +151,8 @@ export function isAgentEvent(x: unknown): x is AgentEvent {
       return (
         str('message') &&
         typeof x.recoverable === 'boolean' &&
-        (!('kind' in x) || strNonEmpty('kind'))
+        (!('kind' in x) || strNonEmpty('kind')) &&
+        (!('stalledKind' in x) || strNonEmpty('stalledKind'))
       );
     default:
       return false;

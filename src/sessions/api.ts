@@ -141,22 +141,6 @@ export function listFolders(): Promise<SessionFolder[]> {
   return invoke<SessionFolder[]>('list_folders');
 }
 
-export function createFolder(name: string): Promise<SessionFolder> {
-  return invoke<SessionFolder>('create_folder', { name });
-}
-
-export function renameFolder(folderId: string, name: string): Promise<void> {
-  return invoke<void>('rename_folder', { folderId, name });
-}
-
-export function deleteFolder(folderId: string): Promise<void> {
-  return invoke<void>('delete_folder', { folderId });
-}
-
-export function setSessionFolder(sessionId: string, folderId: string): Promise<void> {
-  return invoke<void>('set_session_folder', { sessionId, folderId });
-}
-
 export function setFolderCollapsed(folderId: string, collapsed: boolean): Promise<void> {
   return invoke<void>('set_folder_collapsed', { folderId, collapsed });
 }

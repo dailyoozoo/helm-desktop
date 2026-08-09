@@ -30,7 +30,6 @@ export function createSession(opts: CreateSessionOpts): Promise<string> {
     reasoningEffort: opts.reasoningEffort,
     mode: opts.mode,
     permissionProfile: opts.permissionProfile,
-    folderId: opts.folderId,
   } satisfies CreateSessionArgs;
   return invoke<string>('create_session', args);
 }
@@ -116,7 +115,7 @@ export function closeSession(handleId: string): Promise<void> {
   return invoke<void>('close_session', { handleId });
 }
 
-// 回应一个审批请求：仅一次 / 本会话 / 此项目 / 全局 / 拒绝
+// 回应一个审批请求：当次允许 / 总是允许(本会话) / 拒绝
 export function respondApproval(
   handleId: string,
   approvalId: string,
@@ -181,4 +180,32 @@ export function getGitStatus(cwd: string): Promise<GitStatus> {
 /** 获取暂存区文件列表 */
 export function getGitStaged(cwd: string): Promise<StagedFile[]> {
   return invoke<StagedFile[]>('get_git_staged', { cwd });
+}
+
+// 变更-33：文件/附件预览
+
+/** 预览内容类型 */
+export type PreviewKind = 'text' | 'image' | 'binary';
+
+/** 文件预览结果 */
+export interface FilePreview {
+  kind: PreviewKind;
+  /** Text 时为文本内容；Image 时为原始图片 Bytes 的 base64 */
+  content?: string | null;
+  /** 图片 MIME */
+  mime?: string | null;
+  /** 实际文件字节数 */
+  size: number;
+  /** 是否因超过预览上限被截断 */
+  truncated: boolean;
+}
+
+/** 软件内只读预览文件（文本/图片）；二进制返回类型标记。 */
+export function readFilePreview(path: string): Promise<FilePreview> {
+  return invoke<FilePreview>('read_file_preview', { path });
+}
+
+/** 用系统默认程序打开文件/目录（供二进制或需要在外部查看的文件使用）。 */
+export function openPathInSystem(path: string): Promise<void> {
+  return invoke<void>('open_path_in_system', { path });
 }

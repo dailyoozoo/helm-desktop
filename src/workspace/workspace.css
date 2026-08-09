@@ -86,14 +86,6 @@
   color: var(--fg-4);
   font: 500 11px var(--font-mono);
 }
-.ws-folder__action {
-  opacity: 0;
-  transition: opacity 0.12s;
-}
-.ws-folder__head:hover .ws-folder__action,
-.ws-folder__action:focus-within {
-  opacity: 1;
-}
 .ws-folder__empty {
   padding: 4px 10px 8px 28px;
   color: var(--fg-4);
@@ -103,51 +95,6 @@
   margin-left: 10px;
   width: calc(100% - 10px);
   padding: 7px 10px;
-}
-.ws-folder-create {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 7px;
-  width: 100%;
-  padding: 7px 10px;
-  margin-top: 10px;
-  border: 1px dashed var(--border);
-  border-radius: 8px;
-  background: none;
-  color: var(--fg-4);
-  font: inherit;
-  font-size: 12px;
-  cursor: pointer;
-}
-.ws-folder-create:hover {
-  color: var(--fg-2);
-  border-color: var(--border-2);
-  background: var(--surface);
-}
-.ws-folder-create svg {
-  width: 13px;
-  height: 13px;
-}
-.ws-folder-menu {
-  right: 0;
-  min-width: 170px;
-}
-.ws-folder-chip svg:first-child {
-  color: var(--accent-hi);
-}
-.ws-folder-chip {
-  max-width: min(22vw, 220px);
-}
-.ws-folder-chip span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.ws-folder-picker {
-  right: 0;
-  min-width: 210px;
 }
 
 .ws-new-session {
@@ -1521,6 +1468,77 @@
   display: flex;
   flex-direction: column;
   gap: 20px;
+  flex: 1;
+  min-height: 0;
+}
+/* 变更-33：文件/附件内嵌预览面板（固定于右栏底部） */
+.fpv {
+  flex: none;
+  border-top: 1px solid var(--line);
+  background: color-mix(in oklch, var(--bg) 92%, black 2%);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  max-height: 46%;
+}
+.fpv__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+}
+.fpv__title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fg-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fpv__body {
+  overflow: auto;
+  padding: 12px;
+  min-height: 0;
+}
+.fpv__text {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--fg-2);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.fpv__img {
+  max-width: 100%;
+  max-height: 46vh;
+  display: block;
+  margin: 0 auto;
+  border-radius: 8px;
+}
+.fpv__hint {
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--fg-3);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+}
+.fv__err {
+  padding: 12px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--fg-3);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.fpv-row .nm {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .csec__t {
   font-size: 11px;

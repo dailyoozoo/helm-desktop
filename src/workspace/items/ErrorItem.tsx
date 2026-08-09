@@ -48,16 +48,31 @@ const ERROR_KIND_META: Record<
     title: '进程异常退出',
     hint: 'CLI 进程非正常结束。可展开详情查看原始输出，或直接重试。',
   },
+  tool_stalled: {
+    title: '工具运行时间较长',
+    hint: '这不是系统故障。你可以点击「停止」中断本轮，或继续等待它自行恢复。',
+  },
+};
+
+const STALLED_KIND_META: Record<string, { title: string; hint: string }> = {
+  waiting_approval: {
+    title: '有一项操作正在等待你的确认',
+    hint: '在会话里找到对应的审批卡，点击允许或拒绝即可继续。',
+  },
 };
 
 export const ErrorItem = memo(function ErrorItem({
   message,
   errorKind,
+  stalledKind,
 }: {
   message: string;
   errorKind?: string;
+  stalledKind?: string;
 }) {
   const meta = errorKind ? ERROR_KIND_META[errorKind] : undefined;
+  const stalledMeta =
+    errorKind === 'tool_stalled' && stalledKind ? STALLED_KIND_META[stalledKind] : undefined;
   const [showDetail, setShowDetail] = useState(false);
 
   return (
@@ -69,8 +84,8 @@ export const ErrorItem = memo(function ErrorItem({
           <div className="ws-error__body">
             {meta ? (
               <>
-                <div className="prose ws-error__title">{meta.title}</div>
-                <div className="prose">{meta.hint}</div>
+                <div className="prose ws-error__title">{stalledMeta?.title ?? meta.title}</div>
+                <div className="prose">{stalledMeta?.hint ?? meta.hint}</div>
                 <div className="ws-error__actions">
                   {meta.action?.page ? (
                     <button

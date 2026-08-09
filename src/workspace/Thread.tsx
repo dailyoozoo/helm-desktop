@@ -217,7 +217,7 @@ export function Thread({
       case 'error':
         return (
           <div key={`error-${it.id}`} data-thread-item-id={it.id}>
-            <ErrorItem message={it.message} errorKind={it.errorKind} />
+            <ErrorItem message={it.message} errorKind={it.errorKind} stalledKind={it.stalledKind} />
           </div>
         );
       default:

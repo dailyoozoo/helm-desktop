@@ -6,7 +6,6 @@ import { ErrorBoundary } from './shell/ErrorBoundary';
 import { ToastLayer } from './components/ToastLayer';
 import { showToast } from './components/toast';
 import { HomePage } from './home/HomePage';
-import { OnboardingWizard } from './home/OnboardingWizard';
 import { applyAppearanceSettings } from './settings/appearance';
 import { loadSettings, saveSettings } from './settings/api';
 import { CommandPaletteView } from './settings/CommandPaletteView';
@@ -60,7 +59,6 @@ export function App() {
   const [newSessionRequest, setNewSessionRequest] = useState(0);
   const [toggleContextRequest, setToggleContextRequest] = useState(0);
   const [cycleEngineRequest, setCycleEngineRequest] = useState(0);
-  const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [settingsSaveState, setSettingsSaveState] = useState<SaveState>('idle');
   const settingsSaverRef = useRef<LatestSerialSaver<AppSettings> | null>(null);
   if (!settingsSaverRef.current) {
@@ -77,15 +75,11 @@ export function App() {
       .then((next) => {
         if (active) {
           setSettings(next);
-          setSettingsLoaded(true);
-          // 首启引导未完成时以总览页作为第一屏（决策 D1）
-          if (!next.general.onboardingCompleted) setPage('home');
         }
       })
       .catch(() => {
         if (active) {
           setSettings(DEFAULT_SETTINGS);
-          setSettingsLoaded(true);
           showToast('设置加载失败，已回退到默认设置', 'error');
         }
       });
@@ -347,20 +341,6 @@ export function App() {
         </ErrorBoundary>
       </div>
       <ToastLayer />
-      {settingsLoaded && !settings.general.onboardingCompleted ? (
-        <OnboardingWizard
-          settings={settings}
-          onUpdateSettings={persistSettings}
-          onNavigate={(p) => setPage(p as PageId)}
-          onFinish={(target) => {
-            persistSettings((prev) => ({
-              ...prev,
-              general: { ...prev.general, onboardingCompleted: true },
-            }));
-            if (target) setPage(target as PageId);
-          }}
-        />
-      ) : null}
     </div>
   );
 }

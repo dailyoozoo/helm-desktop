@@ -2,6 +2,7 @@ node_modules
 dist
 .scratch
 .cargo-target-*
+target/
 package-lock.json
 **/test/fixtures/**
 

@@ -524,23 +524,6 @@ function GeneralTab({
         </div>
         <div className="srow2">
           <div className="srow2__m">
-            <b>首次使用引导</b>
-            <small>重新运行引擎检测、接入方式与工作目录的配置向导。</small>
-          </div>
-          <button
-            className="btn btn--subtle btn--sm srow2__c"
-            onClick={() =>
-              update((prev) => ({
-                ...prev,
-                general: { ...prev.general, onboardingCompleted: false },
-              }))
-            }
-          >
-            重新运行引导
-          </button>
-        </div>
-        <div className="srow2">
-          <div className="srow2__m">
             <b>设置备份</b>
             <small>导出当前设置，或从本地文件恢复。</small>
           </div>
@@ -1212,7 +1195,7 @@ function PermissionsTab() {
           持久权限规则
         </div>
         <div className="sgroup__d">
-          Helm 按引擎、具体能力、项目路径和作用域记录永久授权；可在这里随时撤销。
+          Helm 按引擎、具体能力、路径和作用域记录授权；可在这里随时撤销。
         </div>
         {permissionLoadError ? (
           <div className="settings-inline-error" role="alert">
@@ -1259,7 +1242,7 @@ function PermissionsTab() {
           })}
           {!permissionLoadError && permissionRules.length === 0 ? (
             <div className="allowlist__empty">
-              暂无持久规则——审批卡上选择「永久允许」后会出现在这里
+              暂无持久规则——审批卡上选择「总是允许」后会出现在这里
             </div>
           ) : null}
         </div>

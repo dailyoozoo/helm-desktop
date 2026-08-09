@@ -12,7 +12,6 @@ export interface CreateSessionArgs {
   reasoningEffort?: ReasoningEffort;
   mode?: TurnMode;
   permissionProfile?: PermissionProfile;
-  folderId?: string;
 }
 
 /** Tauri `send_message` 的参数。 */
@@ -60,7 +59,6 @@ export type AgentCommand =
       engine: EngineId;
       model: string;
       cwd: string;
-      folderId?: string;
       mode?: TurnMode;
       permissionProfile?: PermissionProfile;
       reasoningEffort?: ReasoningEffort;

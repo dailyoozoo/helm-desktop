@@ -9,6 +9,7 @@ pub mod codex_app_server;
 pub mod codex_capabilities;
 pub mod commands;
 pub mod extensions;
+pub mod file_preview;
 pub mod git;
 pub mod handoff;
 pub mod installer;
@@ -67,23 +68,23 @@ mod tests {
 use capability_registry::EngineCapabilityRegistry;
 use commands::{
     add_session_context, approval_response, cancel_background_operation, clear_permission_audit,
-    close_session, create_folder, create_permission_deny_rule, create_session, delete_folder,
-    delete_hook, delete_mcp_server, delete_provider_config, delete_session, delete_slash_command,
-    delete_subagent, export_permission_audit, get_active_session, get_background_operation,
-    get_budget, get_daily_usage, get_equivalent_env, get_permission_audit_summary,
-    get_permission_rules, get_provider_config, get_reasoning_effort_capability,
-    get_session_history, get_top_sessions, get_turn_snapshot, get_usage_by_model,
-    get_usage_by_provider, get_usage_stats, interrupt, list_folders, list_hooks, list_mcp_servers,
-    list_session_contexts, list_sessions, list_skills, list_slash_commands, list_subagents,
-    market_install_skill, market_search_skills, read_engine_config_file, remove_permission_rule,
-    remove_session_context, rename_folder, rename_session, restore_checkpoint, resume_session,
-    retry_background_operation, reveal_provider_secret, save_binding_config, save_engine_config,
-    save_hook, save_mcp_server, save_model_config, save_pasted_image, save_provider_config,
-    save_provider_model_selection, save_slash_command, save_subagent, search_workspace_files,
-    send_message, set_budget, set_folder_collapsed, set_session_folder, set_session_mcp_disabled,
-    set_session_permission_profile, set_session_pinned, set_session_turn_preference,
-    start_session_fork, sync_provider_models_config, test_engine_config, test_mcp_connection,
-    test_provider_config, toggle_skill, undo_revert, write_engine_config_file, SessionStore,
+    close_session, create_permission_deny_rule, create_session, delete_hook, delete_mcp_server,
+    delete_provider_config, delete_session, delete_slash_command, delete_subagent,
+    export_permission_audit, get_active_session, get_background_operation, get_budget,
+    get_daily_usage, get_equivalent_env, get_permission_audit_summary, get_permission_rules,
+    get_provider_config, get_reasoning_effort_capability, get_session_history, get_top_sessions,
+    get_turn_snapshot, get_usage_by_model, get_usage_by_provider, get_usage_stats, interrupt,
+    list_folders, list_hooks, list_mcp_servers, list_session_contexts, list_sessions, list_skills,
+    list_slash_commands, list_subagents, market_install_skill, market_search_skills,
+    read_engine_config_file, remove_permission_rule, remove_session_context, rename_session,
+    restore_checkpoint, resume_session, retry_background_operation, reveal_provider_secret,
+    save_binding_config, save_engine_config, save_hook, save_mcp_server, save_model_config,
+    save_pasted_image, save_provider_config, save_provider_model_selection, save_slash_command,
+    save_subagent, search_workspace_files, send_message, set_budget, set_folder_collapsed,
+    set_session_mcp_disabled, set_session_permission_profile, set_session_pinned,
+    set_session_turn_preference, start_session_fork, sync_provider_models_config,
+    test_engine_config, test_mcp_connection, test_provider_config, toggle_skill, undo_revert,
+    write_engine_config_file, SessionStore,
 };
 use installer::install_cli_engine;
 use permission_service::PermissionService;
@@ -190,10 +191,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             create_session,
             list_folders,
-            create_folder,
-            rename_folder,
-            delete_folder,
-            set_session_folder,
             set_folder_collapsed,
             close_session,
             delete_session,
@@ -290,7 +287,9 @@ pub fn run() {
             select_directory,
             git::get_git_branch,
             git::get_git_status,
-            git::get_git_staged
+            git::get_git_staged,
+            file_preview::read_file_preview,
+            file_preview::open_path_in_system
         ])
         .on_window_event(|window, event| {
             // 关闭行为（变更-12）：closeToTray 开启 → 隐藏到托盘（后台会话继续跑）；

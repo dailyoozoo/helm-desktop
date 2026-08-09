@@ -56,18 +56,26 @@ fn rule_matches(action: &ActionDescriptor, rule: &PermissionRule, now_ms: i64) -
     let process_allow_requires_matcher = action.capability == Capability::ProcessExec
         && rule.effect == PermissionEffect::Allow
         && rule.scope != PermissionScope::Once;
+    let is_session_exec_allow =
+        process_allow_requires_matcher && rule.scope == PermissionScope::Session;
     let exact_process_allow = process_allow_requires_matcher
+        && !is_session_exec_allow
         && rule
             .resource_pattern
             .as_deref()
             .is_some_and(|pattern| crate::permissions::process_exec_rule_matches(pattern, action));
+    let session_process_allow = is_session_exec_allow
+        && rule.resource_pattern.as_deref().is_some_and(|pattern| {
+            crate::permissions::process_exec_session_rule_matches(pattern, action)
+        });
+    let process_allow_matched = exact_process_allow || session_process_allow;
     if rule.principal != action.principal
         || rule
             .engine
             .as_deref()
             .is_some_and(|engine| engine != action.engine)
         || rule.capability != action.capability
-        || (!exact_process_allow
+        || (!process_allow_matched
             && rule
                 .operation
                 .as_deref()
@@ -81,7 +89,7 @@ fn rule_matches(action: &ActionDescriptor, rule: &PermissionRule, now_ms: i64) -
         return false;
     }
     if process_allow_requires_matcher {
-        return exact_process_allow;
+        return process_allow_matched;
     }
     match rule.resource_pattern.as_deref() {
         Some(_) if action.resources.is_empty() => false,

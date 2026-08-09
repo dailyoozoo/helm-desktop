@@ -363,7 +363,13 @@ export type ThreadItem =
       fileCount: number;
       reason?: string;
     } & ThreadItemMeta)
-  | ({ kind: 'error'; id: string; message: string; errorKind?: string } & ThreadItemMeta);
+  | ({
+      kind: 'error';
+      id: string;
+      message: string;
+      errorKind?: string;
+      stalledKind?: string;
+    } & ThreadItemMeta);
 
 export interface SessionState {
   handleId: string | null;
@@ -897,6 +903,7 @@ export function reduceSessionEvent(s: SessionState, e: AgentEvent, turnId?: stri
             id: uid('e'),
             message: e.message,
             errorKind: e.kind,
+            stalledKind: e.stalledKind,
             ...(turnId ? { turnId } : {}),
           },
         ],
@@ -1567,7 +1574,6 @@ export function useSession(defaults?: SessionDefaults) {
       commandText?: string,
       reasoningEffort: ReasoningEffort = 'auto',
       permissionProfile: import('./transport').PermissionProfile = 'standard',
-      folderId?: string,
     ) => {
       const trimmed = text.trim();
       if (!trimmed) return false;
@@ -1593,7 +1599,6 @@ export function useSession(defaults?: SessionDefaults) {
             reasoningEffort,
             mode,
             permissionProfile,
-            folderId,
           });
           handleRef.current = handle;
           // 新会话的 history id 即句柄 id（后端 bind_history_session(handle, handle)）

@@ -36,21 +36,17 @@ import {
   type SlashCommand,
 } from '../extensions/extensionsApi';
 import {
-  createFolder,
   cancelBackgroundOperation,
-  deleteFolder,
   deleteSession,
   getActiveSession,
   getBackgroundOperation,
   getSessionHistory,
   listFolders,
   listSessions,
-  renameFolder,
   renameSession,
   resumeSession,
   retryBackgroundOperation,
   setFolderCollapsed,
-  setSessionFolder,
   setSessionPinned,
   startSessionFork,
   type BackgroundOperation,
@@ -71,7 +67,6 @@ import {
 import type { TurnMode } from '../engine/transport';
 import {
   defaultModelForEngine,
-  sameWorkspacePath,
   workspaceEngineOptions,
   workspaceSessionIsActive,
 } from './workspaceViewModel';
@@ -144,7 +139,6 @@ export function Workspace({
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [folders, setFolders] = useState<SessionFolder[]>([]);
-  const [newSessionFolderId, setNewSessionFolderId] = useState<string | undefined>();
   const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
   const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
   const [skills, setSkills] = useState<Skill[]>([]);
@@ -272,12 +266,6 @@ export function Workspace({
   const [renameTarget, setRenameTarget] = useState<SessionSummary | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [deleteTarget, setDeleteTarget] = useState<SessionSummary | null>(null);
-  const [folderDeleteTarget, setFolderDeleteTarget] = useState<SessionFolder | null>(null);
-  const [folderEditor, setFolderEditor] = useState<{
-    folder: SessionFolder | null;
-    value: string;
-    moveSession?: SessionSummary;
-  } | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -566,19 +554,14 @@ export function Workspace({
   );
 
   /** 新建会话：线程重置 + 模式回落设置默认（变更-04 B.1，新会话不沿用上一段的模式） */
-  const startNewSession = useCallback(
-    (folderId?: string) => {
-      const defaultOption = engineOptions.find(
-        (option) => option.engine.id === sessionDefaults.engine,
-      );
-      // 全局新建由后端按 canonical cwd 自动归类；只有 Folder 上下文入口才显式覆盖。
-      setNewSessionFolderId(folderId);
-      reset();
-      setTurnMode(defaultTurnMode);
-      setReasoningEffort(defaultOption?.binding?.reasoningEffort ?? 'auto');
-    },
-    [defaultTurnMode, engineOptions, reset, sessionDefaults.engine],
-  );
+  const startNewSession = useCallback(() => {
+    const defaultOption = engineOptions.find(
+      (option) => option.engine.id === sessionDefaults.engine,
+    );
+    reset();
+    setTurnMode(defaultTurnMode);
+    setReasoningEffort(defaultOption?.binding?.reasoningEffort ?? 'auto');
+  }, [defaultTurnMode, engineOptions, reset, sessionDefaults.engine]);
 
   // 恢复历史会话或切换引擎后，不能继续沿用另一个 Engine 的模式。
   useEffect(() => {
@@ -712,7 +695,6 @@ export function Workspace({
       commandText,
       reasoningEffort,
       permissionProfile,
-      newSessionFolderId,
     );
     if (!sent && !state.handleId && permissionProfile === 'full_access') {
       // 新会话的 FullAccessLease 只能在首次发送、Session id 已确定后签发。
@@ -746,14 +728,22 @@ export function Workspace({
     if (!notifEnabled) return;
     // 检查是否在 Tauri 环境
     if (!isTauriRuntime()) return;
-    // 判断是出错还是正常完成
+    // 判断终止原因：正常完成 / 等待用户确认 / 其它未完成
     const lastItem = state.items[state.items.length - 1];
-    const hasError = lastItem?.kind === 'error';
+    const isWaitingApproval =
+      lastItem?.kind === 'error' &&
+      lastItem.errorKind === 'tool_stalled' &&
+      lastItem.stalledKind === 'waiting_approval';
     try {
-      if (hasError) {
+      if (isWaitingApproval) {
         sendNotification({
           title: 'Helm',
-          body: '轮次出错，请查看会话详情',
+          body: '有一项操作在等待你确认',
+        });
+      } else if (lastItem?.kind === 'error') {
+        sendNotification({
+          title: 'Helm',
+          body: '当前轮次未完成，可到会话中查看',
         });
       } else {
         sendNotification({
@@ -958,44 +948,7 @@ export function Workspace({
     }
   };
 
-  const handleMoveSession = async (session: SessionSummary, folderId: string) => {
-    try {
-      await setSessionFolder(session.id, folderId);
-      setSessions((current) =>
-        current.map((item) => (item.id === session.id ? { ...item, folderId } : item)),
-      );
-    } catch (err) {
-      showToast(`移动会话失败：${err instanceof Error ? err.message : String(err)}`, 'error');
-    }
-  };
-
-  const handleFolderEditorConfirm = async () => {
-    if (!folderEditor?.value.trim()) return;
-    try {
-      if (folderEditor.folder) {
-        await renameFolder(folderEditor.folder.id, folderEditor.value.trim());
-      } else {
-        const created = await createFolder(folderEditor.value.trim());
-        if (folderEditor.moveSession) {
-          await setSessionFolder(folderEditor.moveSession.id, created.id);
-        }
-      }
-      setFolderEditor(null);
-      void refreshSessions();
-    } catch (err) {
-      showToast(`保存文件夹失败：${err instanceof Error ? err.message : String(err)}`, 'error');
-    }
-  };
-
   const freshSession = !state.handleId && !state.sessionId && state.items.length === 0;
-  const automaticFolderId = folders.find(
-    (folder) => folder.cwd && sameWorkspacePath(folder.cwd, state.cwd),
-  )?.id;
-  const activeFolderId =
-    sessions.find((session) => session.id === state.historyId)?.folderId ??
-    newSessionFolderId ??
-    automaticFolderId ??
-    (freshSession ? null : 'folder-default');
 
   return (
     <main
@@ -1027,7 +980,6 @@ export function Workspace({
         runningIds={runningIds}
         approvalIds={approvalIds}
         onNew={startNewSession}
-        onCreateFolder={() => setFolderEditor({ folder: null, value: '' })}
         onToggleFolder={(folder) => {
           setFolders((current) =>
             current.map((item) =>
@@ -1036,12 +988,6 @@ export function Workspace({
           );
           void setFolderCollapsed(folder.id, !folder.collapsed);
         }}
-        onMoveSession={(session, folderId) => void handleMoveSession(session, folderId)}
-        onCreateFolderForSession={(session) =>
-          setFolderEditor({ folder: null, value: '', moveSession: session })
-        }
-        onRenameFolder={(folder) => setFolderEditor({ folder, value: folder.name })}
-        onDeleteFolder={setFolderDeleteTarget}
         onOpenSession={handleOpenSession}
         onRenameSession={(session) => {
           setRenameValue(session.title);
@@ -1060,16 +1006,6 @@ export function Workspace({
       <section className="thread">
         <ThreadHead
           title={sessions.find((session) => session.id === state.historyId)?.title}
-          folders={folders}
-          folderId={activeFolderId}
-          onSelectFolder={(folderId) => {
-            if (state.historyId) {
-              const session = sessions.find((item) => item.id === state.historyId);
-              if (session) void handleMoveSession(session, folderId);
-            } else {
-              setNewSessionFolderId(folderId);
-            }
-          }}
           engineOptions={engineOptions}
           activeOption={activeOption}
           model={state.model || activeModel?.id || '默认模型'}
@@ -1226,36 +1162,6 @@ export function Workspace({
           title={deleteTarget.title}
           onCancel={() => setDeleteTarget(null)}
           onConfirm={handleDeleteConfirm}
-        />
-      ) : null}
-      {folderDeleteTarget ? (
-        <DeleteFolderDialog
-          name={folderDeleteTarget.name}
-          fallbackName={folders.find((folder) => folder.id === 'folder-default')?.name ?? '默认'}
-          onCancel={() => setFolderDeleteTarget(null)}
-          onConfirm={async () => {
-            try {
-              await deleteFolder(folderDeleteTarget.id);
-              if (newSessionFolderId === folderDeleteTarget.id) {
-                setNewSessionFolderId(undefined);
-              }
-              setFolderDeleteTarget(null);
-              void refreshSessions();
-            } catch (error) {
-              showToast(error instanceof Error ? error.message : '删除文件夹失败', 'error');
-            }
-          }}
-        />
-      ) : null}
-      {folderEditor ? (
-        <FolderEditorDialog
-          folder={folderEditor.folder}
-          value={folderEditor.value}
-          onChange={(value) =>
-            setFolderEditor((current) => (current ? { ...current, value } : null))
-          }
-          onCancel={() => setFolderEditor(null)}
-          onConfirm={handleFolderEditorConfirm}
         />
       ) : null}
       {identitySwitch ? (
@@ -1483,127 +1389,6 @@ function DeleteSessionDialog({
             onClick={() => void onConfirm()}
           >
             删除
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function DeleteFolderDialog({
-  name,
-  fallbackName,
-  onCancel,
-  onConfirm,
-}: {
-  name: string;
-  fallbackName: string;
-  onCancel: () => void;
-  onConfirm: () => Promise<void>;
-}) {
-  const dialogRef = useDialogBehavior(onCancel);
-  return (
-    <div
-      className="modal-overlay"
-      onMouseDown={(event) => event.target === event.currentTarget && onCancel()}
-    >
-      <div
-        ref={dialogRef}
-        className="modal-panel"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="delete-folder-title"
-        tabIndex={-1}
-      >
-        <div className="modal-panel__head">
-          <b id="delete-folder-title">删除文件夹</b>
-          <button className="btn-icon sm" onClick={onCancel} aria-label="关闭" type="button">
-            ×
-          </button>
-        </div>
-        <div className="modal-panel__body">
-          <p>
-            确定删除「{name}」吗？其中的会话会移入「{fallbackName}」，不会删除任何会话内容。
-          </p>
-        </div>
-        <div className="modal-panel__foot">
-          <button className="btn btn--sm" type="button" onClick={onCancel}>
-            取消
-          </button>
-          <button
-            className="btn btn--danger btn--sm"
-            type="button"
-            onClick={() => void onConfirm()}
-          >
-            删除
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function FolderEditorDialog({
-  folder,
-  value,
-  onChange,
-  onCancel,
-  onConfirm,
-}: {
-  folder: SessionFolder | null;
-  value: string;
-  onChange: (value: string) => void;
-  onCancel: () => void;
-  onConfirm: () => Promise<void>;
-}) {
-  const dialogRef = useDialogBehavior(onCancel);
-  const title = folder ? '重命名文件夹' : '新建文件夹';
-  return (
-    <div
-      className="modal-overlay"
-      onMouseDown={(event) => event.target === event.currentTarget && onCancel()}
-    >
-      <div
-        ref={dialogRef}
-        className="modal-panel"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="folder-editor-title"
-        tabIndex={-1}
-      >
-        <div className="modal-panel__head">
-          <b id="folder-editor-title">{title}</b>
-          <button className="btn-icon sm" onClick={onCancel} aria-label="关闭" type="button">
-            ×
-          </button>
-        </div>
-        <div className="modal-panel__body">
-          <label className="field">
-            <span className="label">文件夹名称</span>
-            <input
-              className="input"
-              autoFocus
-              maxLength={80}
-              value={value}
-              onChange={(event) => onChange(event.target.value)}
-              onKeyDown={(event) => {
-                if (!event.nativeEvent.isComposing && event.key === 'Enter' && value.trim())
-                  void onConfirm();
-              }}
-            />
-          </label>
-        </div>
-        <div className="modal-panel__foot">
-          <button className="btn btn--sm" type="button" onClick={onCancel}>
-            取消
-          </button>
-          <button
-            className="btn btn--primary btn--sm"
-            type="button"
-            disabled={!value.trim()}
-            onClick={() => void onConfirm()}
-          >
-            保存
           </button>
         </div>
       </div>

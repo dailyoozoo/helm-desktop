@@ -131,7 +131,6 @@ const fixtures: Record<string, unknown> = {
       pricingFeedUrls: [],
       pricingUnknownPolicy: 'warn',
       pricingMaxAgeDays: 30,
-      onboardingCompleted: true,
       autoTitleSessions: true,
     },
     engines: {

@@ -14,8 +14,6 @@ export interface AppSettings {
     pricingFeedUrls: string[];
     pricingUnknownPolicy: 'warn' | 'block';
     pricingMaxAgeDays: number;
-    /** 首启引导是否已完成/跳过（完成或显式跳过都置 true） */
-    onboardingCompleted?: boolean;
     /** 首轮后用 fast model 自动起标题与摘要（外发到用户绑定的服务商，可关） */
     autoTitleSessions: boolean;
     /** 点关闭按钮时最小化到托盘而不是退出（变更-12）：后台会话继续运行 */
@@ -89,7 +87,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
     pricingFeedUrls: [],
     pricingUnknownPolicy: 'warn',
     pricingMaxAgeDays: 30,
-    onboardingCompleted: false,
     autoTitleSessions: true,
   },
   engines: {

@@ -124,6 +124,10 @@ pub struct RuntimeGrantDisplay {
 
 pub const RUNTIME_GRANT_CEILING_VERSION: &str = "runtime-safe-v1";
 const PROCESS_EXEC_MATCHER_PREFIX: &str = "helm:process-exec:v1:";
+/// Session 范围的 ProcessExec 授权按"可执行文件身份"（而不是精确 argv）匹配，见 ADR 0016。
+/// 只用于 `PermissionScope::Session`；Turn/Project/Global/Always 仍用精确 argv 的
+/// `process-exec:v1`。跨会话持久授权不放宽。
+const PROCESS_EXEC_SESSION_MATCHER_PREFIX: &str = "helm:process-exec-session:v1:";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -132,6 +136,18 @@ struct ProcessExecMatcherV1 {
     executable_sha256: String,
     argv_sha256: String,
     stdin_sha256: String,
+}
+
+/// Session 范围 ProcessExec 授权 matcher：只绑定可执行文件身份与引擎/工作目录，
+/// 不含 argv/stdin，因此同一可执行文件在本会话内的命令可复用授权（ADR 0016）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProcessExecSessionMatcherV1 {
+    canonical_executable: String,
+    executable_sha256: String,
+    engine: String,
+    /// 授权时的工作目录；匹配时若动作 cwd 不同则 fail-closed 回退 Ask。None 表示不校验 cwd。
+    cwd: Option<String>,
 }
 
 pub fn runtime_approval_adapter_version(engine: &str) -> Option<&'static str> {
@@ -210,6 +226,14 @@ pub fn runtime_grant_display(action: &ActionDescriptor) -> Option<RuntimeGrantDi
             (
                 format!("此项目始终允许读取 {origin}"),
                 format!("当前引擎 + GET/HEAD + {origin}"),
+            )
+        }
+        "process_exec_v1" => {
+            let executable = process_exec_matcher_executable_label(action)
+                .unwrap_or_else(|| "该程序".to_string());
+            (
+                format!("此项目永久允许执行 {executable}"),
+                format!("当前引擎 + {executable}"),
             )
         }
         _ => {
@@ -334,6 +358,89 @@ pub(crate) fn process_exec_rule_matches(pattern: &str, action: &ActionDescriptor
         return false;
     };
     process_exec_matcher(action).is_some_and(|actual| actual == expected)
+}
+
+/// 从命令里提取可执行文件名，用于审批卡等用户可见文案。
+fn process_exec_matcher_executable_label(action: &ActionDescriptor) -> Option<String> {
+    let command = action.raw_input.get("command")?.as_str()?;
+    let (executable, _) = command_executable_and_tail(command)?;
+    let path = std::path::Path::new(executable);
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    Some(if name.is_empty() {
+        executable.to_string()
+    } else {
+        name
+    })
+}
+
+/// Session 范围 ProcessExec 授权 matcher 的生成（ADR 0016）。只绑定可执行文件身份 +
+/// 引擎 + 授权时 cwd，不含 argv/stdin，允许同一可执行文件的本会话命令复用授权。
+pub(crate) fn process_exec_session_matcher_pattern(action: &ActionDescriptor) -> Option<String> {
+    if action.invalid_reason.is_some() || action.capability != Capability::ProcessExec {
+        return None;
+    }
+    let command = action.raw_input.get("command")?.as_str()?;
+    let (executable, _) = command_executable_and_tail(command)?;
+    let canonical = resolve_command_executable(executable, action.cwd.as_deref())?;
+    let canonical_executable = canonical_executable_string(&canonical);
+    let executable_sha256 = sha256_file(&canonical)?;
+    let matcher = ProcessExecSessionMatcherV1 {
+        canonical_executable,
+        executable_sha256,
+        engine: action.engine.clone(),
+        cwd: action.cwd.clone(),
+    };
+    Some(format!(
+        "{PROCESS_EXEC_SESSION_MATCHER_PREFIX}{}",
+        serde_json::to_string(&matcher).ok()?
+    ))
+}
+
+/// Session 范围 ProcessExec 授权 matcher 的匹配：不比较 argv/stdin，但必须同一
+/// 可执行文件、同一引擎、同一 cwd（cwd 授权后改变则 fail-closed 回退 Ask）。
+pub(crate) fn process_exec_session_rule_matches(pattern: &str, action: &ActionDescriptor) -> bool {
+    if action.capability != Capability::ProcessExec {
+        return false;
+    }
+    let Some(encoded) = pattern.strip_prefix(PROCESS_EXEC_SESSION_MATCHER_PREFIX) else {
+        return false;
+    };
+    let Ok(expected) = serde_json::from_str::<ProcessExecSessionMatcherV1>(encoded) else {
+        return false;
+    };
+    if action.engine != expected.engine {
+        return false;
+    }
+    if expected.cwd.is_some()
+        && !session_cwd_matches(expected.cwd.as_deref(), action.cwd.as_deref())
+    {
+        return false;
+    }
+    let Some(command) = action.raw_input.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some((executable, _)) = command_executable_and_tail(command) else {
+        return false;
+    };
+    let Some(canonical) = resolve_command_executable(executable, action.cwd.as_deref()) else {
+        return false;
+    };
+    canonical_executable_string(&canonical) == expected.canonical_executable
+        && sha256_file(&canonical).as_deref() == Some(expected.executable_sha256.as_str())
+}
+
+fn session_cwd_matches(expected: Option<&str>, actual: Option<&str>) -> bool {
+    match (expected, actual) {
+        (Some(expected), Some(actual)) => {
+            normalize_session_path(expected) == normalize_session_path(actual)
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn normalize_session_path(value: &str) -> String {
+    value.replace('\\', "/").to_ascii_lowercase()
 }
 
 fn process_exec_matcher(action: &ActionDescriptor) -> Option<ProcessExecMatcherV1> {
@@ -569,7 +676,12 @@ pub fn build_session_rule_from_action(
     action: &ActionDescriptor,
     created_at: i64,
 ) -> PermissionRule {
-    let resource_pattern = rule_resource_pattern(action);
+    let resource_pattern = if action.capability == Capability::ProcessExec {
+        // ADR 0016：Session 范围 ProcessExec 授权只可执行文件，见下方说明。
+        process_exec_session_matcher_pattern(action)
+    } else {
+        rule_resource_pattern(action)
+    };
     let fingerprint = serde_json::to_vec(&serde_json::json!({
         "principal": action.principal,
         "sessionId": action.session_id,
@@ -746,6 +858,26 @@ pub(crate) fn safe_read_action_is_eligible(action: &ActionDescriptor) -> bool {
         !resource.is_empty()
             && !path_uses_alternate_data_stream(resource)
             && resolve_workspace_path(cwd, cwd, resource)
+                .is_some_and(|resolved| !sensitive_path_is_denied(&resolved))
+    })
+}
+
+/// 判定结构化写目标是否可安全放行：所有资源都可证明落在 `workspace_root` 内、
+/// 且不命中保护路径、不是 ADS。任一资源越界/敏感即返回 false（fail-closed）。
+pub(crate) fn safe_file_write_resources_within(
+    action: &ActionDescriptor,
+    workspace_root: &str,
+) -> bool {
+    if action.invalid_reason.is_some() || action.capability != Capability::FileWrite {
+        return false;
+    }
+    if workspace_root.is_empty() || action.resources.is_empty() {
+        return false;
+    }
+    action.resources.iter().all(|resource| {
+        !resource.is_empty()
+            && !path_uses_alternate_data_stream(resource)
+            && resolve_workspace_path(workspace_root, workspace_root, resource)
                 .is_some_and(|resolved| !sensitive_path_is_denied(&resolved))
     })
 }
@@ -1161,6 +1293,52 @@ mod tests {
     }
 
     #[test]
+    fn safe_file_write_accepts_bounded_non_sensitive_targets_and_rejects_outside_protected() {
+        let root = "D:/repo";
+        let write_action = |resource: &str| {
+            let mut action = normalize_tool_action(
+                "codex",
+                "session-1",
+                "turn-1",
+                "tool-1",
+                "Write",
+                &json!({"file_path": resource}),
+                Some(root),
+            );
+            action.operation = "fileChange".to_string();
+            action.resources = vec![resource.to_string()];
+            action
+        };
+        assert!(crate::permissions::safe_file_write_resources_within(
+            &write_action("src/lib.rs"),
+            root,
+        ));
+        assert!(crate::permissions::safe_file_write_resources_within(
+            &write_action("D:/repo/new-file.txt"),
+            root,
+        ));
+        for resource in [
+            "D:/outside.txt",
+            ".env.local",
+            ".ssh/config",
+            "D:/repo/../secret.txt",
+            "nul",
+            "D:/repo/data:stream",
+        ] {
+            let action = write_action(resource);
+            assert!(
+                !crate::permissions::safe_file_write_resources_within(&action, root),
+                "unsafe file write target was auto-approved: {resource}"
+            );
+        }
+        let empty_root = write_action("src/lib.rs");
+        assert!(!crate::permissions::safe_file_write_resources_within(
+            &empty_root,
+            "",
+        ));
+    }
+
+    #[test]
     fn safe_network_read_accepts_public_structured_reads_and_rejects_sensitive_targets() {
         let action = |tool: &str, input: serde_json::Value| {
             normalize_tool_action(
@@ -1567,11 +1745,20 @@ mod tests {
             session.scope_binding.session_id.as_deref(),
             Some("history-1")
         );
+        // ADR 0016：Session 授权按可执行文件身份，同一可执行文件的不同 argv 复用同一规则。
         let mut other_resource = action.clone();
         other_resource.raw_input = serde_json::json!({"command":"cargo check"});
+        assert_eq!(
+            session.id,
+            super::build_session_rule_from_action(&other_resource, 12).id,
+            "cargo test 与 cargo check 解析到同一可执行文件，Session 授权应复用同一规则"
+        );
+        // 换引擎后不应复用同一规则。
+        let mut other_engine = action.clone();
+        other_engine.engine = "claude-code".to_string();
         assert_ne!(
             session.id,
-            super::build_session_rule_from_action(&other_resource, 12).id
+            super::build_session_rule_from_action(&other_engine, 12).id
         );
         let project = super::build_project_rule_from_action(&action, 13).unwrap();
         assert_eq!(project.scope, PermissionScope::Project);
@@ -1620,7 +1807,7 @@ mod tests {
     }
 
     #[test]
-    fn process_exec_allow_scopes_bind_exact_argv_and_stdin() {
+    fn process_exec_allow_binds_exact_argv_for_persistent_but_not_session() {
         let (root, executable) = process_exec_fixture();
         let approved = process_action(
             &executable,
@@ -1630,29 +1817,30 @@ mod tests {
             "alpha beta",
             json!("input-a"),
         );
-        let rules = [
-            build_turn_rule_from_action(&approved, 1),
-            build_session_rule_from_action(&approved, 1),
-            build_project_rule_from_action(&approved, 1).unwrap(),
-            build_always_rule_from_action(&approved, 1),
-        ];
+        let turn = build_turn_rule_from_action(&approved, 1);
+        let project = build_project_rule_from_action(&approved, 1).unwrap();
+        let always = build_always_rule_from_action(&approved, 1);
 
-        for rule in rules {
+        // 持久范围（Turn/Project/Always）必须精确 argv+stdin 命中，见红线。
+        for rule in [&turn, &project, &always] {
             assert!(rule
                 .resource_pattern
                 .as_deref()
                 .is_some_and(|pattern| pattern.starts_with(PROCESS_EXEC_MATCHER_PREFIX)));
+            assert!(rule
+                .resource_pattern
+                .as_deref()
+                .is_some_and(|pattern| !pattern.starts_with(PROCESS_EXEC_SESSION_MATCHER_PREFIX)));
             assert_eq!(
                 crate::permission_kernel::evaluate_action(
                     &approved,
-                    std::slice::from_ref(&rule),
+                    std::slice::from_ref(rule),
                     2,
-                    1,
+                    1
                 )
                 .effect,
                 PermissionEffect::Allow
             );
-
             let changed_argv = process_action(
                 &executable,
                 "session-1",
@@ -1662,11 +1850,15 @@ mod tests {
                 json!("input-a"),
             );
             assert_eq!(
-                crate::permission_kernel::evaluate_action(&changed_argv, &[rule.clone()], 2, 1)
-                    .effect,
+                crate::permission_kernel::evaluate_action(
+                    &changed_argv,
+                    std::slice::from_ref(rule),
+                    2,
+                    1,
+                )
+                .effect,
                 PermissionEffect::Ask
             );
-
             let changed_stdin = process_action(
                 &executable,
                 "session-1",
@@ -1676,10 +1868,82 @@ mod tests {
                 json!("input-b"),
             );
             assert_eq!(
-                crate::permission_kernel::evaluate_action(&changed_stdin, &[rule], 2, 1).effect,
+                crate::permission_kernel::evaluate_action(
+                    &changed_stdin,
+                    std::slice::from_ref(rule),
+                    2,
+                    1,
+                )
+                .effect,
                 PermissionEffect::Ask
             );
         }
+
+        // Session 范围（ADR 0016）：只绑定可执行文件身份，但不跨 argv/cwd/engine/可执行文件。
+        let session = build_session_rule_from_action(&approved, 1);
+        assert!(session
+            .resource_pattern
+            .as_deref()
+            .is_some_and(|pattern| pattern.starts_with(PROCESS_EXEC_SESSION_MATCHER_PREFIX)));
+        let changed_argv = process_action(
+            &executable,
+            "session-1",
+            "turn-1",
+            "tool-2",
+            "alpha changed",
+            json!("input-a"),
+        );
+        assert_eq!(
+            crate::permission_kernel::evaluate_action(
+                &changed_argv,
+                std::slice::from_ref(&session),
+                2,
+                1
+            )
+            .effect,
+            PermissionEffect::Allow,
+            "同 executable 不同 argv 在本会话内应继续放行"
+        );
+        let changed_stdin = process_action(
+            &executable,
+            "session-1",
+            "turn-1",
+            "tool-3",
+            "alpha beta",
+            json!("input-b"),
+        );
+        assert_eq!(
+            crate::permission_kernel::evaluate_action(
+                &changed_stdin,
+                std::slice::from_ref(&session),
+                2,
+                1
+            )
+            .effect,
+            PermissionEffect::Allow,
+            "同 executable 不同 stdin 在本会话内应继续放行"
+        );
+        // 换个可执行文件（非法路径）不命中。
+        let other_exe = root.join("bin folder").join("other.bin");
+        std::fs::write(&other_exe, b"binary-v1").unwrap();
+        let other_action = process_action(
+            &other_exe,
+            "session-1",
+            "turn-1",
+            "tool-4",
+            "alpha",
+            Value::Null,
+        );
+        assert_eq!(
+            crate::permission_kernel::evaluate_action(
+                &other_action,
+                std::slice::from_ref(&session),
+                2,
+                1,
+            )
+            .effect,
+            PermissionEffect::Ask
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1702,7 +1966,7 @@ mod tests {
             .join("..")
             .join(executable.file_name().unwrap());
         std::fs::create_dir_all(executable.parent().unwrap().join("child")).unwrap();
-        let aliased_action = process_action(
+        let mut aliased_action = process_action(
             &alias,
             "session-1",
             "turn-2",
@@ -1710,6 +1974,8 @@ mod tests {
             "alpha",
             Value::Null,
         );
+        // cwd 由工具真实工作目录驱动，别名路径解析到同一可执行文件，身份应与批准一致。
+        aliased_action.cwd = approved.cwd.clone();
         assert_eq!(
             crate::permission_kernel::evaluate_action(&aliased_action, &[rule.clone()], 2, 1)
                 .effect,

@@ -321,5 +321,10 @@ pub enum AgentEvent {
         /// 缺省视为 unknown（向后兼容旧事件）。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<String>,
+        /// 工具停滞时的细分状态（kind == "tool_stalled" 时）：waiting_approval =
+        /// 有审批在等用户；executing / waiting_result = 工具或结果长时间无进展。
+        /// 用来决定 UI 是引导"去确认审批"还是"停止/继续等待"。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stalled_kind: Option<String>,
     },
 }

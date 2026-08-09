@@ -154,8 +154,8 @@ describe('基础对话场景 DLG-01 至 DLG-12', () => {
       id: 'a-1',
       action: 'Bash',
       detail: 'git status',
-      availableDecisions: ['allow', 'turn', 'session', 'project', 'always', 'deny'],
-      persistentLabel: '本项目永久允许',
+      availableDecisions: ['allow', 'session', 'deny'],
+      persistentLabel: '本会话总是允许',
       matcherSummary: 'Bash + git status',
     });
     let next = reduceSessionEvent(state({ status: 'working' }), request);

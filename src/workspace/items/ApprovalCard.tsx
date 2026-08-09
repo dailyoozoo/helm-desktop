@@ -11,16 +11,16 @@ interface Props {
 }
 
 const DECISION_LABELS: Record<Decision, string> = {
-  allow: '仅允许一次',
+  allow: '当次允许',
   turn: '本轮允许',
-  session: '本会话允许',
+  session: '总是允许',
   project: '此项目允许',
   always: '所有项目允许',
   deny: '拒绝',
 };
 
 const RESOLVED_LABELS: Record<Decision, string> = {
-  allow: '已批准一次',
+  allow: '已批准当次',
   turn: '已批准本轮',
   session: '已批准本会话',
   project: '已批准此项目',
@@ -55,11 +55,10 @@ export const ApprovalCard = memo(function ApprovalCard({ item, onRespond, classN
             Helm 想要执行以下操作，请先审核再允许。
           </div>
           <div className="approve__cmd">{item.detail || item.action}</div>
-          {item.matcherSummary &&
-          item.availableDecisions.some(
-            (decision) => decision === 'project' || decision === 'always',
-          ) ? (
-            <div className="approve__scope">授权匹配范围：{item.matcherSummary}</div>
+          {item.matcherSummary && item.availableDecisions.includes('session') ? (
+            <div className="approve__scope">
+              选择&quot;总是允许&quot;后，本会话执行该程序不再逐条确认。
+            </div>
           ) : null}
           {item.status === 'failed' && item.error ? (
             <div className="prose" style={{ fontSize: 12, color: 'var(--danger)', marginTop: 8 }}>
