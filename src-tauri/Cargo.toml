@@ -1,6 +1,6 @@
 [package]
 name = "helm"
-version = "0.3.0"
+version = "0.4.0"
 description = "Helm —— 驱动本地 CLI Agent 的桌面控制台"
 edition = "2021"
 rust-version = "1.77"

@@ -33,9 +33,15 @@ pub struct StagedFile {
 
 /// 执行 git 命令并返回 stdout；失败时返回错误信息。
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
+    let mut command = Command::new("git");
+    command.args(args).current_dir(cwd);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        // 不闪黑框：release 下 GUI 进程无控制台，直接拉起 git 会弹 cmd 窗口
+        command.creation_flags(0x0800_0000);
+    }
+    let output = command
         .output()
         .map_err(|e| format!("执行 git 失败：{e}"))?;
 

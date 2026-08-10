@@ -171,32 +171,34 @@ export function ProvidersPage() {
   return (
     <main className="main">
       <div className="page scroll">
-        <div className="page__head">
-          <div>
-            <div className="page__title">服务商与模型</div>
-            <div className="page__sub">
-              使用 Claude / ChatGPT 订阅，或配置 API 服务商，并为每个 CLI 引擎绑定生效模型。
+        <div className="providers-sticky">
+          <div className="page__head providers-head">
+            <div>
+              <div className="page__title">服务商与模型</div>
+              <div className="page__sub">
+                使用 Claude / ChatGPT 订阅，或配置 API 服务商，并为每个 CLI 引擎绑定生效模型。
+              </div>
             </div>
-          </div>
-          <button className="btn btn--primary" onClick={() => setAddProviderOpen(true)}>
-            <Icon name="plus" /> 添加服务商
-          </button>
-        </div>
-
-        <div className="providers-tabs tabbar">
-          {[
-            ['bindings', '引擎与绑定'],
-            ['providers', '服务商'],
-            ['models', '模型目录'],
-          ].map(([id, label]) => (
-            <button
-              key={id}
-              className={'tab' + (tab === id ? ' is-active' : '')}
-              onClick={() => setTab(id as Tab)}
-            >
-              {label}
+            <button className="btn btn--primary" onClick={() => setAddProviderOpen(true)}>
+              <Icon name="plus" /> 添加服务商
             </button>
-          ))}
+          </div>
+
+          <div className="providers-tabs tabbar">
+            {[
+              ['bindings', '引擎与绑定'],
+              ['providers', '服务商'],
+              ['models', '模型目录'],
+            ].map(([id, label]) => (
+              <button
+                key={id}
+                className={'tab' + (tab === id ? ' is-active' : '')}
+                onClick={() => setTab(id as Tab)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
         </div>
 
         <div className="providers-wrap">
@@ -1116,6 +1118,7 @@ function ProvidersPanel({
   ).length;
   const deleteBlockedReason = providerDeleteBlockedReason(providerBindingCount);
   const deleteCopy = providerDeleteConfirmation(draft, providerModelCount, providerBindingCount);
+  const failureCategory = providerFailureCategory(draft);
 
   return (
     <div className="providers-split">
@@ -1175,136 +1178,142 @@ function ProvidersPanel({
             {readinessText(draft)}
           </span>
         </div>
-        <div className="divider" />
-        <div className="form-grid">
-          <label className="field">
-            <span>名称</span>
-            <input
-              className="input"
-              value={draft.name}
-              onChange={(event) => setDraft({ ...draft, name: event.target.value })}
-            />
-          </label>
-          {draft.kind === 'subscription' ? (
-            <div className="field pv-account-source">
-              <span>接入方式</span>
-              <b>{draft.protocol === 'anthropic' ? 'Claude 官方订阅' : 'ChatGPT 官方订阅'}</b>
-              <div className="hint">
-                固定用于：{usableEngines.length ? usableEngines.join('、') : '暂无兼容引擎'}；
-                官方地址和认证方式不可在这里修改。
-              </div>
-            </div>
-          ) : (
-            <>
-              <label className="field">
-                <span>接口规范</span>
-                <select
-                  className="select"
-                  value={draft.protocol}
-                  onChange={(event) =>
-                    setDraft({ ...draft, protocol: event.target.value as ProviderProtocol })
-                  }
-                >
-                  {PROTOCOLS.map((protocol) => (
-                    <option key={protocol} value={protocol}>
-                      {protocolLabel(protocol)}
-                    </option>
-                  ))}
-                </select>
+        <div className="provider-section">
+          <div className="provider-section__t">基础配置</div>
+          <div className="form-grid">
+            <label className="field">
+              <span>名称</span>
+              <input
+                className="input"
+                value={draft.name}
+                onChange={(event) => setDraft({ ...draft, name: event.target.value })}
+              />
+            </label>
+            {draft.kind === 'subscription' ? (
+              <div className="field pv-account-source">
+                <span>接入方式</span>
+                <b>{draft.protocol === 'anthropic' ? 'Claude 官方订阅' : 'ChatGPT 官方订阅'}</b>
                 <div className="hint">
-                  决定哪些引擎能使用它 · 当前可用于：
-                  {usableEngines.length ? usableEngines.join('、') : '暂无兼容引擎'}
+                  固定用于：{usableEngines.length ? usableEngines.join('、') : '暂无兼容引擎'}；
+                  官方地址和认证方式不可在这里修改。
                 </div>
-              </label>
-              <label className="field">
-                <span>认证方式</span>
-                <select
-                  className="select"
-                  value={draft.authMethod}
-                  onChange={(event) =>
-                    setDraft({ ...draft, authMethod: event.target.value as ProviderAuthMethod })
-                  }
-                >
-                  {AUTH_METHODS.filter((method) => method !== 'oauth').map((method) => (
-                    <option key={method} value={method}>
-                      {AUTH_METHOD_LABELS[method]}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              {capabilities.showBaseUrl ? (
+              </div>
+            ) : (
+              <>
                 <label className="field">
-                  <span>基础 URL</span>
-                  <input
-                    data-provider-field="base-url"
-                    className="input mono"
-                    value={draft.baseUrl}
-                    disabled={draft.authMethod === 'cloud'}
-                    onChange={(event) => setDraft({ ...draft, baseUrl: event.target.value })}
-                  />
+                  <span>接口规范</span>
+                  <select
+                    className="select"
+                    value={draft.protocol}
+                    onChange={(event) =>
+                      setDraft({ ...draft, protocol: event.target.value as ProviderProtocol })
+                    }
+                  >
+                    {PROTOCOLS.map((protocol) => (
+                      <option key={protocol} value={protocol}>
+                        {protocolLabel(protocol)}
+                      </option>
+                    ))}
+                  </select>
+                  <div className="hint">
+                    决定哪些引擎能使用它 · 当前可用于：
+                    {usableEngines.length ? usableEngines.join('、') : '暂无兼容引擎'}
+                  </div>
                 </label>
-              ) : null}
-            </>
-          )}
+                <label className="field">
+                  <span>认证方式</span>
+                  <select
+                    className="select"
+                    value={draft.authMethod}
+                    onChange={(event) =>
+                      setDraft({ ...draft, authMethod: event.target.value as ProviderAuthMethod })
+                    }
+                  >
+                    {AUTH_METHODS.filter((method) => method !== 'oauth').map((method) => (
+                      <option key={method} value={method}>
+                        {AUTH_METHOD_LABELS[method]}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {capabilities.showBaseUrl ? (
+                  <label className="field">
+                    <span>基础 URL</span>
+                    <input
+                      data-provider-field="base-url"
+                      className="input mono"
+                      value={draft.baseUrl}
+                      disabled={draft.authMethod === 'cloud'}
+                      onChange={(event) => setDraft({ ...draft, baseUrl: event.target.value })}
+                    />
+                  </label>
+                ) : null}
+              </>
+            )}
+          </div>
         </div>
-        <AuthFields
-          draft={draft}
-          keyValue={keyValue}
-          apiKey={apiKey}
-          showKey={showKey}
-          editingKey={editingKey}
-          onDraft={setDraft}
-          onApiKey={setApiKey}
-          onShowKey={setShowKey}
-          onEditingKey={setEditingKey}
-          onSecretMissing={markSecretMissing}
-          onConfig={onConfig}
-          onNotice={onNotice}
-        />
-        {draft.kind !== 'subscription' ? (
-          <div className="stat-3">
-            <div className="ministat">
-              <b>{readinessText(draft)}</b>
-              <small>配置状态</small>
+        <div className="provider-section">
+          <div className="provider-section__t">
+            {draft.kind === 'subscription' ? '订阅登录' : '认证'}
+          </div>
+          <AuthFields
+            draft={draft}
+            keyValue={keyValue}
+            apiKey={apiKey}
+            showKey={showKey}
+            editingKey={editingKey}
+            onDraft={setDraft}
+            onApiKey={setApiKey}
+            onShowKey={setShowKey}
+            onEditingKey={setEditingKey}
+            onSecretMissing={markSecretMissing}
+            onConfig={onConfig}
+            onNotice={onNotice}
+          />
+        </div>
+        {draft.kind !== 'subscription' && capabilities.canTestHttp ? (
+          <div className="provider-section">
+            <div className="provider-section__t">连接与状态</div>
+            <div className="connectivity">
+              <span className="connectivity__ic">
+                <Icon name="zap" />
+              </span>
+              <div className="grow">
+                <b>
+                  {resultLabel(testResult) ?? lastTestText(draft)}
+                  {failureCategory ? (
+                    <span className={'failure-tag failure-tag--' + failureCategory}>
+                      {failureCategoryLabel(failureCategory)}
+                    </span>
+                  ) : null}
+                </b>
+                <small>
+                  {resultLabel(testResult) ? '本次测试' : `上次测试 · ${lastTestTimeText(draft)}`}
+                </small>
+              </div>
+              <button
+                className="btn btn--subtle"
+                disabled={testing}
+                onClick={testProvider}
+                type="button"
+              >
+                <Icon name="refresh" className={testing ? 'spin' : undefined} />
+                测试可达性
+              </button>
             </div>
-            <div className="ministat">
-              <b>{lastTestText(draft)}</b>
-              <small>上次测试</small>
-            </div>
-            <div className="ministat">
-              <b>{lastTestTimeText(draft)}</b>
-              <small>测试时间</small>
-            </div>
+            {failureCategory ? (
+              <div className="connectivity-note">
+                {failureCategory === 'network' && '无法连接到服务商：请检查网络和基础 URL。'}
+                {failureCategory === 'auth' && '认证失败：请确认 API 密钥是否正确。'}
+                {failureCategory === 'timeout' && '连接超时：请检查网络状况或服务商状态。'}
+                {failureCategory === 'unknown' && '未识别的连接错误，可稍后重试。'}{' '}
+                <button className="btn-link" onClick={repairProviderFailure} type="button">
+                  去修复
+                </button>
+              </div>
+            ) : null}
           </div>
         ) : null}
-        {draft.kind !== 'subscription'
-          ? (() => {
-              const failCat = providerFailureCategory(draft);
-              if (!failCat) return null;
-              return (
-                <div className="failure-category-bar">
-                  <span className={'failure-tag failure-tag--' + failCat}>
-                    {failureCategoryLabel(failCat)}
-                  </span>
-                  <span className="failure-category-bar__text">
-                    {failCat === 'network' && '无法连接到服务商，请检查网络和基础 URL。'}
-                    {failCat === 'auth' && '认证失败，请检查 API 密钥是否正确。'}
-                    {failCat === 'timeout' && '连接超时，请检查网络状况或服务商状态。'}
-                    {failCat === 'unknown' && '未知错误，请查看详情后尝试修复。'}
-                  </span>
-                  <button
-                    className="btn btn--subtle btn--sm"
-                    onClick={repairProviderFailure}
-                    disabled={testing}
-                    type="button"
-                  >
-                    <Icon name="refresh" className={testing ? 'spin' : undefined} />
-                    去修复
-                  </button>
-                </div>
-              );
-            })()
-          : null}
         <ProviderModelCatalog
           config={config}
           provider={draft}
@@ -1315,11 +1324,6 @@ function ProvidersPanel({
           onRequestSave={saveProvider}
           onRequestTest={testProvider}
         />
-        <div className="hint">
-          {draft.kind === 'subscription'
-            ? '订阅模式只验证 Helm 独立 CLI Profile，不调用 Provider HTTP 接口。'
-            : (resultLabel(testResult) ?? '测试可达性会调用真实服务商接口。')}
-        </div>
         <div className="provider-actions">
           <button
             className="btn btn--danger"
@@ -1335,12 +1339,6 @@ function ProvidersPanel({
             移除服务商
           </button>
           <span className="grow" />
-          {capabilities.canTestHttp ? (
-            <button className="btn btn--subtle" disabled={testing} onClick={testProvider}>
-              <Icon name="refresh" className={testing ? 'spin' : undefined} />
-              测试可达性
-            </button>
-          ) : null}
           <button className="btn btn--primary" onClick={saveProvider}>
             <Icon name="check" />
             保存服务商与模型
@@ -1570,15 +1568,17 @@ function ProviderModelCatalog({
             <b>{emptyState.title}</b>
             <p>{emptyState.body}</p>
           </div>
-          <button
-            className="btn btn--subtle btn--sm"
-            disabled={syncing}
-            onClick={runEmptyAction}
-            type="button"
-          >
-            <Icon name={emptyState.action === '同步模型列表' ? 'refresh' : 'check'} />
-            {emptyState.action}
-          </button>
+          {emptyState.action !== '测试可达性' ? (
+            <button
+              className="btn btn--subtle btn--sm"
+              disabled={syncing}
+              onClick={runEmptyAction}
+              type="button"
+            >
+              <Icon name={emptyState.action === '同步模型列表' ? 'refresh' : 'check'} />
+              {emptyState.action}
+            </button>
+          ) : null}
         </div>
       )}
       {editingPrice ? (

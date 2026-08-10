@@ -1529,8 +1529,14 @@ fn resolve_claude_binary_path(configured_bin: &str) -> Result<PathBuf, String> {
     } else {
         #[cfg(windows)]
         {
-            let output = std::process::Command::new("where.exe")
-                .arg(configured_bin)
+            let mut probe = std::process::Command::new("where.exe");
+            probe.arg(configured_bin);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt as _;
+                probe.creation_flags(CREATE_NO_WINDOW);
+            }
+            let output = probe
                 .output()
                 .map_err(|error| format!("resolve Claude binary failed: {error}"))?;
             if !output.status.success() {

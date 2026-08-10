@@ -407,9 +407,11 @@ fn resolve_binary_path(configured_bin: &str) -> Result<PathBuf, String> {
         return Ok(candidate.to_path_buf());
     }
     let output = if cfg!(windows) {
-        std::process::Command::new("where.exe")
-            .arg(configured_bin)
-            .output()
+        let mut probe = std::process::Command::new("where.exe");
+        probe.arg(configured_bin);
+        use std::os::windows::process::CommandExt as _;
+        probe.creation_flags(0x0800_0000);
+        probe.output()
     } else {
         std::process::Command::new("which")
             .arg(configured_bin)

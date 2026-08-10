@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .scratch/
+.agent/
 *.log
 .DS_Store
 .helm-public-repo

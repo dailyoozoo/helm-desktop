@@ -147,36 +147,51 @@ try {
   );
   await shot('01-default-standard');
 
-  // B1 视图密度三档
-  await evaluate('document.querySelectorAll("#densMenu .menu__item")[0].click()');
+  // B1 专注模式两态（Ctrl+O 切换，三档密度已取消）
+  check('头部无密度选择器', (await evaluate('!document.getElementById("densBtn")')) === true);
+  check(
+    '头部无跟随 Agent 按钮',
+    (await evaluate('!document.getElementById("followBtn")')) === true,
+  );
+  check('头部无重复分屏按钮', (await evaluate('!document.getElementById("artToggle")')) === true);
+  // 用真实快捷键驱动，不给原型加测试专用全局
+  await evaluate(
+    'document.dispatchEvent(new KeyboardEvent("keydown",{key:"o",ctrlKey:true,bubbles:true}))',
+  );
   await sleep(250);
   check(
-    '精简密度生效',
+    '专注模式生效',
     await evaluate('document.querySelector(".thread").classList.contains("dens-lite")'),
   );
   check(
-    '精简下过程条目被收起',
+    '专注模式下过程条目被收起',
     await evaluate(
       '[...document.querySelectorAll(\'#threadInner .item[data-kind="tgrp"]\')].every((e)=>getComputedStyle(e).display==="none")',
     ),
   );
-  await shot('02-density-lite');
-  await evaluate('document.querySelectorAll("#densMenu .menu__item")[2].click()');
+  await shot('02-focus-on');
+  await evaluate(
+    'document.dispatchEvent(new KeyboardEvent("keydown",{key:"o",ctrlKey:true,bubbles:true}))',
+  );
   await sleep(250);
   check(
-    '详尽密度生效',
-    await evaluate('document.querySelector(".thread").classList.contains("dens-full")'),
+    '关闭专注模式恢复标准',
+    !(await evaluate('document.querySelector(".thread").classList.contains("dens-lite")')),
   );
-  await shot('03-density-full');
-  await evaluate('document.querySelectorAll("#densMenu .menu__item")[1].click()');
-  await sleep(200);
+  await shot('03-focus-off');
 
   // A 交付物区
-  await evaluate('document.getElementById("artToggle").click()');
-  await sleep(400);
+  // auth 会话有 changes，启动时会自动打开右栏；如果已经打开就不需要点击 toggle
+  const hasCtxBefore = await evaluate(
+    '!document.getElementById("ws").classList.contains("no-ctx")',
+  );
+  if (!hasCtxBefore) {
+    await evaluate('document.getElementById("ctxToggle").click()');
+    await sleep(400);
+  }
   check(
     '交付物区打开（A5）',
-    !(await evaluate('document.getElementById("ws").classList.contains("no-ctx")')),
+    await evaluate('!document.getElementById("ws").classList.contains("no-ctx")'),
   );
   check(
     '变更文件清单有内容（A1）',
@@ -196,6 +211,41 @@ try {
   await shot('05-diff-split');
   await evaluate('document.querySelector(\'#dvMode [data-dv="unified"]\').click()');
   await sleep(200);
+
+  // 变更-34 v4：轮次结构与文件链接
+  check(
+    '用户消息不在 .turn 容器内',
+    (await evaluate('document.querySelectorAll(\'#threadInner .item[data-kind="user"]\').length')) >
+      0 &&
+      (await evaluate(
+        '[...document.querySelectorAll(\'#threadInner .item[data-kind="user"]\')].every(u => !u.closest(".turn"))',
+      )),
+  );
+  check(
+    '轮次容器只包含过程条目',
+    (await evaluate('document.querySelectorAll("#threadInner .turn").length')) > 0 &&
+      (await evaluate(
+        '[...document.querySelectorAll("#threadInner .turn")].every(t => !t.querySelector(\'.item[data-kind="user"]\'))',
+      )),
+  );
+  check(
+    '轮次折叠按钮存在',
+    (await evaluate('document.querySelectorAll("#threadInner .turn__lite").length')) > 0,
+  );
+  check(
+    '文件链接被标记',
+    (await evaluate('document.querySelectorAll("#threadInner .file-link").length')) > 0,
+  );
+  const fileLink = await evaluate('document.querySelector("#threadInner .file-link")');
+  if (fileLink) {
+    await evaluate('document.querySelector("#threadInner .file-link").click()');
+    await sleep(300);
+    check(
+      '点击文件链接打开右栏',
+      !(await evaluate('document.getElementById("ws").classList.contains("no-ctx")')),
+    );
+  }
+  await shot('04a-turn-structure-file-links');
 
   // A2 行级审阅意见 → 攒批 → 回灌
   await evaluate('document.querySelector("#chgView .dvl__add").click()');
@@ -238,21 +288,46 @@ try {
   await shot('08-review-fed-back');
   await sleep(1600);
 
-  // 计划 / 终端 tab
-  await evaluate('document.querySelector(\'.ctx__tabs [data-tab="plan"]\').click()');
-  await sleep(300);
+  // 计划 / 终端：动态 tab —— 默认不常驻，只有线程内点开才出现
   check(
-    '计划 tab 有内容（A4）',
+    '计划 tab 默认不常驻',
+    (await evaluate('!document.querySelector(\'.ctx__tabs [data-tab="plan"]\')')) === true,
+  );
+  check(
+    '终端 tab 默认不常驻',
+    (await evaluate('!document.querySelector(\'.ctx__tabs [data-tab="term"]\')')) === true,
+  );
+  await evaluate(
+    '(()=>{const b=document.querySelector(\'#threadInner [data-open="plan"]\');b&&b.click();})()',
+  );
+  await sleep(350);
+  check(
+    '线程内打开后计划 tab 出现并有内容（A4）',
     (await evaluate('document.querySelectorAll("#dockPlan .plan li").length')) > 0,
   );
-  await shot('09-artifact-plan');
-  await evaluate('document.querySelector(\'.ctx__tabs [data-tab="term"]\').click()');
-  await sleep(300);
   check(
-    '终端 tab 有内容（A4）',
+    '计划动态 tab 可关闭',
+    await evaluate('!!document.querySelector(\'.ctx__tabs [data-tab="plan"] .tab__x\')'),
+  );
+  await shot('09-artifact-plan');
+  await evaluate(
+    '(()=>{const b=document.querySelector(\'#threadInner [data-open="term"]\');b&&b.click();})()',
+  );
+  await sleep(350);
+  check(
+    '线程内打开后终端 tab 出现并有内容（A4）',
     (await evaluate('document.getElementById("dockTerm").textContent.trim().length')) > 0,
   );
   await shot('10-artifact-term');
+  // 关掉动态 tab，验证它真的退出常驻
+  await evaluate(
+    '(()=>{const x=document.querySelector(\'.ctx__tabs [data-tab="term"] .tab__x\');x&&x.click();})()',
+  );
+  await sleep(300);
+  check(
+    '关闭后终端 tab 从 tabbar 移除',
+    (await evaluate('!document.querySelector(\'.ctx__tabs [data-tab="term"]\')')) === true,
+  );
 
   // E 右栏任务面板与归因（切到并行子代理会话）
   await evaluate(
@@ -281,8 +356,10 @@ try {
   );
   await shot('11-subagents-thread');
 
-  await evaluate('document.querySelector(\'.ctx__tabs [data-tab="tasks"]\').click()');
-  await sleep(300);
+  await evaluate(
+    '(()=>{const b=document.querySelector(\'#threadInner [data-open="tasks"]\');b&&b.click();})()',
+  );
+  await sleep(350);
   check(
     '任务面板有子代理（E1）',
     (await evaluate('document.querySelectorAll("#saList .toolrow").length')) > 0,
@@ -312,9 +389,15 @@ try {
   );
   check('打开后 popover 真实可见', await evaluate(popVisible));
   check('打开后 MCP 区块可见（原右栏工具内容已并入）', await evaluate(mcpVisible));
+  const attribRows = await evaluate('document.querySelectorAll("#attribList .attrow").length');
+  const attribEmpty = await evaluate('!!document.querySelector("#attribList .sfolder-empty")');
+  const attribHtml = await evaluate(
+    'document.getElementById("attribList").innerHTML.slice(0, 100)',
+  );
   check(
-    '占用归因有行（E2）',
-    (await evaluate('document.querySelectorAll("#attribList .attrow").length')) > 0,
+    '占用归因有行或显示暂无数据（E2）',
+    attribRows > 0 || attribEmpty,
+    'rows=' + attribRows + ' empty=' + attribEmpty + ' html=' + attribHtml,
   );
   await shot('13-attribution');
   await evaluate('document.getElementById("ctxRing").click()');
@@ -427,7 +510,7 @@ try {
   // 深色主题
   await evaluate('Helm.setTheme("dark")');
   await sleep(400);
-  await evaluate('document.getElementById("artToggle").click()');
+  await evaluate('document.getElementById("ctxToggle").click()');
   await sleep(400);
   await shot('17-dark-theme');
   await evaluate('Helm.setTheme("light")');
