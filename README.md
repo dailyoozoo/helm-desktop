@@ -4,6 +4,9 @@ Helm 是一个用于统一管理多个 CLI Agent 引擎的桌面客户端，目�
 
 Helm 不重新实现 Agent，而是负责启动和管理本地 CLI、解析流式事件，并以桌面图形界面呈现会话、工具调用、文件差异、审批和用量等信息。
 
+<img width="1920" height="1008" alt="image" src="https://github.com/user-attachments/assets/0f9daf7e-ea7e-435f-9ede-9da3974d48dc" />
+
+
 ## 功能
 
 - Claude Code、Codex 多引擎会话
