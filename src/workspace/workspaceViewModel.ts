@@ -6,7 +6,7 @@ import type {
   ProviderConfig,
 } from '../providers/api';
 import type { SessionSummary } from '../sessions/sessionTypes';
-import { compatibleProvidersForEngine, modelsForProvider } from '../providers/providerViewModel';
+import { compatibleProvidersForEngine, sessionModelOptions } from '../providers/providerViewModel';
 import type { EngineId } from '@helm/protocol';
 
 export interface WorkspaceEngineOption {
@@ -35,7 +35,7 @@ export function workspaceEngineOptions(config: AppConfig): WorkspaceEngineOption
       engine,
       binding,
       provider,
-      models: provider ? modelsForProvider(config, provider.id) : [],
+      models: provider ? sessionModelOptions(config, provider.id) : [],
     };
   });
 }

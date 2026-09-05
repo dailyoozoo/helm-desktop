@@ -23,7 +23,7 @@ describe('ToolBlock', () => {
     expect(markup).toContain('src/app.ts');
   });
 
-  it('终端交付物成功后保留命令摘要但默认折叠输出', () => {
+  it('渲染形态 B：终端完成态默认折叠为轻量单行「运行命令」，不渲染深色终端卡', () => {
     const markup = render({
       kind: 'tool',
       id: 'bash-1',
@@ -32,12 +32,38 @@ describe('ToolBlock', () => {
       status: 'success',
       output: 'PASS',
     });
-    expect(markup).toContain('aria-expanded="false"');
-    expect(markup).toContain('aria-label="复制命令"');
+    // 轻量行：动作词 + 命令摘要 + 状态药丸；输出与深色终端卡都不渲染
+    expect(markup).toContain('运行命令');
     expect(markup).toContain('npm test');
+    expect(markup).toContain('exit 0');
+    expect(markup).toContain('aria-expanded="false"');
+    expect(markup).not.toContain('PASS');
+    expect(markup).not.toContain('class="term ');
+    expect(markup).not.toContain('aria-label="复制命令"');
   });
 
-  it('兼容终端别名和数组命令，并保持复制入口', () => {
+  it('终端卡运行中（pending）默认收起为轻量行并显示「运行中」药丸，点开才展开', () => {
+    const markup = render({
+      kind: 'tool',
+      id: 'bash-2',
+      name: 'Bash',
+      input: { command: 'npm run build' },
+      status: 'pending',
+      output: 'compiling...',
+    });
+    // 默认收起：渲染轻量行（.tool.is-lite），不渲染完整 .term 卡
+    expect(markup).toContain('tool is-lite');
+    expect(markup).toContain('aria-expanded="false"');
+    expect(markup).toContain('aria-label="展开命令与输出"');
+    expect(markup).not.toContain('class="term ');
+    expect(markup).not.toContain('aria-label="复制命令"');
+    // 收起时提示运行中（含完整命令摘要与药丸）
+    expect(markup).toContain('运行命令');
+    expect(markup).toContain('npm run build');
+    expect(markup).toContain('运行中');
+  });
+
+  it('兼容终端别名和数组命令（轻量行摘要显示完整命令）', () => {
     const markup = render({
       kind: 'tool',
       id: 'shell-1',
@@ -45,12 +71,12 @@ describe('ToolBlock', () => {
       input: { command: ['npm', 'run', 'check'] },
       status: 'success',
     });
-    expect(markup).toContain('aria-expanded="false"');
-    expect(markup).toContain('aria-label="复制命令"');
+    expect(markup).toContain('运行命令');
     expect(markup).toContain('npm run check');
+    expect(markup).not.toContain('class="term ');
   });
 
-  it('失败工具折叠详情时仍展示首行错误摘要', () => {
+  it('非拒绝的工具错误提成顶层 .failc 失败卡（非 .tool 内嵌），标题与分类常驻、详情可展开', () => {
     const markup = render({
       kind: 'tool',
       id: 'web-1',
@@ -59,8 +85,12 @@ describe('ToolBlock', () => {
       status: 'error',
       output: '[runtime_web_search_unavailable] 当前服务商不支持网络搜索\n完整错误详情',
     });
+    // 9/4 折叠化：失败卡默认收起为轻量单行（标题+分类药丸），详情点开展开
     expect(markup).toContain('aria-expanded="false"');
-    expect(markup).toContain('[runtime_web_search_unavailable] 当前服务商不支持网络搜索');
+    expect(markup).toContain('failc');
+    expect(markup).toContain('联网搜索');
+    expect(markup).toContain('网络失败');
+    expect(markup).not.toContain('runtime_web_search_unavailable');
   });
 
   it('自动审查拒绝显示未执行而不是工具失败', () => {
@@ -77,5 +107,16 @@ describe('ToolBlock', () => {
     expect(markup).toContain('未执行');
     expect(markup).toContain('pill--warn');
     expect(markup).not.toContain('pill--danger');
+  });
+
+  it('终端卡无「在交付物区查看」跳转按钮（原型无该入口）', () => {
+    const markup = render({
+      kind: 'tool',
+      id: 'bash-1',
+      name: 'Bash',
+      input: { command: 'npm test' },
+      status: 'success',
+    });
+    expect(markup).not.toContain('在交付物区查看全部命令输出');
   });
 });

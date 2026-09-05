@@ -1,46 +1,33 @@
-/* 用量页面样式 */
-.usage-wrap {
-  max-width: 1140px;
-  margin: 0 auto;
-  padding: 4px 36px 56px;
+/* ============================================================
+   用量页（S5 视觉对齐）—— 结构消费 src/styles/components.css 的
+   cm-* 共享组件，本文件只保留两层：
+   1) prototype/usage.html 内联覆盖层原样移植：选择器由
+      body[data-page="usage"] 收敛为页面根 .usage-page（实现不在
+      body 上标 data-page），每段注明原型行号；
+   2) 实现特有结构的作用域适配（加载/错误态、刷新置灰、焦点环、
+      折线对位、窄屏热力图滚动、五档图例），均注明与原型的差异。
+   颜色/圆角/字号只消费 src/styles/tokens.css 变量与 color-mix。
+   ============================================================ */
+
+/* —— 实现特有：加载占位 / 内联错误 / 局部刷新置灰 —— */
+.usage-loading {
+  padding: 3rem 0;
+  color: var(--fg-4);
+  font-size: 13px;
+  text-align: center;
 }
 
-/* 切周期局部刷新（B1-3）：保留已渲染数据，降透明度并禁交互，不整页替换 */
-.usage-wrap--refreshing {
-  opacity: 0.55;
-  pointer-events: none;
-  transition: opacity 0.15s;
-}
-
-.usage-inline-error,
-.usage-dialog-error {
+.usage-inline-error {
   display: flex;
   align-items: center;
   gap: 10px;
+  margin-bottom: 14px;
   padding: 10px 12px;
   border: 1px solid color-mix(in oklch, var(--danger) 35%, transparent);
   border-radius: var(--r-sm);
   background: var(--danger-soft);
   color: var(--fg-2);
-  font-size: 12.5px;
-}
-
-.usage-inline-error {
-  margin-bottom: 16px;
-}
-
-.usage-top-session {
-  width: 100%;
-  border: 0;
-  text-align: left;
-  font: inherit;
-  color: inherit;
-  cursor: pointer;
-  background: transparent;
-}
-
-.usage-top-session:hover {
-  background: var(--hover);
+  font-size: 12px;
 }
 
 .usage-inline-error svg {
@@ -50,445 +37,320 @@
   flex: none;
 }
 
-.usage-dialog-error {
-  align-items: flex-start;
+/* 切换时间范围时的局部刷新置灰（原型无此态） */
+.usage-refreshing {
+  opacity: 0.55;
+  pointer-events: none;
+  transition: opacity 0.15s var(--ease);
 }
 
-.usage-stats {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 14px;
-  margin-bottom: 14px;
-}
+/* ============================================================
+   一、自 prototype/usage.html 内联样式移植（页面覆盖层）
+   ============================================================ */
 
-.stat {
+/* —— KPI 卡片：浅色底块、圆角、无线条，右侧图标徽章
+      （自 prototype/usage.html L17-67 移植）—— */
+.usage-page .cm-kpi-grid {
+  gap: 12px;
+  border: 0;
+}
+.usage-page .cm-kpi-grid > .cm-kpi {
+  position: relative;
+  border: 0;
+  border-radius: var(--r);
+  background: color-mix(in oklch, var(--fg) 2.5%, var(--bg));
+  box-shadow: none;
+  min-height: auto;
   padding: 16px 18px;
+  transition: background 0.16s var(--ease);
+}
+.usage-page .cm-kpi-grid > .cm-kpi:hover {
+  background: color-mix(in oklch, var(--fg) 4%, var(--bg));
+}
+/* 替换基础小圆点装饰为图标徽章（L35） */
+.usage-page .cm-kpi::after {
+  display: none;
+}
+.usage-page .cm-kpi__badge {
+  position: absolute;
+  top: 14px;
+  right: 16px;
+  width: 32px;
+  height: 32px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r-sm);
+  background: var(--accent-soft);
+  color: var(--accent-hi);
+}
+/* 实现差异：Icon 直接渲染裸 svg（原型为 [data-ic] > svg 两层），尺寸规则随层适配 */
+.usage-page .cm-kpi__badge svg {
+  width: 16px;
+  height: 16px;
+}
+.usage-page .cm-kpi__label {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 12px;
+  color: var(--fg-4);
+}
+.usage-page .cm-kpi__split {
+  gap: 0;
+  margin-top: 8px;
+  font-size: 10.5px;
+}
+.usage-page .cm-kpi__split span + span {
+  border-left: 0;
+  padding-left: 0;
+  margin-left: 0;
+}
+.usage-page .cm-kpi__split span::before {
+  content: '·';
+  margin-right: 6px;
+  color: var(--fg-4);
+  opacity: 0.5;
+}
+.usage-page .cm-kpi__split span:first-child::before {
+  content: none;
+  margin: 0;
+}
+.usage-page .cm-kpi__meta {
+  margin-top: 8px;
+  font-size: 10.5px;
 }
 
-.stat__l {
+/* —— 图表面板：浅色底块，弱化网格线（自 L70-87 移植）—— */
+.usage-page .cm-chart {
+  border: 0;
+  border-radius: var(--r);
+  background: color-mix(in oklch, var(--fg) 2.5%, var(--bg));
+  min-height: 260px;
+  padding: 18px 18px 14px;
+}
+.usage-page .cm-bars {
+  border-bottom: 0;
+}
+.usage-page .cm-bars::before {
+  border-top: 0;
+  border-bottom: 0;
+}
+.usage-page .cm-chart__head {
+  margin-bottom: 4px;
+}
+.usage-page .cm-chart__title {
+  font-size: 13px;
+  font-weight: 650;
+}
+.usage-page .cm-chart__legend {
+  gap: 14px;
+}
+/* 实现差异（用户决议 2026-09）：折线是真实双轴数据，不是原型装饰线——
+   x 由 TSX 对齐柱心；这里把零点基线与柱体轴线重合（原型 bottom:54px 浮在轴上方）。 */
+.usage-page .cm-chart__line {
+  right: 18px;
+  bottom: 28px;
+  left: 18px;
+}
+
+/* —— 用量构成：Tab + 表格，去除行间分隔线（自 L90-109 移植）—— */
+.usage-page .cm-tab-view {
+  margin-top: 14px;
+  border: 0;
+  border-radius: var(--r);
+  background: color-mix(in oklch, var(--fg) 2.5%, var(--bg));
+  padding: 4px 16px 8px;
+}
+.usage-page .cm-table th {
+  border-bottom: 0;
+  background: transparent;
+  padding: 12px 12px 6px;
+}
+.usage-page .cm-table td {
+  border-bottom: 0;
+  padding: 11px 12px;
+}
+.usage-page .cm-table tbody tr:hover {
+  background: color-mix(in oklch, var(--surface-2) 60%, transparent);
+}
+
+/* —— 高用量任务卡片：磁贴风格，浅底色块（自 L112-156 移植）—— */
+.usage-page .cm-usage-task-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.usage-page .cm-usage-task {
   display: flex;
   align-items: center;
-  gap: 8px;
-  color: var(--fg-4);
-  font-size: 12px;
+  gap: 12px;
+  padding: 14px 16px;
+  border: 0;
+  border-radius: var(--r);
+  background: color-mix(in oklch, var(--fg) 2.5%, var(--bg));
+  text-decoration: none;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  transition:
+    background 0.16s var(--ease),
+    transform 0.16s var(--ease);
 }
-
-.stat__l svg {
-  width: 14px;
-  height: 14px;
+.usage-page .cm-usage-task:hover {
+  background: color-mix(in oklch, var(--accent) 5%, var(--bg));
+  transform: translateY(-1px);
 }
-
-.stat__v {
-  font-family: var(--font-mono);
-  font-size: 25px;
-  font-weight: 600;
-  margin-top: 9px;
-  letter-spacing: -0.01em;
+.usage-page .cm-usage-task__brand {
+  width: 36px;
+  height: 36px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  color: var(--fg);
 }
-
-.stat__v small {
+/* 原型 L135 为 img 规则；实现 EngineBrand 输出内联 svg，宽高由组件属性给出 */
+.usage-page .cm-usage-task__brand img {
+  width: 20px;
+  height: 20px;
+  object-fit: contain;
+}
+.usage-page .cm-usage-task__main {
+  min-width: 0;
+  flex: 1;
+}
+.usage-page .cm-usage-task__main b {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
   font-size: 13px;
-  color: var(--fg-4);
-  font-weight: 400;
+  font-weight: 640;
 }
-
-.usage-cost-kinds {
-  margin-top: 6px;
+.usage-page .cm-usage-task__main small {
+  display: block;
+  overflow: hidden;
+  margin-top: 4px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
   color: var(--fg-4);
   font-size: 11px;
-  line-height: 1.45;
+  line-height: 1.4;
 }
-
-.stat__d {
-  font-size: 11.5px;
+.usage-page .cm-usage-task__stat {
+  flex: none;
+  text-align: right;
+}
+.usage-page .cm-usage-task__stat b {
+  display: block;
+  font-size: 13px;
+  font-weight: 680;
+  font-variant-numeric: tabular-nums;
+}
+.usage-page .cm-usage-task__stat small {
+  display: block;
+  margin-top: 3px;
   color: var(--fg-4);
-  margin-top: 5px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
 }
 
-.stat__d.flat {
-  color: var(--fg-4);
+/* —— 热力图面板：浅色底块（自 L159-164 移植）—— */
+.usage-page .cm-section[data-od-id='usage-heatmap'] .cm-panel--pad {
+  border: 0;
+  border-radius: var(--r);
+  background: color-mix(in oklch, var(--fg) 2.5%, var(--bg));
+  padding: 16px 20px;
 }
 
-.usage-grid2 {
-  display: grid;
-  grid-template-columns: 1.62fr 1fr;
-  gap: 14px;
-  margin: 14px 0;
+/* —— 时间范围 segment：选中态与 Tab 统一（自 L167-174 移植）—— */
+.usage-page .cm-segment {
+  border-color: var(--border);
+}
+.usage-page .cm-segment button.is-active {
+  background: color-mix(in oklch, var(--accent) 10%, var(--bg));
+  color: var(--accent-hi);
+  font-weight: 650;
 }
 
-.usage-grid2--equal {
-  grid-template-columns: 1fr 1fr;
+@media (max-width: 720px) {
+  /* 自 prototype/usage.html L176-178 移植 */
+  .usage-page .cm-usage-task-list {
+    grid-template-columns: 1fr;
+  }
 }
 
-.panel__h {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 15px 18px;
-  border-bottom: 1px solid var(--line);
+/* ============================================================
+   二、实现特有结构的作用域适配（原型无对应结构或行为）
+   ============================================================ */
+
+/* 区块头图标：实现 Icon 渲染裸 svg；数值取原型 commercial.css
+   .cm-section__head h2 [data-ic]（18px / fg-3 / stroke 1.75） */
+.usage-page .cm-section__head h2 > svg {
+  width: 18px;
+  height: 18px;
+  flex: none;
+  color: var(--fg-3);
+  stroke-width: 1.75;
 }
 
-.panel__h b {
-  font-size: 14px;
-  font-weight: 600;
-}
-
-.panel__h small {
-  color: var(--fg-4);
-  font-size: 12px;
-}
-
-.panel__b {
-  padding: 18px;
-}
-
-/* 柱状图 */
-.chart {
-  display: flex;
-  align-items: flex-end;
-  gap: 6px;
-  height: 208px;
-}
-
-.chart .col {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  justify-content: flex-end;
-  align-items: center;
-  gap: 8px;
-  height: 100%;
-  min-width: 0;
-}
-
-.chart .bcell {
-  width: 100%;
-  display: flex;
-  justify-content: center;
-  align-items: flex-end;
-  flex: 1;
-}
-
-.chart .bar {
-  width: 100%;
-  max-width: 30px;
-  border-radius: 6px 6px 2px 2px;
-  background: linear-gradient(
-    180deg,
-    var(--accent),
-    color-mix(in oklch, var(--accent) 42%, var(--surface))
-  );
-  transition: 0.16s;
-  min-height: 3px;
-}
-
-.chart .col:hover .bar {
+/* 柱体 hover 提亮（旧实现的交互反馈，保留） */
+.usage-page .cm-bar:hover .cm-bar__input {
   background: var(--accent-hi);
 }
 
-.chart .cl {
+/* 键盘焦点环（无障碍要求，原型静态页无此态） */
+.usage-page .cm-tabs button:focus-visible,
+.usage-page .cm-segment button:focus-visible {
+  outline: 2px solid var(--accent-line);
+  outline-offset: -2px;
+}
+.usage-page .cm-usage-task:focus-visible {
+  outline: 2px solid var(--accent-line);
+  outline-offset: 2px;
+}
+
+/* 构成表「暂无」占位弱化（真实数据缺失态，原型 mock 恒有值） */
+.usage-page .cm-table td.is-empty {
+  color: var(--fg-4);
+}
+
+/* 热力图窄窗口横向滚动：53 列在窄窗会低于可读宽度；原型桌面定宽无此态 */
+.usage-heatmap-scroll {
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+.usage-page .cm-heatmap {
+  min-width: 640px;
+}
+
+/* —— 热力图图例：五档（0-4 分位档），与格子 data-level 一一对应
+   （用户决议 2026-09：数据是五档，图例恢复五档；色阶与 cm-heatmap 格子一致）—— */
+.usage-heat-legend {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--fg-4);
   font-size: 10.5px;
-  color: var(--fg-4);
-  font-family: var(--font-mono);
-  white-space: nowrap;
 }
-
-.chart .tip {
-  position: absolute;
-  bottom: calc(100% + 4px);
-  left: 50%;
-  transform: translateX(-50%) scale(0.96);
-  transform-origin: bottom center;
-  padding: 5px 9px;
-  background: var(--surface-2, var(--fg));
-  color: var(--bg, var(--surface));
-  font-size: 11.5px;
-  white-space: nowrap;
-  border-radius: 6px;
-  opacity: 0;
-  pointer-events: none;
-  transition: 0.15s;
-  z-index: 5;
+.usage-page .usage-heat-swatch {
+  display: block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  background: var(--surface-2);
 }
-
-.chart .col:hover .tip {
-  opacity: 1;
-  transform: translateX(-50%) scale(1);
+.usage-page .usage-heat-swatch--1 {
+  background: color-mix(in oklch, var(--accent) 22%, var(--surface-2));
 }
-
-.chart__foot {
-  display: flex;
-  justify-content: space-between;
-  margin-top: 12px;
-  font-size: 11.5px;
-  color: var(--fg-4);
+.usage-page .usage-heat-swatch--2 {
+  background: color-mix(in oklch, var(--accent) 42%, var(--surface-2));
 }
-
-.legend {
-  display: flex;
-  gap: 16px;
-  font-size: 12px;
-  color: var(--fg-3);
+.usage-page .usage-heat-swatch--3 {
+  background: color-mix(in oklch, var(--accent) 66%, var(--surface-2));
 }
-
-.legend i {
-  display: inline-block;
-  width: 9px;
-  height: 9px;
-  border-radius: 3px;
+.usage-page .usage-heat-swatch--4 {
   background: var(--accent);
-  margin-right: 6px;
-  vertical-align: 0;
-}
-
-/* 占比单元格 */
-.sharecell {
-  display: flex;
-  align-items: center;
-  gap: 11px;
-  min-width: 150px;
-}
-
-.sharecell .meter {
-  flex: 1;
-}
-
-.sharecell .pct {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  color: var(--fg-3);
-  width: 34px;
-  text-align: right;
-}
-
-/* 预算卡片 */
-.budget__big {
-  font-family: var(--font-mono);
-  font-size: 30px;
-  font-weight: 650;
-  letter-spacing: -0.02em;
-}
-
-.budget__big small {
-  font-size: 14px;
-  color: var(--fg-4);
-  font-weight: 400;
-}
-
-.budget__sub {
-  color: var(--fg-3);
-  font-size: 12.5px;
-  margin-top: 6px;
-}
-
-.budget .meter {
-  height: 9px;
-  margin: 16px 0 10px;
-}
-
-.alerts {
-  margin-top: 16px;
-  padding-top: 15px;
-  border-top: 1px solid var(--line);
-  display: flex;
-  flex-direction: column;
-  gap: 11px;
-}
-
-.alert-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 12.5px;
-  color: var(--fg-2);
-}
-
-.alert-row svg {
-  width: 15px;
-  height: 15px;
-  flex: none;
-}
-
-/* 分组行 */
-.brow {
-  display: flex;
-  align-items: center;
-  gap: 13px;
-  padding: 13px 0;
-  border-bottom: 1px solid var(--line);
-}
-
-.brow:last-child {
-  border-bottom: 0;
-}
-
-.brow__ic {
-  width: 32px;
-  height: 32px;
-  border-radius: 9px;
-  display: grid;
-  place-items: center;
-  background: var(--surface-2);
-  color: var(--fg-2);
-  flex: none;
-}
-
-.brow__ic svg {
-  width: 17px;
-  height: 17px;
-}
-
-.brow__m {
-  flex: 1;
-  min-width: 0;
-}
-
-.brow__m b {
-  font-size: 13px;
-  font-weight: 550;
-}
-
-.brow__m small {
-  color: var(--fg-4);
-  font-size: 11.5px;
-  display: block;
-  margin-top: 2px;
-}
-
-.brow__v {
-  text-align: right;
-  flex: none;
-}
-
-.brow__v b {
-  font-family: var(--font-mono);
-  font-size: 14px;
-  font-weight: 600;
-}
-
-.brow__v small {
-  display: block;
-  color: var(--fg-4);
-  font-size: 11px;
-  font-family: var(--font-mono);
-  margin-top: 2px;
-}
-
-@media (max-width: 980px) {
-  .usage-stats {
-    grid-template-columns: 1fr 1fr;
-  }
-  .usage-grid2 {
-    grid-template-columns: 1fr;
-  }
-}
-
-@media (max-width: 560px) {
-  .usage-stats {
-    grid-template-columns: 1fr;
-  }
-}
-
-/* 预算弹窗 */
-.modal-backdrop {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  background: rgba(0, 0, 0, 0.5);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 1000;
-}
-
-.modal {
-  background: var(--surface);
-  border-radius: 12px;
-  width: 90%;
-  max-width: 480px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-}
-
-.modal__head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 20px 24px;
-  border-bottom: 1px solid var(--line);
-}
-
-.modal__head h3 {
-  font-size: 16px;
-  font-weight: 600;
-  margin: 0;
-}
-
-.modal__body {
-  padding: 24px;
-}
-
-.modal__foot {
-  display: flex;
-  gap: 12px;
-  justify-content: flex-end;
-  padding: 16px 24px;
-  border-top: 1px solid var(--line);
-}
-
-.form-group {
-  margin-bottom: 20px;
-}
-
-.form-group:last-child {
-  margin-bottom: 0;
-}
-
-.form-group label {
-  display: block;
-  font-size: 13px;
-  font-weight: 500;
-  margin-bottom: 8px;
-  color: var(--fg-2);
-}
-
-.form-group input[type='number'],
-.form-group input[type='text'] {
-  width: 100%;
-  padding: 10px 12px;
-  font-size: 14px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: var(--surface-2);
-  color: var(--fg);
-  font-family: var(--font-mono);
-}
-
-.form-group input[type='number']:focus,
-.form-group input[type='text']:focus {
-  outline: none;
-  border-color: var(--accent);
-}
-
-.form-group small {
-  display: block;
-  margin-top: 6px;
-  font-size: 12px;
-  color: var(--fg-4);
-}
-
-.form-group label.checkbox {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  cursor: pointer;
-  font-weight: 400;
-}
-
-.form-group label.checkbox input[type='checkbox'] {
-  width: 18px;
-  height: 18px;
-  cursor: pointer;
 }

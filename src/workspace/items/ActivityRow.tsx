@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react';
 import type { SessionState } from '../../engine/useSession';
-import { Icon } from '../../shell/icons';
 import { activityPresentationParts } from '../activityViewModel';
 
 export function ActivityRow({ state }: { state: SessionState }) {
@@ -16,14 +15,10 @@ export function ActivityRow({ state }: { state: SessionState }) {
   if (!presentation) return null;
 
   return (
-    <div className="item">
-      <div className="item__gut">
-        <div className="ava-bot">
-          <Icon name="bot" />
-        </div>
-      </div>
+    <div className="item" data-kind="act">
+      <div className="item__gut" />
       <div className="item__main">
-        <div className="working activity-row">
+        <div className="working">
           <span className="pulse" aria-hidden="true">
             <i />
             <i />

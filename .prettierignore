@@ -2,7 +2,10 @@ node_modules
 dist
 .scratch
 .cargo-target-*
+.helm-cargo-target
+**/.worktrees
 target/
+.tmp
 package-lock.json
 **/test/fixtures/**
 
@@ -14,3 +17,7 @@ prototype/
 docs/
 briefs/
 src-tauri/
+
+# vite/vitest 配置临时副本（进程异常退出残留）
+vite.config.ts.timestamp-*.mjs
+vitest.config.ts.timestamp-*.mjs

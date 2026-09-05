@@ -1,67 +1,127 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react';
 import { Icon } from '../shell/icons';
+import { EngineBrand } from '../shell/EngineBrand';
 import { EmptyState } from '../components/EmptyState';
-import { useDialogBehavior } from '../components/useDialogBehavior';
 import {
-  getBudget,
+  USAGE_RANGE_DAYS,
   getDailyUsage,
   getTopSessions,
-  getUsageByModel,
-  getUsageByProvider,
+  getUsageBreakdown,
   getUsageStats,
-  setBudget,
-  type Budget,
   type DailyUsage,
-  type ModelUsage,
   type TopSession,
+  type UsageBreakdownDimension,
+  type UsageBreakdownRow,
+  type UsageRangeDays,
   type UsageStats,
 } from './api';
-import { detectCliLogin, getProviderConfig } from '../providers/api';
-import { buildUsageCsv } from './exportCsv';
 import {
+  detectCliLogin,
+  getProviderConfig,
+  type CliLoginState,
+  type ProviderConfig,
+} from '../providers/api';
+import {
+  TOP_TASKS_LIMIT,
+  breakdownCostNote,
+  breakdownTotalTokens,
+  buildDailyChart,
+  buildHeatmapCells,
+  cacheRate,
   comparisonText,
   createRequestGate,
-  mergeProviderUsage,
-  projectedMonthEndCost,
-  type ProviderUsageRow,
+  formatCompactTokens,
+  formatMonthDay,
+  mergeProviderBreakdown,
+  type DailyChartModel,
+  type HeatmapCell,
+  type ProviderBreakdownRow,
 } from './metrics';
 import './usage.css';
 
-type Period = '7d' | '30d';
+const BREAKDOWN_DIMENSIONS: { id: UsageBreakdownDimension; label: string }[] = [
+  { id: 'model', label: '模型' },
+  { id: 'engine', label: '引擎' },
+  { id: 'provider', label: '服务商' },
+];
+
+const ENGINE_LABELS: Record<string, string> = {
+  'claude-code': 'Claude Code',
+  codex: 'Codex',
+};
+
+function engineLabel(engine: string): string {
+  return ENGINE_LABELS[engine] ?? engine;
+}
+
+function providerKindLabel(kind: ProviderBreakdownRow['kind']): string {
+  if (kind === 'subscription') return '订阅';
+  if (kind === 'api') return 'API';
+  if (kind === 'local') return '本地';
+  return '未标注';
+}
+
+type BreakdownByDimension = Record<UsageBreakdownDimension, UsageBreakdownRow[]>;
+
+/** 调用折线平滑画法（Catmull-Rom → 三次贝塞尔），与原型 cm-chart__line 的曲线观感一致。 */
+function smoothLinePath(points: { x: number; y: number }[]): string {
+  if (points.length === 0) return '';
+  if (points.length === 1) return `M${points[0].x.toFixed(2)} ${points[0].y.toFixed(2)}`;
+  let d = `M${points[0].x.toFixed(2)} ${points[0].y.toFixed(2)}`;
+  for (let i = 0; i < points.length - 1; i += 1) {
+    const p0 = points[i - 1] ?? points[i];
+    const p1 = points[i];
+    const p2 = points[i + 1];
+    const p3 = points[i + 2] ?? p2;
+    const c1x = p1.x + (p2.x - p0.x) / 6;
+    const c1y = p1.y + (p2.y - p0.y) / 6;
+    const c2x = p2.x - (p3.x - p1.x) / 6;
+    const c2y = p2.y - (p3.y - p1.y) / 6;
+    d += ` C${c1x.toFixed(2)} ${c1y.toFixed(2)} ${c2x.toFixed(2)} ${c2y.toFixed(2)} ${p2.x.toFixed(2)} ${p2.y.toFixed(2)}`;
+  }
+  return d;
+}
 
 export function UsagePage() {
-  const [period, setPeriod] = useState<Period>('7d');
+  const [days, setDays] = useState<UsageRangeDays>(30);
+  const [activeDim, setActiveDim] = useState<UsageBreakdownDimension>('model');
   const [stats, setStats] = useState<UsageStats | null>(null);
-  const [modelUsage, setModelUsage] = useState<ModelUsage[]>([]);
-  const [providerUsage, setProviderUsage] = useState<ProviderUsageRow[]>([]);
   const [dailyUsage, setDailyUsage] = useState<DailyUsage[]>([]);
+  const [breakdown, setBreakdown] = useState<BreakdownByDimension>({
+    model: [],
+    engine: [],
+    provider: [],
+  });
   const [topSessions, setTopSessions] = useState<TopSession[]>([]);
-  const [budget, setBudget] = useState<Budget | null>(null);
+  const [providers, setProviders] = useState<ProviderConfig[]>([]);
+  const [logins, setLogins] = useState<Record<string, CliLoginState | null>>({});
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [updatedAt, setUpdatedAt] = useState<number | null>(null);
   const loadGate = useRef(createRequestGate());
 
-  const days = period === '7d' ? 7 : 30;
-
-  const loadData = useCallback(async () => {
+  const loadData = useCallback(async (range: UsageRangeDays) => {
     const generation = loadGate.current.begin();
     setLoading(true);
     setLoadError(null);
     try {
-      const [statsData, modelData, providerData, dailyData, topData, budgetData, providers] =
+      const [statsData, dailyData, modelRows, engineRows, providerRows, topData, providerCfg] =
         await Promise.all([
-          getUsageStats(days),
-          getUsageByModel(days),
-          getUsageByProvider(days),
-          getDailyUsage(days),
-          getTopSessions(days, 3),
-          getBudget(),
+          getUsageStats(range),
+          getDailyUsage(range),
+          getUsageBreakdown(range, 'model'),
+          getUsageBreakdown(range, 'engine'),
+          getUsageBreakdown(range, 'provider'),
+          // S5 验收口径：高用量任务固定 limit=5
+          getTopSessions(range, TOP_TASKS_LIMIT),
           getProviderConfig()
             .then((config) => config.providers)
-            .catch(() => []),
+            .catch(() => [] as ProviderConfig[]),
         ]);
+      // 订阅服务商登录状态沿用现有真实 API；单个探测失败不阻塞整页
       const loginEntries = await Promise.all(
-        providers
+        providerCfg
           .filter((provider) => provider.kind === 'subscription')
           .map(async (provider) => {
             const engine = provider.protocol === 'anthropic' ? 'claude-code' : 'codex';
@@ -70,24 +130,19 @@ export function UsagePage() {
             } catch {
               return [
                 provider.id,
-                {
-                  state: 'unknown',
-                  authMethod: 'unknown',
-                  detail: 'CLI 登录状态检测失败',
-                },
+                { state: 'unknown', authMethod: 'unknown', detail: 'CLI 登录状态检测失败' },
               ] as const;
             }
           }),
       );
       if (!loadGate.current.isCurrent(generation)) return;
       setStats(statsData);
-      setModelUsage(modelData);
-      setProviderUsage(
-        mergeProviderUsage(providers, providerData, Object.fromEntries(loginEntries)),
-      );
       setDailyUsage(dailyData);
+      setBreakdown({ model: modelRows, engine: engineRows, provider: providerRows });
       setTopSessions(topData);
-      setBudget(budgetData);
+      setProviders(providerCfg);
+      setLogins(Object.fromEntries(loginEntries));
+      setUpdatedAt(Date.now());
     } catch (err) {
       if (!loadGate.current.isCurrent(generation)) return;
       console.error('加载用量数据失败:', err);
@@ -95,637 +150,632 @@ export function UsagePage() {
     } finally {
       if (loadGate.current.isCurrent(generation)) setLoading(false);
     }
-  }, [days]);
+  }, []);
 
   useEffect(() => {
-    loadData();
-  }, [loadData]);
+    void loadData(days);
+  }, [loadData, days]);
 
-  // 首次加载才整页占位（B1-3）；已有数据时切周期走局部刷新，不清空已渲染内容
+  // 首次加载才整页占位；已有数据时切换范围走局部刷新，不清空已渲染内容
   if (loading && !stats) {
-    return (
-      <div className="page">
-        <div className="page__head">
-          <div className="page__title">用量与成本</div>
-        </div>
-        <div style={{ padding: '2rem', textAlign: 'center', color: 'var(--fg-4)' }}>加载中...</div>
-      </div>
-    );
+    return <UsageLoadingView />;
   }
-
   if (loadError && !stats) {
-    return (
-      <div className="page">
-        <div className="page__head">
-          <div>
-            <div className="page__title">用量与成本</div>
-            <div className="page__sub">当前无法读取用量数据，原有数据不会被覆盖。</div>
-          </div>
-        </div>
-        <div className="usage-wrap">
-          <div className="usage-inline-error" role="alert">
-            <Icon name="alert" />
-            <span>{loadError}</span>
-            <button
-              className="btn btn--subtle btn--sm"
-              onClick={() => void loadData()}
-              type="button"
-            >
-              重试
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  const avgPerSession =
-    stats && stats.session_count > 0 ? stats.total_cost / stats.session_count : 0;
-  const previousAvgPerSession =
-    stats && stats.previous_session_count > 0
-      ? stats.previous_total_cost / stats.previous_session_count
-      : 0;
-  const comparisonLabel = period === '7d' ? '较前 7 天' : '较前 30 天';
-
-  function exportCsv() {
-    const csv = buildUsageCsv({
-      periodLabel: period === '7d' ? '近 7 天' : '近 30 天',
-      stats,
-      modelUsage,
-      dailyUsage,
-      topSessions,
-      budget,
-      generatedAt: new Date(),
-    });
-    const blob = new Blob([`\uFEFF${csv}`], { type: 'text/csv;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = `helm-usage-${period}-${new Date().toISOString().slice(0, 10)}.csv`;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    URL.revokeObjectURL(url);
+    return <UsageErrorView message={loadError} onRetry={() => void loadData(days)} />;
   }
 
   return (
-    <div className="page scroll">
-      <div className="page__head">
-        <div>
-          <div className="page__title">用量与成本</div>
-          <div className="page__sub">
-            跨每个引擎、服务商和会话的 token 吞吐量与花费 — 并附预算护栏。
-          </div>
-        </div>
-        <div className="row gap-sm">
-          <div className="seg">
-            <button
-              className={period === '7d' ? 'is-active' : ''}
-              disabled={loading}
-              onClick={() => setPeriod('7d')}
-            >
-              近 7 天
-            </button>
-            <button
-              className={period === '30d' ? 'is-active' : ''}
-              disabled={loading}
-              onClick={() => setPeriod('30d')}
-            >
-              近 30 天
-            </button>
-          </div>
-          <button className="btn btn--subtle" disabled={loading} onClick={exportCsv}>
-            <Icon name="upright" /> 导出 CSV
-          </button>
-        </div>
-      </div>
+    <UsageLoadedView
+      days={days}
+      loading={loading}
+      loadError={loadError}
+      updatedAt={updatedAt}
+      stats={stats!}
+      dailyUsage={dailyUsage}
+      breakdown={breakdown}
+      topSessions={topSessions}
+      providers={providers}
+      logins={logins}
+      activeDim={activeDim}
+      onDaysChange={setDays}
+      onDimensionChange={setActiveDim}
+      onRetry={() => void loadData(days)}
+    />
+  );
+}
 
-      <div
-        className={'usage-wrap' + (loading ? ' usage-wrap--refreshing' : '')}
-        aria-busy={loading}
-      >
-        {loadError ? (
-          <div className="usage-inline-error">
-            <Icon name="alert" />
-            <span>{loadError}</span>
-            <button className="btn btn--subtle btn--sm" onClick={() => void loadData()}>
-              重试
-            </button>
-          </div>
-        ) : null}
-        {/* 顶部统计卡 */}
-        <div className="usage-stats">
-          <div className="card stat">
-            <div className="stat__l">
-              <Icon name="dollar" />
-              花费 <small>· {period === '7d' ? '近 7 天' : '近 30 天'}</small>
-            </div>
-            <div className="stat__v">
-              ${Math.floor(stats?.total_cost || 0)}
-              <small>.{((stats?.total_cost || 0) % 1).toFixed(2).slice(2)}</small>
-            </div>
-            <div className="stat__d">
-              {comparisonText(
-                stats?.total_cost ?? 0,
-                stats?.previous_total_cost ?? 0,
-                comparisonLabel,
-              )}
-            </div>
-            <div className="usage-cost-kinds">
-              实际 ${(stats?.actual_cost ?? 0).toFixed(2)} · 估算 $
-              {(stats?.estimated_cost ?? 0).toFixed(2)}
-              {(stats?.subscription_count ?? 0) > 0
-                ? ` · 订阅内 ${stats?.subscription_count ?? 0} 次`
-                : ''}
-              {(stats?.unknown_count ?? 0) > 0
-                ? ` · ${stats?.unknown_count ?? 0} 次无价格数据`
-                : ''}
-              {(stats?.legacy_count ?? 0) > 0
-                ? ` · 历史未分类 $${(stats?.legacy_cost ?? 0).toFixed(2)}（${stats?.legacy_count ?? 0} 次）`
-                : ''}
-            </div>
-          </div>
-
-          <div className="card stat">
-            <div className="stat__l">
-              <Icon name="layers" />
-              Token <small>· {period === '7d' ? '近 7 天' : '近 30 天'}</small>
-            </div>
-            <div className="stat__v">
-              {((stats?.total_tokens || 0) / 1_000_000).toFixed(2)}
-              <small>M</small>
-            </div>
-            <div className="stat__d">
-              {comparisonText(
-                stats?.total_tokens ?? 0,
-                stats?.previous_total_tokens ?? 0,
-                '吞吐量较前一期',
-              )}
-            </div>
-          </div>
-
-          <div className="card stat">
-            <div className="stat__l">
-              <Icon name="chat" />
-              请求数 <small>· {period === '7d' ? '近 7 天' : '近 30 天'}</small>
-            </div>
-            <div className="stat__v">{stats?.request_count || 0}</div>
-            <div className="stat__d">
-              {comparisonText(
-                stats?.request_count ?? 0,
-                stats?.previous_request_count ?? 0,
-                comparisonLabel,
-              )}
-            </div>
-            <div className="stat__d flat">跨 {stats?.session_count || 0} 个会话</div>
-          </div>
-
-          <div className="card stat">
-            <div className="stat__l">
-              <Icon name="history" />
-              平均 / 会话
-            </div>
-            <div className="stat__v">
-              ${Math.floor(avgPerSession)}
-              <small>.{(avgPerSession % 1).toFixed(2).slice(2)}</small>
-            </div>
-            <div className="stat__d">
-              {comparisonText(avgPerSession, previousAvgPerSession, '较前一期')}
-            </div>
-          </div>
-        </div>
-
-        {/* 花费趋势图 + 预算 */}
-        <div className="usage-grid2">
-          <div className="card">
-            <div className="panel__h">
-              <b>花费趋势</b>
-              <span className="legend">
-                <span>
-                  <i />
-                  每日花费 (USD)
-                </span>
-              </span>
-            </div>
-            <div className="panel__b">
-              <DailyChart data={dailyUsage} />
-            </div>
-          </div>
-
-          <BudgetCard budget={budget} onUpdate={loadData} />
-        </div>
-
-        {/* 按模型花费 */}
-        {modelUsage.length > 0 && (
-          <div className="card" style={{ marginBottom: 14 }}>
-            <div className="panel__h">
-              <b>按模型花费</b>
-              <small>
-                近 {days} 天 · {modelUsage.length} 个模型活跃
-              </small>
-            </div>
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>模型</th>
-                  <th>引擎</th>
-                  <th>请求数</th>
-                  <th>输入 / 输出 token</th>
-                  <th>花费</th>
-                  <th style={{ width: 190 }}>占比</th>
-                </tr>
-              </thead>
-              <tbody>
-                {modelUsage.map((m, i) => (
-                  <tr key={i}>
-                    <td>
-                      <span className="row gap-sm">
-                        <Icon name="sparkles" style={{ width: 15, height: 15 }} />
-                        <span className="strong mono">{m.model}</span>
-                      </span>
-                    </td>
-                    <td>
-                      <span className="row gap-sm">
-                        <Icon
-                          name={m.engine === 'claude-code' ? 'zap' : 'cpu'}
-                          style={{ width: 14, height: 14 }}
-                        />
-                        {m.engine === 'claude-code' ? 'Claude Code' : 'Codex'}
-                      </span>
-                    </td>
-                    <td className="mono">{m.request_count}</td>
-                    <td className="mono">
-                      {(m.input_tokens / 1000).toFixed(0)}K / {(m.output_tokens / 1000).toFixed(0)}K
-                    </td>
-                    <td className="mono strong">${m.cost_usd.toFixed(2)}</td>
-                    <td>
-                      <div className="sharecell">
-                        <div className="meter">
-                          <i style={{ width: `${m.share * 100}%` }} />
-                        </div>
-                        <span className="pct">{Math.round(m.share * 100)}%</span>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-
-        {/* 按服务商花费 + 花费最高的会话 */}
-        <div className="usage-grid2 usage-grid2--equal">
-          {/* 按服务商花费 */}
-          <div className="card">
-            <div className="panel__h">
-              <b>按服务商花费</b>
-              <small>真实归属 · 近 {days} 天</small>
-            </div>
-            <div className="panel__b" style={{ paddingTop: 6, paddingBottom: 8 }}>
-              {providerUsage.map((p) => {
-                return (
-                  <div key={p.provider || 'unknown'} className="brow">
-                    <div className="brow__ic">
-                      <Icon name={p.provider ? 'server' : 'history'} />
-                    </div>
-                    <div className="brow__m">
-                      <b>{p.name}</b>
-                      <small>
-                        {p.kind === 'subscription'
-                          ? `订阅${p.ready ? ' · 已就绪' : ''}`
-                          : p.kind === 'local'
-                            ? `本地${p.ready ? ' · 已就绪' : ''}`
-                            : p.kind === 'api'
-                              ? `API${p.ready ? ' · 已就绪' : ''}`
-                              : '历史记录'}
-                        {p.cost_usd === 0 && p.ready ? ' · 本期未使用' : ''}
-                      </small>
-                      <div className="meter">
-                        <i style={{ width: `${p.share * 100}%` }} />
-                      </div>
-                    </div>
-                    <div className="brow__v">
-                      <b>${p.cost_usd.toFixed(2)}</b>
-                      <small>{Math.round(p.share * 100)}%</small>
-                    </div>
-                  </div>
-                );
-              })}
-              {providerUsage.length === 0 && (
-                <EmptyState
-                  icon="chart"
-                  title="还没有任何用量记录"
-                  hint="发起一次真实会话后，这里会展示按服务商聚合的花费与占比。"
-                  action={{
-                    label: '去工作区发起会话',
-                    onClick: () =>
-                      window.dispatchEvent(
-                        new CustomEvent('helm:navigate', { detail: { page: 'workspace' } }),
-                      ),
-                  }}
-                />
-              )}
-            </div>
-          </div>
-
-          {/* 花费最高的会话 */}
-          {topSessions.length > 0 && (
-            <div className="card">
-              <div className="panel__h">
-                <b>花费最高的会话</b>
-              </div>
-              <div className="panel__b" style={{ paddingTop: 6, paddingBottom: 8 }}>
-                {topSessions.map((s) => (
-                  <button
-                    key={s.id}
-                    className="brow usage-top-session"
-                    type="button"
-                    onClick={() =>
-                      window.dispatchEvent(
-                        new CustomEvent('helm:open-session', { detail: { sessionId: s.id } }),
-                      )
-                    }
-                  >
-                    <div className="brow__ic">
-                      <Icon name={s.engine === 'claude-code' ? 'zap' : 'cpu'} />
-                    </div>
-                    <div className="brow__m">
-                      <b>{s.title}</b>
-                      <small className="mono">{s.model}</small>
-                    </div>
-                    <div className="brow__v">
-                      <b>${s.cost_usd.toFixed(2)}</b>
-                      <small>{(s.total_tokens / 1000).toFixed(1)}K token</small>
-                    </div>
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
+export function UsageLoadingView() {
+  return (
+    <div className="page">
+      <div className="cm-pagebody usage-page">
+        <div className="usage-loading" role="status">
+          正在加载用量…
         </div>
       </div>
     </div>
   );
 }
 
-// 按服务商聚合
-// 每日花费图表
-function DailyChart({ data }: { data: DailyUsage[] }) {
-  if (data.length === 0) {
-    return (
-      <div style={{ padding: '2rem', textAlign: 'center', color: 'var(--fg-4)', fontSize: 13 }}>
-        暂无花费记录，发起会话后这里会出现每日趋势
-      </div>
-    );
-  }
-
-  const maxCost = Math.max(...data.map((d) => d.cost_usd));
-
+export function UsageErrorView({ message, onRetry }: { message: string; onRetry: () => void }) {
   return (
-    <>
-      <div className="chart">
-        {data.map((d, i) => {
-          const height = maxCost > 0 ? (d.cost_usd / maxCost) * 100 : 0;
-          const date = new Date(d.date);
-          const label = date.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' });
-          const weekday = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][date.getDay()];
-          const daysAgo = data.length - 1 - i;
-          const isToday = daysAgo === 0;
-          const showLabel = data.length <= 7 || isToday || daysAgo % 7 === 0;
-          return (
-            <div key={i} className="col">
-              <span className="tip">
-                {isToday ? '今天' : `${label} ${weekday}`} · ${d.cost_usd.toFixed(2)}
-              </span>
-              <div className="bcell">
-                <div className="bar" style={{ height: `${height}%` }} />
-              </div>
-              {showLabel ? (
-                <div className="cl">{isToday ? '今天' : label}</div>
-              ) : (
-                <div className="cl" style={{ visibility: 'hidden' }}>
-                  ·
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
-      <div className="chart__foot">
-        <span>{data.length} 天前</span>
-        <span>峰值 ${maxCost.toFixed(2)}</span>
-        <span>今天</span>
-      </div>
-    </>
-  );
-}
-
-// 预算卡片
-function BudgetCard({ budget, onUpdate }: { budget: Budget | null; onUpdate: () => void }) {
-  const [editing, setEditing] = useState(false);
-
-  if (!budget) {
-    return (
-      <div className="card">
-        <div className="panel__h">
-          <b>本月预算</b>
-        </div>
-        <div
-          className="panel__b budget"
-          style={{ textAlign: 'center', padding: '2rem 0', color: 'var(--fg-4)' }}
-        >
-          <div>预算数据加载失败</div>
-          <button
-            className="btn btn--subtle btn--sm"
-            style={{ marginTop: 12 }}
-            onClick={onUpdate}
-            type="button"
-          >
+    <div className="page">
+      <div className="cm-pagebody usage-page">
+        <div className="usage-inline-error" role="alert">
+          <Icon name="alert" />
+          <span>{message}</span>
+          <button className="btn btn--subtle btn--sm" onClick={onRetry} type="button">
             重试
           </button>
         </div>
       </div>
-    );
-  }
-
-  const remaining = budget.monthly_limit - budget.current_month_cost;
-  // 阈值提醒档位与托盘通知一致（P3-2）：70% 起视为已触发
-  const isAlert = budget.alert_at_80 && budget.percentage >= 70;
-  const isStop = budget.stop_at_100 && budget.percentage >= 100;
-
-  return (
-    <div className="card">
-      <div className="panel__h">
-        <b>本月预算</b>
-        <button className="btn-icon sm" onClick={() => setEditing(true)} title="编辑预算">
-          <Icon name="settings" />
-        </button>
-      </div>
-      <div className="panel__b budget">
-        {budget.monthly_limit > 0 ? (
-          <>
-            <div className="budget__big">
-              ${Math.floor(budget.current_month_cost)}
-              <small>.{(budget.current_month_cost % 1).toFixed(2).slice(2)}</small>
-              <span style={{ color: 'var(--fg-4)', fontSize: 15 }}>
-                {' '}
-                / ${budget.monthly_limit.toFixed(0)}
-              </span>
-            </div>
-            <div className="budget__sub">
-              {new Date().getFullYear()} 年 {new Date().getMonth() + 1} 月 · 已用{' '}
-              {budget.percentage.toFixed(0)}% · 预计月末达 $
-              {projectedMonthEndCost(budget.current_month_cost).toFixed(0)}
-            </div>
-            <div className={`meter ${isAlert ? 'meter--warn' : ''}`}>
-              <i style={{ width: `${Math.min(budget.percentage, 100)}%` }} />
-            </div>
-            <div
-              className="row row--between"
-              style={{ fontSize: 11.5, color: 'var(--fg-4)', marginTop: 10 }}
-            >
-              <span>下月 1 日重置</span>
-              <span
-                className="mono"
-                style={remaining < 0 ? { color: 'var(--danger)', fontWeight: 600 } : undefined}
-              >
-                剩余 ${remaining.toFixed(2)}
-              </span>
-            </div>
-            <div className="alerts">
-              {budget.alert_at_80 && (
-                <div className="alert-row">
-                  <Icon name={isAlert ? 'alert' : 'checkc'} />
-                  阈值提醒（70% / 90% 系统通知）· {isAlert ? '已触发' : '已启用'}
-                </div>
-              )}
-              {budget.stop_at_100 && (
-                <div className="alert-row">
-                  <Icon name="shield" />达 100% 自动停止 · {isStop ? '已阻止新任务' : '已启用'}
-                </div>
-              )}
-            </div>
-          </>
-        ) : (
-          <div style={{ textAlign: 'center', padding: '2rem 0', color: 'var(--fg-4)' }}>
-            <div style={{ marginBottom: 12 }}>未设置预算</div>
-            <button className="btn btn--primary" onClick={() => setEditing(true)}>
-              设置预算
-            </button>
-          </div>
-        )}
-      </div>
-
-      {editing && (
-        <BudgetDialog
-          budget={budget}
-          onClose={() => setEditing(false)}
-          onSave={() => {
-            setEditing(false);
-            onUpdate();
-          }}
-        />
-      )}
     </div>
   );
 }
 
-// 预算编辑弹窗
-function BudgetDialog({
-  budget,
-  onClose,
-  onSave,
-}: {
-  budget: Budget;
-  onClose: () => void;
-  onSave: () => void;
-}) {
-  const dialogRef = useDialogBehavior(onClose);
-  const [limit, setLimit] = useState(budget.monthly_limit.toString());
-  const [alert80, setAlert80] = useState(budget.alert_at_80);
-  const [stop100, setStop100] = useState(budget.stop_at_100);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+export interface UsageLoadedProps {
+  days: UsageRangeDays;
+  loading: boolean;
+  loadError: string | null;
+  updatedAt: number | null;
+  stats: UsageStats;
+  dailyUsage: DailyUsage[];
+  breakdown: BreakdownByDimension;
+  topSessions: TopSession[];
+  providers: ProviderConfig[];
+  logins: Record<string, CliLoginState | null>;
+  activeDim: UsageBreakdownDimension;
+  onDaysChange: (days: UsageRangeDays) => void;
+  onDimensionChange: (dimension: UsageBreakdownDimension) => void;
+  onRetry: () => void;
+}
 
-  async function handleSave() {
-    setSaving(true);
-    setError(null);
-    try {
-      await setBudget(parseFloat(limit) || 0, alert80, stop100);
-      onSave();
-    } catch (err) {
-      console.error('保存预算失败:', err);
-      setError('保存失败：' + (err instanceof Error ? err.message : String(err)));
-    } finally {
-      setSaving(false);
+/* 页面骨架消费共享组件库（cm-pagebody/cm-pagehead/cm-section/cm-kpi…），
+   与 prototype/usage.html 同构；.usage-page 仅作为本页覆盖层作用域钩子。 */
+export function UsageLoadedView(props: UsageLoadedProps) {
+  const {
+    days,
+    loading,
+    loadError,
+    updatedAt,
+    stats,
+    dailyUsage,
+    breakdown,
+    topSessions,
+    providers,
+    logins,
+    activeDim,
+    onDaysChange,
+    onDimensionChange,
+    onRetry,
+  } = props;
+
+  return (
+    <div className="page scroll">
+      <div
+        className={'cm-pagebody usage-page' + (loading ? ' usage-refreshing' : '')}
+        aria-busy={loading}
+      >
+        <header className="cm-pagehead">
+          <div>
+            <h1 className="cm-pagehead__title">用量</h1>
+            <p className="cm-pagehead__desc">
+              按真实 Usage 汇总 Token、调用、缓存与 Helm 预估费用。
+            </p>
+          </div>
+          <div className="cm-pagehead__actions">
+            <div className="cm-segment" role="group" aria-label="统计时间范围">
+              {USAGE_RANGE_DAYS.map((range) => (
+                <button
+                  key={range}
+                  type="button"
+                  className={days === range ? 'is-active' : ''}
+                  aria-pressed={days === range}
+                  disabled={loading}
+                  onClick={() => onDaysChange(range)}
+                >
+                  {range} 天
+                </button>
+              ))}
+            </div>
+          </div>
+        </header>
+
+        {loadError ? (
+          <div className="usage-inline-error" role="alert">
+            <Icon name="alert" />
+            <span>{loadError}</span>
+            <button className="btn btn--subtle btn--sm" onClick={onRetry} type="button">
+              重试
+            </button>
+          </div>
+        ) : null}
+
+        <UsageKpis stats={stats} />
+
+        <section className="cm-section" data-od-id="daily-usage" aria-label="每日用量">
+          <div className="cm-section__head">
+            <div>
+              <h2>
+                <Icon name="chartcolumn" />
+                每日用量
+              </h2>
+              <p>输入与输出 Token 使用左侧刻度，调用次数使用右侧刻度。</p>
+            </div>
+            {updatedAt ? (
+              <span className="cm-activity">
+                更新于{' '}
+                {new Date(updatedAt).toLocaleTimeString('zh-CN', {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                  hour12: false,
+                })}
+              </span>
+            ) : null}
+          </div>
+          <div className="cm-chart" aria-label={`过去 ${days} 天 Token 与调用次数图表`}>
+            <div className="cm-chart__head">
+              <div className="cm-chart__title">过去 {days} 天</div>
+              <div className="cm-chart__legend">
+                <span className="cm-legend cm-legend--input">输入</span>
+                <span className="cm-legend cm-legend--output">输出</span>
+                <span className="cm-legend cm-legend--calls">调用次数</span>
+              </div>
+            </div>
+            {dailyUsage.length === 0 ? (
+              <EmptyState
+                icon="chart"
+                title="当前范围暂无用量记录"
+                hint="发起一次真实会话后，这里会出现每日输入/输出与调用趋势。"
+                action={{
+                  label: '去工作区发起会话',
+                  onClick: () =>
+                    window.dispatchEvent(
+                      new CustomEvent('helm:navigate', { detail: { page: 'workspace' } }),
+                    ),
+                }}
+              />
+            ) : (
+              <DailyBars chart={buildDailyChart(dailyUsage)} />
+            )}
+          </div>
+        </section>
+
+        <BreakdownSection
+          rows={breakdown}
+          activeDim={activeDim}
+          onDimensionChange={onDimensionChange}
+          providers={providers}
+          logins={logins}
+        />
+
+        <TopTasksSection sessions={topSessions} />
+
+        <HeatmapSection dailyUsage={dailyUsage} />
+      </div>
+    </div>
+  );
+}
+
+/** 成本口径摘要：只罗列后端返回的非零计数，不做换算。 */
+function describeCostKinds(s: UsageStats): string {
+  const parts: string[] = [`实际 $${s.actual_cost.toFixed(2)}`];
+  if (s.estimated_cost > 0) parts.push(`估算 $${s.estimated_cost.toFixed(2)}`);
+  if (s.subscription_count > 0) parts.push(`订阅内 ${s.subscription_count} 次`);
+  if (s.unknown_count > 0) parts.push(`${s.unknown_count} 次无价格数据`);
+  if (s.legacy_count > 0)
+    parts.push(`历史未分类 $${s.legacy_cost.toFixed(2)}（${s.legacy_count} 次）`);
+  return parts.join(' · ');
+}
+
+function UsageKpis({ stats }: { stats: UsageStats }) {
+  const rate = cacheRate(stats.cached_input_tokens, stats.input_tokens);
+  return (
+    <div className="cm-kpi-grid">
+      <article className="cm-panel cm-kpi">
+        <span className="cm-kpi__badge">
+          <Icon name="coins" />
+        </span>
+        <div className="cm-kpi__label">总 Token</div>
+        <div className="cm-kpi__value">{formatCompactTokens(stats.total_tokens)}</div>
+        <div className="cm-kpi__split">
+          <span>输入 {formatCompactTokens(stats.input_tokens)}</span>
+          <span>输出 {formatCompactTokens(stats.output_tokens)}</span>
+        </div>
+        <div className="cm-kpi__meta">
+          {comparisonText(stats.total_tokens, stats.previous_total_tokens, '较前一期')}
+        </div>
+      </article>
+
+      <article className="cm-panel cm-kpi">
+        <span className="cm-kpi__badge">
+          <Icon name="gauge" />
+        </span>
+        <div className="cm-kpi__label">调用次数</div>
+        <div className="cm-kpi__value">{stats.request_count}</div>
+        <div className="cm-kpi__split">
+          <span>跨 {stats.session_count} 个会话</span>
+        </div>
+        <div className="cm-kpi__meta">
+          {comparisonText(stats.request_count, stats.previous_request_count, '较前一期')}
+        </div>
+      </article>
+
+      <article className="cm-panel cm-kpi">
+        <span className="cm-kpi__badge">
+          <Icon name="database" />
+        </span>
+        <div className="cm-kpi__label">缓存命中率</div>
+        <div className="cm-kpi__value">
+          {rate === null ? '暂无' : `${(rate * 100).toFixed(1)}%`}
+        </div>
+        <div className="cm-kpi__meta">
+          {rate === null
+            ? '暂无 Token 证据，无法计算命中率'
+            : `缓存读取 ${formatCompactTokens(stats.cached_input_tokens)} / 总输入 ${formatCompactTokens(stats.input_tokens)}`}
+        </div>
+      </article>
+
+      <article className="cm-panel cm-kpi">
+        <span className="cm-kpi__badge">
+          <Icon name="dollar" />
+        </span>
+        <div className="cm-kpi__label">预估费用</div>
+        <div className="cm-kpi__value">${stats.total_cost.toFixed(2)}</div>
+        <div className="cm-kpi__meta">{describeCostKinds(stats)}</div>
+      </article>
+    </div>
+  );
+}
+
+function DailyBars({ chart }: { chart: DailyChartModel }) {
+  const { points, maxTokens, maxRequests } = chart;
+  const labelStep = Math.max(1, Math.ceil(points.length / 8));
+  // 实测 .cm-bars 宽度后按 flex 几何精确对位柱心；SSR/首帧回退到均分估算
+  const barsRef = useRef<HTMLDivElement | null>(null);
+  const [measuredWidth, setMeasuredWidth] = useState<number | null>(null);
+  useEffect(() => {
+    const el = barsRef.current;
+    if (!el) return;
+    const update = () => setMeasuredWidth(el.clientWidth);
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+  const width = measuredWidth ?? Math.max(points.length * 12, 60);
+  // 折线画布 130 单位高（与 cm-chart__line 元素 1:1，无拉伸畸变）；126 为零点基线。
+  const linePoints = (() => {
+    const n = points.length;
+    if (n === 0 || width <= 0) return [];
+    if (measuredWidth == null) {
+      return points.map((_, index) => ({
+        x: ((index + 0.5) / n) * width,
+        y:
+          maxRequests > 0 && points[index].requests > 0
+            ? 126 - (points[index].requests / maxRequests) * 104
+            : 126,
+      }));
     }
+    // 与 .cm-bars 的 space-between + gap(12px) + 柱宽上限(38px) 严格一致的柱心坐标
+    const gap = 12;
+    const barMax = 38;
+    const slot = (width - (n - 1) * gap) / n;
+    const center = (index: number) =>
+      slot <= barMax
+        ? (index + 0.5) * slot + index * gap
+        : index * (barMax + (width - n * barMax) / (n - 1)) + barMax / 2;
+    return points.map((point, index) => ({
+      x: center(index),
+      y: maxRequests > 0 && point.requests > 0 ? 126 - (point.requests / maxRequests) * 104 : 126,
+    }));
+  })();
+  const path = smoothLinePath(linePoints);
+
+  return (
+    <>
+      <div className="cm-bars" ref={barsRef}>
+        {points.map((point, index) => {
+          const inputHeight =
+            maxTokens > 0 && point.inputTokens !== null && point.inputTokens > 0
+              ? Math.max(1.5, (point.inputTokens / maxTokens) * 100)
+              : 0;
+          const outputHeight =
+            maxTokens > 0 && point.outputTokens !== null && point.outputTokens > 0
+              ? Math.max(1.5, (point.outputTokens / maxTokens) * 100)
+              : 0;
+          const showLabel = (points.length - 1 - index) % labelStep === 0;
+          const tooltip = `${formatMonthDay(point.date)} · 输入 ${
+            point.inputTokens === null ? '暂无' : formatCompactTokens(point.inputTokens)
+          } · 输出 ${
+            point.outputTokens === null ? '暂无' : formatCompactTokens(point.outputTokens)
+          } · ${point.requests} 次`;
+          return (
+            <div key={point.date} className="cm-bar" title={tooltip}>
+              <i className="cm-bar__input" style={{ height: `${inputHeight}%` }} />
+              <i className="cm-bar__output" style={{ height: `${outputHeight}%` }} />
+              {showLabel ? (
+                <span className="cm-bar__label">{formatMonthDay(point.date)}</span>
+              ) : null}
+            </div>
+          );
+        })}
+      </div>
+      {maxRequests > 0 && linePoints.length > 0 ? (
+        <svg
+          className="cm-chart__line"
+          viewBox={`0 0 ${width} 130`}
+          preserveAspectRatio="none"
+          aria-hidden="true"
+        >
+          <path d={path} vectorEffect="non-scaling-stroke" />
+          {linePoints.map((point, index) => (
+            <circle key={points[index].date} cx={point.x} cy={point.y} r="3" />
+          ))}
+        </svg>
+      ) : null}
+    </>
+  );
+}
+
+function BreakdownSection({
+  rows,
+  activeDim,
+  onDimensionChange,
+  providers,
+  logins,
+}: {
+  rows: BreakdownByDimension;
+  activeDim: UsageBreakdownDimension;
+  onDimensionChange: (dimension: UsageBreakdownDimension) => void;
+  providers: ProviderConfig[];
+  logins: Record<string, CliLoginState | null>;
+}) {
+  const activeMeta = BREAKDOWN_DIMENSIONS.find((d) => d.id === activeDim)!;
+  const tableRows =
+    activeDim === 'provider'
+      ? mergeProviderBreakdown(providers, rows.provider, logins)
+      : rows[activeDim];
+
+  function handleTabKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
+    const count = BREAKDOWN_DIMENSIONS.length;
+    const index = BREAKDOWN_DIMENSIONS.findIndex((d) => d.id === activeDim);
+    let next: number | null = null;
+    if (event.key === 'ArrowRight') next = (index + 1) % count;
+    else if (event.key === 'ArrowLeft') next = (index + count - 1) % count;
+    else if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = count - 1;
+    if (next === null) return;
+    event.preventDefault();
+    onDimensionChange(BREAKDOWN_DIMENSIONS[next].id);
+    document.getElementById(`usage-tab-${BREAKDOWN_DIMENSIONS[next].id}`)?.focus();
   }
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div
-        ref={dialogRef}
-        className="modal"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="budget-dialog-title"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="modal__head">
-          <h3 id="budget-dialog-title">编辑预算</h3>
-          <button className="btn-icon" onClick={onClose} aria-label="关闭预算设置">
-            <Icon name="x" />
-          </button>
-        </div>
-        <div className="modal__body">
-          <div className="form-group">
-            <label>月度预算（USD）</label>
-            <input
-              type="number"
-              value={limit}
-              onChange={(e) => setLimit(e.target.value)}
-              placeholder="0"
-              min="0"
-              step="0.01"
-            />
-            <small style={{ color: 'var(--fg-4)', fontSize: 12 }}>设为 0 表示不限制预算</small>
-          </div>
-          {error ? <div className="usage-dialog-error">{error}</div> : null}
-
-          <div className="form-group">
-            <label className="checkbox">
-              <input
-                type="checkbox"
-                checked={alert80}
-                onChange={(e) => setAlert80(e.target.checked)}
-              />
-              <span>用量阈值提醒（达 70% / 90% 时发系统通知，托盘同步显示）</span>
-            </label>
-          </div>
-
-          <div className="form-group">
-            <label className="checkbox">
-              <input
-                type="checkbox"
-                checked={stop100}
-                onChange={(e) => setStop100(e.target.checked)}
-              />
-              <span>达 100% 时自动停止新任务</span>
-            </label>
-            <small style={{ color: 'var(--fg-4)', fontSize: 12 }}>
-              启用后，超预算将无法发送新消息
-            </small>
-          </div>
-        </div>
-        <div className="modal__foot">
-          <button className="btn btn--subtle" onClick={onClose} disabled={saving}>
-            取消
-          </button>
-          <button className="btn btn--primary" onClick={handleSave} disabled={saving}>
-            {saving ? '保存中...' : '保存'}
-          </button>
+    <section className="cm-section" data-od-id="usage-breakdown" aria-label="用量构成">
+      <div className="cm-section__head">
+        <div>
+          <h2>
+            <Icon name="layers" />
+            用量构成
+          </h2>
+          <p>切换模型、引擎或服务商查看相同口径的汇总。</p>
         </div>
       </div>
-    </div>
+      <div
+        className="cm-tabs"
+        role="tablist"
+        aria-label="用量构成维度"
+        onKeyDown={handleTabKeyDown}
+      >
+        {BREAKDOWN_DIMENSIONS.map((dimension) => (
+          <button
+            key={dimension.id}
+            id={`usage-tab-${dimension.id}`}
+            type="button"
+            role="tab"
+            aria-selected={activeDim === dimension.id}
+            aria-controls={`usage-panel-${dimension.id}`}
+            tabIndex={activeDim === dimension.id ? 0 : -1}
+            className={activeDim === dimension.id ? 'is-active' : ''}
+            onClick={() => onDimensionChange(dimension.id)}
+          >
+            {dimension.label}
+          </button>
+        ))}
+      </div>
+      {/* 实现只渲染当前维度单面板；原型为三面板预置隐藏 DOM，行为等价（aria 由 tab/tabpanel 表达） */}
+      <div
+        className="cm-tabpanel is-active cm-tab-view cm-panel cm-table-wrap"
+        role="tabpanel"
+        id={`usage-panel-${activeDim}`}
+        aria-labelledby={`usage-tab-${activeDim}`}
+      >
+        {tableRows.length === 0 ? (
+          <EmptyState
+            icon="layers"
+            title={`当前范围暂无${activeMeta.label}维度用量`}
+            hint="发起会话并产生真实用量后，这里会展示相同口径的聚合数据。"
+          />
+        ) : (
+          <table className="cm-table">
+            <thead>
+              <tr>
+                <th>{activeMeta.label}</th>
+                <th className="num">Token</th>
+                <th className="num">调用次数</th>
+                <th className="num">缓存命中率</th>
+                <th className="num">预估费用</th>
+              </tr>
+            </thead>
+            <tbody>
+              {tableRows.map((row) => (
+                <BreakdownRowItem key={`${row.engine}:${row.key}`} row={row} dim={activeDim} />
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function BreakdownRowItem({ row, dim }: { row: UsageBreakdownRow; dim: UsageBreakdownDimension }) {
+  const total = breakdownTotalTokens(row);
+  const rate = cacheRate(row.cached_input_tokens, row.input_tokens);
+  const note = breakdownCostNote(row);
+
+  let nameCell: ReactNode;
+  if (dim === 'model') {
+    // 原型结构：品牌块 + 主行/副行两行文本；契约只有模型 ID 与引擎，副行展示引擎标签
+    nameCell = (
+      <span className="cm-table__primary">
+        <span className="cm-brand cm-brand--light">
+          <EngineBrand engine={row.engine} size={20} />
+        </span>
+        <span>
+          <b>{row.key}</b>
+          <small className="mono">{engineLabel(row.engine)}</small>
+        </span>
+      </span>
+    );
+  } else if (dim === 'engine') {
+    nameCell = <b>{engineLabel(row.key)}</b>;
+  } else {
+    const providerRow = row as ProviderBreakdownRow;
+    nameCell = (
+      <span>
+        <b>{providerRow.name}</b>
+        <small className="cm-table__sub">
+          {providerKindLabel(providerRow.kind)}
+          {providerRow.ready ? ' · 已就绪' : ''}
+        </small>
+      </span>
+    );
+  }
+
+  return (
+    <tr>
+      <td>{nameCell}</td>
+      <td className={'num' + (total === null ? ' is-empty' : '')}>
+        {total === null ? '暂无' : formatCompactTokens(total)}
+      </td>
+      <td className="num">{row.request_count}</td>
+      <td className={'num' + (rate === null ? ' is-empty' : '')}>
+        {rate === null ? '暂无' : `${(rate * 100).toFixed(1)}%`}
+      </td>
+      <td className="num">
+        ${row.cost_usd.toFixed(2)}
+        {note ? <small className="cm-table__sub">{note}</small> : null}
+      </td>
+    </tr>
+  );
+}
+
+function TopTasksSection({ sessions }: { sessions: TopSession[] }) {
+  return (
+    <section className="cm-section" data-od-id="high-usage-tasks" aria-label="高用量任务">
+      <div className="cm-section__head">
+        <div>
+          <h2>
+            <Icon name="listtodo" />
+            高用量任务
+          </h2>
+          {/* 后端 get_top_sessions 契约按窗口内花费降序返回前 limit 条；文案保持真实排序 */}
+          <p>当前时间范围内花费最高的前 5 个任务。</p>
+        </div>
+        {/* 原型 settings.html#tasks 的实现等价物：设置页挂载时读取 helm:settings-tab（一次性） */}
+        <a
+          className="cm-inline-link"
+          href="#tasks"
+          onClick={(event) => {
+            event.preventDefault();
+            sessionStorage.setItem('helm:settings-tab', 'tasks');
+            window.dispatchEvent(
+              new CustomEvent('helm:navigate', { detail: { page: 'settings' } }),
+            );
+          }}
+        >
+          全部任务
+        </a>
+      </div>
+      {sessions.length === 0 ? (
+        <EmptyState
+          icon="inbox"
+          title="当前范围暂无任务花费"
+          hint="发起会话后，花费最高的任务会出现在这里。"
+        />
+      ) : (
+        <div className="cm-usage-task-list">
+          {sessions.map((session) => (
+            <button
+              key={session.id}
+              type="button"
+              className="cm-usage-task"
+              onClick={() =>
+                window.dispatchEvent(
+                  new CustomEvent('helm:open-session', { detail: { sessionId: session.id } }),
+                )
+              }
+            >
+              <span className="cm-usage-task__brand">
+                <EngineBrand engine={session.engine} size={20} />
+              </span>
+              <span className="cm-usage-task__main">
+                <b>{session.title}</b>
+                <small>
+                  {session.model} · {engineLabel(session.engine)}
+                </small>
+              </span>
+              <span className="cm-usage-task__stat">
+                <b>{formatCompactTokens(session.total_tokens)}</b>
+                <small>${session.cost_usd.toFixed(2)}</small>
+              </span>
+            </button>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function heatmapCellTitle(cell: HeatmapCell): string {
+  const label = formatMonthDay(cell.date);
+  if (cell.requests === 0) return `${label} · 无用量记录`;
+  if (cell.tokens === null) return `${label} · ${cell.requests} 次调用 · 无 Token 记录`;
+  return `${label} · ${formatCompactTokens(cell.tokens)} Token`;
+}
+
+function HeatmapSection({ dailyUsage }: { dailyUsage: DailyUsage[] }) {
+  // 窗口固定 365 天，不随上方时间范围分段切换（S5 验收口径）
+  const cells = useMemo(() => buildHeatmapCells(dailyUsage, new Date()), [dailyUsage]);
+  return (
+    <section className="cm-section" data-od-id="usage-heatmap" aria-label="365 天 Token 活跃度">
+      <div className="cm-section__head">
+        <div>
+          <h2>
+            <Icon name="clock" />
+            365 天 Token 活跃度
+          </h2>
+          <p>固定展示最近一年，不随上方时间范围切换。</p>
+        </div>
+        {/* 图例五档（0-4 分位档），与热力图格子 data-level 一一对应；用户决议 2026-09 */}
+        <span className="usage-heat-legend">
+          少
+          {[0, 1, 2, 3, 4].map((level) => (
+            <i key={level} className={`usage-heat-swatch usage-heat-swatch--${level}`} />
+          ))}
+          多
+        </span>
+      </div>
+      <div className="cm-panel cm-panel--pad">
+        <div className="usage-heatmap-scroll">
+          <div className="cm-heatmap" role="img" aria-label="365 天 Token 活跃度热力图">
+            {cells.map((cell) => (
+              <i key={cell.date} data-level={cell.level} title={heatmapCellTitle(cell)} />
+            ))}
+          </div>
+        </div>
+      </div>
+    </section>
   );
 }

@@ -2,10 +2,8 @@
 export interface AppSettings {
   // 通用
   general: {
-    workspaceName: string;
     defaultDirectory: string;
     reopenLastSession: boolean;
-    anonymousAnalytics: boolean;
     autoUpdateChannel: 'stable' | 'beta';
     updateFeedUrl: string;
     /** 后台刷新签名价格目录；失败时继续使用缓存或安装包内置目录。 */
@@ -16,6 +14,8 @@ export interface AppSettings {
     pricingMaxAgeDays: number;
     /** 首轮后用 fast model 自动起标题与摘要（外发到用户绑定的服务商，可关） */
     autoTitleSessions: boolean;
+    /** 生成式 UI 总开关（默认关闭）：开启才允许最终结果使用交互式可视化输出；渲染能力后续接入。 */
+    generativeUi?: boolean;
     /** 点关闭按钮时最小化到托盘而不是退出（变更-12）：后台会话继续运行 */
     closeToTray?: boolean;
     /** 轮次完成/出错时弹出系统通知 */
@@ -44,15 +44,13 @@ export interface AppSettings {
   appearance: {
     theme: 'light' | 'dark' | 'system';
     accentColor: { base: string; hi: string };
-    uiDensity: 'compact' | 'comfortable';
-    monospaceFont: string;
-    reduceMotion: boolean;
   };
   // 快捷键
   shortcuts: {
     commandPalette: string;
     newSession: string;
     toggleContext: string;
+    stop: string;
     cycleEngine: string;
     navigationPrefix: string;
     home: string;
@@ -74,13 +72,11 @@ export interface UpdateStatus {
 
 export const DEFAULT_SETTINGS: AppSettings = {
   general: {
-    workspaceName: '我的工作区',
     defaultDirectory:
       typeof window !== 'undefined' && navigator.platform.includes('Win')
         ? 'C:\\Users\\Public\\Documents'
         : '~/code',
     reopenLastSession: true,
-    anonymousAnalytics: false,
     autoUpdateChannel: 'stable',
     updateFeedUrl: '',
     pricingAutoUpdate: true,
@@ -88,6 +84,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
     pricingUnknownPolicy: 'warn',
     pricingMaxAgeDays: 30,
     autoTitleSessions: true,
+    generativeUi: false,
   },
   engines: {
     defaultEngine: 'claude-code',
@@ -106,15 +103,13 @@ export const DEFAULT_SETTINGS: AppSettings = {
   permissions: {},
   appearance: {
     theme: 'light',
-    accentColor: { base: 'oklch(55% 0.2 264)', hi: 'oklch(49% 0.21 264)' },
-    uiDensity: 'comfortable',
-    monospaceFont: 'JetBrains Mono',
-    reduceMotion: false,
+    accentColor: { base: 'oklch(52% 0.12 230)', hi: 'oklch(46% 0.13 230)' },
   },
   shortcuts: {
     commandPalette: 'Ctrl+K',
     newSession: 'Ctrl+N',
     toggleContext: 'Ctrl+.',
+    stop: '',
     cycleEngine: 'Ctrl+E',
     navigationPrefix: 'G',
     home: 'H',

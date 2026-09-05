@@ -1,26 +1,18 @@
-/* 页面粘性头：head 与 tab 作为一体滚动，避免 tab 滚到 head 上方与其重叠 */
-.providers-sticky {
-  position: sticky;
-  top: 0;
-  z-index: 5;
-  background: var(--bg);
-  box-shadow: 0 10px 18px -18px color-mix(in oklch, var(--fg) 55%, transparent);
+/* —— 第五轮：本页局部对齐原型的精确色（原型 commercial.css 计算值；仅 AI 配置页作用域）—— */
+.cm-tabs-wrapper,
+.cm-pagebody--scroll,
+.cm-drawer {
+  --pv-proto-surface-tint: oklch(0.947723 0.0130693 288.5 / 0.505);
+  --pv-proto-border-strong: oklch(0.22 0.012 250);
+  --pv-proto-accent-line: oklch(0.52 0.12 230);
+  --pv-proto-muted-strong: oklch(0.38 0.011 250);
 }
-
-.providers-head {
-  position: static;
-  background: none;
-}
-
-.providers-tabs {
-  padding: 0 36px;
-  background: transparent;
-}
-
-.providers-wrap {
-  max-width: 1100px;
+/* 粘性页签与内容列：骨架类已对齐 cm-tabs-wrapper / cm-pagebody--scroll（components.css），
+   此处仅保留实现壳层的宽度/内距适配（1180px 公式与 12px 顶距）。 */
+.cm-pagebody--scroll {
+  width: min(1180px, calc(100% - 56px));
   margin: 0 auto;
-  padding: 4px 36px 64px;
+  padding: 12px 0 56px;
 }
 
 .providers-warning {
@@ -68,69 +60,14 @@
 }
 
 .providers-add-modal {
-  width: 560px;
+  width: min(680px, 94vw);
 }
 
 .providers-confirm-modal {
   width: 440px;
 }
 
-.provider-template-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.provider-template {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  width: 100%;
-  padding: 12px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-  background: var(--bg);
-  color: inherit;
-  cursor: pointer;
-  text-align: left;
-  transition: 0.13s;
-}
-
-.provider-template:hover {
-  border-color: var(--border-2);
-  background: var(--surface);
-}
-
-.provider-template.is-active {
-  border-color: var(--accent-line);
-  background: var(--accent-soft);
-}
-
-.provider-template__ic {
-  width: 36px;
-  height: 36px;
-  border-radius: 9px;
-  display: grid;
-  place-items: center;
-  background: var(--surface-2);
-  color: var(--fg-2);
-  flex: none;
-}
-
-.provider-template__ic svg {
-  width: 18px;
-  height: 18px;
-}
-
-.provider-template b,
-.provider-template small {
-  display: block;
-}
-
-.provider-template b {
-  font-size: 13.5px;
-  font-weight: 620;
-}
+/* 旧 provider-template 平铺列表已由 pv-pick-seg/pv-add 预设卡取代。 */
 
 .provider-template small {
   margin-top: 3px;
@@ -156,107 +93,26 @@
   white-space: nowrap;
 }
 
-.providers-split {
-  display: grid;
-  grid-template-columns: 300px 1fr;
-  gap: 22px;
-  align-items: start;
-}
-
-.provider-list {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.provider-item {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 11px 12px;
-  border-radius: 11px;
-  border: 1px solid transparent;
-  background: transparent;
-  cursor: pointer;
-  text-align: left;
-  color: inherit;
-  transition: 0.13s;
-}
-
-.provider-item:hover {
-  background: var(--surface);
-}
-
-.provider-item.is-active {
-  background: var(--surface-2);
-  border-color: var(--border);
-}
-
-.provider-item__ic {
-  width: 34px;
-  height: 34px;
-  border-radius: 9px;
-  flex: none;
-  display: grid;
-  place-items: center;
-  background: var(--surface-2);
-  color: var(--fg-2);
-}
-
-.provider-item__ic svg {
-  width: 18px;
-  height: 18px;
-}
-
-.provider-item__m {
-  flex: 1;
-  min-width: 0;
-}
-
-.provider-item__m b {
-  display: block;
-  font-size: 13.5px;
-  font-weight: 600;
-}
-
-.provider-item__m small {
-  font-size: 11.5px;
-  color: var(--fg-4);
-}
+/* S6：旧「列表 + 详情」分栏布局已由 pv-group/pv-card 网格与 pv-drawer 抽屉取代。 */
 
 .provider-detail {
   display: flex;
   flex-direction: column;
-  gap: 18px;
-}
-
-.provider-detail__head {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-}
-
-.provider-detail__head h2 {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-  font-size: 19px;
-  font-weight: 640;
+  gap: 16px;
 }
 
 .provider-detail__big {
-  width: 48px;
-  height: 48px;
-  border-radius: 13px;
+  width: 44px;
+  height: 44px;
+  border-radius: var(--r);
   display: grid;
   place-items: center;
   background: var(--surface-2);
 }
 
 .provider-detail__big svg {
-  width: 24px;
-  height: 24px;
+  width: 22px;
+  height: 22px;
 }
 
 /* 详情页分区头：把配置项归组，让「配置 → 认证 → 连接 → 模型」流程一目了然 */
@@ -286,14 +142,14 @@
   gap: 12px;
   padding: 12px 14px;
   border: 1px solid var(--border);
-  border-radius: 11px;
+  border-radius: var(--r-lg);
   background: var(--bg);
 }
 
 .connectivity__ic {
   width: 36px;
   height: 36px;
-  border-radius: 9px;
+  border-radius: var(--r);
   flex: none;
   display: grid;
   place-items: center;
@@ -311,7 +167,7 @@
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
-  font-size: 13.5px;
+  font-size: 13px;
   font-weight: 620;
 }
 
@@ -382,14 +238,14 @@
   gap: 12px;
   padding: 12px 14px;
   border: 1px solid var(--border);
-  border-radius: 11px;
+  border-radius: var(--r-lg);
   background: var(--bg);
 }
 
 .authcard__ic {
   width: 34px;
   height: 34px;
-  border-radius: 9px;
+  border-radius: var(--r);
   display: grid;
   place-items: center;
   background: var(--surface-2);
@@ -399,7 +255,7 @@
 
 .authcard b {
   display: block;
-  font-size: 13.5px;
+  font-size: 13px;
 }
 
 .authcard small {
@@ -427,7 +283,7 @@
 }
 
 .section-h b {
-  font-size: 13.5px;
+  font-size: 13px;
   font-weight: 600;
 }
 
@@ -443,14 +299,14 @@
   gap: 12px;
   padding: 14px;
   border: 1px dashed var(--border-2);
-  border-radius: 11px;
+  border-radius: var(--r-lg);
   background: var(--bg);
 }
 
 .provider-model-empty__ic {
   width: 36px;
   height: 36px;
-  border-radius: 9px;
+  border-radius: var(--r);
   display: grid;
   place-items: center;
   background: var(--surface-2);
@@ -466,7 +322,7 @@
 .provider-model-empty b {
   display: block;
   color: var(--fg-2);
-  font-size: 13.5px;
+  font-size: 13px;
   font-weight: 620;
 }
 
@@ -482,7 +338,7 @@
   flex-direction: column;
   overflow: hidden;
   border: 1px solid var(--border);
-  border-radius: 11px;
+  border-radius: var(--r-lg);
 }
 
 .provider-model-row {
@@ -541,7 +397,7 @@
   padding: 10px 12px;
   margin-bottom: 10px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--r);
   background: var(--surface-2);
 }
 
@@ -567,8 +423,10 @@
   width: 74px;
 }
 
+/* 定价目录弹窗：对齐原型 .cm-modal--pricing（min(720px,94vw)，providers.html L109 实测 720）。 */
+
 .provider-price-modal {
-  width: min(560px, calc(100vw - 32px));
+  width: min(360px, calc(100vw - 32px));
 }
 
 .provider-price-grid {
@@ -649,16 +507,17 @@
 }
 
 .providers-note {
-  margin-top: 14px;
+  margin-top: 16px;
   color: var(--fg-4);
   font-size: 12px;
   line-height: 1.6;
 }
 
 .engines-grid {
+  gap: 12px;
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 18px;
+  gap: 16px;
 }
 
 .engine-card {
@@ -666,63 +525,129 @@
   flex-direction: column;
 }
 
-.engine-card__head {
-  display: flex;
-  align-items: center;
-  gap: 13px;
-  padding: 18px;
-  border-bottom: 1px solid var(--line);
+.engine-card__desc {
+  padding: 12px 16px 0;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--fg-3);
 }
 
-.engine-card__head h3 {
+.engine-card__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin-top: auto;
+  padding: 12px 16px 14px;
+  font-size: 11.5px;
+  color: var(--fg-4);
+}
+
+/* —— 执行引擎详情面板（决策 2026-08-24 按原型补齐）—— */
+.cm-detail-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 18px 0 12px;
+}
+
+.cm-detail-header h2 {
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.cm-detail-header p {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--fg-3);
+}
+
+.pv-bind-needed {
   display: flex;
   align-items: center;
   gap: 10px;
-  font-size: 16px;
-  font-weight: 640;
-}
-
-.engine-card__head small {
-  color: var(--fg-4);
+  padding: 10px 14px;
+  border: 1px solid var(--warn, var(--line));
+  border-radius: var(--r);
+  background: var(--warn-soft);
   font-size: 12px;
+  color: var(--fg-2);
 }
 
-.engine-card__ic {
-  width: 44px;
-  height: 44px;
-  border-radius: 12px;
-  display: grid;
-  place-items: center;
-  background: var(--surface-2);
-  flex: none;
+.cm-engine-detail__card {
+  margin-top: 12px;
+  padding: 4px 16px 8px;
 }
 
-.engine-card__ic svg {
-  width: 23px;
-  height: 23px;
+.pv-advanced {
+  margin: 12px 0 10px;
+  border-top: 1px solid var(--line);
 }
 
-.engine-card__body {
-  padding: 16px 18px;
+.pv-advanced > summary {
   display: flex;
-  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 0;
+  cursor: pointer;
+  list-style: none;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.pv-advanced > summary::-webkit-details-marker {
+  display: none;
+}
+
+.pv-advanced__hint {
+  font-size: 11.5px;
+  font-weight: 400;
+  color: var(--fg-4);
+}
+
+.pv-advanced__body {
+  display: grid;
+  gap: 14px;
+  padding-bottom: 12px;
+}
+
+.pv-advsec {
+  margin-top: 18px;
+}
+
+.pv-advsec__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   gap: 12px;
+}
+
+.pv-advsec__head h3 {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.pv-advsec__note {
+  margin: 4px 0 8px;
+  font-size: 11.5px;
+  color: var(--fg-4);
 }
 
 .bind-box {
   background: var(--bg);
   border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 4px 14px;
+  border-radius: var(--r-sm);
+  padding: 2px 12px;
 }
 
 .bind-row {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 9px 0;
+  gap: 10px;
+  padding: 8px 0;
   border-bottom: 1px solid var(--line);
-  font-size: 13.5px;
+  font-size: 13px;
   flex-wrap: wrap;
 }
 
@@ -731,15 +656,15 @@
 }
 
 .bind-row > span:first-child {
-  width: 78px;
+  width: 72px;
   flex: none;
   color: var(--fg-4);
-  font-size: 12px;
+  font-size: 11.5px;
 }
 
 .bind-row code {
   font-family: var(--font-mono);
-  font-size: 12.5px;
+  font-size: 12px;
 }
 
 .bind-edit {
@@ -759,7 +684,7 @@
 
 .envbox summary {
   cursor: pointer;
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--fg-3);
   list-style: none;
   user-select: none;
@@ -781,7 +706,7 @@
   margin-top: 10px;
   background: var(--term-bg);
   color: var(--term-fg);
-  border-radius: 9px;
+  border-radius: var(--r);
   padding: 12px 14px;
   font-family: var(--font-mono);
   font-size: 11.5px;
@@ -806,7 +731,7 @@
   width: 100%;
   min-height: 120px;
   border: 1px solid var(--border);
-  border-radius: 9px;
+  border-radius: var(--r);
   background: var(--bg);
   color: var(--fg-2);
   padding: 10px 12px;
@@ -819,13 +744,6 @@
 .engine-file__editor {
   resize: vertical;
   outline: none;
-}
-
-.engine-card__actions {
-  display: flex;
-  gap: 8px;
-  padding: 14px 18px;
-  border-top: 1px solid var(--line);
 }
 
 .reachability-box {
@@ -853,7 +771,7 @@
 .ministat {
   background: var(--bg);
   border: 1px solid var(--border);
-  border-radius: 11px;
+  border-radius: var(--r-lg);
   padding: 12px 14px;
 }
 
@@ -869,21 +787,6 @@
   font-size: 11px;
 }
 
-.pv-modal-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 200;
-  display: none;
-  align-items: center;
-  justify-content: center;
-  background: rgba(12, 16, 24, 0.42);
-  backdrop-filter: blur(3px);
-}
-
-.pv-modal-overlay.open {
-  display: flex;
-}
-
 .pv-modal {
   width: 480px;
   max-width: calc(100vw - 40px);
@@ -891,23 +794,8 @@
   overflow: hidden;
   display: flex;
   flex-direction: column;
-  border-radius: 16px;
+  border-radius: var(--r-xl);
   box-shadow: var(--shadow-pop);
-}
-
-.pv-modal__hd {
-  flex: none;
-  padding: 18px 20px 6px;
-  font-size: 15px;
-  font-weight: 600;
-}
-
-.pv-modal__hd small {
-  display: block;
-  margin-top: 3px;
-  color: var(--fg-4);
-  font-size: 12px;
-  font-weight: 400;
 }
 
 .pv-modal__bd {
@@ -920,18 +808,16 @@
   padding: 14px 20px 4px;
 }
 
-.pv-modal__ft {
-  flex: none;
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-  padding: 16px 20px;
-  margin-top: 8px;
-  border-top: 1px solid var(--line);
+/* 添加流程：对齐原型 .pv-add-form 作用域（仅本流程生效，不污染共享层）。
+   原型 .pv-add-form .cm-detail-card__head h3 为 14px，覆盖全局 13px。 */
+.pv-add-form {
+  margin-top: 4px;
+}
+.pv-add-form .cm-detail-card__head h3 {
+  font-size: 14px;
 }
 
 @media (max-width: 880px) {
-  .providers-split,
   .engines-grid,
   .form-grid {
     grid-template-columns: 1fr;
@@ -948,14 +834,6 @@
 }
 
 /* 订阅登录态 pill（P3-1） */
-.pv-account-source {
-  justify-content: center;
-  min-height: 76px;
-  padding: 12px 14px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: var(--surface-2);
-}
 
 .pv-account-actions {
   display: flex;
@@ -985,4 +863,1379 @@
   background: var(--danger-soft);
   color: var(--danger);
   border-color: color-mix(in oklch, var(--danger) 35%, transparent);
+}
+
+/* 原型口径：吸顶与内容区同宽（min(1180px,100%-56px)），无毛玻璃 */
+
+.engine-card,
+.provider-template,
+.authcard,
+.connectivity {
+  border-radius: var(--r);
+  transition:
+    border-color 0.22s var(--ease),
+    transform 0.22s var(--ease),
+    box-shadow 0.22s var(--ease);
+}
+
+.engine-card:hover,
+.provider-template:hover,
+.authcard:hover,
+.connectivity:hover {
+  border-color: var(--accent-line);
+  box-shadow: 0 16px 30px -28px var(--fg);
+  transform: translateY(-2px);
+}
+
+@media (max-width: 620px) {
+  .cm-tabs-wrapper,
+  .cm-pagebody--scroll {
+    width: calc(100% - 28px);
+  }
+}
+
+/* ============================================================
+   S6 · AI 配置定价入口与详情结构（对齐 prototype/providers.html）
+   只消费 src/styles/tokens.css 变量；类名带 pv- 页面前缀。
+   ============================================================ */
+
+/* 页头 / 工具条（对齐原型 pv-head / pv-toolbar） */
+.pv-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.pv-head__title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 650;
+  color: var(--fg);
+}
+
+.pv-head__sub {
+  margin: 4px 0 0;
+  color: var(--fg-4);
+  font-size: 12px;
+}
+
+.pv-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.pv-toolbar__hint {
+  color: var(--fg-4);
+  font-size: 11px;
+}
+
+/* 接入类型分组 + 服务商卡网格（pv-group / pv-grid / pv-card） */
+.pv-group {
+  margin-top: 22px;
+}
+
+.pv-group:first-of-type {
+  margin-top: 2px;
+}
+
+.pv-group__label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 8px;
+  padding: 0 2px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg-4);
+}
+
+.pv-group__label::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: color-mix(in oklch, var(--fg) 6%, transparent);
+}
+
+.pv-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.pv-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 13px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  background: var(--bg);
+  font: inherit;
+  text-align: left;
+  color: inherit;
+  cursor: pointer;
+  transition:
+    border-color 0.12s,
+    background 0.12s;
+}
+
+.pv-card:hover {
+  border-color: color-mix(in oklch, var(--accent) 40%, transparent);
+  background: var(--surface-2);
+}
+
+.pv-card__top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.pv-card__brand {
+  width: 30px;
+  height: 30px;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  color: var(--fg-2);
+}
+
+.pv-card__brand svg {
+  width: 16px;
+  height: 16px;
+}
+
+.pv-card__id {
+  min-width: 0;
+  flex: 1;
+}
+
+.pv-card__id b {
+  display: block;
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pv-card__type {
+  display: block;
+  margin-top: 2px;
+  font-size: 10.5px;
+  color: var(--fg-4);
+}
+
+.pv-card__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  color: var(--fg-4);
+  font-size: 11px;
+}
+
+.pv-card__meta span {
+  position: relative;
+  white-space: nowrap;
+}
+
+.pv-card__meta span + span::before {
+  content: '·';
+  position: absolute;
+  left: -7px;
+  color: var(--border-2);
+}
+
+/* 卡片状态 pill：ready/warn/muted 三档，全部来自真实状态映射。
+   形态对齐原型 .cm-status-pill（commercial.css L416–422）：23px 高、0 8px 内距、10px 字、
+   中性 surface-2 底 + 6px 彩色圆点，颜色只留给 warn/danger。仅作用本页前缀类。 */
+.pill.pv-status--ready,
+.pill.pv-status--warn,
+.pill.pv-status--muted {
+  height: auto;
+  min-height: 23px;
+  padding: 0 8px;
+  border-color: transparent;
+  font-size: 10px;
+}
+
+.pill.pv-status--ready::before,
+.pill.pv-status--warn::before,
+.pill.pv-status--muted::before {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  content: '';
+}
+
+.pill.pv-status--ready {
+  background: var(--surface-2);
+  color: var(--fg-3);
+}
+
+.pill.pv-status--ready::before {
+  background: var(--success);
+}
+
+.pill.pv-status--warn {
+  background: color-mix(in oklch, var(--warn) 10%, transparent);
+  color: var(--warn);
+}
+
+.pill.pv-status--muted {
+  background: var(--surface-2);
+  color: var(--fg-3);
+}
+
+/* 添加服务商：接入类型分段 + 预设卡（pv-pick-seg / pv-add） */
+.pv-pick-seg {
+  display: flex;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  padding: 3px;
+  gap: 2px;
+}
+
+.pv-pick-seg button {
+  flex: 1;
+  min-height: 32px;
+  border: 0;
+  border-radius: var(--r-xs);
+  background: transparent;
+  color: var(--fg-3);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.pv-pick-seg button:hover {
+  color: var(--fg);
+}
+
+.pv-pick-seg button.is-active {
+  background: var(--raised);
+  color: var(--accent-hi);
+  font-weight: 650;
+  box-shadow: var(--shadow-sm);
+}
+
+.pv-pick-hint {
+  margin: 10px 2px 0;
+  color: var(--fg-4);
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+
+.pv-add {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.pv-add__opt {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  padding: 13px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  background: var(--bg);
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  transition:
+    border-color 0.12s,
+    background 0.12s;
+}
+
+button.pv-add__opt:hover {
+  border-color: var(--accent-line);
+  background: var(--surface-2);
+}
+
+.pv-add__opt--static {
+  cursor: default;
+}
+
+.pv-add__ic {
+  width: 30px;
+  height: 30px;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  color: var(--accent-hi);
+}
+
+.pv-add__ic svg {
+  width: 16px;
+  height: 16px;
+}
+
+.pv-add__main {
+  min-width: 0;
+  flex: 1;
+}
+
+.pv-add__main b {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.pv-add__main small {
+  display: block;
+  margin-top: 3px;
+  color: var(--fg-4);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.pv-pick__back {
+  align-self: flex-start;
+  margin-bottom: 4px;
+}
+
+/* 详情抽屉（pv-drawer）：右侧滑出，遮罩可点击/Esc 关闭 */
+.pv-drawer-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.pv-drawer__backdrop {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  padding: 0;
+  background: color-mix(in oklch, var(--term-bg) 42%, transparent);
+  cursor: default;
+}
+
+.pv-drawer {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  width: min(520px, 92vw);
+  height: 100%;
+  border-left: 1px solid var(--border);
+  background: var(--bg);
+  box-shadow: var(--shadow-pop);
+}
+
+/* 保存语义提示：绑定/配置保存走下一次发送生效，不碰运行中的 Turn */
+
+/* 模型管理：按模型分组 + 可展开接入路径（pv-model / pv-path） */
+.pv-models {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.pv-model {
+  overflow: hidden;
+  margin-bottom: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  background: var(--bg);
+}
+
+.pv-model__head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.pv-model__head::-webkit-details-marker {
+  display: none;
+}
+
+.pv-model__name b {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.pv-model__name small {
+  display: block;
+  margin-top: 2px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--fg-4);
+}
+
+.pv-model__price {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--fg-3);
+  white-space: nowrap;
+}
+
+.pv-model__price em,
+.pv-path__price em {
+  font-style: normal;
+  color: var(--fg-4);
+}
+
+.pv-model__price.pv-plan,
+.pv-path__price.pv-plan {
+  color: var(--fg-4);
+}
+
+.pv-model__count {
+  font-size: 11px;
+  color: var(--fg-4);
+  white-space: nowrap;
+}
+
+.pv-model__chev {
+  display: inline-flex;
+  color: var(--fg-4);
+  transition: transform 0.15s;
+}
+
+.pv-model__chev svg {
+  width: 15px;
+  height: 15px;
+}
+
+.pv-model[open] .pv-model__chev {
+  transform: rotate(90deg);
+}
+
+.pv-model__paths {
+  padding: 2px 14px 8px;
+  border-top: 1px solid var(--line);
+}
+
+.pv-path {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) auto minmax(0, auto) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.pv-path:last-child {
+  border-bottom: 0;
+}
+
+.pv-path__main b {
+  display: block;
+  overflow: hidden;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fg);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pv-path__main small {
+  display: block;
+  margin-top: 2px;
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--fg-4);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pv-path__billing {
+  font-size: 11px;
+  color: var(--fg-4);
+  white-space: nowrap;
+}
+
+.pv-path__price {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--fg-3);
+  white-space: nowrap;
+}
+
+.pv-path__switch {
+  display: inline-flex;
+  margin: 0;
+}
+
+/* 定价目录弹窗（pv-pricing） */
+
+.pv-pricing__toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 10px 0 10px;
+}
+
+.pv-pricing__toolbar .select {
+  width: 150px;
+  flex: none;
+}
+
+@media (max-width: 760px) {
+  .pv-grid,
+  .pv-add {
+    grid-template-columns: 1fr;
+  }
+
+  .pv-path {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-auto-flow: row;
+  }
+
+  .pv-toolbar {
+    flex-wrap: wrap;
+  }
+}
+
+/* —— 第二轮原型对齐：抽屉连接信息卡 + 模型配置双模式（对齐 providers.html §7.5.3-§7.5.6）—— */
+
+.pv-login__actions {
+  width: 100%;
+  justify-content: center;
+  margin-top: 16px;
+}
+
+/* 已由文件末尾「从 prototype/providers.html 移植」统一块取代 */
+.pv-models-hint {
+  margin: 8px 0 0;
+  color: var(--fg-4);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* pv-mlist：角色行列表容器（原型用 .pv-mline 直接堆叠，容器只负责去尾线） */
+.pv-mlist .pv-mline:last-child {
+  border-bottom: 0;
+}
+
+/* 添加流程订阅登录引导（原型 .pv-login 极简三步卡） */
+.pv-login {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 26px 22px 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface);
+  text-align: center;
+}
+
+.pv-login__brand {
+  width: 44px;
+  height: 44px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r-lg);
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.pv-login h3 {
+  margin: 12px 0 4px;
+  font-size: 14px;
+  font-weight: 680;
+}
+
+.pv-login > p {
+  margin: 0;
+  color: var(--fg-4);
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+
+.pv-login ol {
+  display: grid;
+  gap: 7px;
+  width: 100%;
+  margin: 16px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.pv-login ol li {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 12px;
+  border-radius: var(--r-sm);
+  background: var(--bg);
+  color: var(--fg-2);
+  font-size: 11.5px;
+  text-align: left;
+}
+
+.pv-login ol li i {
+  flex: none;
+  width: 17px;
+  height: 17px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent-hi);
+  font-size: 10px;
+  font-weight: 650;
+  font-style: normal;
+}
+
+.pv-login__note {
+  margin-top: 13px;
+  color: var(--fg-4);
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+
+/* 抽屉脚注：去绑定 / 移除（安静链接，保留删除能力）/ 保存修改 */
+.pv-drawer__foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 2px;
+}
+
+/* —— 第三轮：执行引擎卡与详情面板对齐原型度量 —— */
+.main .card.engine-card {
+  display: grid;
+  gap: 12px;
+  padding: 15px;
+  border-radius: var(--r-sm);
+  background: var(--pv-proto-surface-tint);
+  border-color: var(--border);
+}
+
+.engine-card__id {
+  gap: 4px;
+}
+
+.main .engine-card .bind-edit {
+  min-height: 36px;
+  padding-right: 12px;
+  padding-left: 12px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  font-weight: 400;
+  background: var(--surface);
+}
+
+.main .engine-card .bind-edit:hover {
+  border-color: var(--accent-line);
+  background: var(--surface);
+}
+
+.engine-card:hover {
+  transform: translateY(-1px);
+}
+
+.engine-card h3 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+}
+
+.engine-card__id {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.engine-card__id h3 {
+  display: block;
+  gap: normal;
+}
+
+.engine-card__desc {
+  min-height: 34px;
+  margin: 0;
+  color: var(--fg-4);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.engine-card__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  color: var(--fg-4);
+  font-size: 11px;
+}
+
+.engine-card__meta span + span::before {
+  content: '·';
+  margin-right: 6px;
+  color: var(--border-2);
+}
+
+/* 偏好行：对齐 cm-option-row 度量 */
+
+/* 来源小标签（原型 cm-source-label） */
+
+/* 宽度工具（原型 w-130 / w-150 / w-160） */
+.w-130 {
+  width: 130px;
+}
+.w-150 {
+  width: 150px;
+}
+.w-160 {
+  width: 160px;
+}
+
+/* 环境变量表（原型 pv-env：名称 / 值 / 秘密 / 移除） */
+.pv-env {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--bg);
+}
+
+.pv-env__row {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) minmax(160px, 1.3fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.pv-env__row:last-child {
+  border-bottom: 0;
+}
+
+.pv-env__value {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.pv-env__value .input {
+  flex: 1;
+  min-width: 0;
+}
+
+/* 定价弹窗高级折叠区留白 */
+
+.pv-pricing__adv .pv-advanced__body > textarea,
+.pv-pricing__adv .pv-advanced__body > .provider-actions {
+  margin-left: 2px;
+  margin-right: 2px;
+}
+
+/* —— 第四轮：只读底色通病 / 返回按钮 / 模型路径四列 —— */
+.cm-drawer .input[readonly],
+.pv-modal__bd .input[readonly],
+.cm-pagebody--scroll .input[readonly] {
+  background: var(--surface-2);
+  color: var(--fg-3);
+  cursor: not-allowed;
+}
+
+.pv-pick__back {
+  min-height: 28px;
+  padding: 0 10px;
+  font-size: 11px;
+}
+
+.pv-path {
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+}
+
+.pv-path__price span + span::before,
+.pv-model__price span + span::before {
+  content: '\00B7';
+  margin-right: 6px;
+  color: var(--border-2);
+}
+
+/* 详情面板：白卡 + 区块头字号 */
+.main .cm-detail-header h2 {
+  font-size: 16px;
+  font-weight: 680;
+}
+
+.main details.pv-advanced {
+  border: 1px solid color-mix(in oklch, var(--fg) 14%, transparent);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+}
+
+.main details.pv-advanced summary {
+  min-height: 48px;
+  padding: 0 18px;
+  gap: 8px;
+  font-weight: 640;
+  color: var(--pv-proto-muted-strong);
+  border: 0;
+}
+
+/* 第四轮补充：引擎网格两列 12px */
+.engines-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.main .pill--success {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 23px;
+  padding: 0 8px;
+  font-size: 10px;
+  line-height: 15px;
+}
+
+.main .pill--success::before {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  content: '';
+}
+
+/* ============================================================
+   执行引擎 Tab · 页面覆盖（自 prototype/providers.html 内联样式移植，2026-08-25）
+   基础组件（cm-engine-card / cm-option-row / cm-status-pill / cm-switch /
+   cm-select / cm-note / cm-setting-grid / cm-detail-header）在 components.css。
+   ============================================================ */
+
+/* 引擎卡：标题/状态/绑定按钮同行对齐；元信息一行静默分隔（providers.html L16-30） */
+.cm-engine-card__top {
+  align-items: flex-start;
+}
+.cm-engine-card__id {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.cm-engine-card__id h3 {
+  font-size: 15px;
+  font-weight: 650;
+}
+.cm-engine-card__bind {
+  margin-left: auto;
+  align-self: flex-start;
+}
+.cm-engine-card__desc {
+  margin: 0;
+  color: var(--fg-4);
+  font-size: 11.5px;
+  line-height: 1.5;
+  min-height: 0;
+}
+.cm-engine-card__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  color: var(--fg-4);
+  font-size: 11px;
+}
+.cm-engine-card__meta span {
+  position: relative;
+  white-space: nowrap;
+}
+.cm-engine-card__meta span + span::before {
+  content: '·';
+  position: absolute;
+  left: -7px;
+  color: var(--border-2);
+}
+
+/* 13. 单面板结构：运行环境/引擎偏好/高级设置直接浮在页面背景上，
+   不套白色底托；行间不留分隔线，配置项单列（providers.html L249-262） */
+.pv-panel {
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+}
+.pv-sec,
+.pv-advanced {
+  border: 1px solid color-mix(in oklch, var(--fg) 14%, transparent);
+  border-radius: var(--r-sm);
+  background: var(--cm-surface);
+}
+.pv-sec {
+  padding: 13px 18px 11px;
+}
+.pv-sec + .pv-sec,
+.pv-advanced {
+  margin-top: 10px;
+}
+.pv-sec__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 2px 0 10px;
+}
+.pv-sec__head h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 670;
+}
+.pv-sec__head small {
+  color: var(--fg-4);
+  font-size: 10.5px;
+}
+.cm-engine-detail .cm-setting-grid {
+  grid-template-columns: 1fr;
+  gap: 0;
+}
+.cm-engine-detail .cm-option-row {
+  border-bottom: 0;
+  padding-block: 10px;
+}
+.cm-engine-detail .cm-setting-grid .cm-option-row {
+  min-height: 0;
+}
+
+/* 高级设置（details 折叠，providers.html L265-281） */
+.pv-advanced summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 48px;
+  padding: 0 18px;
+  cursor: pointer;
+  list-style: none;
+  color: var(--fg-2);
+  font-size: 12.5px;
+  font-weight: 640;
+}
+.pv-advanced summary::-webkit-details-marker {
+  display: none;
+}
+.pv-advanced summary::after {
+  content: none;
+}
+.pv-advanced__chev {
+  display: inline-flex;
+  color: var(--fg-4);
+  transition: transform 0.16s ease;
+}
+.pv-advanced__chev svg {
+  width: 14px;
+  height: 14px;
+}
+.pv-advanced[open] summary .pv-advanced__chev {
+  transform: rotate(90deg);
+}
+.pv-advanced__hint {
+  margin-left: auto;
+  color: var(--fg-4);
+  font-size: 10.5px;
+  font-weight: 400;
+}
+.pv-advanced__body {
+  padding: 0 18px 14px;
+}
+
+/* —— 订阅登录卡：cm-auth-card（自 prototype/settings.html L456-491 移植；
+   图标选择器按实现 Icon 直接输出 svg 调整） —— */
+.cm-auth-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 16px;
+  border: 1px solid var(--cm-border);
+  border-radius: var(--r-sm);
+  background: var(--cm-surface);
+  transition: border-color 0.16s var(--ease);
+}
+.cm-auth-card + .cm-auth-card {
+  margin-top: 10px;
+}
+.cm-auth-card:hover {
+  border-color: var(--line-accent-hover);
+}
+.cm-auth-card__icon {
+  width: 32px;
+  height: 32px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  color: var(--fg-3);
+}
+.cm-auth-card__icon svg {
+  width: 16px;
+  height: 16px;
+}
+.cm-auth-card__main {
+  flex: 1;
+  min-width: 0;
+}
+.cm-auth-card__main b {
+  display: block;
+  font-size: 12.5px;
+  font-weight: 640;
+  color: var(--fg);
+}
+.cm-auth-card__main small {
+  display: block;
+  margin-top: 4px;
+  color: var(--fg-4);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+
+/* —— 抽屉结构适配：实现为 pv-drawer-layer 常驻条件渲染（非原型 is-open 滑入模式），
+   覆盖 components.css cm-drawer 的 absolute/translate 定位；类名仍对齐 cm-drawer 一族。 —— */
+.pv-drawer-layer .cm-drawer {
+  position: relative;
+  inset: auto;
+  transform: none;
+  transition: none;
+  display: flex;
+  flex-direction: column;
+  width: min(520px, 92vw);
+  height: 100%;
+  border-left: 1px solid var(--border);
+  padding: 0;
+  overflow: visible;
+}
+.pv-drawer-layer .cm-drawer__head {
+  align-items: center;
+  gap: 12px;
+  padding: 16px 18px 10px;
+  border-bottom-color: var(--line);
+}
+.pv-drawer-layer .cm-drawer__head h2 {
+  font-size: 16px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+.pv-drawer-layer .cm-drawer__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 18px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* 抽屉底部：删除居左（含阻断提示），去绑定/保存居右；原型 commercial.css L139 + providers.html L153 */
+.cm-panel__foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 18px;
+}
+.pv-foot__delete {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.pv-foot__delete small {
+  color: var(--fg-4);
+  font-size: 10.5px;
+}
+
+/* ===== 从 prototype/providers.html 内联样式移植（详情抽屉/添加流程共用） ===== */
+/* 8f. 模型行：角色行与列表行同栅格（providers.html L115-122） */
+.pv-mline {
+  display: grid;
+  gap: 12px;
+  align-items: center;
+  min-height: 42px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--cm-border);
+}
+.pv-mline:last-child {
+  border-bottom: 0;
+}
+.pv-mline--role {
+  grid-template-columns: 84px minmax(0, 1fr) auto;
+}
+.pv-mline--list {
+  grid-template-columns: auto minmax(0, 1fr) auto;
+}
+.pv-mline > b {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cm-drawer__body .pv-mline:first-of-type {
+  margin-top: 2px;
+}
+
+/* 8g. 行尾组合：价签 + 改价 + 移除（L125-127） */
+.pv-mline__end,
+.pv-selrow__end,
+.pv-synclist__end {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  justify-self: end;
+}
+.pv-pricechip {
+  display: inline-block;
+  min-width: 86px;
+  color: var(--fg-3);
+  font: 10px var(--font-mono);
+  white-space: nowrap;
+  text-align: right;
+}
+.pv-pricechip.is-none {
+  color: var(--fg-4);
+}
+
+/* 8h. 模型 ID 组合框：手输 + 下拉候选（添加流程与详情共用，L130-136） */
+.pv-combo {
+  position: relative;
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.pv-combo .cm-model-input {
+  flex: 1;
+  min-width: 0;
+  min-height: 30px;
+}
+.pv-combo__toggle {
+  width: 26px;
+  height: 26px;
+  flex: none;
+  color: var(--fg-3);
+}
+/* 定位完全由 JS 内联 style 接管（portal 后父容器不再是 .pv-combo，
+   这里的 min-width/100% 会把菜单撑成弹窗宽度，left/top 也会被 portal 后的坐标系错位） */
+.pv-combo__menu {
+  z-index: 1000;
+  overflow: auto;
+  padding: 4px;
+  border: 1px solid var(--cm-border);
+  border-radius: var(--r-sm);
+  background: var(--bg);
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.14);
+}
+.pv-combo__opt {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: none;
+  color: var(--fg-2);
+  font: 11px var(--font-mono);
+  text-align: left;
+  cursor: pointer;
+}
+.pv-combo__opt:hover,
+.pv-combo__opt.is-active {
+  background: var(--surface-2);
+  color: var(--fg);
+}
+.pv-combo__opt.is-taken {
+  color: var(--fg-4);
+}
+.pv-combo__opt.is-taken .pv-combo__opt-id {
+  text-decoration: line-through;
+  text-decoration-color: var(--fg-4);
+}
+.pv-combo__opt-price {
+  flex: none;
+  color: var(--fg-4);
+  font-size: 10px;
+}
+
+/* 改价入口（L139） */
+.pv-priceedit {
+  min-height: 22px;
+  padding: 1px 9px;
+  font-size: 11px;
+}
+
+/* 8i. 组合框增强：输入即筛选、空态、静默态输入框（L143-151） */
+.pv-combo__opt-id {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.pv-combo__empty {
+  padding: 9px 10px;
+  color: var(--fg-4);
+  font-size: 11px;
+}
+.pv-combo--ghost .cm-model-input {
+  border-color: transparent;
+  background: transparent;
+  padding-inline: 6px;
+}
+.pv-combo--ghost:hover .cm-model-input,
+.pv-combo--ghost:focus-within .cm-model-input {
+  border-color: var(--cm-border);
+  background: var(--bg);
+}
+
+/* 空态与「添加模型」独占一行（L150-151、L193） */
+.pv-empty {
+  padding: 16px 14px;
+  border: 1px dashed var(--cm-border);
+  border-radius: var(--r-sm);
+  color: var(--fg-4);
+  font-size: 11.5px;
+  text-align: center;
+}
+.pv-synclist__add {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  margin-top: 10px;
+}
+.pv-synclist__add .cm-model-input {
+  min-height: 32px;
+}
+.pv-synclist__add.pv-synclist__add--solo {
+  display: flex;
+  justify-content: flex-start;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+/* 角色行 / 同步列表（L182-194） */
+.pv-selwrap {
+  padding-top: 4px;
+}
+.pv-selrow {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--cm-border);
+}
+.pv-selrow:last-child {
+  border-bottom: 0;
+}
+.pv-selrow > b {
+  font-size: 12px;
+  font-weight: 600;
+}
+.pv-selrow .cm-select {
+  min-height: 32px;
+  font: 11px var(--font-mono);
+}
+.pv-openai-list {
+  margin-top: 4px;
+}
+.pv-synclist__row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--cm-border);
+}
+.pv-synclist__row:last-child {
+  border-bottom: 0;
+}
+
+/* 详情页脚：删除（危险）与阻断态（L154-162） */
+.pv-detail__foot-main {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+.cm-action.is-blocked {
+  color: var(--fg-4);
+  background: transparent;
+  cursor: not-allowed;
+}
+.cm-action.is-blocked:hover {
+  border-color: var(--cm-border);
+  background: transparent;
+  color: var(--fg-4);
+}
+
+/* 详情卡头部右侧组合：状态 pill + 动作按钮（L166） */
+.pv-headright {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+}
+
+/* 表单操作区（L91）：右对齐次按钮 + 主按钮 */
+.cm-form-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
+/* 图标旋转（同步中）：prototype/assets/app.css L590 */
+.spin {
+  animation: pv-spin 1s linear infinite;
+}
+@keyframes pv-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 620px) {
+  .cm-engine-card__bind {
+    margin-left: 0;
+  }
+  .cm-engine-card__top {
+    flex-wrap: wrap;
+  }
+  .pv-advanced summary {
+    flex-wrap: wrap;
+    padding: 10px 14px;
+  }
+  .pv-advanced__hint {
+    display: none;
+  }
 }

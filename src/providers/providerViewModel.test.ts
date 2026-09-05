@@ -1,10 +1,19 @@
 import { describe, expect, it } from 'vitest';
-import type { AppConfig } from './api';
+import type { AppConfig, ModelConfig } from './api';
 import {
   applicableEngineLabels,
   canBindProvider,
   compatibleProvidersForEngine,
   createProviderDraft,
+  modelAccessGroups,
+  modelGroupPriceSummary,
+  multiplierInputToBasisPoints,
+  normalizeModelGroupId,
+  pathBillingLabel,
+  providerAccessGroup,
+  providerCardStatus,
+  templatesForAccessGroup,
+  PROVIDER_ACCESS_GROUPS,
   providerDeleteConfirmation,
   providerDeleteBlockedReason,
   providerModelEmptyState,
@@ -25,6 +34,7 @@ import {
   providerSetupCopy,
   providerRuntimeReady,
   protocolLabel,
+  commitProviderModelRow,
   reachabilityStatus,
   readinessText,
   subscriptionLoginWarning,
@@ -231,13 +241,14 @@ describe('provider view model', () => {
   });
 
   it('creates provider drafts from user intent instead of a generic example record', () => {
-    expect(createProviderDraft('codex-openai', 1783300000000)).toMatchObject({
+    expect(createProviderDraft('official-openai', 1783300000000)).toMatchObject({
       id: 'custom-1783300000000',
-      name: 'OpenAI 兼容服务商',
-      baseUrl: '',
+      name: 'OpenAI API',
+      baseUrl: 'https://api.openai.com/v1',
       protocol: 'openai-responses',
       authMethod: 'apikey',
       kind: 'api',
+      accessType: 'official',
       ready: false,
       lastTest: null,
     });
@@ -403,7 +414,7 @@ describe('provider view model', () => {
     expect(providerCanDelete(0)).toBe(true);
     expect(providerCanDelete(1)).toBe(false);
     expect(providerDeleteBlockedReason(0)).toBeNull();
-    expect(providerDeleteBlockedReason(1)).toContain('引擎与绑定');
+    expect(providerDeleteBlockedReason(1)).toContain('解绑后可删除');
   });
 
   it('reports reachability status from lastTest result', () => {
@@ -432,5 +443,231 @@ describe('provider view model', () => {
     expect(failureCategoryLabel('auth')).toBe('认证');
     expect(failureCategoryLabel('timeout')).toBe('超时');
     expect(failureCategoryLabel('unknown')).toBe('未知');
+  });
+
+  // ===== S6：接入类型分组 / 状态视觉 / 模型接入路径 =====
+
+  it('classifies access groups into the four user-decided buckets (legacy falls back to relay)', () => {
+    expect(providerAccessGroup({ kind: 'subscription' })).toBe('subscription');
+    // 本地服务并入第三方中转展示（用户四分类裁决）
+    expect(providerAccessGroup({ kind: 'local' })).toBe('relay');
+    expect(providerAccessGroup({ kind: 'api', accessType: 'official' })).toBe('official');
+    expect(providerAccessGroup({ kind: 'api', accessType: 'plan' })).toBe('plan');
+    expect(providerAccessGroup({ kind: 'api', accessType: 'relay' })).toBe('relay');
+    // 历史数据：官方域名推断为直连，其余一律归入第三方中转
+    expect(
+      providerAccessGroup({ kind: 'api', accessType: null, baseUrl: 'https://api.anthropic.com' }),
+    ).toBe('official');
+    expect(
+      providerAccessGroup({
+        kind: 'api',
+        accessType: null,
+        baseUrl: 'https://gw.internal.example.com',
+      }),
+    ).toBe('relay');
+    expect(providerAccessGroup({ kind: 'api', accessType: null })).toBe('relay');
+  });
+
+  it('derives card status pills only from real readiness/login/model data', () => {
+    const base = { kind: 'api' as const, ready: true, lastTest: null };
+    expect(providerCardStatus(base, null, 0)).toEqual({ label: '待选模型', tone: 'warn' });
+    expect(providerCardStatus({ ...base, lastTest: { result: 'fail', at: 1 } }, null, 2)).toEqual({
+      label: '探活失败',
+      tone: 'warn',
+    });
+    expect(providerCardStatus({ ...base, lastTest: { result: 'ok', at: 1 } }, null, 2)).toEqual({
+      label: '配置就绪',
+      tone: 'ready',
+    });
+    expect(providerCardStatus({ ...base, ready: false }, null, 2)).toEqual({
+      label: '待配置',
+      tone: 'muted',
+    });
+    // 订阅：登录成功 → 已登录/待选模型；未登录 → 登录态文案
+    const sub = { kind: 'subscription' as const, ready: true, lastTest: null };
+    expect(providerCardStatus(sub, { state: 'ok', authMethod: 'subscription' }, 1)).toEqual({
+      label: '已登录',
+      tone: 'ready',
+    });
+    expect(providerCardStatus(sub, { state: 'ok', authMethod: 'subscription' }, 0)).toEqual({
+      label: '待选模型',
+      tone: 'warn',
+    });
+    expect(providerCardStatus(sub, { state: 'missing' }, 1).tone).toBe('warn');
+  });
+
+  it('normalizes model ids with the same rules as Rust pricing::normalize_model_id', () => {
+    expect(normalizeModelGroupId('Claude-Sonnet-4')).toBe('claude-sonnet-4');
+    expect(normalizeModelGroupId('models/gpt-5')).toBe('gpt-5');
+    expect(normalizeModelGroupId('anthropic/claude-3')).toBe('claude-3');
+    expect(normalizeModelGroupId('openai/gpt-5')).toBe('gpt-5');
+    expect(normalizeModelGroupId('qwen@2025')).toBe('qwen-2025');
+    expect(normalizeModelGroupId('a@b@c')).toBe('a-b-c');
+    expect(normalizeModelGroupId('models/openai/gpt-x')).toBe('gpt-x');
+    expect(normalizeModelGroupId('  GPT-5 ')).toBe('gpt-5');
+  });
+
+  it('labels path billing from the real access group', () => {
+    expect(pathBillingLabel({ kind: 'subscription' })).toBe('订阅折算');
+    expect(pathBillingLabel({ kind: 'api', accessType: 'plan' })).toBe('套餐等效');
+    expect(pathBillingLabel({ kind: 'api', accessType: 'official' })).toBe('官方费率');
+    expect(pathBillingLabel({ kind: 'api', accessType: 'relay' })).toBe('中转报价');
+    expect(pathBillingLabel({ kind: 'local' })).toBe('中转报价');
+    expect(pathBillingLabel({ kind: 'api' })).toBe('中转报价');
+  });
+
+  it('aggregates cross-provider access paths per normalized model id with bindings', () => {
+    const duplicated: AppConfig = {
+      ...config,
+      providers: [
+        ...config.providers,
+        {
+          id: 'kimi-plan',
+          name: 'Kimi 套餐',
+          kind: 'api',
+          baseUrl: 'https://plan.example.com',
+          keyRef: null,
+          ready: true,
+          lastTest: null,
+          protocol: 'openai-responses',
+          authMethod: 'apikey',
+          accessType: 'plan',
+        },
+      ],
+      models: [
+        ...config.models,
+        {
+          id: 'gpt-5-codex',
+          providerId: 'kimi-plan',
+          displayName: 'GPT-5-Codex',
+          inputPricePerMtok: 0,
+          outputPricePerMtok: 0,
+          enabled: false,
+        },
+      ],
+      bindings: [
+        ...config.bindings,
+        { engineId: 'codex', providerId: 'openai', primaryModel: 'gpt-5-codex', fastModel: null },
+      ],
+    };
+    const groups = modelAccessGroups(duplicated);
+    const gpt = groups.find((group) => group.key === 'gpt-5-codex');
+    expect(gpt).toBeDefined();
+    expect(gpt?.paths.map((path) => path.provider.id)).toEqual(['openai', 'kimi-plan']);
+    expect(gpt?.paths[0].boundEngines).toContain('Codex');
+    expect(gpt?.paths[1].billing).toBe('套餐等效');
+  });
+
+  it('summarizes group price preferring token-priced paths over plan fallbacks', () => {
+    const makeModel = (inputPricePerMtok: number, outputPricePerMtok: number): ModelConfig => ({
+      id: 'm1',
+      providerId: 'p1',
+      displayName: 'm1',
+      inputPricePerMtok,
+      outputPricePerMtok,
+      enabled: true,
+    });
+    const summary = modelGroupPriceSummary([
+      {
+        model: makeModel(3, 15),
+        provider: { ...config.providers[0] },
+        billing: '',
+        boundEngines: [],
+      },
+    ]);
+    expect(summary.plan).toBe(false);
+    expect(summary.text).toContain('$3.00');
+    expect(summary.text).toContain('$15.00');
+    expect(summary.segments.map((segment) => segment.label)).toEqual(['输入', '输出']);
+    const withCache = modelGroupPriceSummary([
+      {
+        model: { ...makeModel(3, 15), cachedInputPricePerMtok: 0.3 },
+        provider: { ...config.providers[0] },
+        billing: '',
+        boundEngines: [],
+      },
+    ]);
+    expect(withCache.segments.map((segment) => `${segment.label} ${segment.value}`)).toEqual([
+      '输入 $3.00',
+      '缓存 $0.30',
+      '输出 $15.00',
+    ]);
+    const subscriptionOnly = modelGroupPriceSummary([
+      {
+        model: makeModel(0, 0),
+        provider: {
+          id: 'sub',
+          name: 'Claude 订阅',
+          kind: 'subscription',
+          baseUrl: '',
+          keyRef: null,
+          ready: true,
+          lastTest: null,
+          protocol: 'anthropic',
+          authMethod: 'oauth',
+          accessType: null,
+        },
+        billing: '',
+        boundEngines: [],
+      },
+    ]);
+    expect(subscriptionOnly).toEqual({ segments: [], text: '订阅内', plan: true });
+    const unpriced = modelGroupPriceSummary([
+      {
+        model: makeModel(0, 0),
+        provider: config.providers[2],
+        billing: '',
+        boundEngines: [],
+      },
+    ]);
+    expect(unpriced).toEqual({ segments: [], text: '待配置', plan: true });
+  });
+
+  it('keeps add-flow templates grouped and stamps api drafts with an explicit access type', () => {
+    for (const group of ['subscription', 'official', 'plan', 'relay'] as const) {
+      expect(templatesForAccessGroup(group).length).toBeGreaterThan(0);
+    }
+    expect(PROVIDER_ACCESS_GROUPS.map((item) => item.id).sort()).toEqual([
+      'official',
+      'plan',
+      'relay',
+      'subscription',
+    ]);
+    const relayDraft = createProviderDraft('relay-anthropic', 42);
+    expect(relayDraft.accessType).toBe('relay');
+    expect(relayDraft.kind).toBe('api');
+    const planDraft = createProviderDraft('plan-kimi', 43);
+    expect(planDraft.accessType).toBe('plan');
+    const subDraft = createProviderDraft('claude-subscription', 44);
+    expect(subDraft.accessType).toBeNull();
+  });
+});
+
+describe('commitProviderModelRow（空行保留 / 重复不删行）', () => {
+  it('keeps an empty row instead of deleting it', () => {
+    expect(commitProviderModelRow(['gpt-5', ''], 1, '   ')).toEqual({ action: 'keep-empty' });
+  });
+
+  it('rejects a duplicate id without asking the caller to drop the row', () => {
+    expect(commitProviderModelRow(['gpt-5', ''], 1, 'gpt-5')).toEqual({ action: 'duplicate' });
+  });
+
+  it('applies a new trimmed id', () => {
+    expect(commitProviderModelRow(['gpt-5', ''], 1, '  gpt-5-mini  ')).toEqual({
+      action: 'apply',
+      id: 'gpt-5-mini',
+    });
+  });
+});
+
+describe('multiplierInputToBasisPoints（矩阵 H-4 倍率钳制）', () => {
+  it('空值按 1 倍，负数与零钳到 1bp 下限，小数按基点取整', () => {
+    expect(multiplierInputToBasisPoints('')).toBe(10000);
+    expect(multiplierInputToBasisPoints('0')).toBe(1);
+    expect(multiplierInputToBasisPoints('-5')).toBe(1);
+    expect(multiplierInputToBasisPoints('0.01')).toBe(100);
+    expect(multiplierInputToBasisPoints('0.5')).toBe(5000);
+    expect(multiplierInputToBasisPoints('1.5')).toBe(15000);
+    expect(multiplierInputToBasisPoints('100')).toBe(1000000);
   });
 });

@@ -1,6 +1,7 @@
 import { memo } from 'react';
 import type { Decision } from '@helm/protocol';
 import type { ThreadItem } from '../../engine/useSession';
+import { Icon } from '../../shell/icons';
 
 type ApprovalItem = Extract<ThreadItem, { kind: 'approval' }>;
 
@@ -28,86 +29,69 @@ const RESOLVED_LABELS: Record<Decision, string> = {
   deny: '已拒绝',
 };
 
+/**
+ * 审批卡（批次①对齐原型 .approve，ws.js L123-126）：警示左缘 + 标题 + 审核提示 +
+ * 命令框 + 决定按钮 + 指纹注释。availableDecisions 仍是后端权威决定集合
+ * （AGENTS 红线），按钮族按其动态渲染，不写死决定集合。
+ */
 export const ApprovalCard = memo(function ApprovalCard({ item, onRespond, className }: Props) {
   const disabled = item.status === 'applying' || item.status === 'resolved';
   const retrying = item.status === 'failed';
-  return (
-    <div className={className ? `item ${className}` : 'item'}>
-      <div className="item__gut" />
-      <div className="item__main">
-        <div className={`approve${item.status === 'resolved' ? ' resolved' : ''}`}>
-          <div className="approve__t">
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              width="16"
-              height="16"
-            >
-              <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
-              <line x1="12" y1="9" x2="12" y2="13" />
-              <line x1="12" y1="17" x2="12.01" y2="17" />
-            </svg>
-            {item.action}
-          </div>
-          <div className="prose" style={{ fontSize: 13, color: 'var(--fg-3)', marginBottom: 8 }}>
-            Helm 想要执行以下操作，请先审核再允许。
-          </div>
-          <div className="approve__cmd">{item.detail || item.action}</div>
-          {item.matcherSummary && item.availableDecisions.includes('session') ? (
-            <div className="approve__scope">
-              选择&quot;总是允许&quot;后，本会话执行该程序不再逐条确认。
-            </div>
-          ) : null}
-          {item.status === 'failed' && item.error ? (
-            <div className="prose" style={{ fontSize: 12, color: 'var(--danger)', marginTop: 8 }}>
-              {item.error}
-            </div>
-          ) : null}
-          <div className="approve__acts">
-            {item.availableDecisions.map((decision) => (
-              <button
-                key={decision}
-                className={`btn btn--sm ${
-                  decision === 'allow'
-                    ? 'btn--primary'
-                    : decision === 'deny'
-                      ? 'btn--danger'
-                      : 'btn--subtle'
-                }`}
-                onClick={() => onRespond(item.id, decision)}
-                disabled={disabled}
-              >
-                {retrying ? `重试${DECISION_LABELS[decision]}` : DECISION_LABELS[decision]}
-              </button>
-            ))}
-          </div>
-          {item.status === 'applying' ? (
-            <div className="prose" style={{ fontSize: 12, color: 'var(--fg-3)', marginTop: 8 }}>
-              正在应用审批…
-            </div>
-          ) : null}
-          {item.status === 'resolved' ? (
-            <div className="approve__done">
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                width="15"
-                height="15"
-              >
-                <polyline points="20 6 9 17 4 12" />
-              </svg>
-              <span
-                style={{ color: item.decision === 'deny' ? 'var(--danger)' : 'var(--success)' }}
-              >
-                {item.decision ? RESOLVED_LABELS[item.decision] : '审批已失效'}
-              </span>
-            </div>
-          ) : null}
+  // 渲染形态 B（对齐 WorkBuddy）：已处理完的审批收成轻量行——无需再操作，
+  // 保留完整警示卡片只会让折叠后的过程区显得层层嵌套；待处理审批保持卡片。
+  if (item.status === 'resolved') {
+    const denied = item.decision === 'deny';
+    return (
+      <div className={className} data-kind="approve">
+        <div className="approve-lite">
+          <Icon name={denied ? 'close' : 'check'} />
+          <span className="approve-lite__act">{item.detail || item.action}</span>
+          <span
+            className="approve-lite__res"
+            style={{ color: denied ? 'var(--danger)' : 'var(--success)' }}
+          >
+            {item.decision ? RESOLVED_LABELS[item.decision] : '审批已失效'}
+          </span>
         </div>
+      </div>
+    );
+  }
+  return (
+    /* 批次①：审批卡不再自带 .item 头像壳，由所在轮次 .ai-turn 统一承担 */
+    <div className={className} data-kind="approve">
+      <div className="approve">
+        <div className="approve__t">
+          <Icon name="alert" style={{ width: 16, height: 16 }} />
+          {item.action}
+        </div>
+        <div className="prose">Helm 想要运行一条命令。请先审核再允许。</div>
+        <div className="approve__cmd">{item.detail || item.action}</div>
+        <div className="approve__note">
+          选择&quot;总是允许&quot;后，本会话执行该程序不再逐条确认。
+        </div>
+        {item.status === 'failed' && item.error ? (
+          <div className="approve__error">{item.error}</div>
+        ) : null}
+        <div className="approve__acts">
+          {item.availableDecisions.map((decision) => (
+            <button
+              key={decision}
+              className={`btn btn--sm ${
+                decision === 'allow'
+                  ? 'btn--primary'
+                  : decision === 'deny'
+                    ? 'btn--danger'
+                    : 'btn--subtle'
+              }`}
+              onClick={() => onRespond(item.id, decision)}
+              disabled={disabled}
+            >
+              {decision === 'allow' ? <Icon name="check" /> : null}
+              {retrying ? `重试${DECISION_LABELS[decision]}` : DECISION_LABELS[decision]}
+            </button>
+          ))}
+        </div>
+        {item.status === 'applying' ? <div className="approve__applying">正在应用审批…</div> : null}
       </div>
     </div>
   );

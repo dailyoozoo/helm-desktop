@@ -88,7 +88,7 @@ fn secret_patterns() -> &'static [Regex] {
     static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
     PATTERNS.get_or_init(|| {
         vec![
-            Regex::new(r"(?i)\bbearer\s+[a-z0-9._~+/=-]{8,}").unwrap(),
+            Regex::new(r"(?i)\bbearer\s+[a-z0-9._~+/=-]{4,}").unwrap(),
             Regex::new(r"\bsk-[A-Za-z0-9_-]{8,}\b").unwrap(),
             Regex::new(
                 r#"(?i)[\"']?[a-z0-9_.-]*(?:api[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|secret|password|authorization|credential)[a-z0-9_.-]*[\"']?\s*[:=]\s*[\"']?[^\"',\s}\r\n]+"#,

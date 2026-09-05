@@ -47,6 +47,7 @@ fn mcp_server_save_and_delete_round_trips_claude_settings_json() {
             "D:\\work".to_string(),
         ],
         env: HashMap::from([("SAFE_ENV".to_string(), "1".to_string())]),
+        headers: Default::default(),
         transport: McpTransport::Stdio,
         enabled: true,
         status: McpStatus::Disconnected,
@@ -101,6 +102,7 @@ args = ["server.js"]
             "D:\\work".to_string(),
         ],
         env: HashMap::from([("SAFE_ENV".to_string(), "1".to_string())]),
+        headers: Default::default(),
         transport: McpTransport::Stdio,
         enabled: true,
         status: McpStatus::Disconnected,
@@ -146,6 +148,7 @@ fn mcp_sse_server_round_trips_claude_and_codex_configs() {
         command: "http://127.0.0.1:3000/sse".to_string(),
         args: vec![],
         env: HashMap::new(),
+        headers: Default::default(),
         transport: McpTransport::Sse,
         enabled: true,
         status: McpStatus::Disconnected,
@@ -515,6 +518,7 @@ async fn mcp_sse_connection_reads_tools_list_from_real_sse_stream() {
         command: format!("http://{addr}/sse"),
         args: vec![],
         env: HashMap::new(),
+        headers: Default::default(),
         transport: McpTransport::Sse,
         enabled: true,
         status: McpStatus::Disconnected,
@@ -635,6 +639,7 @@ fn mcp_http_server_round_trips_claude_and_codex_configs() {
         command: "http://127.0.0.1:3000/mcp".to_string(),
         args: vec![],
         env: HashMap::new(),
+        headers: Default::default(),
         transport: McpTransport::Http,
         enabled: true,
         status: McpStatus::Disconnected,
@@ -707,6 +712,7 @@ fn concurrent_mcp_writes_preserve_all_successful_claude_and_codex_entries() {
                 command: format!("mcp-{index}"),
                 args: vec!["--stdio".to_string()],
                 env: HashMap::new(),
+                headers: Default::default(),
                 transport: McpTransport::Stdio,
                 enabled: true,
                 status: McpStatus::Disconnected,
@@ -748,6 +754,7 @@ fn real_clis_parse_isolated_configs_written_by_helm() {
         command: "node".to_string(),
         args: vec!["-e".to_string(), "process.exit(0)".to_string()],
         env: HashMap::new(),
+        headers: Default::default(),
         transport: McpTransport::Stdio,
         enabled: true,
         status: McpStatus::Disconnected,
@@ -1135,4 +1142,252 @@ fn plugin_skills_nonexistent_directory_returns_empty() {
     let dir = temp_dir("plugin-nonexistent");
     let skills = list_plugin_skills_from_dir(&dir.join("nonexistent")).unwrap();
     assert!(skills.is_empty());
+}
+
+// ==================== S7：技能创建/源码/卸载 + 连接器停用库 + JSON 导入解析 ====================
+
+fn skill_request(id: &str, name: &str) -> helm_lib::extensions::CreateSkillRequest {
+    helm_lib::extensions::CreateSkillRequest {
+        engine: "claude-code".to_string(),
+        scope: helm_lib::extensions::SkillScope::Global,
+        id: id.to_string(),
+        name: name.to_string(),
+        description: "一句话说明".to_string(),
+        instructions: "1. 第一步\n2. 第二步".to_string(),
+    }
+}
+
+#[test]
+fn create_skill_writes_frontmatter_and_lists_back() {
+    let root = temp_dir("skill-create");
+    let request = skill_request("Release Check!", "发布检查");
+    let skill =
+        helm_lib::extensions::create_skill_in_root(&root, "claude-code", request.clone()).unwrap();
+
+    // 返回的元信息：slug 归一、触发词跟随引擎、来源是自己创建
+    assert_eq!(skill.id, "release-check");
+    assert_eq!(skill.trigger, "/release-check");
+    assert_eq!(skill.name, "发布检查");
+    assert_eq!(skill.source, helm_lib::extensions::SkillSource::Custom);
+
+    let content = fs::read_to_string(root.join("release-check").join("SKILL.md")).unwrap();
+    assert!(content.starts_with("---"));
+    assert!(content.contains("name: 发布检查"));
+    assert!(content.contains("description: 一句话说明"));
+    assert!(content.contains("1. 第一步"));
+
+    // 创建结果能被现有目录扫描读回（真实 list_skills 链路）
+    let listed = list_skills_from_dir(&root).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "发布检查");
+
+    // 同名目录 fail-closed，绝不覆盖
+    let duplicate = helm_lib::extensions::create_skill_in_root(&root, "claude-code", request);
+    assert!(duplicate.is_err());
+
+    // Codex 触发词是 $ 前缀
+    let codex_skill = helm_lib::extensions::create_skill_in_root(
+        &root,
+        "codex",
+        skill_request("docs-lookup", "文档检索"),
+    )
+    .unwrap();
+    assert_eq!(codex_skill.trigger, "$docs-lookup");
+}
+
+#[test]
+fn read_skill_source_redacts_secrets_and_reports_truncation() {
+    let dir = temp_dir("skill-source");
+    let sentinel = "sk-HELM_TEST_SOURCE_123456";
+    fs::write(
+        dir.join("SKILL.md"),
+        format!("# 测试技能\n\ntoken: {sentinel}\n正常说明保留"),
+    )
+    .unwrap();
+
+    let source = helm_lib::extensions::read_skill_source_file(&dir).unwrap();
+    assert!(!source.truncated);
+    assert!(!source.content.contains(sentinel), "凭证必须被脱敏");
+    assert!(source.content.contains("[REDACTED]"));
+    assert!(source.content.contains("正常说明保留"));
+
+    // 超过大小上限时截断返回，不把超大文件灌进 UI
+    let big = temp_dir("skill-source-big");
+    fs::write(
+        big.join("SKILL.md"),
+        vec![b'a'; (helm_lib::extensions::MAX_SKILL_SOURCE_BYTES + 1) as usize],
+    )
+    .unwrap();
+    let truncated = helm_lib::extensions::read_skill_source_file(&big).unwrap();
+    assert!(truncated.truncated);
+    assert!(truncated.content.is_empty());
+}
+
+#[test]
+fn skill_whitelist_rejects_directories_outside_managed_roots() {
+    let root = temp_dir("skill-root");
+    let inside = root.join("skills").join("demo");
+    fs::create_dir_all(&inside).unwrap();
+    let outside = temp_dir("skill-outside");
+    let roots = vec![root.join("skills")];
+
+    helm_lib::extensions::ensure_dir_within_roots(&inside, &roots).unwrap();
+    assert!(helm_lib::extensions::ensure_dir_within_roots(&outside, &roots).is_err());
+}
+
+#[test]
+fn mcp_store_round_trips_disabled_definitions() {
+    let path = temp_dir("mcp-store").join("mcp-store.json");
+    let server = McpServer {
+        name: "playwright".to_string(),
+        command: "npx".to_string(),
+        args: vec!["-y".to_string(), "@playwright/mcp@latest".to_string()],
+        env: HashMap::new(),
+        headers: Default::default(),
+        transport: McpTransport::Stdio,
+        enabled: true,
+        status: McpStatus::Disconnected,
+        last_tested_at: None,
+        tool_count: None,
+        last_error: None,
+    };
+    let mut store = std::collections::HashMap::new();
+    store.insert("playwright".to_string(), server);
+    helm_lib::extensions::write_mcp_store(&path, &store).unwrap();
+
+    // 读回：停用库里的定义一律标记为停用、未连接
+    let restored = helm_lib::extensions::read_mcp_store(&path).unwrap();
+    let playwright = restored.get("playwright").expect("playwright 应在停用库中");
+    assert!(!playwright.enabled);
+    assert_eq!(
+        playwright.transport,
+        helm_lib::extensions::McpTransport::Stdio
+    );
+    assert_eq!(playwright.args.len(), 2);
+}
+
+#[test]
+fn credential_key_classification_matches_backend_contract() {
+    for key in [
+        "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "OPENAI_API_KEY",
+        "client_secret",
+        "Authorization",
+        "MY_PASSWORD",
+    ] {
+        assert!(
+            helm_lib::extensions::is_credential_key(key),
+            "{key} 应判定为凭证类字段"
+        );
+    }
+    for key in ["MODEL", "BASE_URL", "LOG_LEVEL"] {
+        assert!(
+            !helm_lib::extensions::is_credential_key(key),
+            "{key} 不应判定为凭证类字段"
+        );
+    }
+}
+
+#[test]
+fn http_headers_round_trip_through_claude_settings() {
+    let settings_path = temp_settings_path("mcp-headers");
+    let server = McpServer {
+        name: "context7".to_string(),
+        command: "https://mcp.context7.com/mcp".to_string(),
+        args: vec![],
+        env: HashMap::new(),
+        headers: HashMap::from([("X-API-Key".to_string(), "demo-value".to_string())]),
+        transport: McpTransport::Http,
+        enabled: true,
+        status: McpStatus::Disconnected,
+        last_tested_at: None,
+        tool_count: None,
+        last_error: None,
+    };
+    save_mcp_server_to_settings_path(&settings_path, server).unwrap();
+
+    let servers = list_mcp_servers_from_settings_path(&settings_path).unwrap();
+    assert_eq!(servers.len(), 1);
+    assert_eq!(
+        servers[0].headers.get("X-API-Key").map(String::as_str),
+        Some("demo-value")
+    );
+
+    let raw: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(raw["mcpServers"]["context7"]["type"], "http");
+}
+
+#[test]
+fn parse_mcp_import_json_reports_per_item_results() {
+    use helm_lib::extensions::{parse_mcp_import_json, ParsedMcpImport};
+
+    let json = r#"{
+        "mcpServers": {
+            "github": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "secret-value" } },
+            "context7": { "type": "http", "url": "https://mcp.context7.com/mcp", "headers": { "X-API-Key": "k" } },
+            "legacy": { "type": "sse", "url": "https://example.com/sse" },
+            "broken": {},
+            "badurl": { "type": "http", "url": "ftp://example.com" }
+        }
+    }"#;
+
+    let parsed = parse_mcp_import_json(json).unwrap();
+    assert_eq!(parsed.len(), 5);
+
+    // serde_json 对象按键排序，逐项按名字取回断言，不依赖顺序
+    let by_name = |target: &str| {
+        parsed
+            .iter()
+            .find(|item| match item {
+                ParsedMcpImport::Server { name, .. } => name == target,
+                ParsedMcpImport::Skipped { name, .. } => name == target,
+                ParsedMcpImport::Failed { name, .. } => name == target,
+            })
+            .unwrap_or_else(|| panic!("缺少条目 {target}"))
+    };
+
+    match by_name("github") {
+        ParsedMcpImport::Server { name, server } => {
+            assert_eq!(name, "github");
+            assert_eq!(server.transport, helm_lib::extensions::McpTransport::Stdio);
+            assert_eq!(
+                server.env.get("GITHUB_PERSONAL_ACCESS_TOKEN").unwrap(),
+                "secret-value"
+            );
+        }
+        other => panic!("github 应为可导入的 stdio 服务器：{other:?}"),
+    }
+    match by_name("context7") {
+        ParsedMcpImport::Server { name, server } => {
+            assert_eq!(name, "context7");
+            assert_eq!(server.transport, helm_lib::extensions::McpTransport::Http);
+            assert!(server.headers.contains_key("X-API-Key"));
+        }
+        other => panic!("context7 应为可导入的 http 服务器：{other:?}"),
+    }
+    match by_name("legacy") {
+        ParsedMcpImport::Skipped { name, reason } => {
+            assert_eq!(name, "legacy");
+            assert!(
+                reason.contains("stdio/http"),
+                "跳过原因要说明仅支持 stdio/http"
+            );
+        }
+        other => panic!("sse 条目应被跳过：{other:?}"),
+    }
+    match by_name("broken") {
+        ParsedMcpImport::Failed { name, error } => {
+            assert_eq!(name, "broken");
+            assert!(error.contains("command"));
+        }
+        other => panic!("缺字段条目应失败：{other:?}"),
+    }
+    match by_name("badurl") {
+        ParsedMcpImport::Failed { name, .. } => assert_eq!(name, "badurl"),
+        other => panic!("非法 URL 条目应失败：{other:?}"),
+    }
+
+    // 整体不是 JSON 时报错，而不是静默成功
+    assert!(parse_mcp_import_json("not json").is_err());
 }

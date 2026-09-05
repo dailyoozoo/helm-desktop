@@ -21,14 +21,10 @@ pub struct AppSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneralSettings {
-    #[serde(rename = "workspaceName")]
-    pub workspace_name: String,
     #[serde(rename = "defaultDirectory")]
     pub default_directory: String,
     #[serde(rename = "reopenLastSession")]
     pub reopen_last_session: bool,
-    #[serde(rename = "anonymousAnalytics")]
-    pub anonymous_analytics: bool,
     #[serde(rename = "autoUpdateChannel")]
     pub auto_update_channel: String,
     #[serde(rename = "updateFeedUrl", default)]
@@ -54,6 +50,9 @@ pub struct GeneralSettings {
     /// 会把首轮对话内容发给用户自己绑定的服务商，属可关的外发行为。
     #[serde(rename = "autoTitleSessions", default = "default_true")]
     pub auto_title_sessions: bool,
+    /// 生成式 UI 总开关（默认关闭，渲染能力后续接入）：开启才允许最终结果使用交互式可视化输出。
+    #[serde(rename = "generativeUi", default)]
+    pub generative_ui: bool,
     /// 点关闭按钮时最小化到托盘而不是退出（变更-12）：后台会话继续运行
     #[serde(rename = "closeToTray", default)]
     pub close_to_tray: bool,
@@ -110,12 +109,6 @@ pub struct AppearanceSettings {
     pub theme: String,
     #[serde(rename = "accentColor")]
     pub accent_color: AccentColor,
-    #[serde(rename = "uiDensity")]
-    pub ui_density: String,
-    #[serde(rename = "monospaceFont")]
-    pub monospace_font: String,
-    #[serde(rename = "reduceMotion")]
-    pub reduce_motion: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,10 +168,8 @@ impl Default for AppSettings {
 
         Self {
             general: GeneralSettings {
-                workspace_name: "我的工作区".to_string(),
                 default_directory: default_dir,
                 reopen_last_session: true,
-                anonymous_analytics: false,
                 auto_update_channel: "stable".to_string(),
                 update_feed_url: String::new(),
                 pricing_auto_update: true,
@@ -187,6 +178,7 @@ impl Default for AppSettings {
                 pricing_max_age_days: default_pricing_max_age_days(),
                 onboarding_completed: false,
                 auto_title_sessions: true,
+                generative_ui: false,
                 close_to_tray: false,
                 notifications: Some(NotificationSettings { enabled: true }),
                 assistant_model_id: None,
@@ -210,12 +202,9 @@ impl Default for AppSettings {
             appearance: AppearanceSettings {
                 theme: "light".to_string(),
                 accent_color: AccentColor {
-                    base: "oklch(55% 0.2 264)".to_string(),
-                    hi: "oklch(49% 0.21 264)".to_string(),
+                    base: "oklch(52% 0.12 230)".to_string(),
+                    hi: "oklch(46% 0.13 230)".to_string(),
                 },
-                ui_density: "comfortable".to_string(),
-                monospace_font: "JetBrains Mono".to_string(),
-                reduce_motion: false,
             },
             shortcuts: ShortcutSettings::default(),
         }
@@ -251,27 +240,6 @@ fn normalize_general_settings(settings: &mut GeneralSettings) {
         settings.pricing_unknown_policy = default_pricing_unknown_policy();
     }
     settings.pricing_max_age_days = settings.pricing_max_age_days.clamp(1, 3650);
-}
-
-pub fn export_app_settings_to_path(store: &SessionHistoryStore, path: &Path) -> Result<(), String> {
-    let settings = load_app_settings_from_store(store)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("创建导出目录失败：{e}"))?;
-    }
-    let content =
-        serde_json::to_string_pretty(&settings).map_err(|e| format!("序列化设置失败：{e}"))?;
-    std::fs::write(path, content).map_err(|e| format!("写入设置导出文件失败：{e}"))
-}
-
-pub fn import_app_settings_from_path(
-    store: &SessionHistoryStore,
-    path: &Path,
-) -> Result<AppSettings, String> {
-    let content = std::fs::read_to_string(path).map_err(|e| format!("读取设置文件失败：{e}"))?;
-    let settings: AppSettings =
-        serde_json::from_str(&content).map_err(|e| format!("解析设置文件失败：{e}"))?;
-    save_app_settings_to_store(store, settings.clone())?;
-    Ok(settings)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -313,53 +281,6 @@ pub fn save_app_settings(
     provider_store
         .migrate_legacy_assistant_model(settings.general.assistant_model_id.as_deref())?;
     save_app_settings_to_store(&history_store, settings)
-}
-
-#[tauri::command]
-pub fn export_app_settings(
-    app: tauri::AppHandle,
-    history_store: State<'_, SessionHistoryStore>,
-) -> Result<Option<String>, String> {
-    use tauri_plugin_dialog::{DialogExt, FilePath};
-
-    let Some(path) = app
-        .dialog()
-        .file()
-        .set_title("导出 Helm 设置")
-        .add_filter("JSON", &["json"])
-        .blocking_save_file()
-    else {
-        return Ok(None);
-    };
-    let path = match path {
-        FilePath::Path(path) => path,
-        FilePath::Url(url) => return Err(format!("不支持的导出路径：{url}")),
-    };
-    export_app_settings_to_path(&history_store, &path)?;
-    Ok(Some(path.to_string_lossy().to_string()))
-}
-
-#[tauri::command]
-pub fn import_app_settings(
-    app: tauri::AppHandle,
-    history_store: State<'_, SessionHistoryStore>,
-) -> Result<Option<AppSettings>, String> {
-    use tauri_plugin_dialog::{DialogExt, FilePath};
-
-    let Some(path) = app
-        .dialog()
-        .file()
-        .set_title("导入 Helm 设置")
-        .add_filter("JSON", &["json"])
-        .blocking_pick_file()
-    else {
-        return Ok(None);
-    };
-    let path = match path {
-        FilePath::Path(path) => path,
-        FilePath::Url(url) => return Err(format!("不支持的导入路径：{url}")),
-    };
-    import_app_settings_from_path(&history_store, &path).map(Some)
 }
 
 #[tauri::command]
@@ -410,21 +331,37 @@ fn detect_engine_binary(executable: &str) -> Result<EngineDetectionResult, Strin
         return Err(format!("在 PATH 中找不到 {executable}，可能尚未安装"));
     }
 
-    let mut version_cmd = std::process::Command::new(&path);
-    version_cmd.arg("--version");
+    // Windows：npm 全局安装的 claude/codex 是 .cmd 垫片，CreateProcess 不能直接执行，
+    // 必须经 cmd /C 中转（与 providers.rs build_version_command 同款处理），否则版本恒为 unknown。
     #[cfg(windows)]
-    {
+    let version = {
         use std::os::windows::process::CommandExt;
+        let mut version_cmd = std::process::Command::new("cmd");
+        version_cmd.arg("/C").arg(&path).arg("--version");
         version_cmd.creation_flags(0x0800_0000);
-    }
-    let version = match version_cmd.output() {
-        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .next()
-            .unwrap_or("unknown")
-            .trim()
-            .to_string(),
-        _ => "unknown".to_string(),
+        match version_cmd.output() {
+            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("unknown")
+                .trim()
+                .to_string(),
+            _ => "unknown".to_string(),
+        }
+    };
+    #[cfg(not(windows))]
+    let version = {
+        let mut version_cmd = std::process::Command::new(&path);
+        version_cmd.arg("--version");
+        match version_cmd.output() {
+            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("unknown")
+                .trim()
+                .to_string(),
+            _ => "unknown".to_string(),
+        }
     };
 
     Ok(EngineDetectionResult { path, version })

@@ -1,5 +1,7 @@
+import type { EngineId } from '@helm/protocol';
+
 interface HomeEngine {
-  id: string;
+  id: EngineId;
   name: string;
   status: 'ready' | 'missing' | 'error';
   version?: string | null;

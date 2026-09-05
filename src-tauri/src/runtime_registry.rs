@@ -4,6 +4,7 @@ use crate::operations::{
     ModelOnlyOperationOutput, ModelOnlyOperationPolicy, OperationExecutionSpec,
 };
 use crate::protocol::{AgentEvent, EngineId, StopReason};
+use crate::reasoning::ReasoningEffort;
 use crate::sessions::SessionHistoryStore;
 use crate::turn_start::{digest_json, RuntimeRoute, TurnExecutionSpec};
 use serde::{Deserialize, Serialize};
@@ -123,6 +124,38 @@ impl Drop for OperationTempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// 引擎侧模型拒绝映射（九次反馈）：模型目录漂移或旧配置迁移会让分叉/旁路提问路由到
+/// 引擎链路不认识的模型 ID，CLI 以非零退出并在 stderr 留下含糊的内部 JSON（如
+/// `unrecognized_model`）。命中时翻译成可操作的中文指引并附原始片段（截断＋脱敏），
+/// 其余失败保持既有 tag 与形状。
+fn map_model_only_cli_failure(
+    error_tag_prefix: &str,
+    status: &std::process::ExitStatus,
+    stderr_bytes: &[u8],
+) -> String {
+    let stderr = crate::redaction::redact_text(&String::from_utf8_lossy(stderr_bytes));
+    let clipped: String = stderr.chars().take(1000).collect();
+    if stderr.contains("unrecognized_model") {
+        let hint = extract_json_string_field(&stderr, "model")
+            .map(|model| format!("被拒模型：{model}。"))
+            .unwrap_or_default();
+        return format!(
+            "[{error_tag_prefix}_model_rejected] 引擎链路拒绝了本次路由的模型。{hint}请到「AI 配置」核对该引擎绑定的快速模型/主模型是否为服务商实际提供的 ID 后重试 | 原始输出：{clipped}"
+        );
+    }
+    format!("[{error_tag_prefix}_cli_failed] Claude CLI exit={status} {clipped}")
+}
+
+/// 从混有非 JSON 前后缀的文本中提取字符串字段值（引擎 stderr 不保证是完整 JSON，
+/// 因此只做定位提取，不做整体解析）。
+fn extract_json_string_field(text: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\":\"");
+    let start = text.find(&needle)? + needle.len();
+    let rest = &text[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
 
 async fn read_bounded_operation_output(
@@ -315,7 +348,6 @@ impl RuntimeRegistry {
             &spec.routed_model_id,
             env,
             &operation_dir,
-            prompt,
             spec.routed_reasoning_effort,
         ) {
             Ok(command) => command,
@@ -325,19 +357,48 @@ impl RuntimeRegistry {
                     .await;
             }
         };
+        // spawn 前 argv 预检：prompt 走 stdin 后命令行应有界；超限给可定位错误而非 os error 206。
+        if let Err(error) = crate::adapter::ensure_command_line_within_limit(&command, "operation")
+        {
+            return self
+                .fail_operation_dispatch(spec, attempt_no, &generation, error)
+                .await;
+        }
+        // 环境块预检（七次反馈）：os error 206 也可能来自环境块超限，同样在 spawn 前
+        // 拦截并带 tag 指认最大变量。
+        if let Err(error) = crate::adapter::ensure_env_block_within_limit(&command, "operation") {
+            return self
+                .fail_operation_dispatch(spec, attempt_no, &generation, error)
+                .await;
+        }
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
+                // 失败消息携带取证串（diag=v2）：一次报错即可定位超限输入并证明二进制版本。
                 return self
                     .fail_operation_dispatch(
                         spec,
                         attempt_no,
                         &generation,
-                        format!("[operation_spawn_failed] {error}"),
+                        format!(
+                            "[operation_spawn_failed] {error} | {}",
+                            crate::adapter::command_spawn_forensics(&command)
+                        ),
                     )
                     .await;
             }
         };
+        // prompt 经 stdin 交付（契约见 build_claude_model_only_command）：spawn 后立即
+        // 全量写入并关闭，长 Ledger prompt 不再进入 Windows 约 32K 的命令行上限
+        // （os error 206）。写入失败按既有 dispatch 失败语义回收子进程并落库。
+        if let Err(error) =
+            crate::adapter::write_model_only_prompt(&mut child, prompt, "operation").await
+        {
+            let _ = child.kill().await;
+            return self
+                .fail_operation_dispatch(spec, attempt_no, &generation, error)
+                .await;
+        }
         if let Err(error) = self
             .history
             .mark_operation_attempt_accepted(&spec.operation_id, attempt_no)
@@ -428,12 +489,7 @@ impl RuntimeRegistry {
             }
         };
         if !status.success() {
-            let stderr = crate::redaction::redact_text(&String::from_utf8_lossy(&stderr));
-            let error = format!(
-                "[operation_cli_failed] Claude CLI exit={} {}",
-                status,
-                stderr.chars().take(1000).collect::<String>()
-            );
+            let error = map_model_only_cli_failure("operation", &status, &stderr);
             self.finish_failed_operation(spec, attempt_no, &generation, "failed", &error)
                 .await;
             return Err(error);
@@ -472,6 +528,134 @@ impl RuntimeRegistry {
             entry.cancel.notify_waiters();
         }
         Ok(requested)
+    }
+
+    /// 旁路提问（变更-34 · D3）：真实 CLI 的一次性无工具问答，**零持久化**。
+    ///
+    /// 与 `run_model_only_operation` 的区别：不创建 runtime_generation / operation
+    /// attempt / background_operation 任何记录，也不登记提交表（无独立可取消句柄）。
+    /// 只借助真实 CLI + ModelOnlyOperationPolicy 能力证明跑一次问答，结果原样返回，
+    /// 由调用方决定怎么显示；本就无副作用，进程由 `kill_on_drop` + wall-clock 兜底回收。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_transient_model_only_operation(
+        &self,
+        engine_id: &str,
+        policy: &ModelOnlyOperationPolicy,
+        bin: &str,
+        env: &[(String, String)],
+        cwd: &std::path::Path,
+        prompt: &str,
+        routed_model_id: &str,
+        routed_reasoning_effort: ReasoningEffort,
+        output_limit: u64,
+        wall_clock_ms: u64,
+    ) -> Result<ModelOnlyOperationOutput, String> {
+        if engine_id != "claude-code" {
+            return Err(
+                "[side_query_tools_not_disableable] Codex 当前合同不能关闭全部内建工具，旁路提问不可用"
+                    .to_string(),
+            );
+        }
+        if !policy.tools_disabled
+            || !policy.extensions_disabled
+            || !policy.persistent_grants_disabled
+            || !policy.canonical_cwd.is_empty()
+        {
+            return Err(
+                "[side_query_policy_mismatch] 旁路提问策略不满足无工具隔离契约".to_string(),
+            );
+        }
+        let mut command = crate::adapter::build_claude_model_only_command(
+            bin,
+            routed_model_id,
+            env,
+            cwd,
+            routed_reasoning_effort,
+        )?;
+        // spawn 前 argv 预检（与后台任务同源契约）：超限给可定位错误而非 os error 206。
+        crate::adapter::ensure_command_line_within_limit(&command, "side_query")?;
+        // 环境块预检（七次反馈）：与后台任务同源，超限带 tag 指认最大变量。
+        crate::adapter::ensure_env_block_within_limit(&command, "side_query")?;
+        let mut child = command.spawn().map_err(|error| {
+            // 失败消息携带取证串（diag=v2）：一次报错即可定位超限输入并证明二进制版本。
+            format!(
+                "[side_query_spawn_failed] {error} | {}",
+                crate::adapter::command_spawn_forensics(&command)
+            )
+        })?;
+        // prompt 经 stdin 交付（契约见 build_claude_model_only_command），与后台任务
+        // 同源；本路径零持久化，失败时仅回收子进程后返回错误。
+        if let Err(error) =
+            crate::adapter::write_model_only_prompt(&mut child, prompt, "side_query").await
+        {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(error);
+        }
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "[side_query_stdout_missing] Claude CLI stdout 未建立管道".to_string());
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "[side_query_stderr_missing] Claude CLI stderr 未建立管道".to_string());
+        let (stdout, stderr) = match (stdout, stderr) {
+            (Ok(stdout), Ok(stderr)) => (stdout, stderr),
+            (Err(error), _) | (_, Err(error)) => {
+                let _ = child.kill().await;
+                return Err(error);
+            }
+        };
+        let output_exceeded = Arc::new(tokio::sync::Notify::new());
+        let output_reader = tokio::spawn(read_bounded_operation_output(
+            stdout,
+            stderr,
+            output_limit,
+            output_exceeded.clone(),
+        ));
+        let wait = async {
+            tokio::select! {
+                status = child.wait() => status.map_err(|error| format!("[side_query_wait_failed] {error}")),
+                _ = output_exceeded.notified() => Err("[budget_output_bytes_exceeded] 旁路提问输出超过上限".to_string()),
+            }
+        };
+        let status =
+            match tokio::time::timeout(std::time::Duration::from_millis(wall_clock_ms), wait).await
+            {
+                Ok(Ok(status)) => status,
+                Ok(Err(error)) => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    output_reader.abort();
+                    return Err(error);
+                }
+                Err(_) => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    output_reader.abort();
+                    return Err(
+                        "[budget_wall_clock_exceeded] 旁路提问超过 wall-clock 上限".to_string()
+                    );
+                }
+            };
+        let (stdout, stderr) = match output_reader.await {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(error);
+            }
+            Err(error) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(format!("[side_query_output_join_failed] {error}"));
+            }
+        };
+        if !status.success() {
+            return Err(map_model_only_cli_failure("side_query", &status, &stderr));
+        }
+        crate::adapter::parse_claude_model_only_output(&stdout)
     }
 
     async fn fail_operation_dispatch<T>(
@@ -879,6 +1063,11 @@ impl RuntimeRegistry {
         self.entry(owner).await?.session.interrupt_and_wait().await
     }
 
+    /// 触发引擎原生上下文压缩（变更-34/35 · B4）：只有 Codex 有真实 headless 契约。
+    pub async fn compact_context(&self, owner: &RuntimeOwnerRef) -> Result<(), String> {
+        self.entry(owner).await?.session.compact_context().await
+    }
+
     pub async fn reset_context(
         &self,
         owner: &RuntimeOwnerRef,
@@ -1113,6 +1302,60 @@ mod tests {
     use super::*;
     use crate::reasoning::ReasoningEffort;
     use crate::turn_start::PricingBasisSnapshot;
+
+    /// Windows stable 工具链没有 ExitStatus←ExitCode 转换，用真实子进程构造状态码。
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        #[cfg(windows)]
+        {
+            std::process::Command::new("cmd")
+                .args(["/C", &format!("exit {code}")])
+                .status()
+                .unwrap()
+        }
+        #[cfg(not(windows))]
+        {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("exit {code}"))
+                .status()
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn unrecognized_model_stderr_maps_to_actionable_error() {
+        let status = exit_status(1);
+        let stderr: &[u8] =
+            br#"[claude-code:unrecognized_model] {"model":"DeepSeek-V4-Flash-0731","query_source":"generate_session_title"}"#;
+        let error = map_model_only_cli_failure("operation", &status, stderr);
+        assert!(
+            error.starts_with("[operation_model_rejected]"),
+            "必须映射为可操作 tag：{error}"
+        );
+        assert!(
+            error.contains("DeepSeek-V4-Flash-0731"),
+            "必须指认被拒模型：{error}"
+        );
+        assert!(error.contains("AI 配置"), "必须给出修复入口：{error}");
+    }
+
+    #[test]
+    fn other_cli_failures_keep_original_tag_and_shape() {
+        let status = exit_status(2);
+        let error = map_model_only_cli_failure("side_query", &status, b"boom");
+        assert!(error.starts_with("[side_query_cli_failed]"), "{error}");
+        assert!(error.contains("boom"), "{error}");
+    }
+
+    #[test]
+    fn json_string_field_extraction_handles_present_and_missing() {
+        assert_eq!(
+            extract_json_string_field("prefix {\"model\":\"m-1\",\"x\":2} suffix", "model")
+                .as_deref(),
+            Some("m-1")
+        );
+        assert_eq!(extract_json_string_field("no json here", "model"), None);
+    }
 
     fn route(model: &str, effort: ReasoningEffort) -> RuntimeRoute {
         RuntimeRoute {

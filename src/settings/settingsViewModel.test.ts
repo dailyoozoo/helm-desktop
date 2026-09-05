@@ -4,9 +4,11 @@ import {
   defaultTurnModeForEngine,
   defaultTurnModeFromSettings,
   engineConfigWithDetection,
+  mostRecentSessionId,
   pricingFeedUrlsFromDraft,
   sessionDefaultsFromSettings,
   shouldReopenLastSession,
+  startupLandingFromRecovery,
   updateStatusSummary,
   workspaceIdentityFromSettings,
 } from './settingsViewModel';
@@ -106,6 +108,59 @@ describe('settings view model', () => {
     ).toBe(false);
   });
 
+  it('startup landing keeps the workspace when the pointer session exists (auto-resume handles it)', () => {
+    expect(
+      startupLandingFromRecovery(DEFAULT_SETTINGS, {
+        hasActiveSession: true,
+        recentSessionId: 'session-1',
+      }),
+    ).toEqual({ kind: 'workspace' });
+  });
+
+  it('startup landing falls back to the most recent session when the pointer is missing', () => {
+    // 截图场景：有 35 个历史会话但指针为空 → 兜底打开最近会话，而不是工作区空态
+    expect(
+      startupLandingFromRecovery(DEFAULT_SETTINGS, {
+        hasActiveSession: false,
+        recentSessionId: 'session-7',
+      }),
+    ).toEqual({ kind: 'recent', sessionId: 'session-7' });
+  });
+
+  it('startup landing goes to the new task page only when there is nothing to reopen', () => {
+    expect(
+      startupLandingFromRecovery(DEFAULT_SETTINGS, {
+        hasActiveSession: false,
+        recentSessionId: null,
+      }),
+    ).toEqual({ kind: 'home' });
+  });
+
+  it('startup landing honors reopenLastSession=false with the legacy workspace empty state', () => {
+    const disabled = {
+      ...DEFAULT_SETTINGS,
+      general: { ...DEFAULT_SETTINGS.general, reopenLastSession: false },
+    };
+    expect(
+      startupLandingFromRecovery(disabled, {
+        hasActiveSession: false,
+        recentSessionId: 'session-1',
+      }),
+    ).toEqual({ kind: 'workspace' });
+  });
+
+  it('mostRecentSessionId picks the latest non-archived session by updatedAt', () => {
+    const sessions = [
+      { id: 'old', updatedAt: 100 },
+      { id: 'archived-newest', archived: true, updatedAt: 900 },
+      { id: 'newest', updatedAt: 500 },
+      { id: 'middle', updatedAt: 300 },
+    ];
+    expect(mostRecentSessionId(sessions)).toBe('newest');
+    expect(mostRecentSessionId([{ id: 'only-archived', archived: true, updatedAt: 1 }])).toBeNull();
+    expect(mostRecentSessionId([])).toBeNull();
+  });
+
   it('summarizes unavailable update checks without pretending the app is current', () => {
     expect(
       updateStatusSummary({
@@ -117,22 +172,10 @@ describe('settings view model', () => {
     ).toBe('当前版本 v0.1.0 · 未配置自动更新发布源；当前仅保存更新通道偏好。');
   });
 
-  it('turns the workspace name setting into shell identity text', () => {
-    expect(
-      workspaceIdentityFromSettings({
-        ...DEFAULT_SETTINGS,
-        general: { ...DEFAULT_SETTINGS.general, workspaceName: 'Helm 产品组' },
-      }),
-    ).toEqual({
-      name: 'Helm 产品组',
+  it('always returns the fixed Helm workspace identity (settings input removed)', () => {
+    expect(workspaceIdentityFromSettings(DEFAULT_SETTINGS)).toEqual({
+      name: 'Helm 工作区',
       avatar: 'H',
     });
-
-    expect(
-      workspaceIdentityFromSettings({
-        ...DEFAULT_SETTINGS,
-        general: { ...DEFAULT_SETTINGS.general, workspaceName: '  ' },
-      }).name,
-    ).toBe('Helm 工作区');
   });
 });

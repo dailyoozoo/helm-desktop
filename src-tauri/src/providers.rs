@@ -66,6 +66,17 @@ pub enum ProviderKind {
     Local,
 }
 
+/// 服务商接入类型（S6）：用户在添加/详情时声明的分组意图。
+/// subscription 由 kind 表达，local 固定归「本地服务」，这里只覆盖 api 类的三个原型分组。
+/// 旧配置缺省为 None，前端归入「待分类」组，保存详情时补齐，不做 baseUrl 猜测。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderAccessType {
+    Official,
+    Plan,
+    Relay,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TestOutcome {
@@ -139,6 +150,14 @@ pub struct ProviderConfig {
     pub protocol: Protocol,
     #[serde(default = "default_auth_method")]
     pub auth_method: AuthMethod,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_type: Option<ProviderAccessType>,
+    /// 角色模型选择：键 default/sonnet/opus/haiku/main/fast → 模型 ID（原型 §7.5.4）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_models: Option<HashMap<String, String>>,
+    /// 最近一次成功同步模型目录时间（秒级 epoch，与 last_test.at 同口径）；None = 尚未同步
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sync_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +168,9 @@ pub struct ModelConfig {
     pub display_name: String,
     pub input_price_per_mtok: f64,
     pub output_price_per_mtok: f64,
+    /// 缓存读取价（美元 / M tokens）；目录无该档或上游未提供时为 None（决策 B-2b）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_price_per_mtok: Option<f64>,
     #[serde(default)]
     pub price_source: Option<PriceSource>,
     pub enabled: bool,
@@ -170,6 +192,17 @@ pub enum PriceSource {
     Unknown,
 }
 
+/// 引擎级环境变量覆盖（秘密值不落盘，仅会话生效）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineEnvVar {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineConfig {
@@ -179,6 +212,9 @@ pub struct EngineConfig {
     pub default_model: String,
     pub status: EngineStatus,
     pub version: Option<String>,
+    /// 引擎级环境变量覆盖（秘密值不落盘）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_vars: Option<Vec<EngineEnvVar>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,6 +229,12 @@ pub struct BindingConfig {
     pub assistant_model_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Claude Code 引擎偏好：默认开启思考（决策 2026-08-24 按原型补齐）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_enabled: Option<bool>,
+    /// Claude Code 引擎偏好：1M 上下文（开启前由前端校验服务商与模型能力）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_1m: Option<bool>,
     #[serde(default)]
     pub revision: u64,
 }
@@ -261,6 +303,14 @@ pub struct ConnectionResult {
     pub verified: bool,
     pub message: String,
     pub latency_ms: u128,
+}
+
+/// 「同步模型」候选拉取结果：远端模型 ID + 最新配置（含同步时间戳），候选不落模型行。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderModelListing {
+    pub model_ids: Vec<String>,
+    pub config: AppConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -641,6 +691,76 @@ impl<S: SecretStore> ProviderStore<S> {
         Ok(config)
     }
 
+    /// 同步入库：reset_enabled=true 时非绑定模型一律不勾选（用户裁决：OpenAI 格式同步后手动勾选）。
+    pub fn save_models_for_provider_sync(
+        &self,
+        provider_id: &str,
+        models: Vec<ModelConfig>,
+        reset_enabled: bool,
+    ) -> Result<AppConfig, String> {
+        let mut gate = self
+            .gate
+            .lock()
+            .map_err(|_| "ProviderStore 闸门锁中毒".to_string())?;
+        let mut config = self.load_locked(&mut gate)?;
+        if !config
+            .providers
+            .iter()
+            .any(|provider| provider.id == provider_id)
+        {
+            return Err(format!("找不到服务商：{provider_id}"));
+        }
+        let bound: HashSet<String> = config
+            .bindings
+            .iter()
+            .filter(|binding| binding.provider_id == provider_id)
+            .flat_map(|binding| {
+                let mut ids = vec![binding.primary_model.clone()];
+                if let Some(fast) = binding
+                    .fast_model
+                    .as_deref()
+                    .filter(|f| !f.trim().is_empty())
+                {
+                    ids.push(fast.to_string());
+                }
+                if let Some(assistant) = binding
+                    .assistant_model_id
+                    .as_deref()
+                    .filter(|a| !a.trim().is_empty())
+                {
+                    ids.push(assistant.to_string());
+                }
+                ids
+            })
+            .collect();
+        let prev_enabled: HashMap<String, bool> = config
+            .models
+            .iter()
+            .filter(|model| model.provider_id == provider_id)
+            .map(|model| (model.id.clone(), model.enabled))
+            .collect();
+        config
+            .models
+            .retain(|model| model.provider_id != provider_id);
+        config.models.extend(models.into_iter().map(|mut model| {
+            model = normalize_saved_model(model);
+            model.enabled = if bound.contains(&model.id) {
+                true
+            } else if reset_enabled {
+                false
+            } else {
+                prev_enabled
+                    .get(&model.id)
+                    .copied()
+                    .unwrap_or(model.enabled)
+            };
+            model
+        }));
+        retarget_orphaned_bindings(&mut config, provider_id, None);
+        self.save_locked(&mut gate, &config)?;
+        Ok(config)
+    }
+
     pub fn save_models_for_provider(
         &self,
         provider_id: &str,
@@ -674,6 +794,92 @@ impl<S: SecretStore> ProviderStore<S> {
             }
             model
         }));
+        // 目录替换后：绑定若还指着已消失的旧 ID（用户把行 ID 改了、或历史数据
+        // 已经不一致），自动改到该服务商目录里的模型，而不是保存时报
+        // 「请先更改引擎绑定」。用户明确要求：改当前绑定模型时把其它引用一起改。
+        retarget_orphaned_bindings(&mut config, provider_id, None);
+        self.save_locked(&mut gate, &config)?;
+        Ok(config)
+    }
+
+    /// 模型改名（2026-09-03）：**当前绑定正在使用的模型也允许修改**，并把所有引用处一起改掉。
+    /// 此前模型行只能本地改草稿，改成目录里已存在的 ID 会被前端「已在目录中」挡住，
+    /// 而删掉旧 ID 后 binding 仍指向它 → 目录与绑定不一致 → 发送时报模型不可用。
+    ///
+    /// 语义：
+    /// - `old_model_id` 必须存在于该服务商目录；
+    /// - `new_model_id` 已存在 → **合并**：删掉旧那条，enabled 取两者或（旧的那条启用过就
+    ///   保持启用，避免合并后绑定指向的模型被关掉）；
+    /// - `new_model_id` 不存在 → 原地改名，保留展示名/价格/上下文窗口等其余字段与 enabled；
+    /// - 级联：同服务商 binding 的 `primary_model` / `fast_model` / `assistant_model_id`
+    ///   同步替换（会话级 `preferred_model` 由命令层再级联，见 commands.rs）。
+    pub fn rename_provider_model(
+        &self,
+        provider_id: &str,
+        old_model_id: &str,
+        new_model_id: &str,
+    ) -> Result<AppConfig, String> {
+        let old_model_id = old_model_id.trim();
+        let new_model_id = new_model_id.trim();
+        if old_model_id.is_empty() || new_model_id.is_empty() {
+            return Err("模型 ID 不能为空".to_string());
+        }
+        if old_model_id == new_model_id {
+            return Err("新模型 ID 与原 ID 相同".to_string());
+        }
+        let mut gate = self
+            .gate
+            .lock()
+            .map_err(|_| "ProviderStore 闸门锁中毒".to_string())?;
+        let mut config = self.load_locked(&mut gate)?;
+        if !config
+            .providers
+            .iter()
+            .any(|provider| provider.id == provider_id)
+        {
+            return Err(format!("找不到模型所属服务商：{provider_id}"));
+        }
+        let mut owned: Vec<ModelConfig> = config
+            .models
+            .iter()
+            .filter(|model| model.provider_id == provider_id)
+            .cloned()
+            .collect();
+        let old_pos = owned
+            .iter()
+            .position(|model| model.id == old_model_id)
+            .ok_or_else(|| format!("模型 {old_model_id} 不在该服务商目录中"))?;
+        match owned.iter().position(|model| model.id == new_model_id) {
+            Some(new_pos) => {
+                let merged_enabled = owned[new_pos].enabled || owned[old_pos].enabled;
+                owned[new_pos].enabled = merged_enabled;
+                owned.remove(old_pos);
+            }
+            None => {
+                let mut renamed = owned[old_pos].clone();
+                renamed.id = new_model_id.to_string();
+                owned[old_pos] = renamed;
+            }
+        }
+        config
+            .models
+            .retain(|model| model.provider_id != provider_id);
+        config.models.extend(owned);
+        for binding in config
+            .bindings
+            .iter_mut()
+            .filter(|binding| binding.provider_id == provider_id)
+        {
+            if binding.primary_model == old_model_id {
+                binding.primary_model = new_model_id.to_string();
+            }
+            if binding.fast_model.as_deref() == Some(old_model_id) {
+                binding.fast_model = Some(new_model_id.to_string());
+            }
+            if binding.assistant_model_id.as_deref() == Some(old_model_id) {
+                binding.assistant_model_id = Some(new_model_id.to_string());
+            }
+        }
         self.save_locked(&mut gate, &config)?;
         Ok(config)
     }
@@ -705,29 +911,13 @@ impl<S: SecretStore> ProviderStore<S> {
         if let Some(unknown) = enabled.iter().find(|model_id| !known.contains(*model_id)) {
             return Err(format!("当前服务商没有模型目录项：{unknown}"));
         }
-        for binding in config
-            .bindings
-            .iter()
-            .filter(|binding| binding.provider_id == provider_id)
+        if enabled.is_empty()
+            && config
+                .bindings
+                .iter()
+                .any(|binding| binding.provider_id == provider_id)
         {
-            if !enabled.contains(&binding.primary_model) {
-                return Err(format!(
-                    "模型 {} 正在被 {} 用作主模型，请先更改引擎绑定",
-                    binding.primary_model, binding.engine_id
-                ));
-            }
-            if let Some(fast_model) = binding
-                .fast_model
-                .as_deref()
-                .filter(|model| !model.trim().is_empty())
-            {
-                if !enabled.contains(fast_model) {
-                    return Err(format!(
-                        "模型 {fast_model} 正在被 {} 用作快速模型，请先更改引擎绑定",
-                        binding.engine_id
-                    ));
-                }
-            }
+            return Err("该服务商仍被引擎绑定，至少保留一个启用模型".to_string());
         }
         for model in config
             .models
@@ -736,6 +926,9 @@ impl<S: SecretStore> ProviderStore<S> {
         {
             model.enabled = enabled.contains(&model.id);
         }
+        // 绑定指向的模型不在启用列表里（改名后旧 ID、历史不一致、或用户关掉了
+        // 正在用的那条）→ 自动改到启用集里的模型，不再报「请先更改引擎绑定」。
+        retarget_orphaned_bindings(&mut config, provider_id, Some(&enabled));
         self.save_locked(&mut gate, &config)?;
         Ok(config)
     }
@@ -756,6 +949,69 @@ impl<S: SecretStore> ProviderStore<S> {
             .find(|provider| provider.id == provider_id)
             .ok_or_else(|| format!("找不到服务商：{provider_id}"))?;
         provider.last_test = Some(test);
+        self.save_locked(&mut gate, &config)?;
+        Ok(config)
+    }
+
+    /// 同步成功后盖时间戳（只有真实同步事件才写入，不伪造历史）。
+    pub fn touch_provider_sync(&self, provider_id: &str) -> Result<AppConfig, String> {
+        let mut gate = self
+            .gate
+            .lock()
+            .map_err(|_| "ProviderStore 闸门锁中毒".to_string())?;
+        let mut config = self.load_locked(&mut gate)?;
+        let provider = config
+            .providers
+            .iter_mut()
+            .find(|provider| provider.id == provider_id)
+            .ok_or_else(|| format!("找不到服务商：{provider_id}"))?;
+        provider.last_sync_at = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+        );
+        self.save_locked(&mut gate, &config)?;
+        Ok(config)
+    }
+
+    /// 删除服务商下单个模型目录项。若删的是绑定正在用的那条，且还剩其它启用模型，
+    /// 绑定自动改过去；只在「删完后该服务商一个启用模型都不剩」时拒绝。
+    pub fn delete_provider_model(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Result<AppConfig, String> {
+        let mut gate = self
+            .gate
+            .lock()
+            .map_err(|_| "ProviderStore 闸门锁中毒".to_string())?;
+        let mut config = self.load_locked(&mut gate)?;
+        if !config
+            .providers
+            .iter()
+            .any(|provider| provider.id == provider_id)
+        {
+            return Err(format!("找不到服务商：{provider_id}"));
+        }
+        let before = config.models.len();
+        config
+            .models
+            .retain(|model| !(model.provider_id == provider_id && model.id == model_id));
+        if config.models.len() == before {
+            return Err(format!("当前服务商没有模型目录项：{model_id}"));
+        }
+        if config
+            .bindings
+            .iter()
+            .any(|binding| binding.provider_id == provider_id)
+            && !config.models.iter().any(|model| {
+                model.provider_id == provider_id && model.enabled && !model.id.trim().is_empty()
+            })
+        {
+            return Err("该服务商仍被引擎绑定，至少保留一个启用模型".to_string());
+        }
+        retarget_orphaned_bindings(&mut config, provider_id, None);
         self.save_locked(&mut gate, &config)?;
         Ok(config)
     }
@@ -1094,6 +1350,8 @@ fn migrate_bindings(config: &mut AppConfig) {
                 fast_model: None,
                 assistant_model_id: None,
                 reasoning_effort: None,
+                thinking_enabled: None,
+                context_1m: None,
                 revision: 0,
             });
         }
@@ -1157,6 +1415,23 @@ fn validate_binding_model(
     model_id: &str,
     label: &str,
 ) -> Result<(), String> {
+    // 方案 b：role: 前缀表示绑定到服务商角色，启动时解析为角色对应模型；
+    // 此处只校验角色已配置模型，不要求目录中存在具体模型条目。
+    if let Some(role_key) = model_id.strip_prefix("role:") {
+        let configured = config
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .and_then(|provider| provider.role_models.as_ref())
+            .and_then(|role_models| role_models.get(role_key))
+            .filter(|model| !model.trim().is_empty());
+        if configured.is_none() {
+            return Err(format!(
+                "角色 {role_key} 未配置对应模型，请在服务商详情中补全"
+            ));
+        }
+        return Ok(());
+    }
     let model = config
         .models
         .iter()
@@ -1530,13 +1805,15 @@ pub fn models_from_provider_response(
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| item.id.clone());
         let builtin = builtin_model_pricing(protocol, &item.id);
-        let (input_price_per_mtok, output_price_per_mtok) = builtin.unwrap_or((0.0, 0.0));
+        let (input_price_per_mtok, output_price_per_mtok, cached_input_price_per_mtok) =
+            builtin.unwrap_or((0.0, 0.0, None));
         models.push(ModelConfig {
             id: item.id,
             provider_id: provider_id.to_string(),
             display_name,
             input_price_per_mtok,
             output_price_per_mtok,
+            cached_input_price_per_mtok,
             price_source: Some(if builtin.is_some() {
                 PriceSource::Builtin
             } else {
@@ -1550,11 +1827,11 @@ pub fn models_from_provider_response(
     Ok(models)
 }
 
-fn builtin_model_pricing(protocol: &Protocol, model_id: &str) -> Option<(f64, f64)> {
+fn builtin_model_pricing(protocol: &Protocol, model_id: &str) -> Option<(f64, f64, Option<f64>)> {
     PricingCatalog::builtin()
         .ok()?
         .resolve(protocol, model_id, ServiceTier::Standard, 0)
-        .map(|rate| (rate.band.input, rate.band.output))
+        .map(|rate| (rate.band.input, rate.band.output, rate.band.cached_input))
 }
 
 fn apply_catalog_model_pricing(
@@ -1598,6 +1875,7 @@ fn apply_catalog_model_pricing(
                 ) {
                     config.models[idx].input_price_per_mtok = 0.0;
                     config.models[idx].output_price_per_mtok = 0.0;
+                    config.models[idx].cached_input_price_per_mtok = None;
                     config.models[idx].price_source = Some(PriceSource::Unknown);
                     continue;
                 }
@@ -1631,12 +1909,102 @@ fn apply_catalog_model_pricing_to_model(
         if model.input_price_per_mtok == 0.0 || model.output_price_per_mtok == 0.0 {
             model.input_price_per_mtok = input;
             model.output_price_per_mtok = output;
+            model.cached_input_price_per_mtok = rate.band.cached_input;
             model.price_source = Some(PriceSource::Builtin);
         } else if model.price_source.is_none() {
             model.price_source = Some(PriceSource::Builtin);
         }
     } else if model.price_source.is_none() {
         model.price_source = Some(PriceSource::Unknown);
+    }
+}
+
+/// 把同服务商 binding 里「目录/启用集里已经不存在」的模型引用改到新目标。
+///
+/// 目标优先取：启用集 ∩ 目录（`allowed` 有值时）或目录里已启用的模型；都没有才
+/// 回落到该服务商任意目录项。`role:` 前缀是角色绑定，不改。
+/// 改了 primary/fast 时 bump `revision`，让运行时候选失效、下轮用新模型。
+fn retarget_orphaned_bindings(
+    config: &mut AppConfig,
+    provider_id: &str,
+    allowed: Option<&HashSet<String>>,
+) {
+    let catalog: Vec<String> = config
+        .models
+        .iter()
+        .filter(|model| model.provider_id == provider_id && !model.id.trim().is_empty())
+        .map(|model| model.id.clone())
+        .collect();
+    if catalog.is_empty() {
+        return;
+    }
+    let enabled: Vec<String> = config
+        .models
+        .iter()
+        .filter(|model| {
+            model.provider_id == provider_id
+                && model.enabled
+                && !model.id.trim().is_empty()
+                && allowed.map(|set| set.contains(&model.id)).unwrap_or(true)
+        })
+        .map(|model| model.id.clone())
+        .collect();
+    let fallback = enabled
+        .first()
+        .cloned()
+        .or_else(|| {
+            allowed.and_then(|set| {
+                catalog
+                    .iter()
+                    .find(|id| set.contains(*id))
+                    .cloned()
+            })
+        })
+        .or_else(|| catalog.first().cloned());
+    let Some(fallback) = fallback else {
+        return;
+    };
+    let is_valid = |model_id: &str| {
+        if model_id.trim().is_empty() || model_id.starts_with("role:") {
+            return true;
+        }
+        if !catalog.iter().any(|id| id == model_id) {
+            return false;
+        }
+        if let Some(set) = allowed {
+            return set.contains(model_id);
+        }
+        enabled.iter().any(|id| id == model_id) || enabled.is_empty()
+    };
+    for binding in config
+        .bindings
+        .iter_mut()
+        .filter(|binding| binding.provider_id == provider_id)
+    {
+        let mut changed = false;
+        if !is_valid(&binding.primary_model) {
+            binding.primary_model = fallback.clone();
+            changed = true;
+        }
+        if let Some(fast) = binding.fast_model.as_deref().filter(|id| !id.trim().is_empty()) {
+            if !is_valid(fast) {
+                binding.fast_model = Some(fallback.clone());
+                changed = true;
+            }
+        }
+        if let Some(assistant) = binding
+            .assistant_model_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+        {
+            if !is_valid(assistant) {
+                binding.assistant_model_id = Some(fallback.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            binding.revision = binding.revision.saturating_add(1);
+        }
     }
 }
 
@@ -1651,6 +2019,22 @@ fn normalize_saved_model(mut model: ModelConfig) -> ModelConfig {
         );
     }
     model
+}
+
+/// 同步入库的勾选裁决：绑定模型恒启用；reset 时其余不勾选；否则沿用旧值。
+fn sync_enabled_decision(
+    prev: Option<bool>,
+    id: &str,
+    bound: &HashSet<String>,
+    reset: bool,
+) -> bool {
+    if bound.contains(id) {
+        return true;
+    }
+    if reset {
+        return false;
+    }
+    prev.unwrap_or(false)
 }
 
 fn simple_pricing_profile(
@@ -1703,6 +2087,7 @@ pub(crate) fn subscription_models_for_provider(provider: &ProviderConfig) -> Vec
             display_name: (*display_name).to_string(),
             input_price_per_mtok: 0.0,
             output_price_per_mtok: 0.0,
+            cached_input_price_per_mtok: None,
             price_source: Some(PriceSource::Subscription),
             enabled: true,
             context_window: None,
@@ -1746,6 +2131,7 @@ pub fn seed_config() -> AppConfig {
                 default_model: String::new(),
                 status: EngineStatus::Missing,
                 version: None,
+                env_vars: None,
             },
             EngineConfig {
                 id: "codex".to_string(),
@@ -1754,6 +2140,7 @@ pub fn seed_config() -> AppConfig {
                 default_model: String::new(),
                 status: EngineStatus::Missing,
                 version: None,
+                env_vars: None,
             },
         ],
         bindings: Vec::new(),
@@ -1795,43 +2182,40 @@ pub async fn test_provider_connection<S: SecretStore>(
         .secret(key_ref)?
         .ok_or_else(|| "钥匙串中没有找到 API 密钥".to_string())?;
 
+    probe_provider_endpoint(&provider.protocol, &provider.base_url, &api_key).await
+}
+
+/// 端点探活核心：GET /models 口径（Bedrock/Vertex 打基础地址）；密钥为空时
+/// 不带认证头（本地服务如 Ollama 无需认证）。已保存服务商与添加流程草稿共用。
+async fn probe_provider_endpoint(
+    protocol: &Protocol,
+    base_url: &str,
+    api_key: &str,
+) -> Result<ConnectionResult, String> {
+    let started = Instant::now();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("创建 HTTP 客户端失败：{e}"))?;
-    let response = match provider.protocol {
-        Protocol::Anthropic => {
-            client
-                .get(provider_models_endpoint_for_protocol(
-                    &provider.protocol,
-                    &provider.base_url,
-                ))
-                .header("x-api-key", api_key)
-                .header("anthropic-version", "2023-06-01")
-                .send()
-                .await
+    let endpoint = provider_models_endpoint_for_protocol(protocol, base_url);
+    let request = match protocol {
+        Protocol::Anthropic => client
+            .get(endpoint)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01"),
+        Protocol::OpenAiResponses | Protocol::OpenAiChat | Protocol::Bedrock | Protocol::Vertex => {
+            if api_key.is_empty() {
+                client.get(endpoint)
+            } else {
+                client.get(endpoint).bearer_auth(api_key)
+            }
         }
-        Protocol::OpenAiResponses | Protocol::OpenAiChat => {
-            client
-                .get(provider_models_endpoint_for_protocol(
-                    &provider.protocol,
-                    &provider.base_url,
-                ))
-                .bearer_auth(api_key)
-                .send()
-                .await
-        }
-        Protocol::Bedrock | Protocol::Vertex => {
-            client
-                .get(provider.base_url.as_str())
-                .bearer_auth(api_key)
-                .send()
-                .await
-        }
-    }
-    .map_err(|e| format!("测试可达性失败：{e}"))?;
-
+    };
+    let response = request
+        .send()
+        .await
+        .map_err(|e| format!("测试可达性失败：{e}"))?;
     let status = response.status();
     Ok(ConnectionResult {
         ok: status.is_success(),
@@ -1845,20 +2229,70 @@ pub async fn test_provider_connection<S: SecretStore>(
     })
 }
 
+/// 添加流程「测试连接」：对未保存草稿（Base URL + 密钥 + 协议）做真实 HTTP 探活，
+/// 与已保存服务商的 test_provider_connection 同一探测逻辑，不落任何持久化状态。
+pub async fn test_provider_draft(
+    base_url: &str,
+    api_key: &str,
+    protocol: &Protocol,
+) -> Result<ConnectionResult, String> {
+    let base_url = base_url.trim();
+    if base_url.is_empty() {
+        return Err("请先填写 Base URL".to_string());
+    }
+    probe_provider_endpoint(protocol, base_url, api_key.trim()).await
+}
 pub async fn sync_provider_models<S: SecretStore>(
     store: &ProviderStore<S>,
     provider_id: &str,
 ) -> Result<AppConfig, String> {
+    let (provider, models) = fetch_provider_model_catalog(store, provider_id).await?;
+    if matches!(provider.kind, ProviderKind::Subscription) {
+        store.save_models_for_provider(provider_id, models)?;
+    } else {
+        let reset_enabled = !matches!(provider.protocol, Protocol::Anthropic);
+        store.save_models_for_provider_sync(provider_id, models, reset_enabled)?;
+    }
+    store.touch_provider_sync(provider_id)
+}
+
+/// 同步用的 Base URL：表单草稿优先，空草稿回落到已保存值。
+pub fn effective_catalog_base_url<'a>(saved: &'a str, draft: Option<&'a str>) -> &'a str {
+    draft
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| saved.trim())
+}
+
+/// 拉取服务商模型目录（订阅返回官方内置目录；api/local 走真实 /models 请求）。
+/// 只取数据不落库，供「落库同步」与「候选拉取」两条路径共用。
+async fn fetch_provider_model_catalog<S: SecretStore>(
+    store: &ProviderStore<S>,
+    provider_id: &str,
+) -> Result<(ProviderConfig, Vec<ModelConfig>), String> {
     let config = store.load()?;
     let provider = config
         .providers
         .iter()
         .find(|provider| provider.id == provider_id)
-        .ok_or_else(|| format!("找不到服务商：{provider_id}"))?;
+        .ok_or_else(|| format!("找不到服务商：{provider_id}"))?
+        .clone();
+    fetch_provider_model_catalog_from(store, provider, None, None, &config.models).await
+}
+
+async fn fetch_provider_model_catalog_from<S: SecretStore>(
+    store: &ProviderStore<S>,
+    mut provider: ProviderConfig,
+    base_url_override: Option<&str>,
+    api_key_override: Option<&str>,
+    existing_models: &[ModelConfig],
+) -> Result<(ProviderConfig, Vec<ModelConfig>), String> {
     if matches!(provider.kind, ProviderKind::Subscription) {
-        return store
-            .save_models_for_provider(provider_id, subscription_models_for_provider(provider));
+        let models = subscription_models_for_provider(&provider);
+        return Ok((provider, models));
     }
+    provider.base_url =
+        effective_catalog_base_url(&provider.base_url, base_url_override).to_string();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -1870,13 +2304,21 @@ pub async fn sync_provider_models<S: SecretStore>(
     ));
     match provider.auth_method {
         AuthMethod::ApiKey => {
-            let key_ref = provider
-                .key_ref
-                .as_deref()
-                .ok_or_else(|| "请先保存 API 密钥".to_string())?;
-            let api_key = store
-                .secret(key_ref)?
-                .ok_or_else(|| "钥匙串中没有找到 API 密钥".to_string())?;
+            let api_key = match api_key_override
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                Some(key) => key.to_string(),
+                None => {
+                    let key_ref = provider
+                        .key_ref
+                        .as_deref()
+                        .ok_or_else(|| "请先保存 API 密钥".to_string())?;
+                    store
+                        .secret(key_ref)?
+                        .ok_or_else(|| "钥匙串中没有找到 API 密钥".to_string())?
+                }
+            };
             request = match provider.protocol {
                 Protocol::Anthropic => request
                     .header("x-api-key", api_key)
@@ -1902,8 +2344,40 @@ pub async fn sync_provider_models<S: SecretStore>(
         .await
         .map_err(|e| format!("读取模型列表失败：{e}"))?;
     let models =
-        models_from_provider_response(&provider.protocol, provider_id, &body, &config.models)?;
-    store.save_models_for_provider(provider_id, models)
+        models_from_provider_response(&provider.protocol, &provider.id, &body, existing_models)?;
+    Ok((provider, models))
+}
+
+/// 「同步模型」候选拉取：返回远端模型 ID 列表并盖同步时间戳，但不把候选写入
+/// provider.models——模型行只由用户显式「添加模型」产生（同步只喂组合框候选）。
+/// 草稿 Base URL / API Key 只用于本次请求，不落库；保存时再一并写入。
+pub async fn list_provider_models<S: SecretStore>(
+    store: &ProviderStore<S>,
+    provider_id: &str,
+    base_url: Option<&str>,
+    api_key: Option<&str>,
+) -> Result<ProviderModelListing, String> {
+    let config = store.load()?;
+    let provider = config
+        .providers
+        .iter()
+        .find(|item| item.id == provider_id)
+        .ok_or_else(|| format!("找不到服务商：{provider_id}"))?
+        .clone();
+    let (provider, models) =
+        fetch_provider_model_catalog_from(store, provider, base_url, api_key, &config.models)
+            .await?;
+    let model_ids = models
+        .iter()
+        .map(|model| model.id.clone())
+        .collect::<Vec<_>>();
+    let config = if matches!(provider.kind, ProviderKind::Subscription) {
+        // 订阅官方目录是角色行候选的持久来源，仍走落库同步
+        store.save_models_for_provider(provider_id, models)?
+    } else {
+        store.touch_provider_sync(provider_id)?
+    };
+    Ok(ProviderModelListing { model_ids, config })
 }
 
 pub async fn test_engine_connection(bin: &str) -> ConnectionResult {
@@ -1961,6 +2435,80 @@ fn build_version_command(bin: &str) -> Command {
 mod tests {
     use super::*;
 
+    // S6：接入类型字段向后兼容——旧配置无 access_type 可反序列化，显式值可往返。
+    #[test]
+    fn provider_config_without_access_type_defaults_to_none() {
+        let legacy = r#"{
+            "id": "anthropic",
+            "name": "Anthropic",
+            "kind": "api",
+            "baseUrl": "https://api.anthropic.com",
+            "keyRef": null,
+            "ready": true,
+            "protocol": "anthropic",
+            "authMethod": "apikey"
+        }"#;
+        let provider: ProviderConfig = serde_json::from_str(legacy).expect("legacy config parses");
+        assert_eq!(provider.access_type, None);
+    }
+
+    #[test]
+    fn sync_enabled_decision_resets_except_bound() {
+        let bound: HashSet<String> = ["bound-main".to_string()].into();
+        assert!(!super::sync_enabled_decision(
+            Some(true),
+            "kept-old",
+            &bound,
+            true
+        ));
+        assert!(!super::sync_enabled_decision(
+            None,
+            "brand-new",
+            &bound,
+            true
+        ));
+        assert!(super::sync_enabled_decision(
+            None,
+            "bound-main",
+            &bound,
+            true
+        ));
+        assert!(super::sync_enabled_decision(
+            Some(true),
+            "plain",
+            &bound,
+            false
+        ));
+        assert!(!super::sync_enabled_decision(
+            Some(false),
+            "plain",
+            &bound,
+            false
+        ));
+    }
+
+    #[test]
+    fn provider_config_access_type_round_trips() {
+        let provider = ProviderConfig {
+            id: "relay-1".into(),
+            name: "团队中转".into(),
+            kind: ProviderKind::Api,
+            base_url: "https://gw.example.com".into(),
+            key_ref: None,
+            ready: false,
+            last_test: None,
+            protocol: Protocol::Anthropic,
+            auth_method: AuthMethod::ApiKey,
+            access_type: Some(ProviderAccessType::Relay),
+            role_models: None,
+            last_sync_at: None,
+        };
+        let json = serde_json::to_string(&provider).expect("serialize");
+        assert!(json.contains("\"accessType\":\"relay\""));
+        let back: ProviderConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.access_type, Some(ProviderAccessType::Relay));
+    }
+
     #[test]
     fn classify_failure_returns_none_when_ok() {
         assert_eq!(classify_failure("anything", true, true), None);
@@ -2009,5 +2557,348 @@ mod tests {
             classify_failure("something unexpected happened", false, true),
             Some(FailureCategory::Unknown)
         );
+    }
+
+    #[test]
+    fn draft_base_url_overrides_saved_catalog_endpoint() {
+        assert_eq!(
+            effective_catalog_base_url(
+                "https://api.openai.com/v1",
+                Some("https://gw.example.com/v1")
+            ),
+            "https://gw.example.com/v1"
+        );
+        assert_eq!(
+            effective_catalog_base_url("https://api.openai.com/v1", Some("  ")),
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            provider_models_endpoint_for_protocol(
+                &Protocol::OpenAiResponses,
+                effective_catalog_base_url(
+                    "https://api.openai.com/v1",
+                    Some("https://gw.example.com")
+                )
+            ),
+            "https://gw.example.com/v1/models"
+        );
+    }
+
+    /// 模型改名（2026-09-03）：目录条目原地改名/合并 + 同服务商 binding 三处引用级联。
+    /// 用临时目录跑真实 ProviderStore，防回归「删旧建新导致绑定指向不存在的 ID」。
+    fn rename_test_provider() -> ProviderConfig {
+        ProviderConfig {
+            id: "relay-test".into(),
+            name: "测试中转".into(),
+            kind: ProviderKind::Api,
+            base_url: "https://gw.example.com/v1".into(),
+            key_ref: None,
+            ready: true,
+            last_test: None,
+            protocol: Protocol::OpenAiResponses,
+            auth_method: AuthMethod::ApiKey,
+            access_type: None,
+            role_models: None,
+            last_sync_at: None,
+        }
+    }
+
+    fn rename_test_model(id: &str, provider_id: &str, enabled: bool) -> ModelConfig {
+        ModelConfig {
+            id: id.into(),
+            provider_id: provider_id.into(),
+            display_name: id.into(),
+            input_price_per_mtok: 1.0,
+            output_price_per_mtok: 2.0,
+            cached_input_price_per_mtok: None,
+            price_source: None,
+            enabled,
+            context_window: None,
+            capabilities: None,
+        }
+    }
+
+    #[test]
+    fn rename_provider_model_renames_and_cascades_bindings() {
+        let dir = std::env::temp_dir().join(format!("helm-rename-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("providers.json");
+        let store = ProviderStore::new(path.clone(), MemorySecretStore::default());
+        let provider = rename_test_provider();
+        let provider_id = provider.id.clone();
+        store.save_provider(provider, None).expect("seed provider");
+
+        let models = vec![
+            rename_test_model("DeepSeek-V4-Flash-0731", &provider_id, true),
+            rename_test_model("fast-model", &provider_id, true),
+        ];
+        let binding = BindingConfig {
+            engine_id: "codex".into(),
+            provider_id: provider_id.clone(),
+            primary_model: "DeepSeek-V4-Flash-0731".into(),
+            fast_model: Some("DeepSeek-V4-Flash-0731".into()),
+            assistant_model_id: Some("DeepSeek-V4-Flash-0731".into()),
+            ..serde_json::from_str::<BindingConfig>(
+                "{\"engineId\":\"\",\"providerId\":\"\",\"primaryModel\":\"\"}",
+            )
+            .expect("minimal binding for remaining fields")
+        };
+        store.save_models_for_provider(&provider_id, models).expect("save models");
+        store.save_binding(binding).expect("save binding");
+
+        // 改名到一个不存在的 ID：原地改名，三处 binding 引用一并替换
+        let config = store
+            .rename_provider_model(
+                &provider_id,
+                "DeepSeek-V4-Flash-0731",
+                "DeepSeek-V4-Flash-0731-1M",
+            )
+            .expect("rename");
+        assert!(config
+            .models
+            .iter()
+            .any(|model| model.provider_id == provider_id
+                && model.id == "DeepSeek-V4-Flash-0731-1M"));
+        assert!(!config
+            .models
+            .iter()
+            .any(|model| model.provider_id == provider_id
+                && model.id == "DeepSeek-V4-Flash-0731"));
+        let binding = config
+            .bindings
+            .iter()
+            .find(|binding| binding.provider_id == provider_id)
+            .expect("binding kept");
+        assert_eq!(binding.primary_model, "DeepSeek-V4-Flash-0731-1M");
+        assert_eq!(
+            binding.fast_model.as_deref(),
+            Some("DeepSeek-V4-Flash-0731-1M")
+        );
+        // assistant_model_id 是旧配置迁移输入，save_binding 落库时已清理为 None；
+        // rename 的级联代码是防御性的（处理磁盘上仍存留该字段的旧配置），此处不断言。
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 防御场景：磁盘配置里 binding 仍带着旧字段 assistant_model_id（旧版本写入），
+    /// 改名时也要一并替换。
+    #[test]
+    fn rename_provider_model_cascades_legacy_assistant_model_id() {
+        let dir =
+            std::env::temp_dir().join(format!("helm-rename-assist-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("providers.json");
+        let store = ProviderStore::new(path.clone(), MemorySecretStore::default());
+        let provider = rename_test_provider();
+        let provider_id = provider.id.clone();
+        store.save_provider(provider.clone(), None).expect("seed provider");
+        let models = vec![rename_test_model("old-m", &provider_id, true)];
+        store.save_models_for_provider(&provider_id, models.clone()).expect("save models");
+        // 直接把带 assistant_model_id 的旧格式 JSON 写进磁盘，绕过 save_binding 的清理逻辑
+        store.load().expect("warm gate");
+        let raw = serde_json::json!({
+            "providers": [provider],
+            "models": models,
+            "engines": [],
+            "bindings": [{
+                "engineId": "codex",
+                "providerId": provider_id,
+                "primaryModel": "old-m",
+                "assistantModelId": "old-m"
+            }],
+            "defaultEngine": "codex",
+            "defaultModel": "old-m"
+        });
+        std::fs::write(&path, serde_json::to_string(&raw).expect("json"))
+            .expect("write legacy config");
+        {
+            let mut gate = store.gate.lock().map_err(|_| "gate").expect("gate");
+            gate.published = None;
+        }
+
+        let config = store
+            .rename_provider_model(&provider_id, "old-m", "new-m")
+            .expect("rename");
+        let binding = config
+            .bindings
+            .iter()
+            .find(|binding| binding.provider_id == provider_id)
+            .expect("binding kept");
+        assert_eq!(binding.primary_model, "new-m");
+        assert_eq!(binding.assistant_model_id.as_deref(), Some("new-m"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rename_provider_model_merges_into_existing_target() {
+        let dir = std::env::temp_dir().join(format!("helm-rename-merge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let store = ProviderStore::new(dir.join("providers.json"), MemorySecretStore::default());
+        let provider = rename_test_provider();
+        let provider_id = provider.id.clone();
+        store.save_provider(provider, None).expect("seed provider");
+        let models = vec![
+            rename_test_model("old-a", &provider_id, false),
+            rename_test_model("target-b", &provider_id, true),
+        ];
+        store.save_models_for_provider(&provider_id, models).expect("save models");
+
+        // 改名到已存在的 ID：合并——目标保留自身字段，enabled 取两者或（false || true = true），
+        // 旧条目删除
+        let config = store
+            .rename_provider_model(&provider_id, "old-a", "target-b")
+            .expect("rename merge");
+        let own: Vec<&ModelConfig> = config
+            .models
+            .iter()
+            .filter(|model| model.provider_id == provider_id)
+            .collect();
+        assert_eq!(own.len(), 1);
+        assert_eq!(own[0].id, "target-b");
+        assert!(own[0].enabled, "合并后 enabled 取或");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn binding_for(provider_id: &str, primary: &str, fast: Option<&str>) -> BindingConfig {
+        BindingConfig {
+            engine_id: "codex".into(),
+            provider_id: provider_id.into(),
+            primary_model: primary.into(),
+            fast_model: fast.map(|id| id.into()),
+            assistant_model_id: None,
+            reasoning_effort: None,
+            thinking_enabled: None,
+            context_1m: None,
+            revision: 0,
+        }
+    }
+
+    /// 用户实测场景：绑定还指着 DeepSeek-V4-Flash-0731-1M，目录只有不带 -1M 的那条。
+    /// 保存勾选不得再报「请先更改引擎绑定」，而要把绑定改到目录里的模型。
+    #[test]
+    fn save_selection_retargets_binding_when_bound_id_missing_from_catalog() {
+        let dir = std::env::temp_dir().join(format!("helm-retarget-sel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let store = ProviderStore::new(dir.join("providers.json"), MemorySecretStore::default());
+        let provider = rename_test_provider();
+        let provider_id = provider.id.clone();
+        store.save_provider(provider, None).expect("seed");
+        store
+            .save_models_for_provider(
+                &provider_id,
+                vec![rename_test_model("DeepSeek-V4-Flash-0731", &provider_id, true)],
+            )
+            .expect("catalog");
+        store
+            .save_binding(binding_for(
+                &provider_id,
+                "DeepSeek-V4-Flash-0731",
+                Some("DeepSeek-V4-Flash-0731"),
+            ))
+            .expect("bind");
+        // 模拟历史不一致：磁盘绑定被改成 -1M，目录仍是不带 -1M
+        {
+            let mut gate = store.gate.lock().expect("gate");
+            if let Some(config) = gate.published.as_mut() {
+                for binding in config.bindings.iter_mut() {
+                    if binding.provider_id == provider_id {
+                        binding.primary_model = "DeepSeek-V4-Flash-0731-1M".into();
+                        binding.fast_model = Some("DeepSeek-V4-Flash-0731-1M".into());
+                    }
+                }
+            }
+        }
+
+        let config = store
+            .save_provider_model_selection(&provider_id, &["DeepSeek-V4-Flash-0731".into()])
+            .expect("selection must succeed and retarget");
+        let binding = config
+            .bindings
+            .iter()
+            .find(|binding| binding.provider_id == provider_id)
+            .expect("binding");
+        assert_eq!(binding.primary_model, "DeepSeek-V4-Flash-0731");
+        assert_eq!(
+            binding.fast_model.as_deref(),
+            Some("DeepSeek-V4-Flash-0731")
+        );
+        assert!(binding.revision >= 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_models_retargets_binding_when_old_id_removed_from_catalog() {
+        let dir = std::env::temp_dir().join(format!("helm-retarget-cat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let store = ProviderStore::new(dir.join("providers.json"), MemorySecretStore::default());
+        let provider = rename_test_provider();
+        let provider_id = provider.id.clone();
+        store.save_provider(provider, None).expect("seed");
+        store
+            .save_models_for_provider(
+                &provider_id,
+                vec![rename_test_model("DeepSeek-V4-Flash-0731", &provider_id, true)],
+            )
+            .expect("catalog");
+        store
+            .save_binding(binding_for(&provider_id, "DeepSeek-V4-Flash-0731", None))
+            .expect("bind");
+        {
+            let mut gate = store.gate.lock().expect("gate");
+            if let Some(config) = gate.published.as_mut() {
+                for binding in config.bindings.iter_mut() {
+                    if binding.provider_id == provider_id {
+                        binding.primary_model = "DeepSeek-V4-Flash-0731-1M".into();
+                    }
+                }
+            }
+        }
+
+        let config = store
+            .save_models_for_provider(
+                &provider_id,
+                vec![rename_test_model("DeepSeek-V4-Flash-0731", &provider_id, true)],
+            )
+            .expect("save catalog");
+        let binding = config
+            .bindings
+            .iter()
+            .find(|binding| binding.provider_id == provider_id)
+            .expect("binding");
+        assert_eq!(binding.primary_model, "DeepSeek-V4-Flash-0731");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_selection_retargets_when_bound_model_is_disabled() {
+        let dir = std::env::temp_dir().join(format!("helm-retarget-dis-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let store = ProviderStore::new(dir.join("providers.json"), MemorySecretStore::default());
+        let provider = rename_test_provider();
+        let provider_id = provider.id.clone();
+        store.save_provider(provider, None).expect("seed");
+        store
+            .save_models_for_provider(
+                &provider_id,
+                vec![
+                    rename_test_model("primary", &provider_id, true),
+                    rename_test_model("fast", &provider_id, true),
+                ],
+            )
+            .expect("catalog");
+        store
+            .save_binding(binding_for(&provider_id, "primary", Some("fast")))
+            .expect("bind");
+
+        let config = store
+            .save_provider_model_selection(&provider_id, &["fast".into()])
+            .expect("disabling bound primary must retarget, not error");
+        let binding = config
+            .bindings
+            .iter()
+            .find(|binding| binding.provider_id == provider_id)
+            .expect("binding");
+        assert_eq!(binding.primary_model, "fast");
+        assert_eq!(binding.fast_model.as_deref(), Some("fast"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

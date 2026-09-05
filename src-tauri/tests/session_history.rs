@@ -16,7 +16,10 @@ use helm_lib::protocol::{
 use helm_lib::providers::BindingConfig;
 use helm_lib::reasoning::ReasoningEffort;
 use helm_lib::runtime_registry::{RuntimeGeneration, RuntimeOwnerRef, RuntimeRegistry};
-use helm_lib::sessions::{HistoryToolStatus, NewSessionRecord, SessionHistoryStore, SessionStatus};
+use helm_lib::sessions::{
+    HistoryToolStatus, NewSessionRecord, SessionHistoryStore, SessionStatus,
+    UsageBreakdownDimension, SCHEMA_VERSION,
+};
 use helm_lib::turn_start::{
     BindingLiveRouteResolver, PricingBasisSnapshot, RuntimeRoute, TurnExecutionSpec,
     TurnStartCommand,
@@ -444,7 +447,7 @@ fn change_27g_migrates_v25_capability_cache_identity_to_v26() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        30
+        SCHEMA_VERSION
     );
     let capability_column: i64 = conn
         .query_row(
@@ -509,7 +512,7 @@ fn change_27h_migrates_session_turn_preferences_through_v28() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        30
+        SCHEMA_VERSION
     );
 }
 
@@ -591,7 +594,7 @@ fn change_27i_migrates_27h_v27_to_v28_without_losing_preferences_or_usage() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        30
+        SCHEMA_VERSION
     );
     let usage: (i64, i64, Option<String>) = conn
         .query_row(
@@ -681,7 +684,7 @@ fn change_29_migrates_tool_outcome_and_checkpoint_recovery_facts_from_v29_to_v30
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        30
+        SCHEMA_VERSION
     );
     let tool_fact_columns: i64 = conn
         .query_row(
@@ -1120,6 +1123,8 @@ fn resolve_test_route(route: &RuntimeRoute, command: &TurnStartCommand) -> TurnE
         fast_model: None,
         assistant_model_id: None,
         reasoning_effort: None,
+        thinking_enabled: None,
+        context_1m: None,
         revision: 1,
     };
     BindingLiveRouteResolver::resolve(route, &binding, "capability-test", command).unwrap()
@@ -1644,7 +1649,7 @@ fn change_27i_v23_migrates_through_v28_additively_and_reopens_idempotently() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        30
+        SCHEMA_VERSION
     );
     for table in [
         "runtime_generation",
@@ -2548,7 +2553,7 @@ fn schema_v18_migrates_existing_sessions_into_default_folder() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        30
+        SCHEMA_VERSION
     );
 }
 
@@ -2648,7 +2653,7 @@ fn schema_v16_migrates_turn_context_and_history_table() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 30);
+    assert_eq!(version, SCHEMA_VERSION);
     for column in ["turn_mode", "permission_profile", "started_at"] {
         let exists: i64 = conn
             .query_row(
@@ -4120,7 +4125,7 @@ fn permission_schema_v5_migrates_to_current_without_losing_approval_rows() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 30);
+    assert_eq!(version, SCHEMA_VERSION);
     let turn_snapshot_exists: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='turn_snapshot'",
@@ -4167,7 +4172,7 @@ fn current_schema_includes_permission_context_audit_and_usage_price_snapshot() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 30);
+    assert_eq!(version, SCHEMA_VERSION);
     for column in [
         "principal",
         "tool_call_id",
@@ -4273,7 +4278,7 @@ fn schema_v11_migrates_existing_cost_to_honest_legacy_bucket() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 30);
+    assert_eq!(version, SCHEMA_VERSION);
 }
 
 #[test]
@@ -4342,7 +4347,7 @@ fn permission_schema_concurrent_store_initialization_is_safe_and_complete() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 30);
+    assert_eq!(version, SCHEMA_VERSION);
     let permission_rule_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='permission_rule'",
@@ -5516,9 +5521,9 @@ fn prepared_user_turn_rolls_back_all_history_side_effects_when_launch_is_rejecte
 }
 
 #[test]
-fn usage_by_provider_attributes_costs_by_real_provider_id() {
+fn usage_breakdown_provider_attributes_costs_by_real_provider_id() {
     // P3-6：用量按 session.provider_id 真实归属，不再按模型名推断；
-    // 未标注的旧会话归入空 key。
+    // 未标注的旧会话归入空 key。S4 起统一走 get_usage_breakdown(days, dimension)。
     let path = temp_history_path("usage-by-provider");
     let store = SessionHistoryStore::new(path);
     for (id, provider) in [
@@ -5564,8 +5569,8 @@ fn usage_by_provider_attributes_costs_by_real_provider_id() {
                 &AgentEvent::TokenUsage {
                     session_id: cli.to_string(),
                     input_tokens: 100,
-                    cached_input_tokens: None,
-                    cache_write_input_tokens: None,
+                    cached_input_tokens: Some(40),
+                    cache_write_input_tokens: Some(10),
                     output_tokens: 10,
                     cost_usd: cost,
                     service_tier: None,
@@ -5575,15 +5580,44 @@ fn usage_by_provider_attributes_costs_by_real_provider_id() {
             .unwrap();
     }
 
-    let rows = store.get_usage_by_provider(30).unwrap();
+    let rows = store
+        .get_usage_breakdown(30, UsageBreakdownDimension::Provider)
+        .unwrap();
     assert_eq!(rows.len(), 3, "两个真实服务商 + 一个未标注：{rows:?}");
-    assert_eq!(rows[0].provider, "gateway-x");
+    assert_eq!(rows[0].key, "gateway-x");
+    assert_eq!(rows[0].engine, "claude-code");
+    assert_eq!(rows[0].request_count, 1);
+    assert_eq!(rows[0].input_tokens, Some(100));
+    assert_eq!(rows[0].cached_input_tokens, Some(40));
+    assert_eq!(rows[0].cache_write_input_tokens, Some(10));
+    assert_eq!(rows[0].output_tokens, Some(10));
     assert!((rows[0].cost_usd - 3.0).abs() < 1e-9);
     assert!((rows[0].share - 0.6).abs() < 1e-9);
+    assert_eq!(rows[0].cost_kinds.actual, 1);
     assert!(
-        rows.iter().any(|row| row.provider.is_empty()),
+        rows.iter().any(|row| row.key.is_empty()),
         "未标注会话归入空 key"
     );
+}
+
+#[test]
+fn usage_window_rejects_days_outside_frozen_ranges() {
+    // S4 冻结：用量查询只接受 7/30/90/365 天，其余 fail-closed。
+    let path = temp_history_path("usage-window-guard");
+    let store = SessionHistoryStore::new(path);
+    for days in [0u32, 1, 8, 364, 366] {
+        assert!(store.get_daily_usage(days).is_err(), "days={days} 应被拒绝");
+        assert!(store.get_usage_stats(days).is_err(), "days={days} 应被拒绝");
+        assert!(
+            store
+                .get_usage_breakdown(days, UsageBreakdownDimension::Engine)
+                .is_err(),
+            "days={days} 应被拒绝"
+        );
+    }
+    for days in [7u32, 30, 90, 365] {
+        assert!(store.get_daily_usage(days).is_ok(), "days={days} 应合法");
+    }
 }
 
 #[test]
@@ -5632,6 +5666,46 @@ fn auto_title_guard_and_summary_round_trip() {
         Some("排查并修复登录接口 30s 超时"),
         "摘要必须进入会话列表（供搜索）"
     );
+}
+
+#[test]
+fn auto_title_respects_manual_rename_before_first_turn_ends() {
+    // 变更-12 承诺：手动改名后不再被自动起标题覆盖。首轮结束前（summary 仍为 NULL）
+    // 手动改名，守卫必须返回 false，否则自动标题会覆盖用户的手动标题。
+    let path = temp_history_path("auto-title-manual-rename");
+    let store = SessionHistoryStore::new(path);
+    store
+        .create_session(NewSessionRecord {
+            id: "local-rename".to_string(),
+            engine: EngineId::ClaudeCode,
+            model: "claude-sonnet-4.6".to_string(),
+            cwd: r"D:\work\demo".to_string(),
+            created_at: 1_717_171_700,
+        })
+        .unwrap();
+    store
+        .record_user_message("local-rename", "帮我修登录超时", 1_717_171_701)
+        .unwrap();
+    store
+        .record_event_for_session(
+            "local-rename",
+            &AgentEvent::MessageComplete {
+                session_id: "cli-1".to_string(),
+                role: Role::Assistant,
+                text: "已定位到超时原因并修复".to_string(),
+            },
+        )
+        .unwrap();
+    // 默认标题待起标题
+    assert!(store.session_needs_auto_title("local-rename").unwrap());
+    // 手动改名后不再需要自动标题
+    store
+        .rename_session("local-rename", "我的自定义标题")
+        .unwrap();
+    assert!(!store.session_needs_auto_title("local-rename").unwrap());
+    // 标题保持手动值，不被覆盖
+    let sessions = store.list_sessions().unwrap();
+    assert_eq!(sessions[0].title, "我的自定义标题");
 }
 
 fn pricing_profile(source: &str, bands: Vec<PricingBand>) -> ResolvedPricingProfile {
@@ -6060,7 +6134,7 @@ fn schema_v19_migrates_to_v21_without_losing_sessions() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        30
+        SCHEMA_VERSION
     );
     for (table, column) in [
         ("session", "last_context_tokens"),
@@ -6124,7 +6198,7 @@ fn schema_v20_migrates_project_folder_columns_without_reclassifying_history() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        30
+        SCHEMA_VERSION
     );
     for column in ["cwd", "cwd_key"] {
         let exists: i64 = conn
@@ -6152,7 +6226,7 @@ fn assert_change_27a_fixture_health(path: &std::path::Path) {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 30);
+    assert_eq!(version, SCHEMA_VERSION);
 
     let mut statement = conn.prepare("PRAGMA foreign_key_check").unwrap();
     let mut rows = statement.query([]).unwrap();
@@ -6192,7 +6266,7 @@ fn change_27l_fresh_install_and_v21_upgrade_reopen_at_v30() {
         fresh
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        30
+        SCHEMA_VERSION
     );
     drop(fresh);
 

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Icon, type IconName } from '../shell/icons';
+import { EngineBrand } from '../shell/EngineBrand';
 import { getProviderConfig, detectCliLogin } from '../providers/api';
 import { listSessions } from '../sessions/api';
 import type { SessionSummary } from '../sessions/sessionTypes';
@@ -68,28 +69,28 @@ const screens: Array<{ id: string; icon: IconName; title: string; desc: string }
   {
     id: 'sessions',
     icon: 'history',
-    title: '会话历史',
-    desc: '跨项目、引擎与模型，搜索并恢复任意一段会话。',
+    title: '全部任务',
+    desc: '跨项目、引擎与模型，搜索并恢复任意一段任务。',
   },
   {
     id: 'providers',
     icon: 'server',
-    title: '服务商与模型',
-    desc: '管理密钥、模型目录、服务商连接与本地 CLI 引擎。',
+    title: 'AI 配置',
+    desc: '配置执行引擎、服务商路由和工作台可用模型。',
   },
   {
     id: 'extensions',
     icon: 'puzzle',
-    title: '扩展中心',
-    desc: '统一管理技能、MCP 服务器、子代理、斜杠命令与钩子。',
+    title: '插件',
+    desc: '管理技能与连接器。',
   },
   {
     id: 'usage',
     icon: 'chart',
-    title: '用量与成本',
-    desc: '按模型、服务商与会话统计 Token 和花费，并设置预算护栏。',
+    title: '用量',
+    desc: '按模型、引擎与服务商统计 Token 和预估费用。',
   },
-  { id: 'settings', icon: 'settings', title: '设置', desc: '调整引擎、权限、外观与快捷键。' },
+  { id: 'settings', icon: 'settings', title: '设置', desc: '通用、主题、快捷键与关于。' },
 ];
 
 function formatRelativeTime(timestamp: number): string {
@@ -110,10 +111,6 @@ function sessionStatus(session: SessionSummary): { label: string; className: str
     return { label: '等待审批', className: 'pill pill--warn' };
   if (session.status === 'done') return { label: '已完成', className: 'pill pill--ghost' };
   return { label: '可继续', className: 'pill' };
-}
-
-function engineIcon(engine: SessionSummary['engine']): IconName {
-  return engine === 'codex' ? 'cpu' : 'zap';
 }
 
 export function HomePage({ onNavigate, onNewSession }: HomePageProps) {
@@ -264,7 +261,7 @@ export function HomePage({ onNavigate, onNewSession }: HomePageProps) {
                   onClick={() => void handleRetest()}
                   disabled={retesting}
                 >
-                  <Icon name="refresh" style={{ width: 13, height: 13 }} />
+                  <Icon name="refresh" className="h-3.5 w-3.5" style={{ width: 13, height: 13 }} />
                   {retesting ? '重新检测中…' : '重新检测'}
                 </button>
                 <span>
@@ -318,7 +315,7 @@ export function HomePage({ onNavigate, onNewSession }: HomePageProps) {
             {status?.engines.map((engine) => (
               <div className="card estat" key={`engine-${engine.id}`}>
                 <div className="estat__ic">
-                  <Icon name={engine.id === 'codex' ? 'cpu' : 'zap'} />
+                  <EngineBrand engine={engine.id} size={16} />
                 </div>
                 <div className="estat__m">
                   <b>
@@ -369,7 +366,7 @@ export function HomePage({ onNavigate, onNewSession }: HomePageProps) {
                 return (
                   <button className="rrow" key={session.id} onClick={() => openSession(session.id)}>
                     <span className="rrow__ic">
-                      <Icon name={engineIcon(session.engine)} />
+                      <EngineBrand engine={session.engine} size={14} />
                     </span>
                     <span className="rrow__m">
                       <b>{session.title || '未命名会话'}</b>

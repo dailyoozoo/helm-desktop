@@ -12,6 +12,8 @@ export interface CreateSessionArgs {
   reasoningEffort?: ReasoningEffort;
   mode?: TurnMode;
   permissionProfile?: PermissionProfile;
+  /** 页内确认卡已确认；`permissionProfile=full_access` 时必须为 true，否则后端 fail-closed。 */
+  fullAccessConfirmed?: boolean;
 }
 
 /** Tauri `send_message` 的参数。 */
@@ -31,9 +33,17 @@ export interface SetSessionTurnPreferenceArgs {
   reasoningEffort?: ReasoningEffort;
 }
 
+/** Tauri `side_query` 的参数：旁路提问（变更-34 · D3），读上下文不落盘。 */
+export interface SideQueryArgs {
+  handleId: string;
+  text: string;
+}
+
 export interface SetSessionPermissionProfileArgs {
   handleId: string;
   profile: PermissionProfile;
+  /** 页内确认卡已确认；`profile=full_access` 时必须为 true，否则后端 fail-closed。 */
+  fullAccessConfirmed?: boolean;
 }
 
 export type AgentCommand =
@@ -61,6 +71,7 @@ export type AgentCommand =
       cwd: string;
       mode?: TurnMode;
       permissionProfile?: PermissionProfile;
+      fullAccessConfirmed?: boolean;
       reasoningEffort?: ReasoningEffort;
     }
   | { type: 'resume_session'; sessionId: string };

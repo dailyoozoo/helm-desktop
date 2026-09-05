@@ -1,38 +1,69 @@
 import type { ThreadItem } from '../engine/useSession';
 import type { GitStatus, StagedFile } from '../engine/transport';
 
+/** S3（2026-08-22 路线图）：右栏常驻 tab 冻结为「修改记录 / 全部文件」，标签与原型一致。 */
+export type ContextPanelFixedTab = 'changes' | 'files';
+
+/** 常驻 tab 渲染顺序。 */
+export const CONTEXT_PANEL_FIXED_TABS = ['changes', 'files'] as const;
+
+export const CONTEXT_PANEL_FIXED_TAB_LABELS: Record<ContextPanelFixedTab, string> = {
+  changes: '修改记录',
+  files: '全部文件',
+};
+
+/** 右栏默认激活的常驻 tab（S3 验收：默认 tab 与原型一致）。 */
+export const CONTEXT_PANEL_DEFAULT_TAB: ContextPanelFixedTab = 'changes';
+
+export function isContextPanelFixedTab(tab: string): tab is ContextPanelFixedTab {
+  return tab === 'changes' || tab === 'files';
+}
+
+/**
+ * S3：交付物区动态 tab 标识（按需打开、可关闭）。
+ * 「上下文」不再是右栏 tab —— 上下文/计费只从 Composer 圆环 popover 进入；
+ * 「活动」自常驻降为动态 tab（真实能力保留，经 tabbar 入口按钮打开）。
+ */
+export type ArtifactPaneTab = 'plan' | 'term' | 'preview' | 'tasks' | 'log' | 'tools';
+
+/** 动态 tab 标签（单一来源；preview 当前无真实 dev server 能力，不提供打开入口）。 */
+export const DYN_TAB_LABELS: Record<ArtifactPaneTab, string> = {
+  plan: '计划',
+  term: '终端',
+  preview: '预览',
+  tasks: '任务',
+  log: '活动',
+  tools: '工具',
+};
+
+/** 变更-34 · A4：动态 tab 打开/关闭的纯状态机（供单测，UI 层直接投影）。 */
+export interface DynTabsState {
+  open: ArtifactPaneTab[];
+  active: ArtifactPaneTab | null;
+}
+
+export function openDynTab(state: DynTabsState, tab: ArtifactPaneTab): DynTabsState {
+  return {
+    open: state.open.includes(tab) ? state.open : [...state.open, tab],
+    active: tab,
+  };
+}
+
+export function closeDynTab(state: DynTabsState, tab: ArtifactPaneTab): DynTabsState {
+  const open = state.open.filter((t) => t !== tab);
+  // 关闭当前动态 tab 后 active 置空；UI 层把 null 绑定到默认常驻 tab「修改记录」（S3）。
+  return {
+    open,
+    active: state.active === tab ? null : state.active,
+  };
+}
+
 export interface ChangedFileSummary {
   path: string;
   added: number;
   removed: number;
   /** 对同一文件的编辑次数：行数是多次编辑的累计值，UI 需标注「累计」（变更-11） */
   edits: number;
-}
-
-/** 变更行条目（批次 I：变更导航器） */
-export interface ChangeLineEntry {
-  /** 文件路径 */
-  path: string;
-  /** 行号（新文件行号） */
-  lineNumber: number;
-  /** 变更类型：add=新增，del=删除，ctx=上下文 */
-  kind: 'add' | 'del' | 'ctx';
-  /** 行内容（截断显示） */
-  text: string;
-  /** 关联的工具 ID（用于跳转） */
-  toolId: string;
-}
-
-/** 变更文件条目（批次 I：变更导航器） */
-export interface ChangeFileEntry {
-  /** 文件路径 */
-  path: string;
-  /** 变更行列表 */
-  lines: ChangeLineEntry[];
-  /** 新增行数 */
-  added: number;
-  /** 删除行数 */
-  removed: number;
 }
 
 export interface ToolSummary {
@@ -88,8 +119,26 @@ export interface ContextPanelData {
   gitStatus?: GitStatus;
   /** 暂存区文件列表（批次 E） */
   stagedFiles?: StagedFile[];
-  /** 变更文件条目（批次 I：变更导航器） */
-  changeFiles: ChangeFileEntry[];
+}
+
+/** 变更-34 · D4/E2：由累计计费 token 派生展示口径（四账 + 缓存读取占比），ContextRing 与右栏共用。 */
+export function billingSummary(cost?: ContextPanelCost): BillingTokenSummary {
+  const freshInput = Math.max(
+    0,
+    (cost?.inputTokens ?? 0) - (cost?.cachedInputTokens ?? 0) - (cost?.cacheWriteInputTokens ?? 0),
+  );
+  const cacheRead = Math.max(0, cost?.cachedInputTokens ?? 0);
+  const cacheWrite = Math.max(0, cost?.cacheWriteInputTokens ?? 0);
+  const output = Math.max(0, cost?.outputTokens ?? 0);
+  const billingTotal = freshInput + cacheRead + cacheWrite + output;
+  return {
+    freshInput,
+    cacheWrite,
+    cacheRead,
+    output,
+    total: billingTotal,
+    ...(billingTotal > 0 ? { cacheReadShare: cacheRead / billingTotal } : {}),
+  };
 }
 
 export function contextPanelData(
@@ -102,8 +151,6 @@ export function contextPanelData(
   const mountedPaths = new Set<string>();
   let messageCount = 0;
   const tools: ToolSummary[] = [];
-  // 批次 I：变更导航器数据
-  const changeFilesMap = new Map<string, ChangeFileEntry>();
 
   for (const item of items) {
     // 回溯过滤（变更-11）：被回滚的轮次不再计入右栏（文件已还原、上下文已截断），
@@ -133,65 +180,17 @@ export function contextPanelData(
       };
       current.edits += 1;
 
-      // 批次 I：生成变更行条目
-      const changeFile = changeFilesMap.get(item.diff.path) ?? {
-        path: item.diff.path,
-        lines: [],
-        added: 0,
-        removed: 0,
-      };
-
       for (const hunk of item.diff.hunks) {
-        let lineOffset = hunk.newStart;
         for (const line of hunk.lines) {
-          if (line.kind === 'add') {
-            current.added += 1;
-            changeFile.added += 1;
-            changeFile.lines.push({
-              path: item.diff.path,
-              lineNumber: lineOffset,
-              kind: 'add',
-              text: line.text.slice(0, 80), // 截断显示
-              toolId: item.id,
-            });
-            lineOffset++;
-          } else if (line.kind === 'del') {
-            current.removed += 1;
-            changeFile.removed += 1;
-            changeFile.lines.push({
-              path: item.diff.path,
-              lineNumber: lineOffset,
-              kind: 'del',
-              text: line.text.slice(0, 80),
-              toolId: item.id,
-            });
-          } else {
-            // ctx 行
-            changeFile.lines.push({
-              path: item.diff.path,
-              lineNumber: lineOffset,
-              kind: 'ctx',
-              text: line.text.slice(0, 80),
-              toolId: item.id,
-            });
-            lineOffset++;
-          }
+          if (line.kind === 'add') current.added += 1;
+          else if (line.kind === 'del') current.removed += 1;
         }
       }
 
       changedFiles.set(item.diff.path, current);
-      changeFilesMap.set(item.diff.path, changeFile);
     }
   }
 
-  const freshInput = Math.max(
-    0,
-    (cost?.inputTokens ?? 0) - (cost?.cachedInputTokens ?? 0) - (cost?.cacheWriteInputTokens ?? 0),
-  );
-  const cacheRead = Math.max(0, cost?.cachedInputTokens ?? 0);
-  const cacheWrite = Math.max(0, cost?.cacheWriteInputTokens ?? 0);
-  const output = Math.max(0, cost?.outputTokens ?? 0);
-  const billingTotal = freshInput + cacheRead + cacheWrite + output;
   const contextTokens = typeof cost?.contextTokens === 'number' ? cost.contextTokens : undefined;
   const maxTokens =
     typeof cost?.contextWindow === 'number' && cost.contextWindow > 0
@@ -206,6 +205,7 @@ export function contextPanelData(
         : usedRatio >= 0.8
           ? 'warning'
           : 'normal';
+  const billing = billingSummary(cost);
 
   return {
     changedFiles: Array.from(changedFiles.values()),
@@ -226,16 +226,42 @@ export function contextPanelData(
       ...(contextTokens != null && maxTokens ? { ratio: usedRatio } : {}),
       level: usageLevel,
     },
-    billing: {
-      freshInput,
-      cacheWrite,
-      cacheRead,
-      output,
-      total: billingTotal,
-      ...(billingTotal > 0 ? { cacheReadShare: cacheRead / billingTotal } : {}),
-    },
+    billing,
     gitStatus,
     stagedFiles,
-    changeFiles: Array.from(changeFilesMap.values()),
   };
+}
+
+/** S3「全部文件」列表行：目录淡色 + 文件名 + 真实暂存状态徽标（仅真实 Git 事实）。 */
+export interface WorkspaceFileRow {
+  /** 相对 cwd 的路径（正斜杠） */
+  path: string;
+  /** 目录前缀（含结尾斜杠；根目录文件为空串） */
+  dir: string;
+  /** 文件名 */
+  base: string;
+  /** 暂存区状态首字母（A/M/D/R…），非暂存文件无徽标 */
+  badge?: string;
+}
+
+/** 把 search_workspace_files 的真实结果与暂存区状态合成为「全部文件」行。 */
+export function workspaceFileRows(files: string[], stagedFiles?: StagedFile[]): WorkspaceFileRow[] {
+  const badgeByPath = new Map<string, string>();
+  for (const file of stagedFiles ?? []) {
+    badgeByPath.set(file.path.replace(/\\/g, '/'), file.status.charAt(0).toUpperCase());
+  }
+  // 目录条目（尾斜杠，供新任务页文件中心选择目录用）不进「全部文件」：S3 冻结契约是文件列表。
+  return files
+    .filter((path) => !path.endsWith('/'))
+    .map((path) => {
+      const normalized = path.replace(/\\/g, '/');
+      const cut = normalized.lastIndexOf('/');
+      const badge = badgeByPath.get(normalized);
+      return {
+        path,
+        dir: cut >= 0 ? normalized.slice(0, cut + 1) : '',
+        base: normalized.slice(cut + 1) || normalized,
+        ...(badge != null ? { badge } : {}),
+      };
+    });
 }

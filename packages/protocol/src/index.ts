@@ -25,6 +25,7 @@ export type {
   SendMessageArgs,
   SetSessionPermissionProfileArgs,
   SetSessionTurnPreferenceArgs,
+  SideQueryArgs,
   TurnMode,
 } from './commands';
 export type { EngineAdapter, SessionHandle, Decision } from './adapter';
@@ -51,6 +52,8 @@ export type {
   Protocol,
   Provider,
   ProviderKind,
+  ProviderAccessType,
+  ProviderRoleKey,
   ServiceTier,
   PricingBand,
   PricingTier,
@@ -58,6 +61,7 @@ export type {
   ProviderPricingMode,
   ProviderPricingPreference,
   PricingCatalogStatus,
+  PricingCatalogEntry,
   ProviderTest,
 } from './config';
 export type {

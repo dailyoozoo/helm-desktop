@@ -270,6 +270,13 @@ impl TurnSupervisor {
                     },
                 },
             );
+        // 状态徽标实时刷新（#1 补缝，9/4）：新轮次落库即广播侧栏刷新。此前
+        // idle→running 的起点无广播，侧栏「运行中」徽标要等首条引擎事件跨过
+        // 状态边界才点亮（delta 合批/CLI 冷启动期间可达数秒盲区）。
+        // 此处 prev 必为空或终态（上方未收口检查已挡掉并发轮），必然是真实边界。
+        if let Some(app) = self.inner.app.as_ref() {
+            let _ = app.emit("helm-sessions-changed", history_session_id);
+        }
         self.spawn_budget_watchdog(history_session_id, turn_id, attempt_no);
         Ok(())
     }
@@ -544,8 +551,14 @@ impl TurnSupervisor {
         };
 
         let event_kind = event_kind(&event);
-        let event_digest = crate::turn_start::digest_json(&event)
-            .unwrap_or_else(|_| "sha256:unavailable".to_string());
+        // 性能：digest 只服务于落库（stream_boundary 与终态 finalize），delta 事件不落库，
+        // 不必为每条 delta 做一次全量序列化 + SHA-256。合批后约 30 条/秒，省下的量可观。
+        let event_digest = if is_delta(&event) {
+            String::new()
+        } else {
+            crate::turn_start::digest_json(&event)
+                .unwrap_or_else(|_| "sha256:unavailable".to_string())
+        };
         let persisted = if snapshot.status.is_terminal() {
             self.inner.store.finalize_supervised_turn(
                 &snapshot,
@@ -597,6 +610,7 @@ impl TurnSupervisor {
                     && turn.binding.attempt_no == candidate.attempt_no
                     && turn.binding.runtime_generation_id == candidate.runtime_generation_id
                 {
+                    let prev_status = turn.snapshot.status;
                     turn.last_source_seq = candidate.source_seq;
                     if let Some(identity) = candidate.native_event_id.as_ref() {
                         turn.seen_native_events.insert(identity.clone());
@@ -604,7 +618,16 @@ impl TurnSupervisor {
                     if native_identity.is_some() {
                         turn.native_session_id = native_identity;
                     }
+                    let new_status = snapshot.status;
                     turn.snapshot = snapshot;
+                    // 状态徽标实时刷新（#1）：lastTurnStatus 实际变更时广播侧栏刷新事件，
+                    // 仅在该边界事件改变状态时才发，避免每个事件都触发 Rail 全量重读。
+                    if prev_status != new_status {
+                        if let Some(app) = self.inner.app.as_ref() {
+                            let _ =
+                                app.emit("helm-sessions-changed", &candidate.history_session_id);
+                        }
+                    }
                 }
             }
         }
@@ -880,6 +903,7 @@ fn apply_transition(snapshot: &mut TurnSnapshot, event: &AgentEvent) {
         | AgentEvent::Checkpoint { .. }
         | AgentEvent::TokenUsage { .. }
         | AgentEvent::ContextUsage { .. }
+        | AgentEvent::ContextCompaction { .. }
         | AgentEvent::SessionStarted { .. }
         | AgentEvent::Error { .. } => snapshot.status = TurnStatus::Running,
     }
@@ -1039,6 +1063,7 @@ fn event_kind(event: &AgentEvent) -> &'static str {
         AgentEvent::Checkpoint { .. } => "checkpoint",
         AgentEvent::TokenUsage { .. } => "token_usage",
         AgentEvent::ContextUsage { .. } => "context_usage",
+        AgentEvent::ContextCompaction { .. } => "context_compaction",
         AgentEvent::TurnComplete { .. } => "turn_complete",
         AgentEvent::Error { .. } => "error",
     }

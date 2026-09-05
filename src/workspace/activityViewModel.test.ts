@@ -29,6 +29,7 @@ function activityState(
     startedAt: 1,
     turnActivity: stage ? { stage, since: 1_000, ...activity } : null,
     turnStartedAt: stage ? 1_000 : null,
+    turnCostUsd: 0,
     disabledMcp: [],
   };
 }

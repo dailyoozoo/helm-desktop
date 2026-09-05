@@ -96,129 +96,105 @@ export const ToolGroup = memo(function ToolGroup({
   const ends = items.flatMap((item) => (item.endedAt ? [item.endedAt] : []));
   const totalMs = starts.length && ends.length ? Math.max(...ends) - Math.min(...starts) : 0;
   return (
+    /* 批次①：工具组不再自带 .item 头像壳，由所在轮次 .ai-turn 统一承担 */
     <div
-      className={`item${items.every((item) => item.reverted) ? ' rolled' : ''}`}
+      className={items.every((item) => item.reverted) ? 'rolled' : undefined}
       data-thread-item-id={items[0].id}
+      data-kind="tgrp"
     >
-      <div className="item__gut" />
-      <div className="item__main">
-        <div className={`tgrp${open ? '' : ' collapsed'}`}>
-          <button
-            className="tgrp__head"
-            type="button"
-            aria-expanded={open}
-            onClick={() => setManualOpen(!open)}
-          >
-            <span className="tgrp__ic">
-              <Icon name="layers" />
-            </span>
-            <span className="tgrp__t">
-              {running ? `正在执行第 ${items.length} 个工具…` : `执行了 ${items.length} 个工具`}
-            </span>
-            <span className="tgrp__meta">
-              {filesChanged ? `${filesChanged} 个文件变更` : ''}
-              {failed ? ` · ${failed} 失败` : ''}
-              {denied ? ` · ${denied} 未执行/拒绝` : ''}
-              {totalMs ? ` · ${(totalMs / 1000).toFixed(1)}s` : ''}
-            </span>
-            {/* 折叠态命令预览（G-7）：显示第一个 Bash 命令或第一个工具的 target */}
-            {!open && items.length > 0 ? (
-              <span className="tgrp__preview">
-                {(() => {
-                  const bashItem = items.find((item) => item.name === 'Bash');
-                  if (bashItem) {
-                    const cmd =
-                      bashItem.input && typeof bashItem.input === 'object'
-                        ? String((bashItem.input as Record<string, unknown>).command ?? '')
-                        : '';
-                    return cmd ? (
-                      <span className="mono">
-                        {' '}
-                        · {cmd.length > 40 ? `${cmd.slice(0, 39)}…` : cmd}
-                      </span>
-                    ) : null;
-                  }
-                  const firstTarget = target(items[0]);
-                  return firstTarget ? (
-                    <span>
-                      {' '}
-                      · {firstTarget.length > 40 ? `${firstTarget.slice(0, 39)}…` : firstTarget}
-                    </span>
-                  ) : null;
-                })()}
-              </span>
-            ) : null}
-            {failed ? (
-              <span className="pill pill--danger">{failed} 失败</span>
-            ) : denied ? (
-              <span className="pill pill--warn">{denied} 未执行/拒绝</span>
-            ) : running ? (
-              <span className="pill pill--warn">运行中</span>
-            ) : null}
-            <span className="tool__chev">
-              <Icon name="down" />
-            </span>
-          </button>
-          {open ? (
-            <div className="tgrp__body">
-              {items.map((item) => (
-                <div
-                  className={`trow${item.status === 'error' && !isDenied(item) ? ' is-err' : ''}`}
-                  key={item.id}
-                  data-thread-item-id={item.id}
-                >
-                  <button
-                    className="trow__line"
-                    type="button"
-                    title="展开工具输出"
-                    aria-expanded={openRows.has(item.id)}
-                    onClick={() =>
-                      setOpenRows((current) => {
-                        const next = new Set(current);
-                        if (next.has(item.id)) next.delete(item.id);
-                        else next.add(item.id);
-                        return next;
-                      })
-                    }
-                  >
-                    <Icon
-                      name={
-                        item.name === 'Bash'
-                          ? 'terminal'
-                          : item.name === 'Grep' || item.name === 'Glob'
-                            ? 'search'
-                            : 'file'
-                      }
-                    />
-                    <span className="trow__name">
-                      <b>{item.name}</b>
-                      {target(item) ? ` · ${target(item)}` : ''}
-                    </span>
-                    <span className="trow__meta">{resultMeta(item)}</span>
-                    <span className="trow__dur">{duration(item)}</span>
-                    <span
-                      className={`trow__st ${item.status === 'pending' ? 'is-run' : item.status === 'error' && item.output?.includes('[turn_interrupted]') ? 'is-stop' : item.status === 'error' ? '' : ''}`}
-                    >
-                      {item.status === 'pending' ? (
-                        <>
-                          <i />
-                          运行中
-                        </>
-                      ) : (
-                        terminalLabel(item)
-                      )}
-                    </span>
-                  </button>
-                  {openRows.has(item.id) ? (
-                    <pre className="trow__out">
-                      {item.output || JSON.stringify(item.input, null, 2)}
-                    </pre>
-                  ) : null}
-                </div>
-              ))}
-            </div>
+      <div className={`tgrp${open ? '' : ' collapsed'}`}>
+        <button
+          className="tgrp__head"
+          type="button"
+          aria-expanded={open}
+          onClick={() => setManualOpen(!open)}
+        >
+          <span className="tgrp__ic">
+            <Icon name="layers" />
+          </span>
+          <span className="tgrp__t">
+            {running ? `正在执行第 ${items.length} 个工具…` : `执行了 ${items.length} 个工具`}
+          </span>
+          <span className="tgrp__meta">
+            {[
+              filesChanged ? `${filesChanged} 个文件变更` : '',
+              failed ? `${failed} 失败` : '',
+              denied ? `${denied} 未执行/拒绝` : '',
+              totalMs ? `${(totalMs / 1000).toFixed(1)}s` : '',
+            ]
+              .filter(Boolean)
+              .join(' · ')}
+          </span>
+          {failed ? (
+            <span className="pill pill--danger">{failed} 失败</span>
+          ) : denied ? (
+            <span className="pill pill--warn">{denied} 未执行/拒绝</span>
+          ) : running ? (
+            <span className="pill pill--warn">运行中</span>
           ) : null}
-        </div>
+          <span className="tool__chev">
+            <Icon name="down" />
+          </span>
+        </button>
+        {open ? (
+          <div className="tgrp__body">
+            {items.map((item) => (
+              <div
+                className={`trow${item.status === 'error' && !isDenied(item) ? ' is-err' : ''}`}
+                key={item.id}
+                data-thread-item-id={item.id}
+              >
+                <button
+                  className="trow__line"
+                  type="button"
+                  title="展开工具输出"
+                  aria-expanded={openRows.has(item.id)}
+                  onClick={() =>
+                    setOpenRows((current) => {
+                      const next = new Set(current);
+                      if (next.has(item.id)) next.delete(item.id);
+                      else next.add(item.id);
+                      return next;
+                    })
+                  }
+                >
+                  <Icon
+                    name={
+                      item.name === 'Bash'
+                        ? 'terminal'
+                        : item.name === 'Grep' || item.name === 'Glob'
+                          ? 'search'
+                          : 'file'
+                    }
+                  />
+                  <span className="trow__name">
+                    <b>{item.name}</b>
+                    {target(item) ? ` · ${target(item)}` : ''}
+                  </span>
+                  <span className="trow__meta">{resultMeta(item)}</span>
+                  <span className="trow__dur">{duration(item)}</span>
+                  <span
+                    className={`trow__st ${item.status === 'pending' ? 'is-run' : item.status === 'error' && item.output?.includes('[turn_interrupted]') ? 'is-stop' : item.status === 'error' ? '' : ''}`}
+                  >
+                    {item.status === 'pending' ? (
+                      <>
+                        <i />
+                        运行中
+                      </>
+                    ) : (
+                      terminalLabel(item)
+                    )}
+                  </span>
+                </button>
+                {openRows.has(item.id) ? (
+                  <pre className="trow__out">
+                    {item.output || JSON.stringify(item.input, null, 2)}
+                  </pre>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        ) : null}
       </div>
     </div>
   );

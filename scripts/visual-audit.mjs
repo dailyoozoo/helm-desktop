@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import react from '@vitejs/plugin-react';
+import tailwindcss from '@tailwindcss/vite';
 import { build as viteBuild } from 'vite';
 
 const root = path.resolve(import.meta.dirname, '..');
@@ -16,56 +17,75 @@ const siteDir = path.join(outputDir, 'site');
 const pageSpecs = [
   {
     id: 'workspace',
-    aria: '工作区',
+    aria: '新建任务',
+    // 原型 workspace.html workspace-titlebar__task：工作区标题栏中段显示任务标题，
+    // 而非页面名「工作区」（2026-08-27 对齐原型，ThreadHead 行退役）。
+    title: '修复鉴权令牌刷新',
     ready: '.turn-process',
     expected: 1,
     prototype: 'workspace.html',
   },
   {
     id: 'sessions',
-    aria: '会话历史',
-    ready: '.sessions-row',
+    aria: '全部任务',
+    // 原型 commercial.js titlebar()：icon 搜索模式页标题栏中段无页名文字（仅品牌+搜索+三键）；
+    // 「原型标题栏无页名文字」为 2026-08-24 五轮决议（Titlebar.tsx 注释），页名断言过时于 8/22。
+    // 无独立原型页：prototype/sessions.html 已随变更-34/35 删除（全部任务由设置页任务 Tab 承载，
+    // 2026-08-23 决议），生产 sessions 路由保留但原型对照跳过（f4a0b90 删除文件，断言悬空待清理）。
+    title: '',
+    ready: '.tcard',
     expected: 4,
-    prototype: 'sessions.html',
   },
   {
     id: 'providers',
-    aria: '服务商与模型',
-    ready: '.engines-grid .engine-card',
+    aria: 'AI 配置',
+    title: '',
+    ready: '.cm-grid--2 .cm-engine-card',
     expected: 2,
     prototype: 'providers.html',
   },
   {
     id: 'extensions',
-    aria: '扩展中心',
-    ready: '.xsum .ministat',
-    expected: 4,
+    aria: '插件',
+    title: '',
+    ready: '.cm-skill-grid',
+    expected: 1,
     prototype: 'extensions.html',
   },
   {
     id: 'usage',
-    aria: '用量与成本',
-    ready: '.usage-stats .stat',
+    aria: '用量',
+    title: '',
+    ready: '.cm-kpi-grid .cm-kpi',
     expected: 4,
     prototype: 'usage.html',
   },
   {
     id: 'settings',
     aria: '设置',
-    ready: '.setlayout .snav',
+    // 二级页唯一例外：原型 settings 页标题栏显示页名「设置」+ 返回键。
+    title: '设置',
+    ready: '.cm-settings-layout .cm-settings-tabs',
     expected: 1,
     prototype: 'settings.html',
   },
 ];
 const allPageSpecs = [
-  { id: 'home', aria: '总览', ready: '.cards .scard', expected: 6, prototype: 'index.html' },
+  {
+    id: 'home',
+    aria: '新任务',
+    ready: '.cm-composer',
+    expected: 1,
+    prototype: 'index.html',
+  },
   ...pageSpecs,
 ];
 const viewports = [
+  { width: 1600, height: 900 },
   { width: 1366, height: 768 },
-  { width: 1280, height: 720 },
+  { width: 1280, height: 800 },
   { width: 1024, height: 720 },
-  { width: 800, height: 600 },
+  { width: 860, height: 720 },
 ];
 const themes = ['light', 'dark'];
 const chromeCandidates = [
@@ -176,6 +196,7 @@ async function ensureVisualBoot(call, attempts = 1) {
 }
 
 async function capture(call, name) {
+  await new Promise((resolve) => setTimeout(resolve, 800));
   const result = await call('Page.captureScreenshot', {
     format: 'png',
     captureBeyondViewport: false,
@@ -190,7 +211,15 @@ async function pageOverflow(call) {
       overflowX: document.documentElement.scrollWidth > document.documentElement.clientWidth,
       visibleRightOverflow: [...document.querySelectorAll('body *')].filter((element) => {
         const style = getComputedStyle(element); const rect = element.getBoundingClientRect();
-        return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.right > innerWidth + 1;
+      const visible = element.checkVisibility?.({ checkOpacity: true, checkVisibilityCSS: true }) ??
+        (style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) > 0);
+      const clipped = (() => { let parent = element.parentElement; while (parent) {
+        const parentStyle = getComputedStyle(parent); const parentRect = parent.getBoundingClientRect();
+        if (['hidden', 'auto', 'scroll', 'clip'].includes(parentStyle.overflowX) &&
+          parentRect.right <= innerWidth + 1 && rect.right > parentRect.right + 1) return true;
+        parent = parent.parentElement;
+      } return false; })();
+      return visible && !clipped && rect.width > 0 && rect.right > innerWidth + 1;
       }).length,
     }))()`,
   );
@@ -200,10 +229,11 @@ await fsPromises.mkdir(outputDir, { recursive: true });
 await viteBuild({
   root,
   configFile: false,
-  plugins: [react()],
+  plugins: [react(), tailwindcss()],
   resolve: {
     alias: {
       '@helm/protocol': path.join(root, 'packages', 'protocol', 'src', 'index.ts'),
+      '@': path.join(root, 'src'),
     },
   },
   build: {
@@ -263,17 +293,9 @@ try {
   await waitFor(`http://127.0.0.1:${port}/visual-audit.html`, 15_000);
   const { socket, call, diagnostics } = await connectCdp();
   const prepareWorkspace = async () => {
+    // S1：打开动作本身已经过最近任务行恢复该会话，这里只等线程内容就绪。
     if (await evaluate(call, `Boolean(document.querySelector('.turn-process'))`)) return;
-    await waitForExpression(
-      call,
-      `[...document.querySelectorAll('.sitem')].some((item) => item.textContent?.includes('修复鉴权令牌刷新'))`,
-      180_000,
-    );
-    await evaluate(
-      call,
-      `[...document.querySelectorAll('.sitem')].find((item) =>
-        item.textContent?.includes('修复鉴权令牌刷新'))?.click()`,
-    );
+    await waitForExpression(call, `Boolean(document.querySelector('.turn-process'))`, 180_000);
   };
   await call('Page.navigate', { url: `http://127.0.0.1:${port}/visual-audit.html` });
   try {
@@ -287,8 +309,8 @@ try {
       `${error.message}\n浏览器诊断：${JSON.stringify(diagnostics)}\n资源：${JSON.stringify(resources)}\nVite：${previewOutput}`,
     );
   }
-  await evaluate(call, `document.querySelector('button[aria-label="总览"]')?.click()`);
-  await waitForExpression(call, `document.querySelectorAll('.cards .scard').length === 6`);
+  await evaluate(call, `document.querySelector('button[aria-label="新任务"]')?.click()`);
+  await waitForExpression(call, `document.querySelectorAll('.cm-composer').length === 1`);
   const react = await evaluate(
     call,
     `(() => {
@@ -297,24 +319,61 @@ try {
       boot: document.body.dataset.visualBoot || null, rootHtml: document.getElementById('root')?.innerHTML.slice(0, 120) || '',
       errors: window.__visualAuditErrors || [],
       errorText: document.body.innerText.includes('设置加载失败'),
-      eyebrow: document.querySelectorAll('.hero .eyebrow').length, cards: document.querySelectorAll('.cards .scard').length,
-      engines: document.querySelectorAll('.statgrid .estat').length, sessions: document.querySelectorAll('.cont .rrow').length,
-      usage: document.querySelectorAll('.cont .umini').length, overflowX: document.documentElement.scrollWidth > document.documentElement.clientWidth,
-      hero: rect('.hero'), console: rect('.console'), cardsRect: rect('.cards') };
+      titlebar: document.querySelector('.titlebar__center')?.textContent?.trim() || '',
+      helper: document.querySelectorAll('.cm-start__heading > p').length,
+      composerCount: document.querySelectorAll('.cm-composer').length,
+      metaCount: document.querySelectorAll('.cm-start-meta button').length,
+      sessions: document.querySelectorAll('.cm-start .rail-task__link').length,
+      starterCount: document.querySelectorAll('.home-starters > button').length,
+      backgroundImage: getComputedStyle(document.querySelector('.home')).backgroundImage,
+      railLogoCount: document.querySelectorAll('.rail__logo').length,
+      overflowX: document.documentElement.scrollWidth > document.documentElement.clientWidth,
+      start: rect('.cm-start'), composer: rect('.cm-composer'), meta: rect('.cm-start-meta') };
   })()`,
   );
   await capture(call, 'react-home-1366x768.png');
   console.log('React 视觉入口状态：', react);
 
+  const openReactPage = async (spec) => {
+    if (spec.id !== 'settings') {
+      // 设置页是全页布局，打开期间 Rail 不在 DOM（.cm-settings-back 点击无法恢复导航）。
+      // 离开设置统一用全局导航事件回工作区，让 Rail 重新挂载后再进入目标页；
+      // 非设置页上下文中该事件为幂等 no-op。
+      await evaluate(
+        call,
+        `window.dispatchEvent(new CustomEvent('helm:navigate', { detail: { page: 'workspace' } }))`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+    if (spec.id === 'sessions') {
+      // 2026-08-23 像素对齐：主侧栏「全部」入口移除（全部任务由设置页任务 Tab 承载），
+      // 审计改走 App 全局导航事件进入 sessions 路由。
+      await evaluate(
+        call,
+        `window.dispatchEvent(new CustomEvent('helm:navigate', { detail: { page: 'sessions' } }))`,
+      );
+      return;
+    }
+    if (spec.id === 'workspace') {
+      // S1 任务型主侧栏：工作区经最近任务行进入（与原型一致）；独立「新建任务」按钮已随图标栏移除。
+      await evaluate(
+        call,
+        `[...document.querySelectorAll('.rail-task')]
+           .find((item) => item.textContent?.includes('修复鉴权令牌刷新'))
+           ?.querySelector('.rail-task__link')?.click()`,
+      );
+      return;
+    }
+    await evaluate(
+      call,
+      `document.querySelector('button[aria-label=${JSON.stringify(spec.aria)}]')?.click()`,
+    );
+  };
+
   const reactPages = {};
   for (const spec of pageSpecs) {
-    const openPage = () =>
-      evaluate(
-        call,
-        `document.querySelector('button[aria-label=${JSON.stringify(spec.aria)}]')?.click()`,
-      );
     const preparePage = () => (spec.id === 'workspace' ? prepareWorkspace() : Promise.resolve());
-    await openPage();
+    await openReactPage(spec);
     await preparePage();
     try {
       await waitForExpression(
@@ -325,7 +384,7 @@ try {
       // 首次加载懒分包可能触发 Vite 依赖预构建；刷新后重新进入同一生产页面。
       await call('Page.reload', { ignoreCache: true });
       await ensureVisualBoot(call);
-      await openPage();
+      await openReactPage(spec);
       await preparePage();
       await waitForExpression(
         call,
@@ -336,10 +395,19 @@ try {
       call,
       `(() => ({
         coreCount: document.querySelectorAll(${JSON.stringify(spec.ready)}).length,
+        titlebar: document.querySelector('.titlebar__center')?.textContent?.trim() || '',
         overflowX: document.documentElement.scrollWidth > document.documentElement.clientWidth,
         visibleRightOverflow: [...document.querySelectorAll('body *')].filter((element) => {
           const style = getComputedStyle(element); const rect = element.getBoundingClientRect();
-          return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.right > innerWidth + 1;
+          const visible = element.checkVisibility?.({ checkOpacity: true, checkVisibilityCSS: true }) ??
+            (style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) > 0);
+          const clipped = (() => { let parent = element.parentElement; while (parent) {
+            const parentStyle = getComputedStyle(parent); const parentRect = parent.getBoundingClientRect();
+            if (['hidden', 'auto', 'scroll', 'clip'].includes(parentStyle.overflowX) &&
+              parentRect.right <= innerWidth + 1 && rect.right > parentRect.right + 1) return true;
+            parent = parent.parentElement;
+          } return false; })();
+          return visible && !clipped && rect.width > 0 && rect.right > innerWidth + 1;
         }).length,
         errors: window.__visualAuditErrors || [],
       }))()`,
@@ -359,10 +427,7 @@ try {
       console.log(`检查 React 页面矩阵：${viewport.width}x${viewport.height} ${theme}`);
       await evaluate(call, `document.documentElement.dataset.theme = ${JSON.stringify(theme)}`);
       for (const spec of allPageSpecs) {
-        await evaluate(
-          call,
-          `document.querySelector('button[aria-label=${JSON.stringify(spec.aria)}]')?.click()`,
-        );
+        await openReactPage(spec);
         if (spec.id === 'workspace') {
           await prepareWorkspace();
         }
@@ -370,6 +435,80 @@ try {
           call,
           `document.querySelectorAll(${JSON.stringify(spec.ready)}).length >= ${spec.expected}`,
         );
+        if (spec.id === 'workspace') {
+          const workspaceHierarchy = await evaluate(
+            call,
+            // S1 任务型主侧栏：workspace 是详情态，一级导航不激活；「全部任务」降级为最近任务旁次级入口。
+            // 批次①（2026-09 用户裁决）更新：任务列表侧栏全视口默认收起为抽屉（.sbar display:none），
+            // 抽屉唤起按钮已随原型删除（.ws-sidebar-toggle 应不存在）；.ctx 关闭时不画左边线。
+            `!document.querySelector('.rail-nav .is-active') && Boolean(document.querySelector('.rail-recent')) && (!document.querySelector('.sbar') || getComputedStyle(document.querySelector('.sbar')).display === 'none') && !document.querySelector('.ws-sidebar-toggle') && (!document.querySelector('.ctx') || document.querySelector('.ctx').getBoundingClientRect().width <= 2) && !document.querySelector('.composer__session-status > span.mono')`,
+          );
+          if (!workspaceHierarchy) {
+            matrixFailures.push(
+              `工作区 ${viewport.width}x${viewport.height} ${theme} 导航或信息层级未收敛`,
+            );
+          }
+          // S9 §5 待办落地：工具就地语义正断言（ADR 0019 就地交错红线）。
+          // 工具就地折叠：turn-1 静止工具组默认收起，.tool 基样式全态无边框（防盒套盒回归；
+          // .tgrp 是组卡、按原型带边框，不在此列）；失败工具就地展开：终态失败轮（turn-2）
+          // 过程区默认展开，失败卡 .failc 就地常驻可见。
+          const toolInline = await evaluate(
+            call,
+            `(() => {
+              const groups = [...document.querySelectorAll('[data-kind="tgrp"] > .tgrp')];
+              const standalone = [...document.querySelectorAll('[data-kind="tool"] > .tool')];
+              const visible = (el) => el.checkVisibility?.({ checkOpacity: true, checkVisibilityCSS: true }) ?? true;
+              const bordered = standalone.filter((el) => {
+                const s = getComputedStyle(el);
+                return ['Top', 'Right', 'Bottom', 'Left'].some(
+                  (side) => parseFloat(s['border' + side + 'Width']) > 0,
+                );
+              }).length;
+              const failed = [...document.querySelectorAll('[data-kind="fail"] > .failc')];
+              return {
+                groups: groups.length,
+                collapsed: groups.filter((el) => el.classList.contains('collapsed')).length,
+                standalone: standalone.length,
+                bordered,
+                failCards: failed.length,
+                failVisible: failed.filter(visible).length,
+              };
+            })()`,
+          );
+          if (
+            toolInline.groups === 0 ||
+            toolInline.collapsed !== toolInline.groups ||
+            toolInline.bordered > 0 ||
+            toolInline.failCards === 0 ||
+            toolInline.failVisible !== toolInline.failCards
+          ) {
+            matrixFailures.push(
+              `工作区 ${viewport.width}x${viewport.height} ${theme} 工具就地语义未收敛（${JSON.stringify(toolInline)}）`,
+            );
+          }
+        }
+        if (spec.id === 'settings') {
+          // ≤900px 时 .cm-settings-sidebar 是设计上的横向滚动导航（app.css @media ≤820px），按钮收窄换行属预期；
+          // 只在桌面宽度要求 ≥120×48 的纵向导航密度。
+          const minWidth = viewport.width <= 900 ? 88 : 120;
+          const maxHeight = viewport.width <= 900 ? 72 : 48;
+          const settingsNavReadable = await evaluate(
+            call,
+            `(() => {
+              const buttons = [...document.querySelectorAll('.cm-settings-tabs > button')];
+              return {
+                ok: buttons.every((item) => item.clientWidth >= ${minWidth} && item.clientHeight <= ${maxHeight}),
+                sizes: buttons.map((item) => item.clientWidth + 'x' + item.clientHeight),
+                cols: getComputedStyle(document.querySelector('.body')).gridTemplateColumns,
+              };
+            })()`,
+          );
+          if (!settingsNavReadable.ok) {
+            matrixFailures.push(
+              `设置 ${viewport.width}x${viewport.height} ${theme} 分类导航被挤压（${settingsNavReadable.sizes.join(', ')}；cols=${settingsNavReadable.cols}）`,
+            );
+          }
+        }
         const overflow = await pageOverflow(call);
         if (overflow.overflowX || overflow.visibleRightOverflow > 0) {
           matrixFailures.push(
@@ -395,13 +534,16 @@ try {
     call,
     `(() => {
     const rect = (selector) => { const r = document.querySelector(selector)?.getBoundingClientRect(); return r ? {x:r.x,y:r.y,width:r.width,height:r.height} : null; };
-    return { overflowX: document.documentElement.scrollWidth > document.documentElement.clientWidth, hero: rect('.hero'), console: rect('.console'), cardsRect: rect('.cards') };
+    return { overflowX: document.documentElement.scrollWidth > document.documentElement.clientWidth,
+      start: rect('.cm-start'), composer: rect('.cm-composer'), meta: rect('.cm-start-meta') };
   })()`,
   );
   await capture(call, 'prototype-home-1366x768.png');
 
   const prototypePages = {};
   for (const spec of pageSpecs) {
+    // 无独立原型页的条目（如 sessions，2026-08-23 决议移除）跳过原型对照。
+    if (!spec.prototype) continue;
     await call('Page.navigate', {
       url: pathToFileURL(path.join(root, 'prototype', spec.prototype)).href,
     });
@@ -423,11 +565,33 @@ try {
     for (const theme of themes) {
       console.log(`检查原型页面矩阵：${viewport.width}x${viewport.height} ${theme}`);
       for (const spec of allPageSpecs) {
+        // 无独立原型页的条目（如 sessions）跳过原型矩阵。
+        if (!spec.prototype) continue;
         await call('Page.navigate', {
           url: pathToFileURL(path.join(root, 'prototype', spec.prototype)).href,
         });
-        await new Promise((resolve) => setTimeout(resolve, 150));
+        // 就绪等待替代固定盲等：长会话高负载下 file:// 导航 + commercial.js 渲染
+        // 可能超过 150ms，导致断言打在未提交的文档上（2026-08-23 实测竞态）。
+        await waitForExpression(
+          call,
+          "document.readyState === 'complete' && Boolean(document.body && document.body.children.length > 0)",
+          15_000,
+        );
         await evaluate(call, `document.documentElement.dataset.theme = ${JSON.stringify(theme)}`);
+        if (spec.id === 'workspace') {
+          const prototypeWorkspaceHierarchy = await evaluate(
+            call,
+            // 对齐变更-34/35 原型升级后的 workspace.html 真值（2026-08-22 探针实测）：
+            // 模型/强度选择在 Composer 条内；sessionToggle 已移除；最近任务行有激活态。
+            // 「全部」入口：当前原型 commercial.js 未渲染，React 按术语表实现并已在验收记录登记差异。
+            `!document.querySelector('[data-cm-sidebar] .cm-nav__item[href="sessions.html"]') && document.querySelector('[data-cm-sidebar] [data-cm-task-id].is-active') && !document.getElementById('sessionToggle') && !document.querySelector('.thread__head #modelBtn') && document.querySelector('.composer__bar #modelBtn') && document.querySelector('.composer__bar #effortBtn')`,
+          );
+          if (!prototypeWorkspaceHierarchy) {
+            matrixFailures.push(
+              `原型工作区 ${viewport.width}x${viewport.height} ${theme} 导航或信息层级未收敛`,
+            );
+          }
+        }
         const overflow = await pageOverflow(call);
         if (overflow.overflowX || overflow.visibleRightOverflow > 0) {
           matrixFailures.push(
@@ -444,19 +608,28 @@ try {
   socket.close();
 
   const failures = [];
-  if (react.eyebrow !== 1) failures.push('Hero eyebrow 缺失');
-  if (react.cards !== 6) failures.push(`快速进入卡片应为 6，实际 ${react.cards}`);
-  if (react.engines < 4) failures.push(`引擎/服务商状态项应至少为 4，实际 ${react.engines}`);
-  if (react.sessions !== 4) failures.push(`最近会话应为 4，实际 ${react.sessions}`);
-  if (react.usage !== 1) failures.push('本月用量卡缺失');
+  // 2026-08-23 用户决议：新任务页标题栏无内容（bare），仅保留右侧三键。
+  if (react.titlebar !== '')
+    failures.push(`新任务标题栏应为空（仅三键），实际为「${react.titlebar}」`);
+  if (react.helper !== 1) failures.push('新任务页执行说明缺失');
+  if (react.composerCount !== 1) failures.push('新任务 Composer 缺失');
+  if (react.metaCount !== 2) failures.push(`新任务元数据入口应为 2，实际 ${react.metaCount}`);
+  // 2026-08-23 用户决议：快捷开始整块移除。
+  if (react.starterCount !== 0)
+    failures.push(`新任务快捷开始应已移除，实际 ${react.starterCount} 项`);
+  if (react.sessions !== 0) failures.push(`新任务主区不应重复最近任务，实际 ${react.sessions}`);
+  if (react.backgroundImage !== 'none') failures.push('新任务页仍有网格或装饰线背景');
+  if (react.railLogoCount !== 0) failures.push('标题栏下方不应重复产品 Logo');
   if (react.overflowX || prototype.overflowX) failures.push('页面存在横向溢出');
-  for (const key of ['hero', 'console', 'cardsRect'])
+  for (const key of ['start', 'composer', 'meta'])
     if (!react[key] || !prototype[key]) failures.push(`${key} 无法测量`);
   for (const spec of pageSpecs) {
     const page = reactPages[spec.id];
+    if (page.titlebar !== spec.title)
+      failures.push(`${spec.aria}标题栏应为「${spec.title}」，实际为「${page.titlebar}」`);
     if (page.coreCount < spec.expected)
       failures.push(`${spec.aria}核心区块应至少为 ${spec.expected}，实际 ${page.coreCount}`);
-    if (page.overflowX || page.visibleRightOverflow > 0 || prototypePages[spec.id].overflowX)
+    if (page.overflowX || page.visibleRightOverflow > 0 || prototypePages[spec.id]?.overflowX)
       failures.push(`${spec.aria}存在横向或可见元素越界`);
     if (page.errors.length)
       failures.push(`${spec.aria}出现页面脚本错误：${page.errors.join('；')}`);
@@ -464,7 +637,7 @@ try {
   failures.push(...matrixFailures);
   if (failures.length) throw new Error(`视觉审计失败：\n- ${failures.join('\n- ')}`);
   console.log(
-    `视觉审计通过：7 个生产 React 页面与原型的正常数据态、4 视口、双主题和溢出检查；截图：${outputDir}`,
+    `视觉审计通过：7 个生产 React 页面与原型的正常数据态、${viewports.length} 视口、双主题和溢出检查；截图：${outputDir}`,
   );
 } finally {
   browser.kill();

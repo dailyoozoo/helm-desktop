@@ -129,8 +129,28 @@ export interface BackgroundOperation {
 export function startSessionFork(
   sourceSessionId: string,
   targetEngine: string,
+  boundaryTurnId?: string,
 ): Promise<BackgroundOperation> {
-  return invoke<BackgroundOperation>('start_session_fork', { sourceSessionId, targetEngine });
+  return invoke<BackgroundOperation>('start_session_fork', {
+    sourceSessionId,
+    targetEngine,
+    boundaryTurnId: boundaryTurnId ?? null,
+  });
+}
+
+/** 同引擎无损分支结果（十次反馈）：lossless 即时返回新会话；summary 走既有摘要派生轮询。 */
+export type BranchForkOutcome =
+  | { mode: 'lossless'; sessionId: string }
+  | { mode: 'summary'; operation: BackgroundOperation };
+
+export function startSessionBranch(
+  sourceSessionId: string,
+  sourceTurnId?: string,
+): Promise<BranchForkOutcome> {
+  return invoke<BranchForkOutcome>('start_session_branch', {
+    sourceSessionId,
+    sourceTurnId: sourceTurnId ?? null,
+  });
 }
 
 export function listSessions(): Promise<SessionSummary[]> {
@@ -196,4 +216,8 @@ export function renameSession(sessionId: string, title: string): Promise<void> {
 
 export function setSessionPinned(sessionId: string, pinned: boolean): Promise<void> {
   return invoke<void>('set_session_pinned', { sessionId, pinned });
+}
+
+export function setSessionArchived(sessionId: string, archived: boolean): Promise<void> {
+  return invoke<void>('set_session_archived', { sessionId, archived });
 }

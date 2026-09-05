@@ -8,8 +8,10 @@ use crate::adapter::{
     agent_environment_from_settings, apply_codex_native_search, apply_codex_search_catalog,
     apply_inherited_agent_environment, build_codex_command, build_command,
     codex_native_search_enabled, codex_provider_config_args, create_codex_auth_home,
-    start_claude_with_resume_and_reasoning, start_codex_with_reasoning, ApprovalDecision, TurnMode,
+    log_runtime_line, start_claude_with_resume_and_reasoning, start_codex_with_reasoning,
+    ApprovalDecision, TurnMode,
 };
+use crate::budget::{BudgetDimension, TurnBudgetSnapshot};
 use crate::capability_registry::{
     binary_identity, bounded_probe_output, claude_capabilities_from_help,
     claude_model_only_contract_from_help, codex_capabilities_from_handshake,
@@ -17,13 +19,16 @@ use crate::capability_registry::{
     EngineCapabilitySnapshot, ResumeStrategy, CAPABILITY_PROBE_OUTPUT_LIMIT,
 };
 use crate::codex_app_server::spawn_codex_app_server;
+use crate::operations::ModelOnlyOperationPolicy;
 use crate::protocol::EngineId;
 use crate::providers::{
-    classify_failure, read_engine_config_file as read_engine_config_file_from_disk,
-    sync_provider_models, test_engine_connection, test_provider_connection,
+    classify_failure, list_provider_models,
+    read_engine_config_file as read_engine_config_file_from_disk, sync_provider_models,
+    test_engine_connection, test_provider_connection, test_provider_draft,
     write_engine_config_file as write_engine_config_file_to_disk, AppConfig, BindingConfig,
     ConnectionResult, EngineConfig, EngineConfigFile, KeyringSecretStore, ModelConfig, PriceSource,
-    Protocol, ProviderConfig, ProviderKind, ProviderStore, ProviderTest, TestOutcome,
+    Protocol, ProviderConfig, ProviderKind, ProviderModelListing, ProviderStore, ProviderTest,
+    TestOutcome,
 };
 use crate::reasoning::{
     claude_reasoning_capability, codex_reasoning_capability, ReasoningEffort,
@@ -61,6 +66,9 @@ fn codex_bundled_catalog_cache() -> &'static Mutex<HashMap<String, Vec<u8>>> {
 #[derive(Debug, PartialEq, Eq)]
 enum CodexSearchCatalogPlan {
     Unavailable,
+    /// 模型不在 bundled 目录（自定义服务商）：搜索能力未知。按红线不硬禁、不阻断模型输入，
+    /// 允许运行时尝试原生 WebSearch，由真实 Runtime 观察确认可用与否（对齐「Codex 能联网搜索」）。
+    Unknown,
     HostedResponses,
     HostedResponsesCompatibility(Vec<u8>),
 }
@@ -79,10 +87,14 @@ fn codex_search_catalog_plan(
         })?;
     let entry = models
         .iter_mut()
-        .find(|entry| entry.get("slug").and_then(serde_json::Value::as_str) == Some(model))
-        .ok_or_else(|| {
-            format!("[codex_search_catalog_model_missing] bundled 目录中找不到模型 {model}")
-        })?;
+        .find(|entry| entry.get("slug").and_then(serde_json::Value::as_str) == Some(model));
+    let Some(entry) = entry else {
+        // 2026-08-27 用户实测：自定义服务商（OPENAI_BASE_URL）的模型不在 bundled 目录，
+        // 只说明搜索能力未知，不代表模型不能跑、也不代表网关不支持原生 WebSearch。
+        // 不能硬禁（否则「查天气」类联网请求永远失败）；改为允许运行时尝试原生 WebSearch，
+        // 由真实 Runtime 观察确认可用与否，观察不可用才回落 [runtime_web_search_unavailable]。
+        return Ok(CodexSearchCatalogPlan::Unknown);
+    };
     let supports_search = entry
         .get("supports_search_tool")
         .and_then(serde_json::Value::as_bool)
@@ -236,6 +248,18 @@ pub(crate) async fn ensure_binding_runtime_ready(
         .ok_or_else(|| format!("找不到服务商：{}", binding.provider_id))?;
     if matches!(provider.kind, ProviderKind::Subscription) {
         crate::settings::ensure_subscription_login(profiles, &binding.engine_id).await?;
+        // 订阅会话启动前镜像用户自定义技能到隔离目录（变更-36，只操作 skills 子树、
+        // 不触碰 auth.json）；失败降级为仅日志，不阻断会话启动。
+        match profiles.sync_user_skills(&binding.engine_id) {
+            Ok(result) if result.copied > 0 || result.updated > 0 || result.deleted > 0 => {
+                eprintln!(
+                    "订阅技能同步完成：复制 {}、更新 {}、删除 {}",
+                    result.copied, result.updated, result.deleted
+                );
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("订阅技能同步失败（忽略，不阻断会话）：{error}"),
+        }
         if binding.engine_id == "codex" {
             let codex_home = profiles.profile_dir("codex")?;
             let models =
@@ -355,18 +379,28 @@ pub(crate) async fn resolve_engine_capability_snapshot(
                         Err("[capability_probe_output_limit] Codex model/list 超过上限".to_string())
                     } else {
                         let reasoning = codex_reasoning_capability(&model, &model_list);
+                        let provider_search_capability =
+                            provider_capabilities.as_ref().and_then(|value| {
+                                value
+                                    .get("webSearch")
+                                    .or_else(|| value.get("web_search"))
+                                    .and_then(serde_json::Value::as_bool)
+                            });
+                        log_runtime_line(
+                            "codex-search-probe",
+                            &format!(
+                                "model={model} native_search_enabled={} provider_web_search={:?}",
+                                codex_native_search_enabled(&env),
+                                provider_search_capability
+                            ),
+                        );
                         Ok((
                             codex_capabilities_from_handshake(
                                 &model,
                                 &model_list,
                                 &reasoning,
                                 codex_native_search_enabled(&env),
-                                provider_capabilities.as_ref().and_then(|value| {
-                                    value
-                                        .get("webSearch")
-                                        .or_else(|| value.get("web_search"))
-                                        .and_then(serde_json::Value::as_bool)
-                                }),
+                                provider_search_capability,
                             ),
                             "codex_initialize_model_list".to_string(),
                         ))
@@ -379,6 +413,42 @@ pub(crate) async fn resolve_engine_capability_snapshot(
             }
         })
         .await
+}
+
+/// 自定义服务商的模型按「服务商声明」放行按 Turn 指定模型（仅交互发送路径调用）。
+/// 实证（.agent/evidence/ws/ws-handshake.mjs，2026-08-27）：codex app-server 的
+/// model/list 对自定义 provider 也只返回 bundled OpenAI 目录（dummy key 即可复现），
+/// 永远不会枚举自定义 /models 的模型——按上游该行为，用户显式绑定的自定义模型
+/// 永远拿不到 codex_model_list 证据，整类配置被阻断。这里在「绑定的 primary_model
+/// 就是本次路由模型」时补一条服务商/用户声明证据放行；搜索能力由 catalog/transport/
+/// provider 能力动态裁决：目录命中或未显式禁用即允许原生 WebSearch，交给真实 Runtime 观察
+/// （网关确实缺 WebSearch 工具时运行期再 fail-closed 为 [runtime_web_search_unavailable]，不冒充联网）。
+/// 后台路径（titler/self_review/handoff）不经过本函数，红线阻断保持不变。
+fn apply_provider_declared_model_override(
+    model_override: &mut crate::capability_registry::CapabilityEvidence,
+    engine: &str,
+    env: &[(String, String)],
+    binding_primary_model: &str,
+    routed_model: &str,
+) {
+    use crate::capability_registry::CapabilitySupport;
+    if engine != "codex"
+        || model_override.support != CapabilitySupport::Unsupported
+        || model_override.diagnostic != "codex_model_not_listed"
+    {
+        return;
+    }
+    let custom_provider = env
+        .iter()
+        .any(|(key, value)| key == "OPENAI_BASE_URL" && !value.trim().is_empty());
+    if !custom_provider || routed_model != binding_primary_model {
+        return;
+    }
+    *model_override = crate::capability_registry::CapabilityEvidence::new(
+        CapabilitySupport::Supported,
+        "helm_binding_declared",
+        "custom_provider_binding_model",
+    );
 }
 
 fn ensure_requested_runtime_capabilities(
@@ -590,11 +660,19 @@ async fn prepare_codex_search_launch(
         stdout
     };
 
-    match codex_search_catalog_plan(&stdout, model)? {
+    let catalog_plan = codex_search_catalog_plan(&stdout, model)?;
+    log_runtime_line(
+        "codex-search-catalog-plan",
+        &format!("model={model} plan={catalog_plan:?}"),
+    );
+    match catalog_plan {
         CodexSearchCatalogPlan::Unavailable => env.push((
             CODEX_SEARCH_TRANSPORT_ENV.to_string(),
             "unavailable".to_string(),
         )),
+        // 未知模型：不写入 unavailable 传输标记 → 原生搜索保持开启（web_search="live" + --search），
+        // 让真实 Runtime 自行决定是否提供 WebSearch 工具（网关支持即可联网搜索）。
+        CodexSearchCatalogPlan::Unknown => {}
         CodexSearchCatalogPlan::HostedResponses => env.push((
             CODEX_SEARCH_TRANSPORT_ENV.to_string(),
             "hosted_responses".to_string(),
@@ -689,6 +767,7 @@ fn codex_subscription_models_from_response(
                 display_name,
                 input_price_per_mtok: 0.0,
                 output_price_per_mtok: 0.0,
+                cached_input_price_per_mtok: None,
                 price_source: Some(PriceSource::Subscription),
                 enabled: true,
                 context_window: row.get("contextWindow").and_then(serde_json::Value::as_u64),
@@ -817,6 +896,11 @@ impl SessionStore {
 
 /// 创建会话运行时：返回内部句柄 id；真实 `claude` 进程在 send / approve 时启动。
 #[tauri::command]
+pub fn append_runtime_log(app: AppHandle, line: String) {
+    crate::adapter::log_runtime_event(&app, "frontend", &line);
+}
+
+#[tauri::command]
 pub async fn create_session(
     app: AppHandle,
     store: State<'_, SessionStore>,
@@ -831,8 +915,11 @@ pub async fn create_session(
     reasoning_effort: Option<String>,
     mode: Option<String>,
     permission_profile: Option<String>,
+    full_access_confirmed: Option<bool>,
 ) -> Result<String, String> {
     let _initial_mode = TurnMode::parse(mode.as_deref());
+    // 单独保留一个 AppHandle 克隆用于事件广播；下方启动 runtime 会按值移动 app。
+    let app_for_events = app.clone();
     // 预算护栏：检查是否超预算
     let budget = history_store.get_budget()?;
     ensure_budget_allows_turn(&budget)?;
@@ -905,7 +992,7 @@ pub async fn create_session(
         reasoning_effort,
         pricing_profile,
     )?;
-    let capability_snapshot = resolve_engine_capability_snapshot(
+    let mut capability_snapshot = resolve_engine_capability_snapshot(
         &capability_registry,
         &runtime_route,
         &bin,
@@ -913,18 +1000,20 @@ pub async fn create_session(
         subscription_home.clone(),
     )
     .await?;
+    apply_provider_declared_model_override(
+        &mut capability_snapshot.capabilities.model_override,
+        &engine,
+        &env,
+        launch_binding.primary_model.as_str(),
+        &model,
+    );
     ensure_requested_runtime_capabilities(&capability_snapshot, reasoning_effort)?;
     let handle = store.next_handle();
     let permission_profile = crate::adapter::PermissionProfile::parse(
         permission_profile.as_deref().unwrap_or("standard"),
     )?;
     if permission_profile == crate::adapter::PermissionProfile::FullAccess {
-        let engine_label = if engine == "codex" {
-            "Codex"
-        } else {
-            "Claude Code"
-        };
-        confirm_full_access(&app, engine_label, &cwd)?;
+        require_full_access_confirmed(full_access_confirmed)?;
     }
     // Runtime 初始化会读取该 Session 的持久 Turn epoch。必须先落本地 Session，
     // 否则首条消息创建 Runtime 时会在 latest_turn_epoch 中得到 QueryReturnedNoRows。
@@ -991,6 +1080,7 @@ pub async fn create_session(
                 None,
                 Vec::new(),
                 capability_snapshot.clone(),
+                false,
             )
             .await
         }
@@ -1005,6 +1095,8 @@ pub async fn create_session(
                 cwd.clone(),
                 env,
                 vec![],
+                None,
+                None,
                 None,
                 None,
                 subscription_home,
@@ -1061,6 +1153,9 @@ pub async fn create_session(
         .map_err(|_| "会话表锁中毒".to_string())?
         .insert(handle.clone(), actor);
     store.bind_history_session(&handle, &handle)?;
+    // 新会话已落库并注册 Runtime：广播事件让常驻的 Rail 侧栏即时刷新，
+    // 无需整页刷新才看到新建任务（修复「打开对话后左侧菜单不实时更新」）。
+    let _ = app_for_events.emit("helm-sessions-changed", &handle);
     Ok(handle)
 }
 
@@ -1156,6 +1251,234 @@ pub fn remove_session_context(
     history_store.remove_session_context(&session_id, &context_id)
 }
 
+/// 同引擎无损分支结果（十次反馈）：lossless = 已即时创建分支会话（首轮流复制完整历史）；
+/// summary = 条件不满足（跨引擎/codex/CLI 无 --fork-session/源无 CLI 会话 id），
+/// 自动回退既有摘要派生流程，前端按返回的 operation 走原有轮询。
+/// 注意：`rename_all` 只作用变体名（Lossless→lossless），变体字段需要
+/// `rename_all_fields`——此前 session_id 以 snake_case 下发、前端读 sessionId
+/// 得 undefined，「分叉成功但自动跳转静默失效」（2026-09-04 埋点实证）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "mode")]
+pub enum BranchForkOutcome {
+    Lossless {
+        session_id: String,
+    },
+    Summary {
+        operation: crate::operations::BackgroundOperation,
+    },
+}
+
+/// 分叉任务入口（十次反馈升级）：同引擎 + Claude CLI 支持 `--fork-session` 时走无损
+/// 分支——立即创建新会话并登记来源链接，零等待零 token；首次发送时以
+/// `--resume <源> --fork-session` 复制完整历史（open 流程消费）。其余情况自动
+/// 回退摘要派生，保持既有语义与 UI 轮询不变。
+#[tauri::command]
+pub async fn start_session_branch(
+    app: AppHandle,
+    config_store: State<'_, ProviderStore<KeyringSecretStore>>,
+    history_store: State<'_, SessionHistoryStore>,
+    profiles: State<'_, SubscriptionProfileStore>,
+    capability_registry: State<'_, EngineCapabilityRegistry>,
+    source_session_id: String,
+    source_turn_id: Option<String>,
+) -> Result<BranchForkOutcome, String> {
+    let fallback_summary = |engine: String| {
+        let app = app.clone();
+        let source_session_id = source_session_id.clone();
+        let source_turn_id = source_turn_id.clone();
+        async move {
+            let operation = crate::handoff::start_session_fork(
+                &app,
+                &source_session_id,
+                &engine,
+                source_turn_id.as_deref(),
+            )
+            .await?;
+            Ok::<BranchForkOutcome, String>(BranchForkOutcome::Summary { operation })
+        }
+    };
+    let detail = history_store.get_session(&source_session_id)?;
+    let engine = engine_id_to_string(detail.summary.engine);
+    if engine == "codex" {
+        // Codex 原生无损分支：首轮由 codex 适配器调 thread/fork 按源线程派生新线程，
+        // 此处仅登记分支会话与来源行；源线程 id 取自会话已落库的 cli_session_id。
+        let Some(source_thread) = detail.summary.cli_session_id.clone() else {
+            return Err(
+                "[fork_codex_no_thread] Codex 会话尚未生成原生线程，无法无损分叉；请先运行一轮后再分叉"
+                    .to_string(),
+            );
+        };
+        let branch_id = format!("session-{:032x}", rand::random::<u128>());
+        history_store.create_session(crate::sessions::NewSessionRecord {
+            id: branch_id.clone(),
+            engine: detail.summary.engine.clone(),
+            model: detail.summary.model.clone(),
+            cwd: detail.summary.cwd.clone(),
+            // session.created_at/updated_at 约定秒（sessions.rs「维持秒」注释）；
+            // 此前误用 now_millis() 导致分叉会话永远置顶且显示「刚刚」。
+            created_at: crate::util::now_seconds(),
+        })?;
+        let branch_title = format!(
+            "{}（分叉）",
+            if detail.summary.title.trim().is_empty() {
+                "未命名会话"
+            } else {
+                detail.summary.title.trim()
+            }
+        );
+        history_store.rename_session(&branch_id, &branch_title)?;
+        // 切点分叉：对话内从某条回答点分叉时，前端带被点回答所属的 Helm turn id。
+        // 解析成 Codex 原生轮 id 后登记进来源行——首轮 thread/fork 以此截断到该轮
+        // （含），历史复制同样截断；解析不到（老会话未落库 native id）则整段分叉兜底。
+        let boundary_native = match source_turn_id.as_deref() {
+            Some(turn_id) => history_store
+                .native_turn_id_for_session_turn(&source_session_id, turn_id)
+                .ok()
+                .flatten(),
+            None => None,
+        };
+        history_store.record_session_native_branch(
+            &branch_id,
+            &source_session_id,
+            &source_thread,
+            boundary_native.as_deref(),
+            source_turn_id
+                .as_deref()
+                .filter(|_| boundary_native.is_some()),
+        )?;
+        // 历史可见性：复制源会话消息，分叉出的新会话立即可回看分叉前的对话。
+        // 此前历史只存在于 CLI 侧 fork 出的线程里，界面是空的，用户会以为分叉失败。
+        // 只复制消息，不复制 turn/用量/检查点（分支自首轮起才记账，避免重复计费用）。
+        // 切点存在时按切点截断——只带「这段回答及之前」，该回答之后的轮次不分叉进来。
+        let clone_target = source_turn_id
+            .as_deref()
+            .filter(|_| boundary_native.is_some());
+        let copied = history_store
+            .clone_messages_into_session_upto(&source_session_id, &branch_id, clone_target)
+            .unwrap_or(0);
+        eprintln!(
+            "[helm] [native_branch_history] Codex 分支 {} 已复制来源 {} 的 {} 条历史消息",
+            branch_id, source_session_id, copied
+        );
+        // 分支会话已落库：广播侧栏刷新（与 new_session 同源修复「左栏不实时更新」），
+        // 前端随即跳转分叉会话时无需整页刷新。
+        let _ = app.emit("helm-sessions-changed", &branch_id);
+        return Ok(BranchForkOutcome::Lossless {
+            session_id: branch_id,
+        });
+    }
+    if engine != "claude-code" {
+        return fallback_summary(engine).await;
+    }
+    // 切点分叉目前只有 Codex 支持（thread/fork 带 lastTurnId）。Claude 的
+    // --fork-session 只能整段复制，无法截断到某一轮——带切点的请求走摘要派生，
+    // 保证分叉内容与「这段回答及之前」一致，宁可多一次摘要也不给错误的无损分支。
+    if source_turn_id.is_some() {
+        return fallback_summary(engine).await;
+    }
+    let Some(source_cli) = detail.summary.cli_session_id.clone() else {
+        return fallback_summary(engine).await;
+    };
+    // 解析当前绑定并做能力证明：--fork-session 必须被本机 CLI help 明示（红线：原生
+    // resume/fork 需 capability 证明），否则回退摘要。
+    let config = config_store.load()?;
+    let binding = config
+        .bindings
+        .iter()
+        .find(|binding| binding.engine_id == engine)
+        .cloned()
+        .ok_or_else(|| format!("引擎还没有配置生效绑定：{engine}"))?;
+    let model = resolve_binding_model(&config, &binding, &binding.primary_model);
+    let launch_binding = BindingConfig {
+        primary_model: model.clone(),
+        ..binding.clone()
+    };
+    ensure_binding_runtime_ready(&profiles, &config, &launch_binding).await?;
+    let mut env = config_store.launch_env_for_config(&config, &launch_binding)?;
+    let subscription_home = subscription_profile_for_binding(&profiles, &config, &launch_binding)?;
+    if subscription_home.is_some() {
+        profiles.append_launch_env(&mut env, &engine)?;
+    }
+    env.extend(agent_environment_from_settings(
+        &load_app_settings_from_store(&history_store)?,
+    ));
+    let bin = config
+        .engine_bin(&engine)
+        .filter(|bin| !bin.is_empty())
+        .unwrap_or("claude")
+        .to_string();
+    let pricing_profile = config
+        .models
+        .iter()
+        .find(|candidate| candidate.provider_id == binding.provider_id && candidate.id == model)
+        .map(|candidate| config_store.model_pricing_profile(&config, candidate))
+        .transpose()?
+        .flatten();
+    let route = build_runtime_route(
+        &config,
+        &launch_binding,
+        &model,
+        &bin,
+        &env,
+        binding.reasoning_effort.unwrap_or_default(),
+        pricing_profile,
+    )?;
+    let capability_snapshot = resolve_engine_capability_snapshot(
+        &capability_registry,
+        &route,
+        &bin,
+        &env,
+        subscription_home,
+    )
+    .await?;
+    if capability_snapshot.capabilities.native_branch.support
+        != crate::capability_registry::CapabilitySupport::Supported
+    {
+        return fallback_summary(engine).await;
+    }
+    // 即时创建分支会话：复制源会话的引擎/模型/cwd，标题标注来源；首轮发送时才发生
+    // 真实 CLI 调用（同业体验：分叉即时可见，token 成本延后到用户开口）。
+    let branch_id = format!("session-{:032x}", rand::random::<u128>());
+    history_store.create_session(crate::sessions::NewSessionRecord {
+        id: branch_id.clone(),
+        engine: detail.summary.engine.clone(),
+        model: model.clone(),
+        cwd: detail.summary.cwd.clone(),
+        // 同上：秒约定，勿改回 now_millis()。
+        created_at: crate::util::now_seconds(),
+    })?;
+    let branch_title = format!(
+        "{}（分叉）",
+        if detail.summary.title.trim().is_empty() {
+            "未命名会话"
+        } else {
+            detail.summary.title.trim()
+        }
+    );
+    history_store.rename_session(&branch_id, &branch_title)?;
+    history_store.record_session_native_branch(
+        &branch_id,
+        &source_session_id,
+        &source_cli,
+        None,
+        None,
+    )?;
+    // 同 Codex 分支：复制历史消息让新会话立即可回看分叉前的对话（只复制消息，
+    // 不复制 turn/用量/检查点；首轮仍由 --fork-session 在 CLI 侧复制完整上下文）。
+    let copied = history_store
+        .clone_messages_into_session(&source_session_id, &branch_id)
+        .unwrap_or(0);
+    eprintln!(
+        "[helm] [native_branch_history] Claude 分支 {} 已复制来源 {} 的 {} 条历史消息",
+        branch_id, source_session_id, copied
+    );
+    // 与 Codex 分支一致：广播侧栏即时刷新，前端随后自动跳转分叉会话。
+    let _ = app.emit("helm-sessions-changed", &branch_id);
+    Ok(BranchForkOutcome::Lossless {
+        session_id: branch_id,
+    })
+}
+
 #[tauri::command]
 pub async fn resume_session(
     app: AppHandle,
@@ -1185,6 +1508,15 @@ pub async fn resume_session(
     let app_settings = load_app_settings_from_store(&history_store)?;
     sync_history_model_prices(&history_store, &config_store, &config);
     let engine = engine_id_to_string(detail.summary.engine);
+    // 诊断（2026-09-04）：分叉会话打不开时前端只能拿到最终 Err 文案，靠它反推不出是哪道
+    // 闸门拦的。逐关卡落 helm-runtime.log，末条日志即失败点。
+    log_runtime_line(
+        "resume",
+        &format!(
+            "enter session={} engine={} cli={:?}",
+            session_id, engine, detail.summary.cli_session_id
+        ),
+    );
     let binding = config
         .bindings
         .iter()
@@ -1245,7 +1577,7 @@ pub async fn resume_session(
         requested_effort,
         pricing_profile,
     )?;
-    let capability_snapshot = resolve_engine_capability_snapshot(
+    let mut capability_snapshot = resolve_engine_capability_snapshot(
         &capability_registry,
         &runtime_route,
         &bin,
@@ -1253,6 +1585,13 @@ pub async fn resume_session(
         subscription_home.clone(),
     )
     .await?;
+    apply_provider_declared_model_override(
+        &mut capability_snapshot.capabilities.model_override,
+        &engine,
+        &env,
+        launch_binding.primary_model.as_str(),
+        &model,
+    );
     let reasoning_effort = resolve_routed_effort(&capability_snapshot, requested_effort);
     ensure_requested_runtime_capabilities(&capability_snapshot, reasoning_effort)?;
     let context_messages = ledger_rebuild_messages(&history_store, &session_id)?;
@@ -1261,20 +1600,99 @@ pub async fn resume_session(
         "",
         capability_snapshot.capabilities.context_window,
     )?;
-    let native_candidate = detail.summary.cli_session_id.clone();
+    // 同引擎无损分支（十次反馈）：分支会话首轮以「源 CLI 会话 + --fork-session」
+    // 复制完整历史；来源链接由 start_session_branch 落库，此处只负责消费。
+    let native_branch_row = history_store.load_session_native_branch(&session_id)?;
+    log_runtime_line(
+        "resume",
+        &format!(
+            "native_branch session={} row={}",
+            session_id,
+            match &native_branch_row {
+                Some((source, native, boundary, helm_turn)) => format!(
+                    "source={} native={} boundary={:?} helm_turn={:?}",
+                    source, native, boundary, helm_turn
+                ),
+                None => "none".to_string(),
+            }
+        ),
+    );
+    let native_candidate = match &native_branch_row {
+        Some((source_sid, source_cli, _, _)) => {
+            eprintln!(
+                "[helm] [native_branch_first_turn] Session {} 将以 --resume {} --fork-session 复制来源 {} 的完整历史",
+                session_id, source_cli, source_sid
+            );
+            Some(source_cli.clone())
+        }
+        None => detail.summary.cli_session_id.clone(),
+    };
     let same_launch_profile = match native_candidate.as_deref() {
-        Some(native_id) => history_store.native_resume_profile_matches(
-            &detail.summary.id,
-            native_id,
-            &runtime_route.provider_launch_profile_ref,
-            &runtime_route.provider_launch_profile_digest,
-        )?,
+        Some(native_id) => {
+            // 分支的 native ref 登记在源会话名下，按源会话查询归属。
+            let owner_sid = native_branch_row
+                .as_ref()
+                .map(|(source_sid, _, _, _)| source_sid.as_str())
+                .unwrap_or(&detail.summary.id);
+            history_store.native_resume_profile_matches(
+                owner_sid,
+                native_id,
+                &runtime_route.provider_launch_profile_ref,
+                &runtime_route.provider_launch_profile_digest,
+            )?
+        }
         None => false,
     };
+    log_runtime_line(
+        "resume",
+        &format!(
+            "same_launch_profile session={} value={} route_ref={} route_digest={}",
+            session_id,
+            same_launch_profile,
+            runtime_route.provider_launch_profile_ref,
+            runtime_route.provider_launch_profile_digest
+        ),
+    );
     // get_session 已一次性取回全部未回溯消息；serialize_history_prompt 不做 token/条数截断。
     // legacy_unbound 只影响归属精度，不表示这里拿到的是部分历史。
     let complete_ledger_available = true;
-    let native_resume_id =
+    let pending_native_branch = native_branch_row.is_some();
+    log_runtime_line(
+        "resume",
+        &format!(
+            "gate session={} pending_native_branch={} native_branch_support={:?} context_ok=true",
+            session_id, pending_native_branch, capability_snapshot.capabilities.native_branch.support
+        ),
+    );
+    if pending_native_branch
+        && capability_snapshot.capabilities.native_branch.support
+            != crate::capability_registry::CapabilitySupport::Supported
+    {
+        return Err(if engine == "codex" {
+            "[capability_native_branch_unsupported] 当前 Codex 不支持 thread/fork，无法无损分支；请更新 Codex CLI，或使用摘要分叉".to_string()
+        } else {
+            "[capability_native_branch_unsupported] 当前 Claude CLI 不支持 --fork-session，无法无损分支；请更新 CLI，或使用摘要分叉".to_string()
+        });
+    }
+    let native_resume_id = if pending_native_branch {
+        // 分支语义必须无损：launch profile 漂移时明确失败，禁止静默降级成空历史重建。
+        if !same_launch_profile {
+            return Err(
+                "[capability_native_branch_profile_mismatch] 分支源会话的启动配置已变化，无法安全无损续接；请改用摘要分叉".to_string(),
+            );
+        }
+        match resume_strategy(
+            &capability_snapshot,
+            same_launch_profile,
+            complete_ledger_available,
+        ) {
+            ResumeStrategy::Blocked => return Err(
+                "[capability_resume_blocked] 原生 resume 不兼容且历史账本不足，拒绝静默截断重建"
+                    .to_string(),
+            ),
+            _ => native_candidate,
+        }
+    } else {
         match resume_strategy(
             &capability_snapshot,
             same_launch_profile,
@@ -1286,13 +1704,30 @@ pub async fn resume_session(
                 "[capability_resume_blocked] 原生 resume 不兼容且历史账本不足，拒绝静默截断重建"
                     .to_string(),
             ),
-        };
+        }
+    };
+    let (codex_native_thread_id, codex_fork_source) = if pending_native_branch {
+        (None, native_resume_id.clone())
+    } else {
+        (native_resume_id.clone(), None)
+    };
     if detail.summary.cli_session_id.is_some() && native_resume_id.is_none() {
         eprintln!(
             "[helm] [capability_native_resume_fallback_ledger] Session {} 将从完整 TurnLedger 重建",
             detail.summary.id
         );
     }
+    log_runtime_line(
+        "resume",
+        &format!(
+            "spawn session={} engine={} native_resume={:?} codex_fork_source={:?} messages={}",
+            session_id,
+            engine,
+            native_resume_id,
+            codex_fork_source,
+            context_messages.len()
+        ),
+    );
     let session = match detail.summary.engine {
         EngineId::ClaudeCode => {
             start_claude_with_resume_and_reasoning(
@@ -1306,6 +1741,7 @@ pub async fn resume_session(
                 native_resume_id.clone(),
                 context_messages,
                 capability_snapshot.clone(),
+                pending_native_branch,
             )
             .await?
         }
@@ -1317,7 +1753,13 @@ pub async fn resume_session(
             detail.summary.cwd.clone(),
             env,
             context_messages,
-            native_resume_id,
+            codex_native_thread_id,
+            codex_fork_source,
+            // 切点分叉：来源行若登记了截断轮，首轮 thread/fork 带 lastTurnId；
+            // 左栏整段分叉为 None，行为与升级前完全一致。
+            native_branch_row
+                .as_ref()
+                .and_then(|(_, _, boundary, _)| boundary.clone()),
             None,
             subscription_home,
             capability_snapshot.clone(),
@@ -1327,6 +1769,10 @@ pub async fn resume_session(
     let restored_profile =
         crate::adapter::PermissionProfile::parse(&detail.summary.safe_permission_profile)?;
     session.set_permission_profile(restored_profile).await?;
+    log_runtime_line(
+        "resume",
+        &format!("spawned session={} permission_profile=ok", session_id),
+    );
     let handle = store.next_handle();
     let owner = RuntimeOwnerRef::session(detail.summary.id.clone());
     runtime_registry
@@ -1410,6 +1856,32 @@ pub fn delete_provider_config(
 }
 
 #[tauri::command]
+pub fn save_provider_models_config(
+    store: State<'_, ProviderStore<KeyringSecretStore>>,
+    sessions: State<'_, SessionHistoryStore>,
+    provider_id: String,
+    models: Vec<ModelConfig>,
+) -> Result<AppConfig, String> {
+    let before = store.load()?;
+    let config = store.save_models_for_provider(&provider_id, models)?;
+    cascade_preferred_model_after_retarget(&sessions, &before, &config, &provider_id);
+    Ok(config)
+}
+
+#[tauri::command]
+pub fn delete_provider_model(
+    store: State<'_, ProviderStore<KeyringSecretStore>>,
+    sessions: State<'_, SessionHistoryStore>,
+    provider_id: String,
+    model_id: String,
+) -> Result<AppConfig, String> {
+    let before = store.load()?;
+    let config = store.delete_provider_model(&provider_id, &model_id)?;
+    cascade_preferred_model_after_retarget(&sessions, &before, &config, &provider_id);
+    Ok(config)
+}
+
+#[tauri::command]
 pub fn save_engine_config(
     store: State<'_, ProviderStore<KeyringSecretStore>>,
     engine: EngineConfig,
@@ -1428,10 +1900,49 @@ pub fn save_model_config(
 #[tauri::command]
 pub fn save_provider_model_selection(
     store: State<'_, ProviderStore<KeyringSecretStore>>,
+    sessions: State<'_, SessionHistoryStore>,
     provider_id: String,
     enabled_model_ids: Vec<String>,
 ) -> Result<AppConfig, String> {
-    store.save_provider_model_selection(&provider_id, &enabled_model_ids)
+    let before = store.load()?;
+    let config = store.save_provider_model_selection(&provider_id, &enabled_model_ids)?;
+    cascade_preferred_model_after_retarget(&sessions, &before, &config, &provider_id);
+    Ok(config)
+}
+
+/// 目录/勾选保存把绑定从旧模型 ID 改到新 ID 后，会话 `preferred_model` 一并跟上。
+fn cascade_preferred_model_after_retarget(
+    sessions: &SessionHistoryStore,
+    before: &AppConfig,
+    after: &AppConfig,
+    provider_id: &str,
+) {
+    for after_binding in after
+        .bindings
+        .iter()
+        .filter(|binding| binding.provider_id == provider_id)
+    {
+        let Some(before_binding) = before
+            .bindings
+            .iter()
+            .find(|binding| binding.engine_id == after_binding.engine_id)
+        else {
+            continue;
+        };
+        if before_binding.primary_model != after_binding.primary_model
+            && !before_binding.primary_model.trim().is_empty()
+        {
+            let _ = sessions.rename_session_preferred_model(
+                &before_binding.primary_model,
+                &after_binding.primary_model,
+            );
+        }
+        let before_fast = before_binding.fast_model.as_deref().unwrap_or("");
+        let after_fast = after_binding.fast_model.as_deref().unwrap_or("");
+        if before_fast != after_fast && !before_fast.is_empty() && !after_fast.is_empty() {
+            let _ = sessions.rename_session_preferred_model(before_fast, after_fast);
+        }
+    }
 }
 
 #[tauri::command]
@@ -1490,6 +2001,34 @@ pub async fn test_provider_config(
     Ok(result)
 }
 
+/// 添加流程「测试连接」：草稿探活（URL + 密钥 + 协议），服务商尚未创建、不落测试记录。
+#[tauri::command]
+pub async fn test_provider_draft_config(
+    base_url: String,
+    api_key: String,
+    protocol: Protocol,
+) -> Result<ConnectionResult, String> {
+    test_provider_draft(&base_url, &api_key, &protocol).await
+}
+
+/// 「同步模型」候选拉取：只返回远端模型 ID 与最新配置，不把候选写入模型行。
+/// 草稿 Base URL / API Key 只用于本次请求，不落库。
+#[tauri::command]
+pub async fn list_provider_models_config(
+    store: State<'_, ProviderStore<KeyringSecretStore>>,
+    provider_id: String,
+    base_url: Option<String>,
+    api_key: Option<String>,
+) -> Result<ProviderModelListing, String> {
+    list_provider_models(
+        &store,
+        &provider_id,
+        base_url.as_deref(),
+        api_key.as_deref(),
+    )
+    .await
+}
+
 fn unix_timestamp_seconds() -> Result<i64, String> {
     let duration = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1509,6 +2048,7 @@ fn unix_timestamp_millis() -> Result<i64, String> {
 pub async fn sync_provider_models_config(
     store: State<'_, ProviderStore<KeyringSecretStore>>,
     profiles: State<'_, SubscriptionProfileStore>,
+    sessions: State<'_, SessionHistoryStore>,
     provider_id: String,
 ) -> Result<AppConfig, String> {
     let config = store.load()?;
@@ -1532,9 +2072,13 @@ pub async fn sync_provider_models_config(
             Protocol::Anthropic => crate::providers::subscription_models_for_provider(provider),
             _ => unreachable!("subscription protocol was validated above"),
         };
-        return store.save_models_for_provider(&provider_id, models);
+        let saved = store.save_models_for_provider(&provider_id, models)?;
+        cascade_preferred_model_after_retarget(&sessions, &config, &saved, &provider_id);
+        return Ok(saved);
     }
-    sync_provider_models(&store, &provider_id).await
+    let saved = sync_provider_models(&store, &provider_id).await?;
+    cascade_preferred_model_after_retarget(&sessions, &config, &saved, &provider_id);
+    Ok(saved)
 }
 
 #[tauri::command]
@@ -1569,6 +2113,7 @@ pub async fn get_reasoning_effort_capability(
     if let Some(provider_id) = provider_id.filter(|value| !value.trim().is_empty()) {
         binding.provider_id = provider_id;
     }
+    let bound_provider_id = binding.provider_id.clone();
     let launch_binding = BindingConfig {
         primary_model: model.clone(),
         ..binding
@@ -1741,7 +2286,7 @@ pub async fn send_message(
             requested_effort,
             pricing_basis.profile.clone(),
         )?;
-        let capability_snapshot = resolve_engine_capability_snapshot(
+        let mut capability_snapshot = resolve_engine_capability_snapshot(
             &capability_registry,
             &turn_route,
             &bin,
@@ -1749,6 +2294,13 @@ pub async fn send_message(
             subscription_home.clone(),
         )
         .await?;
+        apply_provider_declared_model_override(
+            &mut capability_snapshot.capabilities.model_override,
+            &engine,
+            &env,
+            binding.primary_model.as_str(),
+            &routed_model,
+        );
         let routed_effort = resolve_routed_effort(&capability_snapshot, requested_effort);
         ensure_requested_runtime_capabilities(&capability_snapshot, routed_effort)?;
         turn_route.default_reasoning_effort = routed_effort;
@@ -1793,6 +2345,15 @@ pub async fn send_message(
         routed_effort,
     ) = committed
         .ok_or_else(|| "Provider 配置连续变化，TurnStart 有界重算未能收敛，请重试".to_string())?;
+    // 首轮会在 start_turn 内把「未命名会话」改写为用户首行文本（sessions.rs）；主动广播，
+    // 让常驻 Rail 侧栏即时刷新标题，无需整页刷新（修复「发送后左侧标题不实时更新」）。
+    if detail.summary.title == "未命名会话" {
+        let _ = app.emit("helm-sessions-changed", &history_session_id);
+    }
+    // 状态徽标实时刷新（9/4）：start_turn 已把 session.status 置 'active'（idle→running
+    // 起点）。此前只有未命名会话改名才广播，续轮发送时侧栏「运行中」徽标要等首条引擎
+    // 事件跨状态边界才点亮——CLI 冷启动/输出静默期是数秒盲区。落库即广播一次。
+    let _ = app.emit("helm-sessions-changed", &history_session_id);
     let owner = RuntimeOwnerRef::session(history_session_id.clone());
     let runtime_result: Result<(), String> = async {
         if runtime_registry
@@ -1893,6 +2454,7 @@ async fn start_route_runtime(
                 None,
                 history_messages,
                 capability_snapshot,
+                false,
             )
             .await
         }
@@ -1904,6 +2466,8 @@ async fn start_route_runtime(
             cwd,
             env,
             history_messages,
+            None,
+            None,
             None,
             None,
             subscription_home,
@@ -1990,6 +2554,37 @@ fn ensure_ledger_fits_context_window(
 }
 
 #[tauri::command]
+pub async fn rename_provider_model(
+    store: tauri::State<'_, ProviderStore<KeyringSecretStore>>,
+    sessions: tauri::State<'_, SessionHistoryStore>,
+    provider_id: String,
+    old_model_id: String,
+    new_model_id: String,
+) -> Result<AppConfig, String> {
+    let (old_id, new_id) = (old_model_id.clone(), new_model_id.clone());
+    let config = {
+        let store = store.inner().clone();
+        tokio::task::spawn_blocking(move || {
+            store.rename_provider_model(&provider_id, &old_id, &new_id)
+        })
+        .await
+        .map_err(|e| format!("模型改名任务失败：{e}"))??
+    };
+    let changed = {
+        let sessions = sessions.inner().clone();
+        tokio::task::spawn_blocking(move || {
+            sessions.rename_session_preferred_model(&old_model_id, &new_model_id)
+        })
+        .await
+        .map_err(|e| format!("会话偏好级联失败：{e}"))??
+    };
+    if changed > 0 {
+        eprintln!("模型改名级联：{changed} 个会话的 preferred_model 已同步到新 ID");
+    }
+    Ok(config)
+}
+
+#[tauri::command]
 pub async fn set_session_turn_preference(
     store: State<'_, SessionStore>,
     history_store: State<'_, SessionHistoryStore>,
@@ -2017,11 +2612,11 @@ pub async fn set_session_turn_preference(
 
 #[tauri::command]
 pub async fn set_session_permission_profile(
-    app: AppHandle,
     store: State<'_, SessionStore>,
     history_store: State<'_, SessionHistoryStore>,
     handle_id: String,
     profile: String,
+    full_access_confirmed: Option<bool>,
 ) -> Result<(), String> {
     let profile = crate::adapter::PermissionProfile::parse(&profile)?;
     let session = store
@@ -2032,8 +2627,7 @@ pub async fn set_session_permission_profile(
         .cloned()
         .ok_or_else(|| format!("找不到会话：{handle_id}"))?;
     if profile == crate::adapter::PermissionProfile::FullAccess {
-        let (engine, cwd) = session.permission_confirmation_context().await?;
-        confirm_full_access(&app, &engine, &cwd)?;
+        require_full_access_confirmed(full_access_confirmed)?;
     }
     session.set_permission_profile(profile).await?;
     if matches!(
@@ -2046,23 +2640,13 @@ pub async fn set_session_permission_profile(
     Ok(())
 }
 
-fn confirm_full_access(app: &AppHandle, engine: &str, cwd: &str) -> Result<(), String> {
-    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
-    let confirmed = app
-        .dialog()
-        .message(format!(
-            "引擎：{engine}\n目录：{cwd}\n\n全部放开会让 Runtime 绕过常规审批，并可能访问工作区外路径或网络。只有进入 Helm Permission Kernel 的动作才会应用显式拒绝规则；Codex 不发审批的动作不会进入该裁决。Helm 不保证此模式仍受沙箱隔离。该授权仅在本次应用运行期间有效。"
-        ))
-        .title("开启全部放开")
-        .kind(MessageDialogKind::Warning)
-        .buttons(MessageDialogButtons::OkCancelCustom(
-            "开启".to_string(),
-            "取消".to_string(),
-        ))
-        .blocking_show();
-    confirmed
-        .then_some(())
-        .ok_or_else(|| "用户取消了全部放开".to_string())
+/// 全部放开只接受前端页内确认卡的显式标记；无标记 fail-closed，禁止 IPC 绕过确认。
+fn require_full_access_confirmed(confirmed: Option<bool>) -> Result<(), String> {
+    if confirmed == Some(true) {
+        Ok(())
+    } else {
+        Err("开启全部放开需要先在页内确认卡确认".to_string())
+    }
 }
 
 /// 中断当前轮次（杀掉对应进程树，并合成 turn_complete{interrupted}）。
@@ -2078,6 +2662,23 @@ pub async fn interrupt(store: State<'_, SessionStore>, handle_id: String) -> Res
     actor.interrupt().await
 }
 
+/// 触发引擎原生上下文压缩（变更-34/35 · B4）：只有 Codex app-server 提供真实
+/// `thread/compact/start` 契约（2026-08-12 更正）；Claude `-p` 返回明确错误。
+#[tauri::command]
+pub async fn compact_context(
+    store: State<'_, SessionStore>,
+    handle_id: String,
+) -> Result<(), String> {
+    let actor = store
+        .sessions
+        .lock()
+        .map_err(|_| "会话表锁中毒".to_string())?
+        .get(&handle_id)
+        .cloned()
+        .ok_or_else(|| format!("找不到会话：{handle_id}"))?;
+    actor.compact_context().await
+}
+
 #[tauri::command]
 pub fn get_background_operation(
     history_store: State<'_, SessionHistoryStore>,
@@ -2091,8 +2692,15 @@ pub async fn start_session_fork(
     app: AppHandle,
     source_session_id: String,
     target_engine: String,
+    boundary_turn_id: Option<String>,
 ) -> Result<crate::operations::BackgroundOperation, String> {
-    crate::handoff::start_session_fork(&app, &source_session_id, &target_engine).await
+    crate::handoff::start_session_fork(
+        &app,
+        &source_session_id,
+        &target_engine,
+        boundary_turn_id.as_deref(),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -2119,6 +2727,15 @@ pub async fn retry_background_operation(
         "fork_job" => crate::handoff::retry_fork_job(&app, &operation_id).await,
         _ => Err("当前 BackgroundOperation 类型不支持手工重试".to_string()),
     }
+}
+
+/// 变更-34 · A3：让 Helm 自评审当前会话的变更（真实 fast model 调用）。
+#[tauri::command]
+pub async fn review_changes(
+    app: AppHandle,
+    history_session_id: String,
+) -> Result<Vec<crate::self_review::ReviewNoteDto>, String> {
+    crate::self_review::review_changes(&app, &history_session_id).await
 }
 
 /// 返回后端权威的最近一轮快照，供前端在 Stop、重连或事件丢失后对账。
@@ -2238,6 +2855,7 @@ where
 
 #[tauri::command]
 pub async fn approval_response(
+    app: AppHandle,
     store: State<'_, SessionStore>,
     history_store: State<'_, SessionHistoryStore>,
     handle_id: String,
@@ -2254,7 +2872,7 @@ pub async fn approval_response(
         other => return Err(format!("未知审批决定：{other}")),
     };
     let history_session_id = store.history_session_id_for_handle(&handle_id)?;
-    apply_approval_response(
+    let outcome = apply_approval_response(
         &*history_store,
         &history_session_id,
         &approval_id,
@@ -2273,7 +2891,13 @@ pub async fn approval_response(
             session.approve(approval_id.clone(), decision).await
         },
     )
-    .await
+    .await;
+    // 侧栏实时性（9/4）：审批账本已落库（pending → applying → resolved/failed），
+    // list_sessions 的 pending_approval 是 SQL 实时派生列，但 Rail/侧栏重拉只认
+    // helm-sessions-changed。deny 等场景 turn 状态可能不变、没有恢复轮事件，
+    // 不在此确定性广播一次，侧栏「等审批」徽标会一直挂着。
+    let _ = app.emit("helm-sessions-changed", &history_session_id);
+    outcome
 }
 
 /// 删除会话（变更-12）：终止其存活运行时 → 级联删库 → 清理检查点快照文件。
@@ -2346,8 +2970,192 @@ pub fn set_session_pinned(
     Ok(())
 }
 
+/// 归档/取消归档（变更-34/35 · 切片7 · F1）：可逆，历史与用量保留，区别于删除。
+#[tauri::command]
+pub fn set_session_archived(
+    app: AppHandle,
+    history_store: State<'_, SessionHistoryStore>,
+    session_id: String,
+    archived: bool,
+) -> Result<(), String> {
+    history_store.set_session_archived(&session_id, archived)?;
+    let _ = app.emit("helm-sessions-changed", &session_id);
+    Ok(())
+}
+
+/// 旁路提问（变更-34 · D3 · SideQuery）：读当前 Session 上下文，跑一次真实 CLI 的
+/// 无工具问答，结果直接返回前端。**不写回 SessionContext、不落盘**：不产生任何
+/// Turn/Operation/用量记录，SQLite 无旁路提问痕迹（DoD）。
+#[tauri::command]
+pub async fn side_query(
+    store: State<'_, SessionStore>,
+    config_store: State<'_, ProviderStore<KeyringSecretStore>>,
+    history_store: State<'_, SessionHistoryStore>,
+    profiles: State<'_, SubscriptionProfileStore>,
+    capability_registry: State<'_, EngineCapabilityRegistry>,
+    runtime_registry: State<'_, RuntimeRegistry>,
+    handle_id: String,
+    text: String,
+) -> Result<String, String> {
+    let budget = history_store.get_budget()?;
+    ensure_budget_allows_turn(&budget)?;
+    let history_session_id = store.history_session_id_for_handle(&handle_id)?;
+    let detail = history_store.get_session(&history_session_id)?;
+    let engine = engine_id_to_string(detail.summary.engine);
+    if engine != "claude-code" {
+        return Err(
+            "[side_query_tools_not_disableable] Codex 当前合同不能关闭全部内建工具，旁路提问不可用"
+                .to_string(),
+        );
+    }
+    // 旁路提问只读最近若干条消息作上下文，不修改任何 Session 状态。
+    let prompt = build_side_query_prompt(&detail, &text)?;
+    let app_settings = load_app_settings_from_store(&history_store)?;
+    let admitted_model = detail
+        .summary
+        .preferred_model
+        .as_deref()
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or(&detail.summary.model)
+        .to_string();
+    let mut committed = None;
+    for _ in 0..3 {
+        let candidate = config_store.route_candidate()?;
+        let binding = candidate
+            .config
+            .bindings
+            .iter()
+            .find(|binding| binding.engine_id == engine)
+            .cloned()
+            .ok_or_else(|| format!("引擎还没有配置生效绑定：{engine}"))?;
+        let requested_model = requested_model_for_binding(Some(&admitted_model), None, &binding);
+        let routed_model = resolve_binding_model(&candidate.config, &binding, &requested_model);
+        let launch_binding = BindingConfig {
+            primary_model: routed_model.clone(),
+            ..binding.clone()
+        };
+        ensure_binding_runtime_ready(&profiles, &candidate.config, &launch_binding).await?;
+        let mut env = config_store.launch_env_for_config(&candidate.config, &launch_binding)?;
+        let subscription_home =
+            subscription_profile_for_binding(&profiles, &candidate.config, &launch_binding)?;
+        if subscription_home.is_some() {
+            profiles.append_launch_env(&mut env, &engine)?;
+        }
+        env.extend(agent_environment_from_settings(&app_settings));
+        let bin = candidate
+            .config
+            .engine_bin(&engine)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("claude")
+            .to_string();
+        let requested_effort = binding.reasoning_effort.unwrap_or(ReasoningEffort::Auto);
+        let route = build_runtime_route(
+            &candidate.config,
+            &launch_binding,
+            &routed_model,
+            &bin,
+            &env,
+            requested_effort,
+            None,
+        )?;
+        let capability = resolve_engine_capability_snapshot(
+            &capability_registry,
+            &route,
+            &bin,
+            &env,
+            subscription_home,
+        )
+        .await?;
+        let routed_effort = resolve_routed_effort(&capability, requested_effort);
+        // 能力证明（红线）：无 tools 原生合同不成立时（Codex 等）在此 fail-closed
+        let policy =
+            ModelOnlyOperationPolicy::from_capability(&capability, crate::util::now_millis())?;
+        committed = Some((
+            route,
+            capability.id.clone(),
+            policy,
+            bin,
+            env,
+            routed_effort,
+        ));
+        break;
+    }
+    let (route, _capability_snapshot_id, policy, bin, env, routed_effort) = committed
+        .ok_or_else(|| "Provider 配置连续变化，旁路提问重算未能收敛，请重试".to_string())?;
+    // 零持久化：直接跑 transient 调用；预算兜底沿用标准 Turn budget 的 wall/output 上限。
+    let turn_budget = TurnBudgetSnapshot::standard(crate::util::now_millis());
+    let output_limit = turn_budget
+        .limit(BudgetDimension::OutputBytes)
+        .map(|limit| limit.limit)
+        .unwrap_or(16 * 1024 * 1024);
+    let wall_limit = turn_budget
+        .limit(BudgetDimension::WallClockMs)
+        .map(|limit| limit.limit)
+        .unwrap_or(60 * 60 * 1000);
+    let output = runtime_registry
+        .run_transient_model_only_operation(
+            &engine,
+            &policy,
+            &bin,
+            &env,
+            std::path::Path::new(&detail.summary.cwd),
+            &prompt,
+            &route.model_id,
+            routed_effort,
+            output_limit,
+            wall_limit,
+        )
+        .await?;
+    let answer = output.text.trim().to_string();
+    if answer.is_empty() {
+        return Err("[side_query_empty] 旁路提问未得到模型回复".to_string());
+    }
+    Ok(answer)
+}
+
+/// 旁路提问 prompt：只冻结当前会话可见的用户/助手消息尾巴与工作目录，
+/// 不携带任何审批、密钥、工具轨迹，也绝不写回。
+fn build_side_query_prompt(detail: &SessionDetail, question: &str) -> Result<String, String> {
+    const MAX_CONTEXT_CHARS: usize = 4000;
+    const MAX_MESSAGES: usize = 8;
+    let role_label = |role: &crate::protocol::Role| match role {
+        crate::protocol::Role::User => "用户",
+        crate::protocol::Role::Assistant => "助手",
+    };
+    let mut transcript: Vec<String> = Vec::new();
+    let mut chars = 0usize;
+    for message in detail.messages.iter().rev().take(MAX_MESSAGES) {
+        if message.reverted {
+            continue;
+        }
+        let segment = format!("{}：{}", role_label(&message.role), message.text);
+        chars += segment.chars().count();
+        if chars > MAX_CONTEXT_CHARS {
+            break;
+        }
+        transcript.push(segment);
+    }
+    transcript.reverse();
+    Ok(format!(
+        "下面是当前会话的一段中文对话上下文（可参考但不要重复它），工作目录：{}\n\n{}\n\n请直接回答我的临时提问，不要使用任何工具，也不要提议修改文件：\n{}",
+        detail.summary.cwd,
+        if transcript.is_empty() {
+            "（暂无对话历史）".to_string()
+        } else {
+            transcript.join("\n")
+        },
+        question.trim()
+    ))
+}
+
 /// @文件引用（变更-12）：在工作目录下按名称片段搜索文件，供输入框 @ 菜单联想。
 /// 深度/数量双限制 + 跳过依赖与版本库目录，防止大仓库遍历卡顿。
+///
+/// 2026-08-12 修复（@ 提及搜不到文档）：
+/// - 匹配改为作用于完整相对路径（目录名也会命中，`@docs` 能搜到 docs/ 下的文件）；
+/// - 跳过 `target-*` 变体构建目录（此前只精确跳过 `target`，displaydoc 等产物污染结果）；
+/// - 遍历完再排序截断：此前遍历中途满 30 条就 break，排序只作用于先遇到的根目录文件，
+///   子目录里的文档永远进不了菜单。
 #[tauri::command]
 pub fn search_workspace_files(cwd: String, query: String) -> Result<Vec<String>, String> {
     const SKIP_DIRS: [&str; 8] = [
@@ -2373,7 +3181,7 @@ pub fn search_workspace_files(cwd: String, query: String) -> Result<Vec<String>,
     let mut scanned = 0usize;
     let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(root.clone(), 0)];
     while let Some((dir, depth)) = stack.pop() {
-        if results.len() >= MAX_RESULTS || scanned >= MAX_SCANNED {
+        if scanned >= MAX_SCANNED {
             break;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -2381,28 +3189,41 @@ pub fn search_workspace_files(cwd: String, query: String) -> Result<Vec<String>,
         };
         for entry in entries.flatten() {
             scanned += 1;
-            if results.len() >= MAX_RESULTS || scanned >= MAX_SCANNED {
+            if scanned >= MAX_SCANNED {
                 break;
             }
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
             if path.is_dir() {
-                if depth + 1 <= MAX_DEPTH
+                // 目录本身也作为可选中条目返回（尾斜杠约定，前端渲染为「目录」行，
+                // 与新任务页文件中心原型一致：可选择文件或目录）。可见性与递归同滤：
+                // 隐藏目录 / node_modules / target* 永不出现。
+                let visible = depth + 1 <= MAX_DEPTH
                     && !name.starts_with('.')
                     && !SKIP_DIRS.contains(&name.as_str())
-                {
-                    stack.push((path, depth + 1));
+                    && !name.starts_with("target-");
+                if visible {
+                    stack.push((path.clone(), depth + 1));
+                    if let Ok(relative) = path.strip_prefix(&root) {
+                        let mut relative = relative.to_string_lossy().replace('\\', "/");
+                        if needle.is_empty() || relative.to_lowercase().contains(&needle) {
+                            relative.push('/');
+                            results.push(relative);
+                        }
+                    }
                 }
                 continue;
             }
-            if needle.is_empty() || name.to_lowercase().contains(&needle) {
-                if let Ok(relative) = path.strip_prefix(&root) {
-                    results.push(relative.to_string_lossy().replace('\\', "/"));
+            if let Ok(relative) = path.strip_prefix(&root) {
+                let relative = relative.to_string_lossy().replace('\\', "/");
+                if needle.is_empty() || relative.to_lowercase().contains(&needle) {
+                    results.push(relative);
                 }
             }
         }
     }
     results.sort_by_key(|item| item.len());
+    results.truncate(MAX_RESULTS);
     Ok(results)
 }
 
@@ -2777,21 +3598,14 @@ pub async fn get_usage_stats(
     history_store.get_usage_stats(days)
 }
 
+/// S4 冻结的统一分组聚合命令：dimension = model / engine / provider
 #[tauri::command]
-pub async fn get_usage_by_model(
+pub async fn get_usage_breakdown(
     history_store: State<'_, SessionHistoryStore>,
     days: u32,
-) -> Result<Vec<crate::sessions::ModelUsage>, String> {
-    history_store.get_usage_by_model(days)
-}
-
-/// 按服务商聚合用量（P3-6）：真实 provider_id 归属，不再按模型名推断
-#[tauri::command]
-pub async fn get_usage_by_provider(
-    history_store: State<'_, SessionHistoryStore>,
-    days: u32,
-) -> Result<Vec<crate::sessions::ProviderUsage>, String> {
-    history_store.get_usage_by_provider(days)
+    dimension: crate::sessions::UsageBreakdownDimension,
+) -> Result<Vec<crate::sessions::UsageBreakdownRow>, String> {
+    history_store.get_usage_breakdown(days, dimension)
 }
 
 #[tauri::command]
@@ -2835,23 +3649,52 @@ pub async fn set_budget(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_approval_response, codex_search_catalog_plan,
+        apply_approval_response, build_side_query_prompt, codex_search_catalog_plan,
         codex_subscription_models_from_response, ensure_budget_allows_turn,
         ensure_discovered_binding_model, ensure_ledger_fits_context_window,
         ensure_pricing_allows_turn, normalize_manual_deny_operation, requested_model_for_binding,
         resolve_binding_model, resolve_routed_effort, resolve_turn_pricing_basis,
-        rollback_failed_session_creation, subscription_profile_for_binding, ApprovalLedger,
-        CodexSearchCatalogPlan,
+        rollback_failed_session_creation, search_workspace_files, subscription_profile_for_binding,
+        ApprovalLedger, CodexSearchCatalogPlan,
     };
     use crate::adapter::ApprovalDecision;
     use crate::capability_registry::{CapabilityIdentity, CapabilitySet, EngineCapabilitySnapshot};
-    use crate::protocol::{AgentEvent, EngineId};
+    use crate::protocol::{AgentEvent, EngineId, Role};
     use crate::providers::{
         AppConfig, AuthMethod, BindingConfig, KeyringSecretStore, ModelConfig, PriceSource,
         Protocol, ProviderConfig, ProviderKind, ProviderStore,
     };
     use crate::reasoning::ReasoningEffort;
-    use crate::sessions::{Budget, NewSessionRecord, SessionHistoryStore};
+    use crate::sessions::{
+        Budget, NewSessionRecord, SessionDetail, SessionHistoryStore, SessionMessage,
+        SessionSummary,
+    };
+
+    #[test]
+    fn branch_fork_outcome_serializes_camel_case_fields() {
+        // 回归守卫（2026-09-04 埋点实证）：rename_all 只作用变体名，变体字段需要
+        // rename_all_fields——此前 session_id 以 snake_case 下发，前端读 sessionId
+        // 得 undefined，分叉自动跳转静默失效。
+        let outcome = super::BranchForkOutcome::Lossless {
+            session_id: "session-abc".to_string(),
+        };
+        let json = serde_json::to_value(&outcome).expect("序列化 BranchForkOutcome 失败");
+        let lossless = json.as_object().expect("lossless 应为对象");
+        assert_eq!(
+            lossless.get("mode").and_then(|v| v.as_str()),
+            Some("lossless"),
+            "变体标签应为 lossless"
+        );
+        assert_eq!(
+            lossless.get("sessionId").and_then(|v| v.as_str()),
+            Some("session-abc"),
+            "变体字段必须 camelCase（sessionId），实际：{json}"
+        );
+        assert!(
+            lossless.get("session_id").is_none(),
+            "不得残留 snake_case 的 session_id 键，实际：{json}"
+        );
+    }
 
     #[test]
     fn codex_search_catalog_only_disables_responses_lite_for_the_target_model() {
@@ -2892,7 +3735,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_search_catalog_fails_closed_on_missing_or_drifted_model_contract() {
+    fn codex_search_catalog_degrades_unknown_model_and_fails_closed_on_drifted_contract() {
         let hosted = serde_json::to_vec(&serde_json::json!({
             "models": [{
                 "slug": "gpt-hosted",
@@ -2906,9 +3749,11 @@ mod tests {
             codex_search_catalog_plan(&hosted, "gpt-hosted").unwrap(),
             CodexSearchCatalogPlan::HostedResponses
         );
-        assert!(codex_search_catalog_plan(&hosted, "missing")
-            .unwrap_err()
-            .starts_with("[codex_search_catalog_model_missing]"));
+        // 未知模型（自定义服务商的模型）能力未知：允许运行时尝试原生 WebSearch，不硬禁
+        assert_eq!(
+            codex_search_catalog_plan(&hosted, "missing").unwrap(),
+            CodexSearchCatalogPlan::Unknown
+        );
 
         let unavailable = serde_json::to_vec(&serde_json::json!({
             "models": [{
@@ -2926,6 +3771,57 @@ mod tests {
             .unwrap_err()
             .starts_with("[codex_search_catalog_schema]"));
     }
+    #[test]
+    fn provider_declared_override_only_for_bound_custom_models() {
+        use crate::capability_registry::{CapabilityEvidence, CapabilitySupport};
+        let env = vec![(
+            "OPENAI_BASE_URL".to_string(),
+            "https://gw.example/v1".to_string(),
+        )];
+        let not_listed = CapabilityEvidence::new(
+            CapabilitySupport::Unsupported,
+            "codex_model_list",
+            "codex_model_not_listed",
+        );
+        let mut bound = not_listed.clone();
+        super::apply_provider_declared_model_override(
+            &mut bound,
+            "codex",
+            &env,
+            "m2/glm-5.2-openai",
+            "m2/glm-5.2-openai",
+        );
+        assert_eq!(bound.support, CapabilitySupport::Supported);
+
+        let mut other_model = CapabilityEvidence::new(
+            CapabilitySupport::Unsupported,
+            "codex_model_list",
+            "codex_model_not_listed",
+        );
+        super::apply_provider_declared_model_override(
+            &mut other_model,
+            "codex",
+            &env,
+            "m2/glm-5.2-openai",
+            "other",
+        );
+        assert_eq!(other_model.support, CapabilitySupport::Unsupported);
+
+        let mut official_no_base_url = CapabilityEvidence::new(
+            CapabilitySupport::Unsupported,
+            "codex_model_list",
+            "codex_model_not_listed",
+        );
+        super::apply_provider_declared_model_override(
+            &mut official_no_base_url,
+            "codex",
+            &[],
+            "m2/glm-5.2-openai",
+            "m2/glm-5.2-openai",
+        );
+        assert_eq!(official_no_base_url.support, CapabilitySupport::Unsupported);
+    }
+
     use crate::settings::AppSettings;
     use crate::subscription_profiles::SubscriptionProfileStore;
     use crate::turn_supervisor::TurnSupervisor;
@@ -2940,6 +3836,8 @@ mod tests {
             fast_model: None,
             assistant_model_id: None,
             reasoning_effort: None,
+            thinking_enabled: None,
+            context_1m: None,
             revision: 9,
         };
         let model = |id: &str, provider_id: &str, enabled| ModelConfig {
@@ -2948,6 +3846,7 @@ mod tests {
             display_name: id.into(),
             input_price_per_mtok: 0.0,
             output_price_per_mtok: 0.0,
+            cached_input_price_per_mtok: None,
             price_source: None,
             enabled,
             context_window: None,
@@ -3080,6 +3979,8 @@ mod tests {
             fast_model: None,
             assistant_model_id: None,
             reasoning_effort: None,
+            thinking_enabled: None,
+            context_1m: None,
             revision: 0,
         };
         let provider = |kind| ProviderConfig {
@@ -3092,6 +3993,9 @@ mod tests {
             last_test: None,
             protocol: Protocol::OpenAiResponses,
             auth_method: AuthMethod::OAuth,
+            access_type: None,
+            role_models: None,
+            last_sync_at: None,
         };
         let config = |kind| AppConfig {
             providers: vec![provider(kind)],
@@ -3457,6 +4361,9 @@ mod tests {
             last_test: None,
             protocol: Protocol::OpenAiResponses,
             auth_method: AuthMethod::ApiKey,
+            access_type: None,
+            role_models: None,
+            last_sync_at: None,
         };
         let provider_id = provider.id.clone();
         let model = |id: &str| ModelConfig {
@@ -3465,6 +4372,7 @@ mod tests {
             display_name: id.to_string(),
             input_price_per_mtok: 0.0,
             output_price_per_mtok: 0.0,
+            cached_input_price_per_mtok: None,
             price_source: Some(PriceSource::Unknown),
             enabled: true,
             context_window: None,
@@ -3529,6 +4437,176 @@ mod tests {
         )
         .expect("提醒模式不应阻断发送");
     }
+
+    fn side_query_detail(cwd: &str, messages: Vec<SessionMessage>) -> SessionDetail {
+        SessionDetail {
+            summary: SessionSummary {
+                id: "s-test".to_string(),
+                cli_session_id: None,
+                title: "测试".to_string(),
+                engine: EngineId::ClaudeCode,
+                model: "claude-opus-4.7".to_string(),
+                cwd: cwd.to_string(),
+                status: crate::sessions::SessionStatus::Active,
+                message_count: messages.len() as u32,
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_usd: 0.0,
+                created_at: 0,
+                updated_at: 0,
+                summary: None,
+                pinned: false,
+                runtime_capabilities: None,
+                safe_permission_profile: "standard".to_string(),
+                folder_id: String::new(),
+                cached_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                last_context_tokens: None,
+                last_context_window: None,
+                preferred_model: None,
+                preferred_reasoning_effort: None,
+                archived: false,
+                current_tool: None,
+                current_target: None,
+                change_additions: 0,
+                change_deletions: 0,
+                pending_approval: false,
+                last_turn_failed: false,
+                forked_from: None,
+                last_turn_status: None,
+            },
+            messages,
+            tool_calls: Vec::new(),
+            checkpoints: Vec::new(),
+            approvals: Vec::new(),
+            turns: Vec::new(),
+            session_context: Vec::new(),
+            fork: None,
+        }
+    }
+
+    #[test]
+    fn side_query_prompt_freezes_recent_context_and_skips_reverted() {
+        let detail = side_query_detail(
+            "D:/work",
+            vec![
+                SessionMessage {
+                    role: Role::User,
+                    text: "帮我修登录".to_string(),
+                    ts: 1,
+                    reverted: false,
+                    turn_id: None,
+                    attachments: Vec::new(),
+                },
+                SessionMessage {
+                    role: Role::Assistant,
+                    text: "好的，正在排查".to_string(),
+                    ts: 2,
+                    reverted: true,
+                    turn_id: None,
+                    attachments: Vec::new(),
+                },
+                SessionMessage {
+                    role: Role::Assistant,
+                    text: "已定位到 token 刷新逻辑".to_string(),
+                    ts: 3,
+                    reverted: false,
+                    turn_id: None,
+                    attachments: Vec::new(),
+                },
+            ],
+        );
+        let prompt = build_side_query_prompt(&detail, "  下一步怎么做？  ").unwrap();
+        assert!(prompt.contains("工作目录：D:/work"));
+        assert!(prompt.contains("用户：帮我修登录"));
+        assert!(prompt.contains("助手：已定位到 token 刷新逻辑"));
+        assert!(!prompt.contains("正在排查"), "reverted 消息必须剔除");
+        assert!(prompt.ends_with("下一步怎么做？"));
+        assert!(prompt.contains("不要使用任何工具"));
+    }
+
+    #[test]
+    fn side_query_prompt_falls_back_to_empty_transcript() {
+        let detail = side_query_detail("D:/work", Vec::new());
+        let prompt = build_side_query_prompt(&detail, "什么是 Helm？").unwrap();
+        assert!(prompt.contains("（暂无对话历史）"));
+        assert!(prompt.contains("什么是 Helm？"));
+    }
+
+    #[test]
+    fn search_workspace_files_matches_directory_names_and_skips_target_variants() {
+        let root = std::env::temp_dir().join(format!(
+            "helm-command-search-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let write = |relative: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "x").unwrap();
+        };
+        // 文档目录（目录名 docs 本身不带 doc 后缀的文件名）
+        write("docs/实施切片计划.md");
+        write("docs/已知限制.md");
+        // target-* 变体构建目录：displaydoc 产物文件名含 doc，必须被跳过
+        write("target-change31/debug/deps/displaydoc-12e117d2cc5dc8bd.d");
+        write("target-change30/debug/deps/displaydoc-12e117d2cc5dc8bd.d");
+        // 根目录普通文件
+        write("README.md");
+        write("src/main.rs");
+
+        // @docs：目录名命中，应带出目录条目本身（尾斜杠）与其下所有文件
+        let docs =
+            search_workspace_files(root.to_string_lossy().to_string(), "docs".to_string()).unwrap();
+        assert_eq!(
+            docs.len(),
+            3,
+            "@docs 应返回 docs/ 目录行 + 其下全部文件：{docs:?}"
+        );
+        assert!(
+            docs.iter().any(|p| p == "docs/"),
+            "目录条目必须以尾斜杠返回：{docs:?}"
+        );
+        assert!(docs.iter().any(|p| p == "docs/实施切片计划.md"));
+        assert!(docs.iter().any(|p| p == "docs/已知限制.md"));
+
+        // @doc：路径匹配同样命中 docs/ 文件，且绝不含 target-* 产物
+        let doc =
+            search_workspace_files(root.to_string_lossy().to_string(), "doc".to_string()).unwrap();
+        assert!(
+            doc.iter().all(|p| !p.starts_with("target-")),
+            "target-* 变体产物不得出现在结果里：{doc:?}"
+        );
+        assert!(doc.iter().any(|p| p.starts_with("docs/")));
+
+        // 空查询：返回全部文件与目录条目，按路径长度升序（根目录目录行最短靠前）
+        let all =
+            search_workspace_files(root.to_string_lossy().to_string(), String::new()).unwrap();
+        assert_eq!(all.len(), 6, "4 文件 + docs/ src/ 两个目录行：{all:?}");
+        assert_eq!(all[0], "src/");
+        assert_eq!(all[1], "docs/");
+        assert_eq!(all[2], "README.md");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn search_workspace_files_truncates_to_30_shortest_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "helm-command-search-limit-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        for i in 0..60 {
+            std::fs::write(root.join(format!("file-{i:02}.md")), "x").unwrap();
+        }
+        let results =
+            search_workspace_files(root.to_string_lossy().to_string(), String::new()).unwrap();
+        // 只截断到 30 条，且按长度排序（全部等长时保留遍历顺序前 30）
+        assert_eq!(results.len(), 30);
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
 
 // ============================================================
@@ -3553,8 +4631,57 @@ pub async fn toggle_skill(
 }
 
 #[tauri::command]
+pub async fn create_skill(
+    request: crate::extensions::CreateSkillRequest,
+    project_dir: Option<String>,
+) -> Result<crate::extensions::Skill, String> {
+    crate::extensions::create_skill(request, project_dir)
+}
+
+#[tauri::command]
+pub async fn read_skill_source(
+    skill_id: String,
+    engine: String,
+    project_dir: Option<String>,
+) -> Result<crate::extensions::SkillSourceFile, String> {
+    tokio::task::spawn_blocking(move || {
+        crate::extensions::read_skill_source(&skill_id, &engine, project_dir)
+    })
+    .await
+    .map_err(|e| format!("读取技能源码任务失败: {e}"))?
+}
+
+#[tauri::command]
+pub async fn delete_skill(
+    skill_id: String,
+    engine: String,
+    project_dir: Option<String>,
+) -> Result<(), String> {
+    crate::extensions::delete_skill(&skill_id, &engine, project_dir)
+}
+
+#[tauri::command]
 pub async fn list_mcp_servers() -> Result<Vec<crate::extensions::McpServer>, String> {
     crate::extensions::list_mcp_servers()
+}
+
+#[tauri::command]
+pub async fn set_mcp_server_enabled(name: String, enabled: bool) -> Result<(), String> {
+    crate::extensions::set_mcp_server_enabled(&name, enabled)
+}
+
+#[tauri::command]
+pub async fn import_mcp_servers(
+    json: String,
+) -> Result<Vec<crate::extensions::McpImportItemResult>, String> {
+    crate::extensions::import_mcp_servers(json).await
+}
+
+#[tauri::command]
+pub async fn list_mcp_credential_status(
+    name: String,
+) -> Result<Vec<crate::extensions::McpCredentialStatus>, String> {
+    crate::extensions::list_mcp_credential_status(&name)
 }
 
 #[tauri::command]
@@ -3569,7 +4696,16 @@ pub async fn test_mcp_connection(
 
 #[tauri::command]
 pub async fn save_mcp_server(server: crate::extensions::McpServer) -> Result<(), String> {
-    crate::extensions::save_mcp_server(server)
+    // 凭证类字段值同步进系统钥匙串；被移除的旧凭证字段一并清理
+    let previous_keys = crate::extensions::list_mcp_servers()
+        .ok()
+        .and_then(|list| {
+            list.into_iter()
+                .find(|existing| existing.name == server.name)
+        })
+        .map(|existing| crate::extensions::credential_keys_of(&existing))
+        .unwrap_or_default();
+    crate::extensions::save_mcp_server_with_credential_sync(&server, &previous_keys)
 }
 
 #[tauri::command]

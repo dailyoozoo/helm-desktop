@@ -10,14 +10,6 @@ export async function saveSettings(settings: AppSettings): Promise<void> {
   return invoke('save_app_settings', { settings });
 }
 
-export async function exportSettings(): Promise<string | null> {
-  return invoke('export_app_settings');
-}
-
-export async function importSettings(): Promise<AppSettings | null> {
-  return invoke('import_app_settings');
-}
-
 export async function getUpdateStatus(): Promise<UpdateStatus> {
   return invoke('get_update_status');
 }
@@ -56,6 +48,42 @@ export interface CliInstallResult {
 
 export async function installCliEngine(engine: 'claude-code' | 'codex'): Promise<CliInstallResult> {
   return invoke('install_cli_engine', { engine });
+}
+
+// —— 工作区环境依赖（变更-37：Node/git 探测与一键安装）——
+
+export interface WorkspaceDepStatus {
+  available: boolean;
+  version: string | null;
+}
+
+export interface WorkspaceDeps {
+  node: WorkspaceDepStatus;
+  npm: WorkspaceDepStatus;
+  git: WorkspaceDepStatus;
+}
+
+/** 探测 node / npm / git（真实 `--version`） */
+export async function detectWorkspaceDeps(): Promise<WorkspaceDeps> {
+  return invoke('detect_workspace_deps');
+}
+
+export interface ToolInstallResult {
+  /** 安装后复检到的可执行文件路径（PATH 或已知安装目录） */
+  path: string;
+  version: string;
+  /** true 表示 PATH 尚未刷新，需要重启 Helm 后才可在新进程中解析 */
+  restartRequired: boolean;
+}
+
+/** 一键静默安装 Node LTS（国内镜像 + SHA-256SUMS 验签） */
+export async function installNode(): Promise<ToolInstallResult> {
+  return invoke('install_node');
+}
+
+/** 一键静默安装 git（git-for-windows 国内二进制镜像 + 校验） */
+export async function installGit(): Promise<ToolInstallResult> {
+  return invoke('install_git');
 }
 
 export async function selectDirectory(): Promise<string | null> {
@@ -139,4 +167,99 @@ export interface ReadinessReport {
 
 export async function getReadinessReport(): Promise<ReadinessReport> {
   return invoke('get_readiness_report');
+}
+
+// —— 关于页（S8）：平台信息 / 日志目录 / 诊断包 / 历史对话导入 ——
+
+export interface PlatformInfo {
+  osName: string;
+  /** 仅 Windows 提供真实内核版本号（RtlGetVersion）；其他平台为 null。 */
+  osVersion: string | null;
+  arch: string;
+  appVersion: string;
+  tauriVersion: string;
+  webviewVersion: string;
+}
+
+/** 真实平台/版本事实，用于「关于」页与反馈核对。 */
+export async function getPlatformInfo(): Promise<PlatformInfo> {
+  return invoke('get_platform_info');
+}
+
+export interface LastDiagnosticsExport {
+  path: string;
+  exportedAt: string;
+}
+
+export interface LogDirInfo {
+  path: string;
+  fileCount: number;
+  lastDiagnosticsExport: LastDiagnosticsExport | null;
+}
+
+/** 解析并确保日志目录存在；打开目录复用 open_path_in_system。 */
+export async function getLogDirInfo(): Promise<LogDirInfo> {
+  return invoke('get_log_dir_info');
+}
+
+export interface DiagnosticsExportResult {
+  path: string;
+  bytes: number;
+}
+
+/** 导出脱敏诊断包；用户取消返回 null。 */
+export async function exportDiagnosticsBundle(): Promise<DiagnosticsExportResult | null> {
+  return invoke('export_diagnostics_bundle');
+}
+
+export interface ImportableHistoryEntry {
+  engine: 'claude-code' | 'codex' | string;
+  path: string;
+  fileName: string;
+  sessionId: string | null;
+  cwd: string | null;
+  messageCount: number;
+  firstMessagePreview: string | null;
+  model: string | null;
+  sizeBytes: number;
+  modifiedAtMs: number;
+}
+
+export interface ImportableHistoryScan {
+  entries: ImportableHistoryEntry[];
+  totalFound: number;
+  skippedTooLarge: number;
+  skippedUnparsable: number;
+}
+
+/** 扫描本机 Claude Code / Codex 记录文件（只读）。 */
+export async function listImportableHistories(
+  engine: 'claude-code' | 'codex',
+): Promise<ImportableHistoryScan> {
+  return invoke('list_importable_histories', { engine });
+}
+
+export interface HistoryImportResult {
+  sessionId: string;
+  title: string;
+  engine: string;
+  cwd: string;
+  importedMessages: number;
+  skippedLines: number;
+}
+
+/**
+ * 把一个 JSONL 历史记录文件导入为本地会话。
+ * engine 传 'auto' 时按内容形状探测（Codex rollout 优先，其次 Claude Code）。
+ */
+export async function importHistory(input: {
+  sourcePath: string;
+  engine: 'claude-code' | 'codex' | 'auto';
+  titleOverride?: string;
+}): Promise<HistoryImportResult> {
+  return invoke('import_history', {
+    sourcePath: input.sourcePath,
+    engine: input.engine,
+    titleOverride: input.titleOverride ?? null,
+  });
 }

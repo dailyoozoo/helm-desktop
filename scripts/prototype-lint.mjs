@@ -8,7 +8,13 @@ const root = path.resolve(import.meta.dirname, '..');
 const html = fs.readFileSync(root + '/prototype/workspace.html', 'utf8');
 const css = fs.readFileSync(root + '/prototype/assets/app.css', 'utf8');
 const js = fs.readFileSync(root + '/prototype/assets/app.js', 'utf8');
-const script = html.slice(html.lastIndexOf('<script>') + 8, html.lastIndexOf('</script>'));
+// 工作台脚本已拆到 assets/workspace*.js（旧版内联时回退到 <script> 块）
+let script = '';
+for (const f of ['workspace-data.js', 'workspace.js', 'workspace-rail.js']) {
+  const p = root + '/prototype/assets/' + f;
+  if (fs.existsSync(p)) script += fs.readFileSync(p, 'utf8') + '\n';
+}
+if (!script) script = html.slice(html.lastIndexOf('<script>') + 8, html.lastIndexOf('</script>'));
 
 const BS = String.fromCharCode(92);
 const SQ = String.fromCharCode(39);
@@ -81,8 +87,11 @@ const warn = [];
 const uniq = (a) => [...new Set(a)];
 const grab = (re, s) => uniq([...s.matchAll(re)].map((m) => m[1]));
 
-// 1) getElementById 的 id 必须在标记中存在
-const domIds = new Set(grab(/id="([A-Za-z0-9_-]+)"/g, html));
+// 1) getElementById 的 id 必须在标记或 JS 生成的标记中存在
+const domIds = new Set([
+  ...grab(/id="([A-Za-z0-9_-]+)"/g, html),
+  ...grab(/id="([A-Za-z0-9_-]+)"/g, script),
+]);
 grab(/getElementById\("([A-Za-z0-9_-]+)"\)/g, script)
   .filter((i) => !domIds.has(i))
   .forEach((i) => fail.push(`getElementById("${i}") 无对应 id`));

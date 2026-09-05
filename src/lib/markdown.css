@@ -80,14 +80,14 @@
 }
 .md img {
   max-width: 100%;
-  border-radius: 8px;
+  border-radius: var(--r-sm);
 }
 .md :not(pre) > code {
   font-family: var(--font-mono);
   font-size: 12.5px;
   background: var(--surface-2);
   padding: 1.5px 5px;
-  border-radius: 5px;
+  border-radius: var(--r-xs);
 }
 /* 围栏代码块 + 复制按钮 */
 .md-code {
@@ -99,7 +99,7 @@
   padding: 11px 14px;
   background: var(--surface-2);
   border: 1px solid var(--border);
-  border-radius: 9px;
+  border-radius: var(--r);
   overflow-x: auto;
   font-family: var(--font-mono);
   font-size: 12.5px;
@@ -124,7 +124,7 @@
   color: var(--fg-3);
   background: var(--raised);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--r-xs);
   cursor: pointer;
   opacity: 0;
   transition: opacity 0.12s;

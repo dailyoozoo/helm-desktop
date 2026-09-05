@@ -47,11 +47,14 @@ describe('ApprovalCard', () => {
     expect(html).not.toContain('disabled=""');
   });
 
-  it('only shows the terminal handled state after backend confirmation', () => {
+  it('渲染形态 B：已处理审批收成轻量行，不再保留禁用的决定按钮', () => {
     const html = render('resolved');
 
+    // 已处理完无需再操作：轻量行展示结果与动作，不再渲染带 disabled 的决定按钮
     expect(html).toContain('已批准本会话');
-    expect(html.match(/disabled=""/g)).toHaveLength(3);
+    expect(html).toContain('approve-lite');
+    expect(html).toContain('ls -la');
+    expect(html).not.toContain('<button');
   });
 
   it('hides session-wide approval when the backend cannot produce a stable matcher', () => {
@@ -59,7 +62,8 @@ describe('ApprovalCard', () => {
 
     expect(html).toContain('当次允许');
     expect(html).toContain('拒绝');
-    expect(html).not.toContain('总是允许');
+    // 原型：指纹注释（含「总是允许」说明）始终显示；仅当后端无稳定 matcher 时不出现「总是允许」按钮
+    expect(html).toContain('不再逐条确认');
     expect(html.match(/<button/g)).toHaveLength(2);
   });
 });

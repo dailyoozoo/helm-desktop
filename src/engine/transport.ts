@@ -14,6 +14,7 @@ import type {
   SendMessageArgs,
   SetSessionPermissionProfileArgs,
   SetSessionTurnPreferenceArgs,
+  SideQueryArgs,
   TurnMode,
 } from '@helm/protocol';
 
@@ -30,6 +31,7 @@ export function createSession(opts: CreateSessionOpts): Promise<string> {
     reasoningEffort: opts.reasoningEffort,
     mode: opts.mode,
     permissionProfile: opts.permissionProfile,
+    fullAccessConfirmed: opts.fullAccessConfirmed,
   } satisfies CreateSessionArgs;
   return invoke<string>('create_session', args);
 }
@@ -69,11 +71,19 @@ export function setSessionTurnPreference(
   return invoke<void>('set_session_turn_preference', args);
 }
 
+// 旁路提问（变更-34 · D3）：真实 CLI 的一次性无工具问答，读上下文但不写回、不落盘。
+// 返回模型回复文本；不产生 Turn/Operation/用量记录。
+export function sideQuery(handleId: string, text: string): Promise<string> {
+  const args = { handleId, text } satisfies SideQueryArgs;
+  return invoke<string>('side_query', args);
+}
+
 export function setSessionPermissionProfile(
   handleId: string,
   profile: PermissionProfile,
+  fullAccessConfirmed?: boolean,
 ): Promise<void> {
-  const args = { handleId, profile } satisfies SetSessionPermissionProfileArgs;
+  const args = { handleId, profile, fullAccessConfirmed } satisfies SetSessionPermissionProfileArgs;
   return invoke<void>('set_session_permission_profile', args);
 }
 
@@ -92,6 +102,12 @@ export function getReasoningEffortCapability(
 // 中断当前轮次（后端杀掉/打断 CLI 进程，应随后发出 turn_complete{interrupted}）。
 export function interrupt(handleId: string): Promise<void> {
   return invoke<void>('interrupt', { handleId });
+}
+
+// 触发引擎原生上下文压缩（变更-34/35 · B4）：只有 Codex app-server 有真实
+// `thread/compact/start` 契约；Claude `-p` 返回明确错误（后端 fail-closed）。
+export function compactContext(handleId: string): Promise<void> {
+  return invoke<void>('compact_context', { handleId });
 }
 
 export function getTurnSnapshot(handleId: string): Promise<{
@@ -113,6 +129,11 @@ export function getTurnSnapshot(handleId: string): Promise<{
 // 关闭并回收一个会话句柄（后端终止残留进程并从 SessionStore 移除，防止 runtime 泄漏）。
 export function closeSession(handleId: string): Promise<void> {
   return invoke<void>('close_session', { handleId });
+}
+
+// 排查日志：把前端侧丢弃/异常事件落盘到后端 runtime 日志（变更-27 调试用，fail-closed）。
+export function appendRuntimeLog(line: string): Promise<void> {
+  return invoke<void>('append_runtime_log', { line });
 }
 
 // 回应一个审批请求：当次允许 / 总是允许(本会话) / 拒绝
@@ -139,10 +160,21 @@ export function onAgentEvent(cb: (envelope: AgentEventEnvelope) => void): Promis
 export function restoreCheckpoint(checkpointId: string): Promise<void> {
   return invoke<void>('restore_checkpoint', { checkpointId });
 }
-
 // 撤销回溯（按内部会话句柄定位——回溯后 CLI 会话 id 已作废）
 export function undoRevert(handleId: string): Promise<void> {
   return invoke<void>('undo_revert', { handleId });
+}
+
+// 变更-34 · A3：让 Helm 自评审当前会话变更（真实 fast model 调用，返回行级意见）。
+export interface ReviewNoteDto {
+  file: string;
+  line: number;
+  text: string;
+  fromAi: boolean;
+}
+
+export function reviewChanges(historySessionId: string): Promise<ReviewNoteDto[]> {
+  return invoke<ReviewNoteDto[]>('review_changes', { historySessionId });
 }
 
 // 批次 E：Git 只读查询命令

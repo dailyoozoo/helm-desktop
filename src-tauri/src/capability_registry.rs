@@ -50,6 +50,9 @@ pub struct CapabilitySet {
     pub model_override: CapabilityEvidence,
     pub reasoning_effort: CapabilityEvidence,
     pub native_resume: CapabilityEvidence,
+    /// 同引擎无损分支（十次反馈）：`--resume <sid> --fork-session` 可把完整历史
+    /// 复制进新 CLI 会话；缺失时分支分叉回退摘要派生。
+    pub native_branch: CapabilityEvidence,
     pub approval: CapabilityEvidence,
     pub search: CapabilityEvidence,
     pub fetch: CapabilityEvidence,
@@ -75,6 +78,7 @@ impl CapabilitySet {
             model_override: evidence("model_override_unknown"),
             reasoning_effort: evidence("reasoning_effort_unknown"),
             native_resume: evidence("native_resume_unknown"),
+            native_branch: evidence("native_branch_unknown"),
             approval: evidence("approval_unknown"),
             search: evidence("search_unknown"),
             fetch: evidence("fetch_unknown"),
@@ -109,9 +113,19 @@ impl CapabilityIdentity {
         launch_profile_identity: String,
     ) -> Self {
         let adapter_version = if route.engine_id == "codex" {
-            format!("{}+codex-search-v3", env!("CARGO_PKG_VERSION"))
+            // +codex-branch-v4：2026-09-02 Codex 无损分支改由 app-server `thread/fork` 提供，
+            // native_branch 探测结论从 Unsupported 翻转为 Supported。该值不进 cache_key，
+            // 旧快照（probed 于翻转前，仍记 nativeBranch=unsupported）会持续命中，令
+            // resume_session 的分支闸门直接把分叉会话判死、界面上「点了打不开」且无报错
+            // （错误只落在收起的会话抽屉里）。换盐使旧探测快照整体失效重探。
+            format!(
+                "{}+codex-search-v3+codex-branch-v4",
+                env!("CARGO_PKG_VERSION")
+            )
         } else {
-            env!("CARGO_PKG_VERSION").to_string()
+            // +no-tools-contract-v2：`claude --help` 的 no-tools 合同匹配升级为折叠
+            // 空白后再匹配（CLI 折行会打断连续短语）。该盐使旧探测快照失效重探。
+            format!("{}+no-tools-contract-v2", env!("CARGO_PKG_VERSION"))
         };
         Self {
             engine_id: route.engine_id.clone(),
@@ -462,6 +476,7 @@ pub fn claude_capabilities_from_help(
         model_override: supported(has("--model"), "claude_flag_model"),
         reasoning_effort: reasoning_evidence(reasoning, "claude_help_model_contract"),
         native_resume: supported(has("--resume"), "claude_flag_resume"),
+        native_branch: supported(has("--fork-session"), "claude_flag_fork_session"),
         approval: CapabilityEvidence::new(
             if has("--permission-prompt-tool") {
                 CapabilitySupport::Degraded
@@ -514,11 +529,14 @@ pub fn claude_capabilities_from_help(
 }
 
 pub fn claude_model_only_contract_from_help(help: &str) -> bool {
-    help.contains("--tools")
-        && help.contains("disable all tools")
-        && help.contains("--disable-slash-commands")
-        && help.contains("--strict-mcp-config")
-        && help.contains("--no-session-persistence")
+    // CLI 的 --help 会对长描述折行（如 "Use \"\" to disable all\n tools"），
+    // 先折叠空白再匹配，避免换行打断连续短语。
+    let normalized: String = help.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalized.contains("--tools")
+        && normalized.contains("disable all tools")
+        && normalized.contains("--disable-slash-commands")
+        && normalized.contains("--strict-mcp-config")
+        && normalized.contains("--no-session-persistence")
 }
 
 pub fn codex_capabilities_from_handshake(
@@ -583,18 +601,30 @@ pub fn codex_capabilities_from_handshake(
             "codex_app_server_handshake",
             "codex_resume_same_launch_profile_only",
         ),
+        // 2026-09-02：Codex 无损分支改由 app-server `thread/fork` 提供（codex_app_server::fork_thread），
+        // 不再依赖「只能摘要派生」。fork 失败按错误透出，禁止静默降级为摘要（语义红线）；
+        // 同 launch profile 约束由 `resume_session` 的 native_resume_profile 校验兜底。
+        native_branch: CapabilityEvidence::new(
+            CapabilitySupport::Supported,
+            "codex_app_server_thread_fork",
+            "codex_native_branch_thread_fork",
+        ),
         approval: CapabilityEvidence::new(
             CapabilitySupport::Degraded,
             "codex_app_server_handshake",
             "codex_server_request_requires_live_observation",
         ),
-        search: if provider_search_capability == Some(false) {
+        search: if provider_search_capability == Some(true) {
+            // 网关在 model_provider_capabilities 里明确声明支持联网搜索：直接判可用。
             CapabilityEvidence::new(
-                CapabilitySupport::Unsupported,
+                CapabilitySupport::Supported,
                 "codex_model_provider_capabilities",
-                "codex_provider_web_search_disabled",
+                "codex_provider_web_search_enabled",
             )
         } else {
+            // 网关声明不支持(webSearch:false)或未知：不硬禁，交给真实 Runtime 观察——
+            // 目录命中按 supportsWebSearch 裁决；否则按原生搜索开关降级为 Degraded(Unknown)，
+            // 由运行时真实 WebSearch 工具是否存在决定可用与否（缺工具再 fail-closed，不冒充联网）。
             model_entry
                 .and_then(|entry| {
                     entry
@@ -721,6 +751,44 @@ mod tests {
     }
 
     #[test]
+    fn claude_native_branch_requires_fork_session_flag() {
+        // 十次反馈：无损分支只在 CLI help 明示 --fork-session 时放行；
+        // 缺失时回退摘要分叉，不得凭 --resume 单独推断。
+        let with_branch = claude_capabilities_from_help(
+            "--model --resume --fork-session --tools --output-format stream-json",
+            &reasoning(),
+            false,
+        );
+        assert_eq!(
+            with_branch.native_branch.support,
+            CapabilitySupport::Supported
+        );
+        let without_branch = claude_capabilities_from_help(
+            "--model --resume --tools --output-format stream-json",
+            &reasoning(),
+            false,
+        );
+        assert_eq!(
+            without_branch.native_branch.support,
+            CapabilitySupport::Unsupported
+        );
+    }
+
+    #[test]
+    fn codex_native_branch_supported_via_thread_fork() {
+        // 2026-09-02 回归守卫：Codex 无损分支由 app-server `thread/fork` 提供，
+        // 不依赖 claude 的 --fork-session。该值若回退为 Unsupported，resume_session
+        // 会对分支会话直接拒绝打开，表现为「左栏分叉出的新任务点不开」。
+        let model_list = serde_json::json!({ "data": [{ "id": "gpt-5" }] });
+        let capabilities =
+            codex_capabilities_from_handshake("gpt-5", &model_list, &reasoning(), false, None);
+        assert_eq!(
+            capabilities.native_branch.support,
+            CapabilitySupport::Supported
+        );
+    }
+
+    #[test]
     fn claude_model_only_contract_requires_every_isolation_flag() {
         let complete = "--tools Use empty to disable all tools --disable-slash-commands \
                         --strict-mcp-config --no-session-persistence";
@@ -728,6 +796,23 @@ mod tests {
         assert!(!claude_model_only_contract_from_help(
             "--tools disable all tools --strict-mcp-config --no-session-persistence"
         ));
+    }
+
+    #[test]
+    fn claude_model_only_contract_survives_help_wrapping() {
+        // 真实 CLI 会把长描述折行（"disable all\n tools"），连续短语被换行打断，
+        // 必须折叠空白后仍能匹配，否则 no-tools 合同被误判为不可用。
+        let wrapped = "--tools <tools...>  Specify the list of available tools from\n\
+                       the built-in set. Use \"\" to disable all\n\
+                       tools, \"default\" to use all tools, or\n\
+                       specify tool names (e.g. \"Bash,Edit,Read\").\n\
+                       --disable-slash-commands  Disable all skills\n\
+                       --strict-mcp-config\n\
+                       --no-session-persistence";
+        assert!(
+            claude_model_only_contract_from_help(wrapped),
+            "折行的 --help 必须仍能验证 no-tools 合同"
+        );
     }
 
     #[test]
@@ -749,8 +834,9 @@ mod tests {
     #[test]
     fn codex_search_launch_flag_is_degraded_until_runtime_observation() {
         let response = serde_json::json!({"data":[{"model":"gpt-a"}]});
+        // 原生搜索开启、provider 未显式声明 → 降级为 Degraded，交运行时观察（缺工具再 fail-closed）。
         let capabilities =
-            codex_capabilities_from_handshake("gpt-a", &response, &reasoning(), true, Some(true));
+            codex_capabilities_from_handshake("gpt-a", &response, &reasoning(), true, None);
         assert_eq!(capabilities.search.support, CapabilitySupport::Degraded);
         assert_eq!(
             capabilities.search.diagnostic,
@@ -759,15 +845,18 @@ mod tests {
     }
 
     #[test]
-    fn codex_provider_capability_can_explicitly_disable_search() {
+    fn codex_provider_capability_web_search_resolution() {
         let response = serde_json::json!({"data":[{"model":"gpt-a"}]});
-        let capabilities =
+        // provider 显式 true → 直接判可用。
+        let enabled =
+            codex_capabilities_from_handshake("gpt-a", &response, &reasoning(), true, Some(true));
+        assert_eq!(enabled.search.support, CapabilitySupport::Supported);
+        assert_eq!(enabled.search.source, "codex_model_provider_capabilities");
+        // provider 显式 false 或未知：不再硬禁，交运行时观察（原生开启即 Degraded）。
+        let disabled =
             codex_capabilities_from_handshake("gpt-a", &response, &reasoning(), true, Some(false));
-        assert_eq!(capabilities.search.support, CapabilitySupport::Unsupported);
-        assert_eq!(
-            capabilities.search.source,
-            "codex_model_provider_capabilities"
-        );
+        assert_eq!(disabled.search.support, CapabilitySupport::Degraded);
+        assert_eq!(disabled.search.source, "codex_search_launch_flag");
     }
 
     #[test]

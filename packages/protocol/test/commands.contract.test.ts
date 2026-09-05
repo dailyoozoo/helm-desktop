@@ -6,6 +6,7 @@ import type {
   SendMessageArgs,
   SetSessionPermissionProfileArgs,
   SetSessionTurnPreferenceArgs,
+  SideQueryArgs,
   TurnMode,
 } from '@helm/protocol';
 import { isAgentEvent } from '@helm/protocol';
@@ -21,6 +22,7 @@ describe('Tauri command contract', () => {
       cwd: 'C:/workspace',
       mode,
       permissionProfile: 'auto',
+      fullAccessConfirmed: true,
     } satisfies CreateSessionArgs;
     const send = {
       handleId: 'handle-test',
@@ -33,26 +35,34 @@ describe('Tauri command contract', () => {
     const profile = {
       handleId: 'handle-test',
       profile: 'full_access',
+      fullAccessConfirmed: true,
     } satisfies SetSessionPermissionProfileArgs;
     const preference = {
       handleId: 'handle-test',
       model: 'gpt-next',
       reasoningEffort: 'high',
     } satisfies SetSessionTurnPreferenceArgs;
-    expect({ create, send, profile, preference }).toBeTruthy();
+    const sideQuery = {
+      handleId: 'handle-test',
+      text: '临时提问，不写回主线程',
+    } satisfies SideQueryArgs;
+    expect({ create, send, profile, preference, sideQuery }).toBeTruthy();
 
     const rust = readFileSync(resolve(root, 'src-tauri/src/commands.rs'), 'utf8');
     expect(rust).toMatch(
-      /pub async fn create_session[\s\S]*mode: Option<String>[\s\S]*permission_profile: Option<String>/,
+      /pub async fn create_session[\s\S]*mode: Option<String>[\s\S]*permission_profile: Option<String>[\s\S]*full_access_confirmed: Option<bool>/,
     );
     expect(rust).toMatch(
       /pub async fn send_message[\s\S]*handle_id: String[\s\S]*display_text: Option<String>[\s\S]*mode: Option<String>[\s\S]*model: Option<String>[\s\S]*reasoning_effort: Option<String>/,
     );
     expect(rust).toMatch(
-      /pub async fn set_session_permission_profile[\s\S]*handle_id: String[\s\S]*profile: String/,
+      /pub async fn set_session_permission_profile[\s\S]*handle_id: String[\s\S]*profile: String[\s\S]*full_access_confirmed: Option<bool>/,
     );
     expect(rust).toMatch(
       /pub async fn set_session_turn_preference[\s\S]*handle_id: String[\s\S]*model: String[\s\S]*reasoning_effort: Option<String>/,
+    );
+    expect(rust).toMatch(
+      /pub async fn side_query[\s\S]*handle_id: String[\s\S]*text: String[\s\S]*-> Result<String, String>/,
     );
 
     const docsPath = resolve(root, 'docs/技术方案.md');

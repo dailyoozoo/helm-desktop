@@ -25,6 +25,7 @@ enum SessionActorCommand {
         responder: oneshot::Sender<Result<(), String>>,
     },
     Interrupt(oneshot::Sender<Result<(), String>>),
+    CompactContext(oneshot::Sender<Result<(), String>>),
     ResetContext {
         messages: Vec<SessionMessage>,
         responder: oneshot::Sender<Result<(), String>>,
@@ -136,6 +137,9 @@ impl SessionActorHandle {
                         dispatch.cancel();
                         let _ = responder.send(registry.interrupt(&actor_owner).await);
                     }
+                    SessionActorCommand::CompactContext(responder) => {
+                        let _ = responder.send(registry.compact_context(&actor_owner).await);
+                    }
                     SessionActorCommand::ResetContext {
                         messages,
                         responder,
@@ -228,6 +232,10 @@ impl SessionActorHandle {
 
     pub async fn interrupt(&self) -> Result<(), String> {
         self.request(SessionActorCommand::Interrupt).await
+    }
+
+    pub async fn compact_context(&self) -> Result<(), String> {
+        self.request(SessionActorCommand::CompactContext).await
     }
 
     pub async fn reset_context(&self, messages: Vec<SessionMessage>) -> Result<(), String> {

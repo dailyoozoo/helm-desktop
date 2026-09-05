@@ -1,0 +1,751 @@
+/* ============================================================
+   插件页（S7）页面样式 —— src/extensions/extensions.css
+   来源与优先级：
+   A. prototype/extensions.html 内联 style 块（L9-L686，视觉唯一真值）——逐条移植，
+      规则尾注 proto L<行号>。原文件用 body[data-page="extensions"] 作用域；
+      实现页内容统一挂在 .ex-root 下（ExtensionsPage 根节点），语义等价。
+   B. prototype/assets/commercial.css 的 .cm-market-card 底座（L529-L533、L656-L679）——
+      共享库 components.css 尚未收录该类，先落在本页文件尾部「待上收」段，
+      待共享库收录后删除。
+   C. 实现特有结构（真实加载态 / 导入反馈 / 凭证输入等原型静态稿没有的形态）——
+      注明「实现适配」，数值沿用原 app.css exp- 段落（原 L5118-L6144，已剪出）。
+   Radix 弹层渲染在 body 直下、拿不到 .ex-root，弹层内部一律用 ex- 前缀类名。
+   ============================================================ */
+
+/* ---------- 页面骨架 ---------- */
+/* 吸顶标签容器由 components.css .cm-tabs-wrapper 统一提供；此处只保留滚动容器适配
+   （proto L682-L685） */
+.ex-root .cm-pagebody--scroll {
+  padding-top: 0;
+  padding-bottom: 0;
+}
+.ex-root .cm-pagebody--scroll > .cm-tabpanel {
+  padding-bottom: 56px;
+}
+
+/* ---------- 工具行 ---------- */
+.ex-root .cm-toolbar {
+  margin: 16px 0 0;
+}
+.ex-root .cm-toolbar__left {
+  flex: 1;
+}
+.ex-root .cm-toolbar .cm-search {
+  flex: 1;
+  max-width: 320px;
+  border: 0;
+  background: var(--surface-2);
+}
+.ex-root .cm-toolbar .cm-search:focus-within {
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.ex-search--wide {
+  width: 100%;
+}
+/* 弹窗内搜索行（实现适配：真实接口需要显式搜索按钮，原型为纯输入过滤） */
+.ex-market-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.ex-market-bar .cm-search {
+  flex: 1;
+}
+
+/* Claude/Codex 引擎切换：统一宽度，选中态 accent 淡底
+   （proto L63-L90；#agentSwitch 对应 .ex-engine-seg） */
+.ex-engine-seg {
+  border-radius: var(--r);
+}
+.ex-engine-seg button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 132px;
+  justify-content: center;
+  font-weight: 600;
+  border-radius: var(--r-xs);
+  transition:
+    background 0.14s var(--ease),
+    color 0.14s var(--ease);
+}
+.ex-engine-seg button svg,
+.ex-engine-seg button img {
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+.ex-engine-seg button:hover:not(.is-active) {
+  background: var(--surface-2);
+  color: var(--fg-2);
+}
+
+/* 技能抽屉 预览/源码 切换：加宽避免换行（proto L87-L90） */
+.ex-view-seg button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 72px;
+}
+
+/* 范围药丸：无白底融入弹框背景（proto L550-L584；ex-scope-seg） */
+.ex-scope-seg {
+  width: fit-content;
+  justify-self: start;
+}
+.ex-scope-seg button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 96px;
+  min-height: 30px;
+  padding: 0 14px;
+  border-radius: var(--r-xs);
+  font-size: 12px;
+  font-weight: 600;
+  transition:
+    background 0.14s var(--ease),
+    color 0.14s var(--ease);
+}
+.ex-scope-seg button:hover:not(.is-active) {
+  color: var(--fg-2);
+}
+
+/* ---------- 分区标题 ---------- */
+.ex-root .cm-section__head {
+  align-items: flex-end;
+  margin-bottom: 12px;
+}
+.ex-root .cm-section__head h2 {
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: -0.012em;
+}
+.ex-root .cm-section__head p {
+  max-width: 620px;
+  margin-top: 3px;
+  font-size: 11.5px;
+}
+
+/* ---------- 技能 / 精选卡网格 ---------- */
+.ex-root .cm-skill-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+/* 卡片底座覆盖（proto L97-L130）：两列 150px 高度语言，hover 用 line-accent-hover */
+.ex-root .cm-skill-card,
+.ex-root .cm-market-card {
+  min-height: 150px;
+  padding: 14px;
+  border-radius: var(--r);
+  background: var(--cm-surface);
+  transition:
+    border-color 0.12s,
+    background 0.12s;
+}
+.ex-root .cm-skill-card:hover,
+.ex-root .cm-market-card:hover {
+  border-color: var(--line-accent-hover);
+  background: var(--surface-2);
+}
+.ex-root .cm-skill-card h3,
+.ex-root .cm-market-card h3 {
+  margin: 10px 0 4px;
+  font-size: 13px;
+  font-weight: 650;
+}
+.ex-root .cm-skill-card p,
+.ex-root .cm-market-card p {
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.ex-root .cm-skill-card__foot,
+.ex-root .cm-market-card__foot {
+  padding-top: 14px;
+}
+
+/* 品牌图标位（proto L132-L143） */
+.ex-root .cm-brand--icon {
+  color: var(--accent-hi);
+}
+.ex-root .cm-brand--icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+/* 来源小标签 / 计数胶囊（proto L145-L148） */
+.ex-root .cm-source-label {
+  min-height: 19px;
+  font-size: 10px;
+}
+
+/* 精选卡 meta 字号（proto L150-L153） */
+.ex-root .cm-market-card__meta {
+  font-size: 10.5px;
+}
+
+/* 精选卡 CTA（2026-08-27 反馈 #5）：已启用/已停用维持透明文字态（proto L155-L164），
+   安装/安装并配置为主按钮实心态，颜色与其他页面 cm-action--primary 一致。 */
+.ex-root .cm-market-card .cm-action:not(.cm-action--primary) {
+  min-height: 31px;
+  border-color: transparent;
+  background: transparent;
+}
+.ex-root .cm-market-card .cm-action:not(.cm-action--primary):hover {
+  border-color: var(--cm-border);
+  background: var(--bg);
+}
+
+/* 卡片头排布：图标居左、来源标签靠右（原型 space-between 语言） */
+.ex-root .cm-skill-card__head {
+  justify-content: flex-start;
+}
+.ex-root .cm-skill-card__head .cm-source-label {
+  margin-left: auto;
+}
+/* 实现适配：停用卡片压暗（原型静态稿无停用态） */
+.ex-root .cm-skill-card.is-off,
+.ex-root .ex-mcp-card.is-off {
+  opacity: 0.72;
+}
+
+/* ---------- 已安装连接器卡 ---------- */
+/* proto L199-L245：#mcpInstalled 卡片网格 → .ex-mcp-card-grid */
+.ex-root .ex-mcp-card-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.ex-mcp-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--cm-border);
+  border-radius: var(--r);
+  background: var(--cm-surface);
+  cursor: pointer;
+  transition: border-color 0.12s;
+}
+.ex-mcp-card:hover {
+  border-color: var(--line-accent-hover);
+}
+.ex-mcp-card__top {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.ex-mcp-card__main {
+  flex: 1;
+  min-width: 0;
+}
+.ex-mcp-card__main b {
+  display: block;
+  font-size: 13px;
+  font-weight: 650;
+}
+.ex-mcp-card__main span {
+  display: block;
+  margin-top: 3px;
+  color: var(--fg-4);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+/* ---------- 抽屉 ---------- */
+/* cm-drawer 底座来自 components.css；React 条件挂载需同时带 is-open 类。
+   实现壳层适配：标题栏 z-90 会盖住 z-50 的底座，抽屉头整体被藏；
+   对齐 providers 页先例（pv-drawer-layer z-120）抬到标题栏之上。 */
+.ex-drawer-backdrop {
+  z-index: 120;
+}
+/* 实现壳层适配（2026-08-27 反馈 #2）：head 固定、body 滚动、foot 固定底部，
+   「打开所在位置 / 卸载」不再随内容滚走。 */
+.ex-drawer {
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+}
+.ex-drawer .cm-drawer__head {
+  padding: 22px 24px 16px;
+}
+.ex-drawer .cm-drawer__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 18px 24px;
+  overflow-y: auto;
+}
+.ex-drawer .cm-panel__foot {
+  margin: 0;
+  padding: 12px 24px;
+  border-top: 1px solid var(--line);
+  background: var(--bg);
+}
+.ex-drawer .cm-subtle-stat {
+  border-left-width: 2px;
+  border-radius: 0 var(--r-xs) var(--r-xs) 0;
+}
+.ex-drawer .cm-subtle-stat small {
+  font-size: 10.5px;
+  letter-spacing: 0.01em;
+}
+.ex-drawer .cm-subtle-stat b {
+  margin-top: 4px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg-2);
+}
+/* 实现适配：抽屉内 cm-section 默认 32px 顶距过散，收紧到 22px */
+.ex-drawer .cm-section {
+  margin-top: 22px;
+}
+/* SKILL.md 标题与 预览/源码 同排靠左（proto L440-L444） */
+.ex-md-head {
+  align-items: center;
+  justify-content: flex-start;
+  gap: 12px;
+}
+.ex-md-head > div {
+  flex: none;
+}
+/* 技能抽屉脚栏：路径与「打开所在位置」同排，超长省略（proto L447-L455） */
+.ex-foot-path {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  color: var(--fg-4);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 技能预览与源码视图（proto L604-L644）
+   实现适配：MarkdownPreview 输出 h3/h4/b 层级，数值随原型 h1/p/ul 映射。 */
+.ex-skill-preview {
+  padding: 16px 18px;
+  border: 1px solid var(--cm-border);
+  border-radius: var(--r-sm);
+  background: var(--cm-surface);
+}
+.ex-skill-preview h1,
+.ex-skill-preview h3 {
+  margin: 0 0 10px;
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--fg);
+}
+.ex-skill-preview h4 {
+  margin: 12px 0 4px;
+  font-size: 12.5px;
+  color: var(--fg);
+}
+.ex-preview-minor {
+  display: block;
+  margin: 10px 0 4px;
+  font-size: 12px;
+  color: var(--fg);
+}
+.ex-skill-preview p {
+  margin: 0 0 8px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--fg-2);
+}
+.ex-skill-preview ul,
+.ex-skill-preview ol {
+  margin: 0 0 8px;
+  padding-left: 18px;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--fg-2);
+}
+.ex-code-source {
+  border: 1px solid var(--cm-border);
+  border-radius: var(--r-sm);
+  background: var(--cm-surface);
+  overflow: hidden;
+}
+.ex-code-source pre {
+  margin: 0;
+  padding: 16px 18px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.7;
+  color: var(--fg-2);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* 连接器抽屉工具列表（proto L248-L290） */
+.ex-tool-list {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--cm-border);
+  border-radius: var(--r-sm);
+  overflow: hidden;
+  background: var(--cm-surface);
+}
+.ex-tool-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--cm-border);
+}
+.ex-tool-row:last-child {
+  border-bottom: 0;
+}
+.ex-tool-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex: none;
+  opacity: 0.5;
+}
+.ex-tool-main {
+  flex: 1;
+  min-width: 0;
+}
+.ex-tool-main b {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg-2);
+}
+.ex-tool-main small {
+  display: -webkit-box;
+  margin-top: 2px;
+  color: var(--fg-4);
+  font-size: 10.5px;
+  line-height: 1.5;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* ---------- 弹窗表单（cm-modal 外壳走 app.css 的 Radix 适配版） ---------- */
+/* 弹框表单统一间距（proto L293-L306） */
+.ex-modal-form {
+  gap: 16px;
+}
+/* 弹窗底部动作：右对齐取消 + 主按钮（proto L383-L392；
+   margin-top 由 DialogFooter 的间距承担，实现适配） */
+.ex-form-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+}
+.ex-form-actions .cm-action--primary {
+  min-width: 120px;
+  min-height: 36px;
+}
+.ex-trigger-preview {
+  margin: 0;
+  color: var(--fg-4);
+  font-size: 11.5px;
+}
+.ex-scope-note {
+  color: var(--fg-4);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+/* 技能创建弹框大指令输入区（proto L377-L380） */
+.ex-skill-textarea {
+  min-height: 160px;
+}
+/* 从 JSON 导入弹窗文本域（proto L544-L547） */
+.ex-import-textarea {
+  min-height: 200px;
+}
+
+/* 添加连接器：接入方式双卡选择（proto L457-L499） */
+.ex-type-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.ex-type-card {
+  display: grid;
+  gap: 4px;
+  padding: 12px 14px;
+  border: 1px solid var(--cm-border);
+  border-radius: var(--r-sm);
+  background: var(--cm-surface);
+  color: var(--fg-2);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color 0.14s ease,
+    background 0.14s ease;
+}
+.ex-type-card:hover {
+  border-color: var(--accent-line);
+}
+.ex-type-card.is-active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.ex-type-card b {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--fg);
+  font-size: 12px;
+}
+.ex-type-card b svg {
+  width: 14px;
+  height: 14px;
+  color: var(--accent-hi);
+}
+.ex-type-card small {
+  color: var(--fg-4);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+
+/* 环境变量 / 请求头 分组表（proto L501-L542） */
+.ex-env {
+  display: grid;
+  border: 1px solid var(--cm-border);
+  border-radius: var(--r-sm);
+  background: var(--bg);
+  overflow: hidden;
+}
+.ex-env__row {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) minmax(160px, 1.3fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--cm-border);
+}
+.ex-env__row .cm-input {
+  width: 100%;
+}
+/* 实现适配：值列带显示/隐藏眼睛按钮，包一层描边容器（原型为裸 password 输入） */
+.ex-secret {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  width: 100%;
+  border: 1px solid var(--cm-border);
+  border-radius: var(--r-xs);
+  background: var(--cm-surface);
+}
+.ex-secret input {
+  flex: 1;
+  min-width: 0;
+  min-height: 34px;
+  padding: 0 10px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+}
+.ex-secret .btn-icon {
+  flex: none;
+}
+.ex-env__add {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 34px;
+  padding: 0 10px;
+  border: 0;
+  background: transparent;
+  color: var(--fg-4);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  transition:
+    color 0.14s ease,
+    background 0.14s ease;
+}
+.ex-env__add:hover {
+  color: var(--fg);
+  background: var(--surface-2);
+}
+.ex-env__add svg {
+  width: 13px;
+  height: 13px;
+}
+/* 凭证说明（实现适配：钥匙串合规提示，原型无对应块） */
+.ex-keynote {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--note-line);
+  border-radius: var(--r-sm);
+  background: var(--note-bg);
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--fg-2);
+}
+.ex-keynote svg {
+  width: 13px;
+  height: 13px;
+  flex: none;
+  margin-top: 2px;
+  color: var(--accent-hi);
+}
+
+/* 市场行描述段（proto L397-L402）；skills.sh 描述字段由后端透传后显示
+   （parse_market_search_response 目前只取 skillId/name/source/installs） */
+.ex-market-desc {
+  margin: 3px 0 0;
+  color: var(--fg-4);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+/* JSON 导入结果（实现适配：真实导入的逐项反馈，原型静态稿无） */
+.ex-result-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+}
+.ex-result-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  font-size: 12px;
+}
+.ex-result-row svg {
+  width: 15px;
+  height: 15px;
+  flex: none;
+}
+.ex-result-row--imported svg {
+  color: var(--success);
+}
+.ex-result-row--skipped svg {
+  color: var(--warn);
+}
+.ex-result-row--failed svg {
+  color: var(--danger);
+}
+.ex-result-row__main {
+  flex: 1;
+  min-width: 0;
+}
+.ex-result-row__main b {
+  font-size: 12px;
+  color: var(--fg);
+}
+.ex-result-row__main span {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--fg-3);
+}
+
+/* 表单/抽屉错误行（实现适配，沿用原 exp-error-line 数值） */
+.ex-error-line {
+  margin: 8px 0 0;
+  font-size: 11.5px;
+  color: var(--danger);
+}
+
+/* 加载失败横条（实现适配：真实命令失败的重试入口） */
+.ex-loaderror {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--danger-soft);
+  border-radius: var(--r-sm);
+  background: var(--danger-soft);
+  color: var(--fg);
+  font-size: 13px;
+}
+.ex-loaderror svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  color: var(--danger);
+}
+.ex-loaderror .cm-action {
+  margin-left: auto;
+}
+
+/* ---------- 待上收：.cm-market-card 底座（commercial.css L529-L533；components.css 未收录） ---------- */
+.cm-market-card {
+  display: flex;
+  flex-direction: column;
+  min-height: 202px;
+  padding: 16px;
+  border: 1px solid var(--cm-border);
+  border-radius: var(--r-sm);
+  background: var(--cm-surface);
+  cursor: pointer;
+}
+.cm-market-card h3 {
+  margin: 12px 0 5px;
+  font-size: 13px;
+}
+.cm-market-card p {
+  margin: 0;
+  color: var(--fg-4);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.cm-market-card__foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: auto;
+  padding-top: 16px;
+}
+.cm-market-card__meta {
+  color: var(--fg-4);
+  font-size: 10px;
+}
+
+/* ---------- 窄屏（proto L646-L680） ---------- */
+@media (max-width: 900px) {
+  .ex-root .cm-skill-grid,
+  .ex-root .ex-mcp-card-grid,
+  .ex-type-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .ex-root .cm-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .ex-root .cm-toolbar__left {
+    align-items: stretch;
+    flex-wrap: wrap;
+  }
+
+  .ex-root .cm-toolbar .cm-search {
+    max-width: none;
+  }
+
+  .ex-drawer {
+    width: 100%;
+  }
+}
+
+@media (max-width: 620px) {
+  .ex-root .cm-section__head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}

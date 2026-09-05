@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react';
 import { dismissToast, subscribeToasts, type ToastEntry, type ToastKind } from './toast';
+import { cn } from '@/lib/cn';
+import { CheckCircle, Info, AlertCircle } from 'lucide-react';
 
-const ICONS: Record<ToastKind, string> = {
-  // 提示/成功/错误共用一套线性图标路径（stroke 风格与页面一致）
-  info: 'M12 8v5m0 3v.01M12 21a9 9 0 1 1 0-18 9 9 0 0 1 0 18Z',
-  success: 'm5 13 4 4L19 7',
-  error: 'M12 8v5m0 3v.01M12 21a9 9 0 1 1 0-18 9 9 0 0 1 0 18Z',
+const ICON_MAP: Record<ToastKind, typeof Info> = {
+  info: Info,
+  success: CheckCircle,
+  error: AlertCircle,
 };
 
 function ToastItem({ toast }: { toast: ToastEntry }) {
@@ -14,20 +15,27 @@ function ToastItem({ toast }: { toast: ToastEntry }) {
     return () => window.clearTimeout(timer);
   }, [toast.id, toast.duration]);
 
+  const Icon = ICON_MAP[toast.kind];
   return (
-    <div className={`toast show toast-item toast-item--${toast.kind}`} role="status">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-        <path d={ICONS[toast.kind]} strokeLinecap="round" strokeLinejoin="round" />
-      </svg>
-      <span>{toast.message}</span>
-      <button
-        type="button"
-        className="toast-item__close"
-        aria-label="关闭提示"
-        onClick={() => dismissToast(toast.id)}
-      >
-        ×
-      </button>
+    <div
+      className={cn(
+        'flex items-center gap-2.5 rounded-lg border bg-raised px-3.5 py-2.5 shadow-[var(--shadow-pop)]',
+        'data-[state=open]:animate-in data-[state=closed]:animate-out',
+        toast.kind === 'error' && 'border-danger/30',
+        toast.kind === 'success' && 'border-success/30',
+        toast.kind === 'info' && 'border-border-2',
+      )}
+      role="status"
+    >
+      <Icon
+        className={cn(
+          'h-4 w-4 shrink-0',
+          toast.kind === 'error' && 'text-danger',
+          toast.kind === 'success' && 'text-success',
+          toast.kind === 'info' && 'text-fg-3',
+        )}
+      />
+      <span className="text-[13px] text-fg">{toast.message}</span>
     </div>
   );
 }
@@ -40,7 +48,7 @@ export function ToastLayer() {
 
   if (toasts.length === 0) return null;
   return (
-    <div className="toast-layer">
+    <div className="fixed bottom-7 left-1/2 z-[400] flex -translate-x-1/2 flex-col items-center gap-2">
       {toasts.map((toast) => (
         <ToastItem key={toast.id} toast={toast} />
       ))}

@@ -153,6 +153,15 @@ pub fn open_path_in_system(path: String) -> Result<(), String> {
     open_with_system(&resolved).map_err(|e| format!("调用系统默认程序打开失败：{e}"))
 }
 
+/// 用系统默认浏览器打开外部链接（仅允许 https，供"查看发布说明"等外链使用）。
+#[tauri::command]
+pub fn open_external_url(url: String) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err("[外部链接] 仅允许 https 地址".to_string());
+    }
+    open_with_system(&url).map_err(|e| format!("调用系统浏览器失败：{e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{read_file_preview, PreviewKind};

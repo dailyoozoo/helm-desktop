@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 pub const PRICING_PUBLIC_KEY_BASE64: &str =
     "RWRHXYdrQnYvw41LlO/UMQ0ef2yjkPQPAqOonnnfXb5gEqSvQMbhT3dP";
@@ -113,6 +113,21 @@ pub struct PricingCatalogStatus {
     pub last_checked_at: Option<i64>,
     pub last_error: Option<String>,
     pub stale: bool,
+}
+
+/// 定价目录标准价格条目（S6「定价目录」弹窗标准价格表数据源，只读参考费率）。
+/// 只暴露 standard 档第一段带；分层/批处理价格继续由 resolve 链路在用量计算时消费。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PricingCatalogEntry {
+    pub vendor: String,
+    pub model_id: String,
+    pub currency: String,
+    pub input: f64,
+    pub cached_input: Option<f64>,
+    pub cache_write: Option<f64>,
+    pub output: f64,
+    pub observed_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -284,6 +299,35 @@ impl PricingCatalogStore {
                 stale: catalog_is_stale(&catalog.published_at, 30),
             },
         ))
+    }
+
+    /// 标准价格表：当前生效目录（已验签缓存优先，否则内置）的只读条目。
+    /// 无 standard 档的卡不导出；排序保证前端展示稳定。
+    pub fn catalog_entries(&self) -> Result<Vec<PricingCatalogEntry>, String> {
+        let (catalog, _) = self.active_catalog()?;
+        let mut entries: Vec<PricingCatalogEntry> = catalog
+            .models
+            .iter()
+            .filter_map(|card| {
+                let band = card.tiers.get(&ServiceTier::Standard)?.bands.first()?;
+                Some(PricingCatalogEntry {
+                    vendor: card.vendor.clone(),
+                    model_id: card.model_id.clone(),
+                    currency: card.currency.clone(),
+                    input: band.input,
+                    cached_input: band.cached_input,
+                    cache_write: band.cache_write,
+                    output: band.output,
+                    observed_at: card.observed_at.clone(),
+                })
+            })
+            .collect();
+        entries.sort_by(|a, b| {
+            a.vendor
+                .cmp(&b.vendor)
+                .then_with(|| a.model_id.cmp(&b.model_id))
+        });
+        Ok(entries)
     }
 
     pub fn resolve_for_provider(
@@ -839,15 +883,35 @@ pub fn vendor_for_protocol(protocol: &Protocol) -> &'static str {
 }
 
 fn vendor_matches(card_vendor: &str, protocol_vendor: &str, normalized_model_id: &str) -> bool {
-    card_vendor.eq_ignore_ascii_case(protocol_vendor)
-        || (normalized_model_id.starts_with("minimax-")
-            && card_vendor.eq_ignore_ascii_case("minimax"))
+    if card_vendor.eq_ignore_ascii_case(protocol_vendor) {
+        return true;
+    }
+    // 第三方厂商经 OpenAI 兼容网关接入时，按模型 ID 厂商前缀匹配目录卡
+    // （先例：minimax-；2026-08-23 决策 B-2b 扩充数据源）。
+    const VENDOR_ID_PREFIXES: &[(&str, &[&str])] = &[
+        ("minimax", &["minimax-"]),
+        ("deepseek", &["deepseek"]),
+        ("alibaba", &["qwen", "qwq"]),
+        ("zhipu", &["glm"]),
+        ("moonshot", &["kimi"]),
+        ("google", &["gemini"]),
+    ];
+    VENDOR_ID_PREFIXES.iter().any(|(vendor, prefixes)| {
+        card_vendor.eq_ignore_ascii_case(vendor)
+            && prefixes
+                .iter()
+                .any(|prefix| normalized_model_id.starts_with(prefix))
+    })
 }
 
 pub fn normalize_model_id(model_id: &str) -> String {
-    model_id
-        .trim()
-        .to_ascii_lowercase()
+    let lowered = model_id.trim().to_ascii_lowercase();
+    // 供应商标记前缀（vendor:id）与前端 normalizeModelGroupId 同口径：取最后一段
+    let lowered = match lowered.rfind(':') {
+        Some(pos) => lowered[pos + 1..].to_string(),
+        None => lowered,
+    };
+    lowered
         .replace('@', "-")
         .trim_start_matches("models/")
         .trim_start_matches("anthropic/")
@@ -974,7 +1038,13 @@ fn utc_date_seconds(value: &str) -> Option<i64> {
     Some((era * 146_097 + day_of_era - 719_468) * 86_400)
 }
 
-pub fn catalog_urls_from_settings(settings: &AppSettings) -> Vec<String> {
+/// Helm 官方定价目录发布源（dailyoozoo/helm-pricing，minisign 验签）：
+/// jsDelivr 在国内可达性更好作首选；GitHub raw 兜底。刷新按序尝试。
+pub const OFFICIAL_CATALOG_URLS: [&str; 2] = [
+    "https://cdn.jsdelivr.net/gh/dailyoozoo/helm-pricing@main/pricing-catalog.json",
+    "https://raw.githubusercontent.com/dailyoozoo/helm-pricing/main/pricing-catalog.json",
+];
+pub fn catalog_urls_from_settings(settings: &AppSettings) -> Result<Vec<String>, String> {
     let mut urls = settings
         .general
         .pricing_feed_urls
@@ -982,19 +1052,27 @@ pub fn catalog_urls_from_settings(settings: &AppSettings) -> Vec<String> {
         .map(|url| url.trim().to_string())
         .filter(|url| !url.is_empty())
         .collect::<Vec<_>>();
-    if urls.is_empty() {
-        let update_feed = settings.general.update_feed_url.trim();
-        if let Ok(mut url) = reqwest::Url::parse(update_feed) {
-            if let Ok(mut segments) = url.path_segments_mut() {
-                segments.pop_if_empty();
-                segments.pop();
-                segments.push("pricing-catalog.json");
-            }
-            urls.push(url.to_string());
-        }
+    if !urls.is_empty() {
+        urls.dedup();
+        return Ok(urls);
     }
-    urls.dedup();
-    urls
+    let update_feed = settings.general.update_feed_url.trim();
+    if update_feed.is_empty() {
+        // 未配置任何源时回退 Helm 官方目录：jsDelivr 对国内网络友好作首选，GitHub raw 兜底。
+        return Ok(OFFICIAL_CATALOG_URLS
+            .iter()
+            .map(|url| url.to_string())
+            .collect());
+    }
+    let mut url = reqwest::Url::parse(update_feed).map_err(|_| {
+        "更新发布源 URL 无效，无法推导出价格目录地址；请检查设置中的更新发布源。".to_string()
+    })?;
+    if let Ok(mut segments) = url.path_segments_mut() {
+        segments.pop_if_empty();
+        segments.pop();
+        segments.push("pricing-catalog.json");
+    }
+    Ok(vec![url.to_string()])
 }
 
 #[tauri::command]
@@ -1011,17 +1089,30 @@ pub fn get_pricing_catalog_status(
 }
 
 #[tauri::command]
+pub fn get_pricing_catalog_entries(
+    store: State<'_, PricingCatalogStore>,
+) -> Result<Vec<PricingCatalogEntry>, String> {
+    store.catalog_entries()
+}
+
+#[tauri::command]
 pub async fn refresh_pricing_catalog(
+    app: AppHandle,
     store: State<'_, PricingCatalogStore>,
     history_store: State<'_, SessionHistoryStore>,
 ) -> Result<PricingCatalogStatus, String> {
     let settings = load_app_settings_from_store(&history_store)?;
-    let urls = catalog_urls_from_settings(&settings);
-    store.refresh_from_urls(&urls).await
+    let urls = catalog_urls_from_settings(&settings)?;
+    let status = store.refresh_from_urls(&urls).await?;
+    // 刷新成功后通知前端重拉服务商配置，让价格目录的新目录立刻反映到模型列表。
+    // emit 失败不影响刷新结果，只丢失一次联动刷新。
+    let _ = app.emit("helm-pricing-catalog-updated", &status);
+    Ok(status)
 }
 
 #[tauri::command]
 pub fn import_pricing_catalog(
+    app: AppHandle,
     store: State<'_, PricingCatalogStore>,
     catalog_path: String,
     signature_path: Option<String>,
@@ -1031,7 +1122,9 @@ pub fn import_pricing_catalog(
         .filter(|path| !path.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("{}.sig", catalog.display())));
-    store.import_from_files(&catalog, &signature)
+    let status = store.import_from_files(&catalog, &signature)?;
+    let _ = app.emit("helm-pricing-catalog-updated", &status);
+    Ok(status)
 }
 
 #[tauri::command]
@@ -1080,25 +1173,33 @@ pub fn spawn_background_refresh(
     history_store: SessionHistoryStore,
 ) {
     tauri::async_runtime::spawn(async move {
-        let Ok(settings) = load_app_settings_from_store(&history_store) else {
-            return;
-        };
-        if !settings.general.pricing_auto_update {
-            return;
+        // 常驻循环：每 6h 醒一次；24h 内已检查过则跳过（真实自动更新）
+        loop {
+            let Ok(settings) = load_app_settings_from_store(&history_store) else {
+                return;
+            };
+            if !settings.general.pricing_auto_update {
+                return;
+            }
+            let status = store.active_catalog().ok().map(|(_, status)| status);
+            let checked_recently = status
+                .and_then(|status| status.last_checked_at)
+                .map(|checked| now_seconds().saturating_sub(checked) < 24 * 60 * 60)
+                .unwrap_or(false);
+            if checked_recently {
+                return;
+            }
+            let urls = match catalog_urls_from_settings(&settings) {
+                Ok(urls) => urls,
+                Err(_) => return,
+            };
+            if urls.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_secs(6 * 60 * 60)).await;
+                continue;
+            }
+            let _ = store.refresh_from_urls(&urls).await;
+            tokio::time::sleep(std::time::Duration::from_secs(6 * 60 * 60)).await;
         }
-        let status = store.active_catalog().ok().map(|(_, status)| status);
-        let checked_recently = status
-            .and_then(|status| status.last_checked_at)
-            .map(|checked| now_seconds().saturating_sub(checked) < 24 * 60 * 60)
-            .unwrap_or(false);
-        if checked_recently {
-            return;
-        }
-        let urls = catalog_urls_from_settings(&settings);
-        if urls.is_empty() {
-            return;
-        }
-        let _ = store.refresh_from_urls(&urls).await;
     });
 }
 
@@ -1108,7 +1209,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    const TEST_PUBLIC_KEY: &str = "RWTTiV0bzI4j8gp43kVpne5Wp2GxEu0SLAMz0K1EFCT8R+46Q0hxktxA";
+    const TEST_PUBLIC_KEY: &str = "RWT8Iwhu0LIgxbEdHQalERdU3qZSYmGw54cQ0KAEGBUfm/a6YUsotGEw";
     const TEST_CATALOG: &[u8] = include_bytes!("../tests/fixtures/pricing-catalog.json");
     const TEST_SIGNATURE: &str = include_str!("../tests/fixtures/pricing-catalog.json.sig");
 
@@ -1317,13 +1418,32 @@ y/rUw2y8/hOUYjZU71eHp/Wo1KZ40fGy2VJEDl34XMJM+TX48Ss/17u3IvIfbVR1FkZZSNCisQbuQY+b
         settings.general.update_feed_url = "https://cn.example.com/helm/latest.json".to_string();
         assert_eq!(
             catalog_urls_from_settings(&settings),
-            vec!["https://cn.example.com/helm/pricing-catalog.json"]
+            Ok(vec![
+                "https://cn.example.com/helm/pricing-catalog.json".to_string()
+            ])
         );
         settings.general.pricing_feed_urls = vec![
             "https://oss.example.cn/pricing-catalog.json".to_string(),
             "https://cos.example.cn/pricing-catalog.json".to_string(),
         ];
-        assert_eq!(catalog_urls_from_settings(&settings).len(), 2);
+        assert_eq!(
+            catalog_urls_from_settings(&settings)
+                .map(|urls| urls.len())
+                .unwrap_or(0),
+            2
+        );
+    }
+
+    #[test]
+    fn falls_back_to_official_catalog_when_no_source_configured() {
+        let settings = AppSettings::default();
+        assert_eq!(
+            catalog_urls_from_settings(&settings),
+            Ok(OFFICIAL_CATALOG_URLS
+                .iter()
+                .map(|url| url.to_string())
+                .collect::<Vec<_>>()),
+        );
     }
 
     #[tokio::test]
@@ -1344,7 +1464,7 @@ y/rUw2y8/hOUYjZU71eHp/Wo1KZ40fGy2VJEDl34XMJM+TX48Ss/17u3IvIfbVR1FkZZSNCisQbuQY+b
             .await
             .unwrap();
         assert_eq!(status.source, "cache");
-        assert_eq!(status.catalog_version, "test.2026.07.17.99");
+        assert_eq!(status.catalog_version, "test.2099.12.31.0");
         assert!(store.cache_bundle_path().exists());
         server.await.unwrap();
 
@@ -1355,7 +1475,7 @@ y/rUw2y8/hOUYjZU71eHp/Wo1KZ40fGy2VJEDl34XMJM+TX48Ss/17u3IvIfbVR1FkZZSNCisQbuQY+b
         let restarted = PricingCatalogStore::with_public_key(directory.clone(), TEST_PUBLIC_KEY);
         let (catalog, status) = restarted.active_catalog().unwrap();
         assert_eq!(status.source, "cache");
-        assert_eq!(catalog.catalog_version, "test.2026.07.17.99");
+        assert_eq!(catalog.catalog_version, "test.2099.12.31.0");
         let _ = fs::remove_dir_all(directory);
     }
 
@@ -1391,6 +1511,34 @@ y/rUw2y8/hOUYjZU71eHp/Wo1KZ40fGy2VJEDl34XMJM+TX48Ss/17u3IvIfbVR1FkZZSNCisQbuQY+b
         assert!(error.contains("超过 2 MiB 上限"));
         assert!(!error.contains(&url), "错误信息不得回显镜像 URL");
         server.await.unwrap();
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    // S6：定价目录弹窗「标准价格表」数据源——来自当前生效目录的只读条目。
+    #[test]
+    fn catalog_entries_lists_sorted_standard_bands_from_builtin() {
+        let directory = test_directory("catalog-entries");
+        let _ = fs::remove_dir_all(&directory);
+        let store = PricingCatalogStore::new(directory.clone());
+
+        let entries = store.catalog_entries().unwrap();
+        assert!(!entries.is_empty(), "内置目录应导出至少一条标准费率");
+        // 排序稳定：vendor 升序内按 modelId 升序
+        let mut sorted = entries.clone();
+        sorted.sort_by(|a, b| {
+            a.vendor
+                .cmp(&b.vendor)
+                .then_with(|| a.model_id.cmp(&b.model_id))
+        });
+        assert_eq!(entries, sorted);
+        // 每条都有非空模型 ID 与非负价格；缓存读取缺失时为 None 而不是估算值
+        for entry in &entries {
+            assert!(!entry.model_id.is_empty());
+            assert!(entry.input >= 0.0 && entry.output >= 0.0);
+            if let Some(cached) = entry.cached_input {
+                assert!(cached >= 0.0);
+            }
+        }
         let _ = fs::remove_dir_all(directory);
     }
 

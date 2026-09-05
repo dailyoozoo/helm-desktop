@@ -1,84 +1,79 @@
-import { useEffect, useState } from 'react';
+// 插件页（S7）：技能 / 连接器 双 Tab，对齐 prototype/extensions.html 与
+// docs/插件页原型-技能与连接器方案.md。子代理/斜杠命令/钩子不再作为本页入口。
+// 所有列表与状态来自真实 Rust 命令；精选目录只是安装模板，卡片状态由真实服务器列表推导。
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { Icon } from '../shell/icons';
+import { EngineBrand } from '../shell/EngineBrand';
+import brandGithub from '../assets/brands/github.svg';
+import brandPlaywright from '../assets/brands/playwright.svg';
+import brandChrome from '../assets/brands/chrome.svg';
+import brandContext7 from '../assets/brands/context7.ico';
 import { showResultToast } from '../components/toast';
 import { EmptyState } from '../components/EmptyState';
-import { Chip } from '../components/Chip';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { Dialog } from '../components/Dialog';
-import { applyExtensionLoadResult } from './extensionLoadState';
-import { loadSettings, selectDirectory } from '../settings/api';
-import { getProviderConfig } from '../providers/api';
-import { modelCatalog } from '../providers/providerViewModel';
+import { openPathInSystem } from '../engine/transport';
+import { loadSettings } from '../settings/api';
 import {
-  deleteHook,
+  createSkill,
   deleteMcpServer,
-  deleteSlashCommand,
-  deleteSubagent,
-  listHooks,
+  deleteSkill,
+  importMcpServers,
   listMcpServers,
   listSkills,
-  listSlashCommands,
-  listSubagents,
-  saveHook,
-  saveMcpServer,
-  saveSlashCommand,
-  saveSubagent,
   marketInstallSkill,
   marketSearchSkills,
+  readSkillSource,
+  saveMcpServer,
+  setMcpServerEnabled,
   testMcpConnection,
-  toggleSkill,
-  HOOK_EVENTS,
-  type Hook,
+  type CreateSkillRequest,
   type MarketSkill,
+  type McpImportItemResult,
   type McpServer,
   type McpTool,
   type Skill,
-  type SlashCommand,
-  type Subagent,
+  type SkillSourceFile,
 } from './extensionsApi';
+import {
+  connectorStatusPill,
+  deriveFeaturedStates,
+  FEATURED_CONNECTORS,
+  filterFeaturedStates,
+  filterSkillsByQuery,
+  formatTestedAt,
+  groupSkillsBySource,
+  importResultRows,
+  isCredentialKey,
+  marketRowIcon,
+  skillCardIcon,
+  skillScopeNote,
+  slugifySkillName,
+  transportLabel,
+  triggerText,
+  type FeaturedCardState,
+  type FeaturedConnectorTemplate,
+  type ImportResultRow,
+  type SkillEngine,
+} from './extensionsViewModel';
+import './extensions.css';
 
-type TabId = 'skills' | 'mcp' | 'subagents' | 'commands' | 'hooks';
-type SkillFilter = 'all' | 'on' | 'global' | 'project';
-type McpFilter = 'all' | 'on' | 'off';
+type TabId = 'skills' | 'mcp';
+
+interface EnvRow {
+  key: string;
+  value: string;
+}
 
 interface McpDraft {
   name: string;
-  transport: 'stdio' | 'sse' | 'http';
+  transport: 'stdio' | 'http';
+  /** stdio 启动命令 / http 服务地址 */
   command: string;
+  /** stdio 参数，每行一个 */
   args: string;
-  env: string;
-}
-
-interface SubagentDraft {
-  id: string;
-  name: string;
-  model: string;
-  role: string;
-  tools: string;
-  auto: boolean;
-  prompt: string;
-  scope: 'global' | 'project';
-}
-
-interface CommandDraft {
-  id: string;
-  trigger: string;
-  description: string;
-  scope: 'global' | 'project';
-  enabled: boolean;
-  body: string;
-  engine: 'all' | 'claude-code' | 'codex';
-  argumentHint?: string;
-}
-
-interface HookDraft {
-  id: string;
-  event: Hook['event'];
-  match: string;
-  command: string;
-  description: string;
-  enabled: boolean;
-  scope: 'global' | 'project';
+  envRows: EnvRow[];
+  headerRows: EnvRow[];
 }
 
 interface PendingConfirm {
@@ -88,68 +83,60 @@ interface PendingConfirm {
   onConfirm: () => Promise<void>;
 }
 
-const EMPTY_MCP: McpDraft = {
+const EMPTY_DRAFT: McpDraft = {
   name: '',
   transport: 'stdio',
   command: '',
   args: '',
-  env: '',
+  envRows: [{ key: '', value: '' }],
+  headerRows: [{ key: '', value: '' }],
 };
 
-const EMPTY_SUBAGENT: SubagentDraft = {
-  id: '',
-  name: '',
-  model: '',
-  role: '',
-  tools: 'Read,Grep,Glob',
-  auto: true,
-  prompt: '',
-  scope: 'global',
+/** 精选卡品牌图（与 prototype/assets/brands 同源）；无品牌图的模板回落通用图标。 */
+const FEATURED_BRANDS: Record<string, string> = {
+  github: brandGithub,
+  playwright: brandPlaywright,
+  'chrome-devtools': brandChrome,
+  context7: brandContext7,
 };
 
-const EMPTY_COMMAND: CommandDraft = {
-  id: '',
-  trigger: '/',
-  description: '',
-  scope: 'global',
-  enabled: true,
-  body: '',
-  engine: 'all',
-  argumentHint: '',
-};
-
-const EMPTY_HOOK: HookDraft = {
-  id: '',
-  event: 'PreToolUse',
-  match: '*',
-  command: '',
-  description: '',
-  enabled: true,
-  scope: 'global',
-};
+function engineLabel(engine: SkillEngine): string {
+  return engine === 'codex' ? 'Codex' : 'Claude Code';
+}
 
 export function ExtensionsPage() {
   const [tab, setTab] = useState<TabId>('skills');
-  const [skills, setSkills] = useState<Skill[]>([]);
-  const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
-  const [subagents, setSubagents] = useState<Subagent[]>([]);
-  const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
-  const [hooks, setHooks] = useState<Hook[]>([]);
-  const [mcpTools, setMcpTools] = useState<Record<string, McpTool[]>>({});
-  const [loading, setLoading] = useState(true);
-  const [marketOpen, setMarketOpen] = useState(false);
-  const [mcpDraft, setMcpDraft] = useState<McpDraft | null>(null);
-  const [subagentDraft, setSubagentDraft] = useState<SubagentDraft | null>(null);
-  const [commandDraft, setCommandDraft] = useState<CommandDraft | null>(null);
-  const [hookDraft, setHookDraft] = useState<HookDraft | null>(null);
-  const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(null);
-  // 加载失败与真空态区分（P2-3）：记录读取失败的来源，横幅展示并可重试
-  const [loadErrors, setLoadErrors] = useState<string[]>([]);
-  // 项目级作用域上下文（变更-05）：默认取设置的默认工作目录，可切换
+  // 项目级作用域上下文：取设置里的默认工作目录，页内不再提供切换（原型无此入口）
   const [projectDir, setProjectDir] = useState('');
-  const [projectDirReady, setProjectDirReady] = useState(false);
-  // 子代理模型候选：来自服务商模型目录
-  const [modelOptions, setModelOptions] = useState<string[]>([]);
+  // ===== 技能 =====
+  const [engine, setEngine] = useState<SkillEngine>('claude-code');
+  const [skills, setSkills] = useState<Skill[]>([]);
+  const [skillsLoading, setSkillsLoading] = useState(true);
+  const [skillsError, setSkillsError] = useState('');
+  const [skillSearch, setSkillSearch] = useState('');
+  const [createOpen, setCreateOpen] = useState(false);
+  const [marketOpen, setMarketOpen] = useState(false);
+  const [drawerSkill, setDrawerSkill] = useState<Skill | null>(null);
+  const [skillSource, setSkillSource] = useState<{
+    state: 'loading' | 'ready' | 'error';
+    file?: SkillSourceFile;
+    error?: string;
+  }>({ state: 'loading' });
+  const [sourceView, setSourceView] = useState<'preview' | 'source'>('preview');
+  // ===== 连接器 =====
+  const [servers, setServers] = useState<McpServer[]>([]);
+  const [serversLoading, setServersLoading] = useState(true);
+  const [serversError, setServersError] = useState('');
+  const [mcpSearch, setMcpSearch] = useState('');
+  // 工具列表只保留本次会话真实检测过的结果；跨重启事实走 servers 的 lastTestedAt/toolCount
+  const [testedTools, setTestedTools] = useState<Record<string, McpTool[]>>({});
+  const [testing, setTesting] = useState<string | null>(null);
+  const [mcpDraft, setMcpDraft] = useState<McpDraft | null>(null);
+  const [importOpen, setImportOpen] = useState(false);
+  const [drawerServerName, setDrawerServerName] = useState<string | null>(null);
+  const [drawerFeatured, setDrawerFeatured] = useState<FeaturedConnectorTemplate | null>(null);
+  const [installingFeatured, setInstallingFeatured] = useState<string | null>(null);
+  const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(null);
 
   useEffect(() => {
     void (async () => {
@@ -158,470 +145,354 @@ export function ExtensionsPage() {
         setProjectDir(settings.general.defaultDirectory.trim());
       } catch (err) {
         console.error('读取默认目录失败:', err);
-      } finally {
-        setProjectDirReady(true);
-      }
-    })();
-    void (async () => {
-      try {
-        const config = await getProviderConfig();
-        setModelOptions(modelCatalog(config).map((model) => model.id));
-      } catch (err) {
-        console.error('读取模型目录失败:', err);
       }
     })();
   }, []);
 
+  const refreshSkills = useCallback(async () => {
+    setSkillsLoading(true);
+    try {
+      setSkills(await listSkills(engine, projectDir || undefined));
+      setSkillsError('');
+    } catch (err) {
+      console.error('加载技能失败:', err);
+      setSkillsError(String(err));
+    } finally {
+      setSkillsLoading(false);
+    }
+  }, [engine, projectDir]);
+
+  const refreshServers = useCallback(async () => {
+    setServersLoading(true);
+    try {
+      setServers(await listMcpServers());
+      setServersError('');
+    } catch (err) {
+      console.error('加载连接器失败:', err);
+      setServersError(String(err));
+    } finally {
+      setServersLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
-    if (!projectDirReady) return;
-    void refreshAll();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectDirReady, projectDir]);
+    void refreshSkills();
+  }, [refreshSkills]);
 
-  async function refreshAll() {
-    setLoading(true);
-    const dir = projectDir || undefined;
-    const [skillsResult, mcpResult, subagentResult, commandResult, hookResult] =
-      await Promise.allSettled([
-        Promise.all([listSkills('claude-code', dir), listSkills('codex', dir)]).then(
-          ([claudeSkills, codexSkills]) => [...claudeSkills, ...codexSkills],
-        ),
-        listMcpServers(),
-        listSubagents(dir),
-        listSlashCommands(undefined, dir),
-        listHooks(dir),
-      ]);
-    const failures: string[] = [];
-    applyExtensionLoadResult(skillsResult, setSkills, '技能', failures);
-    applyExtensionLoadResult(mcpResult, setMcpServers, 'MCP 服务器', failures);
-    applyExtensionLoadResult(subagentResult, setSubagents, '子代理', failures);
-    applyExtensionLoadResult(commandResult, setSlashCommands, '斜杠命令', failures);
-    applyExtensionLoadResult(hookResult, setHooks, '钩子', failures);
-    setLoadErrors(failures);
-    setLoading(false);
-  }
+  useEffect(() => {
+    void refreshServers();
+  }, [refreshServers]);
 
-  async function reloadMcpServers() {
-    try {
-      setMcpServers(await listMcpServers());
-    } catch (err) {
-      console.error('加载 MCP 服务器失败:', err);
-      notify(`重新加载 MCP 服务器失败：${err}`);
-    }
-  }
-
-  async function reloadSubagents() {
-    try {
-      setSubagents(await listSubagents(projectDir || undefined));
-    } catch (err) {
-      console.error('加载子代理失败:', err);
-      notify(`重新加载子代理失败：${err}`);
-    }
-  }
-
-  async function reloadSlashCommands() {
-    try {
-      setSlashCommands(await listSlashCommands(undefined, projectDir || undefined));
-    } catch (err) {
-      console.error('加载斜杠命令失败:', err);
-      notify(`重新加载斜杠命令失败：${err}`);
-    }
-  }
-
-  async function reloadHooks() {
-    try {
-      setHooks(await listHooks(projectDir || undefined));
-    } catch (err) {
-      console.error('加载钩子失败:', err);
-      notify(`重新加载钩子失败：${err}`);
-    }
-  }
-
-  // 全局通知层（P2-2）：按文案自动区分成功/失败级别
   function notify(message: string) {
     showResultToast(message);
   }
 
-  async function handleToggleSkill(skillId: string, enabled: boolean) {
+  /** 精选一键安装：真实写入双引擎配置并自动检测（零输入模板免表单）。 */
+  async function installFeaturedDirect(template: FeaturedConnectorTemplate) {
+    setInstallingFeatured(template.name);
     try {
-      await toggleSkill(skillId, enabled, projectDir || undefined);
-      setSkills((prev) => prev.map((s) => (s.id === skillId ? { ...s, enabled } : s)));
-      notify(enabled ? '技能已启用' : '技能已停用');
-    } catch (err) {
-      console.error('切换技能状态失败:', err);
-      notify(`切换技能状态失败：${err}`);
+      setDrawerFeatured(null);
+      await handleSaveDraft(templateToDraft(template.name), true);
+    } finally {
+      setInstallingFeatured(null);
     }
   }
 
-  async function handleSaveMcp(draft: McpDraft) {
+  /** 静默检测：抽屉打开时自动拉取真实工具列表，不弹 toast 打断。 */
+  async function silentTest(server: McpServer) {
+    setTesting(server.name);
     try {
-      await saveMcpServer(mcpDraftToServer(draft));
-      setMcpDraft(null);
-      await reloadMcpServers();
-      notify('MCP 服务器已保存');
+      const tools = await testMcpConnection(server);
+      setTestedTools((prev) => ({ ...prev, [server.name]: tools }));
     } catch (err) {
-      console.error('保存 MCP 服务器失败:', err);
-      notify(`保存 MCP 服务器失败：${err}`);
+      console.error('自动检测连接器失败:', err);
+    } finally {
+      setTesting(null);
     }
   }
 
-  async function handleDeleteMcp(name: string) {
+  // ===== 技能动作 =====
+  function openSkillDrawer(skill: Skill) {
+    setDrawerSkill(skill);
+    setSourceView('preview');
+    setSkillSource({ state: 'loading' });
+    void (async () => {
+      try {
+        const file = await readSkillSource(skill.id, engine, projectDir || undefined);
+        setSkillSource({ state: 'ready', file });
+      } catch (err) {
+        console.error('读取技能源码失败:', err);
+        setSkillSource({ state: 'error', error: String(err) });
+      }
+    })();
+  }
+
+  async function handleRevealSkill(skill: Skill, sourcePath?: string) {
+    const dir = directoryOf(sourcePath || skill.path);
+    if (!dir) {
+      notify('无法定位技能目录');
+      return;
+    }
+    try {
+      await openPathInSystem(dir);
+    } catch (err) {
+      console.error('打开技能目录失败:', err);
+      notify(`打开技能目录失败：${err}`);
+    }
+  }
+
+  function confirmUninstallSkill(skill: Skill) {
     setPendingConfirm({
-      title: `删除 MCP 服务器「${name}」？`,
-      body: '删除后会移除该服务器配置和已加载的工具列表，当前会话后续将不能再调用这些工具。',
-      confirmLabel: '删除服务器',
+      title: `卸载技能「${skill.name}」？`,
+      body: `会从 ${engineLabel(engine)} 的技能目录删除该技能文件夹，引擎将不再加载它。`,
+      confirmLabel: '卸载技能',
       onConfirm: async () => {
         try {
-          await deleteMcpServer(name);
-          setMcpTools((prev) => {
+          await deleteSkill(skill.id, engine, projectDir || undefined);
+          setDrawerSkill(null);
+          await refreshSkills();
+          notify('技能已卸载');
+        } catch (err) {
+          console.error('卸载技能失败:', err);
+          notify(`卸载技能失败：${err}`);
+        }
+      },
+    });
+  }
+
+  async function handleCreateSkill(request: CreateSkillRequest) {
+    try {
+      await createSkill(request, request.scope === 'project' ? projectDir : undefined);
+      setCreateOpen(false);
+      await refreshSkills();
+      notify(`技能已创建到 ${engineLabel(engine)}`);
+    } catch (err) {
+      console.error('创建技能失败:', err);
+      notify(`创建技能失败：${err}`);
+    }
+  }
+
+  // ===== 连接器动作 =====
+  async function handleTest(server: McpServer) {
+    setTesting(server.name);
+    try {
+      const tools = await testMcpConnection(server);
+      setTestedTools((prev) => ({ ...prev, [server.name]: tools }));
+      notify(`${server.name} 连接正常 · ${tools.length} 个工具`);
+    } catch (err) {
+      console.error('测试连接器失败:', err);
+      notify(`连接失败：${err}`);
+    } finally {
+      setTesting(null);
+      // 最近一次检测结果由后端持久化，刷新带回真实状态
+      void refreshServers();
+    }
+  }
+
+  async function handleToggleServer(server: McpServer, enabled: boolean) {
+    try {
+      await setMcpServerEnabled(server.name, enabled);
+      await refreshServers();
+      notify(enabled ? '连接器已启用，配置写回双引擎' : '连接器已停用，定义保留但不注入引擎');
+    } catch (err) {
+      console.error('切换连接器状态失败:', err);
+      notify(`切换连接器状态失败：${err}`);
+    }
+  }
+
+  function confirmDeleteServer(server: McpServer) {
+    setPendingConfirm({
+      title: `卸载连接器「${server.name}」？`,
+      body: '会从 Claude Code 与 Codex 配置中删除该定义，并清理系统钥匙串中的相关凭证。',
+      confirmLabel: '卸载连接器',
+      onConfirm: async () => {
+        try {
+          await deleteMcpServer(server.name);
+          setTestedTools((prev) => {
             const next = { ...prev };
-            delete next[name];
+            delete next[server.name];
             return next;
           });
-          await reloadMcpServers();
-          notify('MCP 服务器已删除');
+          setDrawerServerName(null);
+          await refreshServers();
+          notify('连接器已卸载');
         } catch (err) {
-          console.error('删除 MCP 服务器失败:', err);
-          notify(`删除 MCP 服务器失败：${err}`);
+          console.error('卸载连接器失败:', err);
+          notify(`卸载连接器失败：${err}`);
         }
       },
     });
   }
 
-  async function handleSaveSubagent(draft: SubagentDraft) {
+  async function handleSaveDraft(draft: McpDraft, autoTest: boolean) {
+    const server = draftToServer(draft);
     try {
-      await saveSubagent(draftToSubagent(draft), projectDir || undefined);
-      setSubagentDraft(null);
-      await reloadSubagents();
-      notify('子代理已保存');
+      await saveMcpServer(server);
     } catch (err) {
-      console.error('保存子代理失败:', err);
-      notify(`保存子代理失败：${err}`);
+      console.error('保存连接器失败:', err);
+      notify(`保存连接器失败：${err}`);
+      return;
     }
-  }
-
-  async function handleToggleSubagentAuto(subagent: Subagent, auto: boolean) {
-    try {
-      await saveSubagent({ ...subagent, auto }, projectDir || undefined);
-      setSubagents((prev) =>
-        prev.map((item) => (item.id === subagent.id ? { ...item, auto } : item)),
-      );
-      notify(auto ? '已设为自动委派' : '已设为手动调用');
-    } catch (err) {
-      console.error('更新子代理失败:', err);
-      notify(`更新子代理失败：${err}`);
+    setMcpDraft(null);
+    await refreshServers();
+    if (!autoTest) {
+      notify('连接器已保存到双引擎');
+      return;
     }
+    await handleTest(server);
   }
 
-  async function handleDeleteSubagent(id: string, name: string) {
-    setPendingConfirm({
-      title: `删除子代理「${name}」？`,
-      body: '删除后，主会话不能再自动委派或手动调用这个子代理。',
-      confirmLabel: '删除子代理',
-      onConfirm: async () => {
-        try {
-          await deleteSubagent(id, projectDir || undefined);
-          await reloadSubagents();
-          notify('子代理已删除');
-        } catch (err) {
-          console.error('删除子代理失败:', err);
-          notify(`删除子代理失败：${err}`);
-        }
-      },
-    });
-  }
-
-  async function handleSaveCommand(draft: CommandDraft) {
-    try {
-      await saveSlashCommand(draftToCommand(draft), projectDir || undefined);
-      setCommandDraft(null);
-      await reloadSlashCommands();
-      notify('斜杠命令已保存');
-    } catch (err) {
-      console.error('保存斜杠命令失败:', err);
-      notify(`保存斜杠命令失败：${err}`);
-    }
-  }
-
-  async function handleToggleCommand(command: SlashCommand, enabled: boolean) {
-    try {
-      await saveSlashCommand({ ...command, enabled }, projectDir || undefined);
-      setSlashCommands((prev) =>
-        prev.map((item) => (item.id === command.id ? { ...item, enabled } : item)),
-      );
-      notify(enabled ? '斜杠命令已启用' : '斜杠命令已停用');
-    } catch (err) {
-      console.error('更新斜杠命令失败:', err);
-      notify(`更新斜杠命令失败：${err}`);
-    }
-  }
-
-  async function handleDeleteCommand(id: string, trigger: string) {
-    setPendingConfirm({
-      title: `删除斜杠命令「${trigger}」？`,
-      body: '删除后，输入框的斜杠菜单不会再展示这个命令模板。',
-      confirmLabel: '删除命令',
-      onConfirm: async () => {
-        try {
-          await deleteSlashCommand(id, projectDir || undefined);
-          await reloadSlashCommands();
-          notify('斜杠命令已删除');
-        } catch (err) {
-          console.error('删除斜杠命令失败:', err);
-          notify(`删除斜杠命令失败：${err}`);
-        }
-      },
-    });
-  }
-
-  async function handleSaveHook(draft: HookDraft) {
-    try {
-      await saveHook(draftToHook(draft), projectDir || undefined);
-      setHookDraft(null);
-      await reloadHooks();
-      notify('钩子已保存');
-    } catch (err) {
-      console.error('保存钩子失败:', err);
-      notify(`保存钩子失败：${err}`);
-    }
-  }
-
-  async function handleToggleHook(hook: Hook, enabled: boolean) {
-    try {
-      await saveHook({ ...hook, enabled }, projectDir || undefined);
-      setHooks((prev) => prev.map((item) => (item.id === hook.id ? { ...item, enabled } : item)));
-      notify(enabled ? '钩子已启用' : '钩子已停用');
-    } catch (err) {
-      console.error('更新钩子失败:', err);
-      notify(`更新钩子失败：${err}`);
-    }
-  }
-
-  async function handleDeleteHook(id: string, description: string) {
-    setPendingConfirm({
-      title: `删除钩子「${description || id}」？`,
-      body: '删除后，对应事件不会再触发这条 Shell 命令。',
-      confirmLabel: '删除钩子',
-      onConfirm: async () => {
-        try {
-          await deleteHook(id, projectDir || undefined);
-          await reloadHooks();
-          notify('钩子已删除');
-        } catch (err) {
-          console.error('删除钩子失败:', err);
-          notify(`删除钩子失败：${err}`);
-        }
-      },
-    });
-  }
-
-  const enabledSkillsCount = skills.filter((s) => s.enabled).length;
-  // MCP 工具数（B1-6）：只聚合本次会话真实测试过连接的 server；一个都没测过时显示「暂无」，
-  // 测过后如实显示数字（0 也显示 0），不用持久化的旧 toolCount 伪造聚合值
-  const testedMcpServerCount = Object.keys(mcpTools).length;
-  const mcpToolCount = Object.values(mcpTools).reduce((sum, tools) => sum + tools.length, 0);
-  const enabledCommandCount = slashCommands.filter((command) => command.enabled).length;
-  const enabledHookCount = hooks.filter((hook) => hook.enabled).length;
-
-  async function chooseProjectDirectory() {
-    const next = await selectDirectory();
-    if (next) setProjectDir(next);
-  }
+  const drawerServer = servers.find((server) => server.name === drawerServerName) ?? null;
+  const filteredFeatured = useMemo(
+    () => filterFeaturedStates(deriveFeaturedStates(FEATURED_CONNECTORS, servers), mcpSearch),
+    [servers, mcpSearch],
+  );
 
   return (
-    <div className="page scroll">
-      <div className="page__head extensions-head">
-        <div>
-          <div className="page__title">扩展中心</div>
-          <div className="page__sub">
-            统一管理驱动 Agent 的技能、MCP 服务器、子代理、斜杠命令与钩子——按各引擎的原生机制生效。
-          </div>
-        </div>
-        <div className="row gap-sm extensions-head-actions">
+    <div className="page scroll ex-root">
+      <div className="cm-tabs-wrapper">
+        <div className="cm-tabs" role="tablist" aria-label="插件页导航">
           <button
-            className="btn btn--subtle extensions-project-picker"
-            onClick={() => void chooseProjectDirectory()}
-            title={projectDir || '未设置项目目录'}
+            role="tab"
+            aria-selected={tab === 'skills'}
+            className={tab === 'skills' ? 'is-active' : ''}
+            onClick={() => setTab('skills')}
           >
-            <span>项目目录：</span>
-            <span className="mono extensions-project-path">{projectDir || '仅显示全局扩展'}</span>
-            <Icon name="down" />
+            技能
           </button>
-          <button className="btn btn--primary" onClick={() => setMarketOpen(true)}>
-            <Icon name="store" /> 浏览市场
+          <button
+            role="tab"
+            aria-selected={tab === 'mcp'}
+            className={tab === 'mcp' ? 'is-active' : ''}
+            onClick={() => setTab('mcp')}
+          >
+            连接器
           </button>
         </div>
       </div>
 
-      <div className="etabs tabbar">
-        <TabButton active={tab === 'skills'} onClick={() => setTab('skills')}>
-          技能
-        </TabButton>
-        <TabButton active={tab === 'mcp'} onClick={() => setTab('mcp')}>
-          MCP 服务器
-        </TabButton>
-        <TabButton active={tab === 'subagents'} onClick={() => setTab('subagents')}>
-          子代理
-        </TabButton>
-        <TabButton active={tab === 'commands'} onClick={() => setTab('commands')}>
-          斜杠命令
-        </TabButton>
-        <TabButton active={tab === 'hooks'} onClick={() => setTab('hooks')}>
-          钩子
-        </TabButton>
-      </div>
-
-      <div className="wrap">
-        {loadErrors.length > 0 ? (
-          <div className="x-load-error" role="alert">
-            <Icon name="alert" />
-            <span>
-              以下来源读取失败：{loadErrors.join('、')}
-              。列表可能不完整，配置文件损坏或权限不足都会导致读取失败。
-            </span>
-            <button className="btn btn--subtle btn--sm" onClick={() => void refreshAll()}>
-              重试
-            </button>
-          </div>
-        ) : null}
-        {!loading ? (
-          <div className="xsum">
-            <SummaryItem icon="sparkles" value={enabledSkillsCount} label="启用技能" />
-            <SummaryItem
-              icon="plug"
-              value={testedMcpServerCount > 0 ? mcpToolCount : '暂无'}
-              label="MCP 工具（已连接）"
-            />
-            <SummaryItem icon="bot" value={subagents.length} label="子代理" />
-            <SummaryItem
-              icon="code"
-              value={`${enabledCommandCount} / ${enabledHookCount}`}
-              label="命令 / 钩子"
-            />
-          </div>
-        ) : null}
-
-        {loading ? (
-          <div className="empty" aria-live="polite">
-            正在读取扩展配置…
-          </div>
-        ) : null}
-        {!loading && tab === 'skills' && (
+      <div className="cm-pagebody cm-pagebody--scroll">
+        {tab === 'skills' ? (
           <SkillsTab
+            engine={engine}
+            onEngineChange={setEngine}
             skills={skills}
-            loading={loading}
-            onToggle={handleToggleSkill}
-            onBrowseMarket={() => setMarketOpen(true)}
+            loading={skillsLoading}
+            error={skillsError}
+            search={skillSearch}
+            onSearchChange={setSkillSearch}
+            onRefresh={() => void refreshSkills()}
+            onOpenSkill={openSkillDrawer}
+            onCreate={() => setCreateOpen(true)}
+            onMarket={() => setMarketOpen(true)}
           />
-        )}
-        {!loading && tab === 'mcp' && (
-          <McpTab
-            servers={mcpServers}
-            tools={mcpTools}
-            onToolsChange={setMcpTools}
-            onAdd={() => setMcpDraft({ ...EMPTY_MCP })}
-            onEdit={(server) => setMcpDraft(mcpServerToDraft(server))}
-            onDelete={handleDeleteMcp}
-            onNotify={notify}
-            onTested={() => void reloadMcpServers()}
-          />
-        )}
-        {!loading && tab === 'subagents' && (
-          <SubagentsTab
-            subagents={subagents}
-            onAdd={() => setSubagentDraft({ ...EMPTY_SUBAGENT, model: modelOptions[0] ?? '' })}
-            onEdit={(subagent) => setSubagentDraft(subagentToDraft(subagent))}
-            onDelete={handleDeleteSubagent}
-            onToggleAuto={handleToggleSubagentAuto}
-          />
-        )}
-        {!loading && tab === 'commands' && (
-          <CommandsTab
-            commands={slashCommands}
-            onAdd={() => setCommandDraft({ ...EMPTY_COMMAND })}
-            onEdit={(command) => setCommandDraft(commandToDraft(command))}
-            onDelete={handleDeleteCommand}
-            onToggle={handleToggleCommand}
-          />
-        )}
-        {!loading && tab === 'hooks' && (
-          <HooksTab
-            hooks={hooks}
-            onAdd={() => setHookDraft({ ...EMPTY_HOOK })}
-            onEdit={(hook) => setHookDraft(hookToDraft(hook))}
-            onDelete={handleDeleteHook}
-            onToggle={handleToggleHook}
+        ) : (
+          <ConnectorsTab
+            servers={servers}
+            featured={filteredFeatured}
+            loading={serversLoading}
+            error={serversError}
+            search={mcpSearch}
+            onSearchChange={setMcpSearch}
+            testedTools={testedTools}
+            onRefresh={() => void refreshServers()}
+            onToggle={handleToggleServer}
+            onAdd={() => setMcpDraft({ ...EMPTY_DRAFT })}
+            onAddTemplate={(name) => setMcpDraft(templateToDraft(name))}
+            onImport={() => setImportOpen(true)}
+            onOpenDrawer={(name) => {
+              setDrawerServerName(name);
+              const server = servers.find((item) => item.name === name);
+              if (server && server.enabled && !testedTools[name]) void silentTest(server);
+            }}
+            onOpenFeatured={(template) => {
+              setDrawerServerName(null);
+              setDrawerFeatured(template);
+            }}
+            onInstallFeatured={installFeaturedDirect}
+            installingFeatured={installingFeatured}
           />
         )}
       </div>
 
-      {marketOpen && (
-        <MarketplaceDialog
-          projectDir={projectDir}
-          modelOptions={modelOptions}
-          onInstalled={() => {
-            void refreshAll();
-          }}
-          onNotify={notify}
-          onClose={() => setMarketOpen(false)}
-          onUseMcp={(draft) => {
-            setMarketOpen(false);
-            setMcpDraft(draft);
-            setTab('mcp');
-          }}
-          onUseSubagent={(draft) => {
-            setMarketOpen(false);
-            setSubagentDraft(draft);
-            setTab('subagents');
-          }}
-          onUseCommand={(draft) => {
-            setMarketOpen(false);
-            setCommandDraft(draft);
-            setTab('commands');
-          }}
-          onUseHook={(draft) => {
-            setMarketOpen(false);
-            setHookDraft(draft);
-            setTab('hooks');
+      {drawerSkill ? (
+        <SkillDrawer
+          skill={drawerSkill}
+          engine={engine}
+          source={skillSource}
+          view={sourceView}
+          onViewChange={setSourceView}
+          onClose={() => setDrawerSkill(null)}
+          onReveal={() => void handleRevealSkill(drawerSkill, skillSource.file?.path)}
+          onUninstall={() => confirmUninstallSkill(drawerSkill)}
+        />
+      ) : null}
+
+      {drawerFeatured ? (
+        <ConnectorDrawer
+          featured={drawerFeatured}
+          installingName={installingFeatured}
+          onClose={() => setDrawerFeatured(null)}
+          onInstall={() => void installFeaturedDirect(drawerFeatured)}
+          onConfigure={() => {
+            setDrawerFeatured(null);
+            setMcpDraft(templateToDraft(drawerFeatured.name));
           }}
         />
-      )}
+      ) : drawerServer ? (
+        <ConnectorDrawer
+          server={drawerServer}
+          tools={testedTools[drawerServer.name]}
+          testing={testing === drawerServer.name}
+          onClose={() => setDrawerServerName(null)}
+          onTest={() => void handleTest(drawerServer)}
+          onDelete={() => confirmDeleteServer(drawerServer)}
+        />
+      ) : null}
 
-      {mcpDraft && (
-        <McpDialog
+      {createOpen ? (
+        <CreateSkillDialog
+          engine={engine}
+          projectAvailable={Boolean(projectDir)}
+          onClose={() => setCreateOpen(false)}
+          onSubmit={handleCreateSkill}
+        />
+      ) : null}
+
+      {marketOpen ? (
+        <MarketDialog
+          engine={engine}
+          installedIds={new Set(skills.map((skill) => skill.id.replace(/^proj:/, '')))}
+          projectDir={projectDir}
+          projectAvailable={Boolean(projectDir)}
+          onClose={() => setMarketOpen(false)}
+          onInstalled={() => void refreshSkills()}
+          onNotify={notify}
+          onViewInstalled={(skillId) => {
+            setMarketOpen(false);
+            const skill = skills.find((item) => item.id.replace(/^proj:/, '') === skillId);
+            if (skill) openSkillDrawer(skill);
+          }}
+        />
+      ) : null}
+
+      {mcpDraft ? (
+        <ConnectorDialog
           draft={mcpDraft}
           onChange={setMcpDraft}
           onClose={() => setMcpDraft(null)}
-          onSave={handleSaveMcp}
+          onSave={handleSaveDraft}
         />
-      )}
-      {subagentDraft && (
-        <SubagentDialog
-          draft={subagentDraft}
-          modelOptions={modelOptions}
-          projectAvailable={Boolean(projectDir)}
-          onChange={setSubagentDraft}
-          onClose={() => setSubagentDraft(null)}
-          onSave={handleSaveSubagent}
+      ) : null}
+
+      {importOpen ? (
+        <ImportDialog
+          onClose={() => setImportOpen(false)}
+          onNotify={notify}
+          onChanged={() => void refreshServers()}
         />
-      )}
-      {commandDraft && (
-        <CommandDialog
-          draft={commandDraft}
-          onChange={setCommandDraft}
-          onClose={() => setCommandDraft(null)}
-          onSave={handleSaveCommand}
-        />
-      )}
-      {hookDraft && (
-        <HookDialog
-          draft={hookDraft}
-          projectAvailable={Boolean(projectDir)}
-          onChange={setHookDraft}
-          onClose={() => setHookDraft(null)}
-          onSave={handleSaveHook}
-        />
-      )}
+      ) : null}
+
       {pendingConfirm ? (
         <ConfirmDialog
           title={pendingConfirm.title}
@@ -635,1305 +506,79 @@ export function ExtensionsPage() {
   );
 }
 
-function TabButton({
-  active,
-  onClick,
-  children,
-}: {
-  active: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <button className={'tab' + (active ? ' is-active' : '')} onClick={onClick}>
-      {children}
-    </button>
-  );
+// ===== 草稿与映射 =====
+
+function directoryOf(path: string): string | null {
+  const normalized = path.replace(/\\/g, '/');
+  const index = normalized.lastIndexOf('/');
+  if (index <= 0) return null;
+  return normalized.slice(0, index);
 }
 
-function SummaryItem({
-  icon,
-  value,
-  label,
-}: {
-  icon: 'sparkles' | 'plug' | 'bot' | 'code';
-  value: string | number;
-  label: string;
-}) {
+function rowsToMap(rows: EnvRow[]): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const row of rows) {
+    const key = row.key.trim();
+    if (!key) continue;
+    result[key] = row.value;
+  }
+  return result;
+}
+
+function draftToServer(draft: McpDraft): McpServer {
+  if (draft.transport === 'http') {
+    return {
+      name: draft.name.trim(),
+      command: draft.command.trim(),
+      args: [],
+      env: {},
+      headers: rowsToMap(draft.headerRows),
+      transport: 'http',
+      enabled: true,
+      status: 'disconnected',
+    };
+  }
+  return {
+    name: draft.name.trim(),
+    command: draft.command.trim(),
+    args: draft.args
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean),
+    env: rowsToMap(draft.envRows),
+    headers: {},
+    transport: 'stdio',
+    enabled: true,
+    status: 'disconnected',
+  };
+}
+
+function templateToDraft(templateName: string): McpDraft {
+  const template = FEATURED_CONNECTORS.find(
+    (item) => item.name.toLowerCase() === templateName.toLowerCase(),
+  );
+  if (!template) return { ...EMPTY_DRAFT };
+  return {
+    name: template.name,
+    transport: template.transport,
+    command: template.transport === 'http' ? (template.url ?? '') : (template.command ?? ''),
+    args: (template.args ?? []).join('\n'),
+    envRows: (template.envKeys ?? []).map((entry) => ({ key: entry.key, value: '' })),
+    headerRows: [{ key: '', value: '' }],
+  };
+}
+
+// ===== 共用小组件 =====
+
+function LoadErrorBanner({ error, onRetry }: { error: string; onRetry: () => void }) {
   return (
-    <div className="ministat">
-      <span className="ic">
-        <Icon name={icon} />
-      </span>
-      <div>
-        <b className="tnum">{value}</b>
-        <small>{label}</small>
-      </div>
+    <div className="ex-loaderror" role="alert">
+      <Icon name="alert" />
+      <span>加载失败：{error}</span>
+      <button className="cm-action" type="button" onClick={onRetry}>
+        <Icon name="refresh" /> 重试
+      </button>
     </div>
-  );
-}
-
-function SkillsTab({
-  skills,
-  loading,
-  onToggle,
-  onBrowseMarket,
-}: {
-  skills: Skill[];
-  loading: boolean;
-  onToggle: (id: string, enabled: boolean) => void;
-  onBrowseMarket: () => void;
-}) {
-  const [search, setSearch] = useState('');
-  const [filter, setFilter] = useState<SkillFilter>('all');
-
-  const filteredSkills = skills.filter((skill) => {
-    if (filter === 'on' && !skill.enabled) return false;
-    if (filter === 'global' && skill.scope !== 'global') return false;
-    if (filter === 'project' && skill.scope !== 'project') return false;
-    const haystack = `${skill.name} ${skill.id} ${skill.description}`.toLowerCase();
-    return !search || haystack.includes(search.toLowerCase());
-  });
-
-  return (
-    <section>
-      <p className="faint" style={{ fontSize: 12.5, margin: '-2px 0 14px' }}>
-        技能是按需加载的提示词能力包，来自用户/项目目录的 skills 文件夹或市场安装。Claude Code
-        技能在会话中以 /技能名 触发，可在此启停；Codex 技能以 $技能名 触发，暂不支持在 Helm 中启停。
-      </p>
-      <div className="toolbar">
-        <SearchBox placeholder="搜索技能…" value={search} onChange={setSearch} />
-        <div className="row gap-sm">
-          <Chip active={filter === 'all'} onClick={() => setFilter('all')}>
-            全部
-          </Chip>
-          <Chip active={filter === 'on'} onClick={() => setFilter('on')}>
-            已启用
-          </Chip>
-          <Chip active={filter === 'global'} onClick={() => setFilter('global')}>
-            全局
-          </Chip>
-          <Chip active={filter === 'project'} onClick={() => setFilter('project')}>
-            项目
-          </Chip>
-        </div>
-        <div className="grow" />
-        <span className="faint" style={{ fontSize: 12.5 }}>
-          {filteredSkills.length} 个技能
-        </span>
-      </div>
-      {loading ? (
-        <div className="empty">加载中...</div>
-      ) : skills.length === 0 ? (
-        <EmptyState
-          icon="sparkles"
-          title="还没有任何技能"
-          hint="技能来自用户目录与项目目录的 skills 文件夹，也可以从市场安装现成的。"
-          action={{ label: '浏览市场', onClick: onBrowseMarket }}
-        />
-      ) : filteredSkills.length === 0 ? (
-        <div className="empty">没有匹配的技能，试试调整搜索或筛选条件</div>
-      ) : (
-        <div className="xgrid">
-          {filteredSkills.map((skill) => (
-            <div key={skill.id} className={'xcard' + (skill.enabled ? '' : ' is-off')}>
-              <div className="xcard__top">
-                <span className="xcard__ic">
-                  <Icon name="sparkles" />
-                </span>
-                <div className="xcard__t">
-                  <b>{skill.name}</b>
-                  <span className="sub">{skill.id}</span>
-                </div>
-                <Switch
-                  checked={skill.enabled}
-                  disabled={skill.engine === 'codex'}
-                  title={
-                    skill.engine === 'codex'
-                      ? 'Codex 技能由 Codex CLI 原生加载，暂不支持在 Helm 中启停'
-                      : undefined
-                  }
-                  onChange={(enabled) => onToggle(skill.id, enabled)}
-                />
-              </div>
-              <div className="xcard__desc">{skill.description}</div>
-              <div className="xcard__foot">
-                <ScopePill scope={skill.scope} />
-                <span className="sep" />
-                <span>{skill.engine === 'codex' ? 'Codex' : 'Claude Code'}</span>
-                <span className="sep" />
-                <span>
-                  {skill.source === 'builtin'
-                    ? '内置'
-                    : skill.source === 'market'
-                      ? '市场'
-                      : skill.source === 'plugin'
-                        ? '插件'
-                        : '自定义'}
-                </span>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-    </section>
-  );
-}
-
-function McpTab({
-  servers,
-  tools,
-  onToolsChange,
-  onAdd,
-  onEdit,
-  onDelete,
-  onNotify,
-  onTested,
-}: {
-  servers: McpServer[];
-  tools: Record<string, McpTool[]>;
-  onToolsChange: (updater: (prev: Record<string, McpTool[]>) => Record<string, McpTool[]>) => void;
-  onAdd: () => void;
-  onEdit: (server: McpServer) => void;
-  onDelete: (name: string) => void;
-  onNotify: (message: string) => void;
-  onTested: () => void;
-}) {
-  const [testing, setTesting] = useState<string | null>(null);
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  const [errors, setErrors] = useState<Record<string, string>>({});
-  const [search, setSearch] = useState('');
-  const [filter, setFilter] = useState<McpFilter>('all');
-
-  const rows = servers.filter((server) => {
-    const connected = Boolean(tools[server.name]) || server.status === 'connected';
-    if (filter === 'on' && !connected) return false;
-    if (filter === 'off' && connected) return false;
-    const haystack = `${server.name} ${server.command} ${server.args.join(' ')}`.toLowerCase();
-    return !search || haystack.includes(search.toLowerCase());
-  });
-
-  async function handleTest(server: McpServer) {
-    try {
-      setTesting(server.name);
-      setErrors((prev) => {
-        const next = { ...prev };
-        delete next[server.name];
-        return next;
-      });
-      const result = await testMcpConnection(server);
-      onToolsChange((prev) => ({ ...prev, [server.name]: result }));
-      onNotify(`${server.name} 连接正常 · ${result.length} 个工具已就绪`);
-    } catch (err) {
-      console.error('测试 MCP 连接失败:', err);
-      setErrors((prev) => ({ ...prev, [server.name]: String(err) }));
-      onNotify(`连接失败：${err}`);
-    } finally {
-      setTesting(null);
-      // 持久化状态已写入 ~/.helm/mcp-status.json，刷新列表带回
-      onTested();
-    }
-  }
-
-  return (
-    <section>
-      <div className="toolbar">
-        <SearchBox placeholder="搜索 MCP 服务器…" value={search} onChange={setSearch} />
-        <div className="row gap-sm">
-          <Chip active={filter === 'all'} onClick={() => setFilter('all')}>
-            全部
-          </Chip>
-          <Chip active={filter === 'on'} onClick={() => setFilter('on')}>
-            已连接
-          </Chip>
-          <Chip active={filter === 'off'} onClick={() => setFilter('off')}>
-            未连接
-          </Chip>
-        </div>
-        <div className="grow" />
-        <button className="btn btn--sm" onClick={onAdd}>
-          <Icon name="plus" /> 添加 MCP 服务器
-        </button>
-      </div>
-      {servers.length === 0 ? (
-        <EmptyState
-          icon="plug"
-          title="还没有配置 MCP 服务器"
-          hint="MCP 服务器为 Agent 提供数据库、浏览器等外部工具，保存后会同步写入各引擎的配置文件。"
-          action={{ label: '添加 MCP 服务器', onClick: onAdd }}
-        />
-      ) : rows.length === 0 ? (
-        <div className="empty">没有匹配的 MCP 服务器</div>
-      ) : (
-        <div className="xgrid">
-          {rows.map((server) => {
-            const serverTools = tools[server.name];
-            const connected = Boolean(serverTools) || server.status === 'connected';
-            const error = errors[server.name] || (connected ? undefined : server.lastError);
-            return (
-              <div key={server.name} className={'xcard' + (connected ? '' : ' is-off')}>
-                <div className="xcard__top">
-                  <span className="xcard__ic">
-                    <Icon name="plug" />
-                  </span>
-                  <div className="xcard__t">
-                    <b>{server.name}</b>
-                    <span className="sub">
-                      {server.transport} · {serverTools?.length ?? server.toolCount ?? '?'} 个工具
-                      {server.lastTestedAt
-                        ? ` · 上次测试 ${new Date(server.lastTestedAt * 1000).toLocaleString()}`
-                        : ''}
-                    </span>
-                  </div>
-                  {error ? <span className="pill pill--danger">连接失败</span> : null}
-                  {connected ? (
-                    <span className="pill pill--success">
-                      <span
-                        className="dot dot--on"
-                        style={{ width: 6, height: 6, boxShadow: 'none' }}
-                      />
-                      已连接
-                    </span>
-                  ) : null}
-                </div>
-                <div className="cmdurl">
-                  {server.command} {server.args.join(' ')}
-                </div>
-                {error ? <div className="xcard__desc">{String(error)}</div> : null}
-                <div className="xcard__foot xcard__actions">
-                  <button
-                    className="btn btn--sm"
-                    onClick={() => handleTest(server)}
-                    disabled={testing === server.name}
-                  >
-                    <Icon
-                      name={testing === server.name ? 'refresh' : 'zap'}
-                      className={testing === server.name ? 'spin' : undefined}
-                    />
-                    {testing === server.name ? '测试中...' : '测试连接'}
-                  </button>
-                  {serverTools ? (
-                    <button
-                      className="btn btn--sm btn--ghost"
-                      onClick={() =>
-                        setExpanded((prev) => ({ ...prev, [server.name]: !prev[server.name] }))
-                      }
-                    >
-                      <Icon name="terminal" /> 查看工具
-                    </button>
-                  ) : null}
-                  <button className="btn btn--sm btn--ghost" onClick={() => onEdit(server)}>
-                    <Icon name="edit" /> 编辑
-                  </button>
-                  <button className="btn btn--sm btn--danger" onClick={() => onDelete(server.name)}>
-                    <Icon name="x" /> 删除
-                  </button>
-                </div>
-                {expanded[server.name] && serverTools ? (
-                  <div className="xpanel open">
-                    <div className="toolchips">
-                      {serverTools.map((tool) => (
-                        <span key={tool.name} className="toolchip" title={tool.description}>
-                          {tool.name}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                ) : null}
-              </div>
-            );
-          })}
-        </div>
-      )}
-    </section>
-  );
-}
-
-function SubagentsTab({
-  subagents,
-  onAdd,
-  onEdit,
-  onDelete,
-  onToggleAuto,
-}: {
-  subagents: Subagent[];
-  onAdd: () => void;
-  onEdit: (subagent: Subagent) => void;
-  onDelete: (id: string, name: string) => void;
-  onToggleAuto: (subagent: Subagent, auto: boolean) => void;
-}) {
-  const [search, setSearch] = useState('');
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  const rows = subagents.filter((subagent) => {
-    const haystack =
-      `${subagent.id} ${subagent.name} ${subagent.role} ${subagent.model}`.toLowerCase();
-    return !search || haystack.includes(search.toLowerCase());
-  });
-
-  return (
-    <section>
-      <p className="faint" style={{ fontSize: 12.5, margin: '-2px 0 14px' }}>
-        <span className="pill">仅 Claude Code</span> 子代理是带独立系统提示、模型与工具白名单的专职
-        Agent。主 Agent 可在需要时自动委派，隔离上下文、并行处理。
-      </p>
-      <div className="toolbar">
-        <SearchBox placeholder="搜索子代理…" value={search} onChange={setSearch} />
-        <div className="grow" />
-        <button className="btn btn--sm" onClick={onAdd}>
-          <Icon name="plus" /> 新建子代理
-        </button>
-      </div>
-      {subagents.length === 0 ? (
-        <EmptyState
-          icon="bot"
-          title="还没有子代理"
-          hint="子代理是带独立提示词与工具限制的专职助手，保存后写入引擎的 agents 目录。"
-          action={{ label: '新建子代理', onClick: onAdd }}
-        />
-      ) : rows.length === 0 ? (
-        <div className="empty">没有匹配的子代理</div>
-      ) : (
-        <div className="xgrid">
-          {rows.map((subagent) => (
-            <div key={subagent.id} className="xcard">
-              <div className="xcard__top">
-                <span className="xcard__ic">
-                  <Icon name="bot" />
-                </span>
-                <div className="xcard__t">
-                  <b>{subagent.name || subagent.id}</b>
-                  <span className="sub">
-                    {subagent.id} · {subagent.model || '默认模型'}
-                  </span>
-                </div>
-                <Switch checked={subagent.auto} onChange={(auto) => onToggleAuto(subagent, auto)} />
-              </div>
-              <div className="xcard__desc">{subagent.role}</div>
-              <div className="xcard__foot xcard__actions">
-                <span className="pill">{subagent.tools || '未限制工具'}</span>
-                <span className="sep" />
-                <span>{subagent.auto ? '自动委派' : '手动调用'}</span>
-                <div className="grow" />
-                <button
-                  className="btn btn--sm btn--ghost"
-                  onClick={() =>
-                    setExpanded((prev) => ({ ...prev, [subagent.id]: !prev[subagent.id] }))
-                  }
-                >
-                  <Icon name="eye" /> 系统提示
-                </button>
-                <button className="btn btn--sm btn--ghost" onClick={() => onEdit(subagent)}>
-                  <Icon name="edit" /> 编辑
-                </button>
-                <button
-                  className="btn btn--sm btn--danger"
-                  onClick={() => onDelete(subagent.id, subagent.name || subagent.id)}
-                >
-                  <Icon name="x" /> 删除
-                </button>
-              </div>
-              {expanded[subagent.id] ? (
-                <div className="xpanel open">
-                  <div className="promptbox">{subagent.prompt}</div>
-                </div>
-              ) : null}
-            </div>
-          ))}
-        </div>
-      )}
-    </section>
-  );
-}
-
-function CommandsTab({
-  commands,
-  onAdd,
-  onEdit,
-  onDelete,
-  onToggle,
-}: {
-  commands: SlashCommand[];
-  onAdd: () => void;
-  onEdit: (command: SlashCommand) => void;
-  onDelete: (id: string, trigger: string) => void;
-  onToggle: (command: SlashCommand, enabled: boolean) => void;
-}) {
-  const [search, setSearch] = useState('');
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  const rows = commands.filter((command) => {
-    const haystack = `${command.trigger} ${command.description} ${command.body}`.toLowerCase();
-    return !search || haystack.includes(search.toLowerCase());
-  });
-
-  return (
-    <section>
-      <div className="toolbar">
-        <SearchBox placeholder="搜索命令…" value={search} onChange={setSearch} />
-        <div className="grow" />
-        <button className="btn btn--sm" onClick={onAdd}>
-          <Icon name="plus" /> 添加斜杠命令
-        </button>
-      </div>
-      {commands.length === 0 ? (
-        <EmptyState
-          icon="code"
-          title="还没有斜杠命令"
-          hint="斜杠命令是可复用的提示词模板，在工作区输入 / 即可唤起，保存后写入引擎的 commands 目录。"
-          action={{ label: '新建斜杠命令', onClick: onAdd }}
-        />
-      ) : rows.length === 0 ? (
-        <div className="empty">没有匹配的斜杠命令</div>
-      ) : (
-        <div className="xlist">
-          {rows.map((command) => {
-            const readOnly = command.source === 'builtin' || command.source === 'engine-user';
-            return (
-              <div key={command.id} className={'xli' + (expanded[command.id] ? ' open' : '')}>
-                <div
-                  className="xli__main"
-                  role="button"
-                  tabIndex={0}
-                  aria-expanded={Boolean(expanded[command.id])}
-                  aria-label={`展开斜杠命令 ${command.trigger}`}
-                  onClick={() =>
-                    setExpanded((prev) => ({ ...prev, [command.id]: !prev[command.id] }))
-                  }
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter' || event.key === ' ') {
-                      event.preventDefault();
-                      setExpanded((prev) => ({ ...prev, [command.id]: !prev[command.id] }));
-                    }
-                  }}
-                >
-                  <Icon name="right" className="caret" />
-                  <span className="xtrig">{command.trigger}</span>
-                  <span className="xli__desc">
-                    {command.description}
-                    {command.argumentHint ? (
-                      <span className="faint mono" style={{ marginLeft: 6 }}>
-                        {command.argumentHint}
-                      </span>
-                    ) : null}
-                  </span>
-                  <ScopePill scope={command.scope} />
-                  <EnginePill engine={command.engine} />
-                  <SourcePill source={command.source} />
-                  {readOnly ? null : (
-                    <>
-                      <span onClick={(event) => event.stopPropagation()}>
-                        <Switch
-                          checked={command.enabled}
-                          onChange={(enabled) => onToggle(command, enabled)}
-                        />
-                      </span>
-                      <button
-                        className="btn-icon sm"
-                        title="编辑"
-                        aria-label={`编辑斜杠命令 ${command.trigger}`}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          onEdit(command);
-                        }}
-                      >
-                        <Icon name="edit" />
-                      </button>
-                      <button
-                        className="btn-icon sm"
-                        title="删除"
-                        aria-label={`删除斜杠命令 ${command.trigger}`}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          onDelete(command.id, command.trigger);
-                        }}
-                      >
-                        <Icon name="x" />
-                      </button>
-                    </>
-                  )}
-                </div>
-                {expanded[command.id] ? (
-                  <div className="xli__exp xpanel open">
-                    <div className="promptbox">{command.body}</div>
-                  </div>
-                ) : null}
-              </div>
-            );
-          })}
-        </div>
-      )}
-      <p className="faint" style={{ fontSize: 12, marginTop: 12 }}>
-        在工作区输入框键入 <span className="mono">/</span>{' '}
-        即可唤起这些命令。命令本质是可复用的提示模板，支持参数占位。
-      </p>
-    </section>
-  );
-}
-
-function HooksTab({
-  hooks,
-  onAdd,
-  onEdit,
-  onDelete,
-  onToggle,
-}: {
-  hooks: Hook[];
-  onAdd: () => void;
-  onEdit: (hook: Hook) => void;
-  onDelete: (id: string, description: string) => void;
-  onToggle: (hook: Hook, enabled: boolean) => void;
-}) {
-  const [search, setSearch] = useState('');
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  const rows = hooks.filter((hook) => {
-    const haystack =
-      `${hook.event} ${hook.match} ${hook.command} ${hook.description}`.toLowerCase();
-    return !search || haystack.includes(search.toLowerCase());
-  });
-
-  return (
-    <section>
-      <p className="faint" style={{ fontSize: 12.5, margin: '-2px 0 14px' }}>
-        <span className="pill">仅 Claude Code</span> 钩子在引擎执行工具的特定时机触发 shell
-        命令——用于自动格式化、拦截危险命令、完成通知等。
-      </p>
-      <div className="toolbar">
-        <SearchBox placeholder="搜索钩子…" value={search} onChange={setSearch} />
-        <div className="grow" />
-        <button className="btn btn--sm" onClick={onAdd}>
-          <Icon name="plus" /> 新建钩子
-        </button>
-      </div>
-      {hooks.length === 0 ? (
-        <EmptyState
-          icon="zap"
-          title="还没有钩子"
-          hint="钩子在工具调用等事件发生时自动执行命令（如格式化、审计），保存后写入引擎设置。"
-          action={{ label: '新建钩子', onClick: onAdd }}
-        />
-      ) : rows.length === 0 ? (
-        <div className="empty">没有匹配的钩子</div>
-      ) : (
-        <div className="xlist">
-          {rows.map((hook) => (
-            <div key={hook.id} className={'xli' + (expanded[hook.id] ? ' open' : '')}>
-              <div
-                className="xli__main"
-                role="button"
-                tabIndex={0}
-                aria-expanded={Boolean(expanded[hook.id])}
-                aria-label={`展开钩子 ${hook.description || hook.command}`}
-                onClick={() => setExpanded((prev) => ({ ...prev, [hook.id]: !prev[hook.id] }))}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter' || event.key === ' ') {
-                    event.preventDefault();
-                    setExpanded((prev) => ({ ...prev, [hook.id]: !prev[hook.id] }));
-                  }
-                }}
-              >
-                <Icon name="right" className="caret" />
-                <span className={'xev ' + eventClass(hook.event)}>{hook.event}</span>
-                <span className="xli__desc">{hook.description || hook.command}</span>
-                <span className="xli__match">{hook.match}</span>
-                <span onClick={(event) => event.stopPropagation()}>
-                  <Switch checked={hook.enabled} onChange={(enabled) => onToggle(hook, enabled)} />
-                </span>
-                <button
-                  className="btn-icon sm"
-                  title="编辑"
-                  aria-label={`编辑钩子 ${hook.description || hook.command}`}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    onEdit(hook);
-                  }}
-                >
-                  <Icon name="edit" />
-                </button>
-                <button
-                  className="btn-icon sm"
-                  title="删除"
-                  aria-label={`删除钩子 ${hook.description || hook.command}`}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    onDelete(hook.id, hook.description);
-                  }}
-                >
-                  <Icon name="x" />
-                </button>
-              </div>
-              {expanded[hook.id] ? (
-                <div className="xli__exp xpanel open">
-                  <div className="promptbox">$ {hook.command}</div>
-                </div>
-              ) : null}
-            </div>
-          ))}
-        </div>
-      )}
-    </section>
-  );
-}
-
-function MarketplaceDialog({
-  projectDir,
-  modelOptions,
-  onInstalled,
-  onNotify,
-  onClose,
-  onUseMcp,
-  onUseSubagent,
-  onUseCommand,
-  onUseHook,
-}: {
-  projectDir: string;
-  modelOptions: string[];
-  onInstalled: () => void;
-  onNotify: (message: string) => void;
-  onClose: () => void;
-  onUseMcp: (draft: McpDraft) => void;
-  onUseSubagent: (draft: SubagentDraft) => void;
-  onUseCommand: (draft: CommandDraft) => void;
-  onUseHook: (draft: HookDraft) => void;
-}) {
-  const [query, setQuery] = useState('');
-  const [results, setResults] = useState<MarketSkill[]>([]);
-  const [searching, setSearching] = useState(false);
-  const [searched, setSearched] = useState(false);
-  const [installing, setInstalling] = useState<string | null>(null);
-  const [installScope, setInstallScope] = useState<'global' | 'project'>('global');
-
-  async function handleSearch() {
-    const keyword = query.trim();
-    if (!keyword) return;
-    setSearching(true);
-    try {
-      const skills = await marketSearchSkills(keyword);
-      setResults(skills.slice(0, 20));
-      setSearched(true);
-    } catch (err) {
-      console.error('搜索技能市场失败:', err);
-      onNotify(`搜索技能市场失败：${err}`);
-    } finally {
-      setSearching(false);
-    }
-  }
-
-  async function handleInstall(skill: MarketSkill) {
-    const key = `${skill.source}/${skill.skillId}`;
-    setInstalling(key);
-    try {
-      await marketInstallSkill(
-        skill.source,
-        skill.skillId,
-        installScope,
-        installScope === 'project' ? projectDir : undefined,
-      );
-      onNotify(`技能「${skill.name}」已安装到${installScope === 'global' ? '全局' : '项目'}`);
-      onInstalled();
-    } catch (err) {
-      console.error('安装技能失败:', err);
-      onNotify(`安装技能失败：${err}`);
-    } finally {
-      setInstalling(null);
-    }
-  }
-
-  const entries = [
-    {
-      kind: 'MCP 服务器',
-      title: 'Filesystem',
-      meta: 'Claude Code / Codex stdio',
-      desc: '本地目录读写与检索工具。',
-      action: () =>
-        onUseMcp({
-          name: 'filesystem',
-          transport: 'stdio',
-          command: 'npx',
-          args: '-y\n@modelcontextprotocol/server-filesystem\nD:\\work',
-          env: '',
-        }),
-    },
-    {
-      kind: 'MCP 服务器',
-      title: 'GitHub',
-      meta: 'Claude Code / Codex stdio',
-      desc: 'Issue、PR、代码搜索与仓库操作。',
-      action: () =>
-        onUseMcp({
-          name: 'github',
-          transport: 'stdio',
-          command: 'npx',
-          args: '-y\n@modelcontextprotocol/server-github',
-          env: 'GITHUB_PERSONAL_ACCESS_TOKEN=',
-        }),
-    },
-    {
-      kind: '子代理',
-      title: 'security-reviewer',
-      meta: '只读审查',
-      desc: '聚焦注入、越权与密钥泄露风险。',
-      action: () =>
-        onUseSubagent({
-          ...EMPTY_SUBAGENT,
-          id: 'security-reviewer',
-          name: '安全审查',
-          model: modelOptions[0] ?? '',
-          role: '审查改动中的注入、鉴权与密钥泄露风险。',
-          tools: 'Read,Grep,Glob',
-          prompt: '你是安全审查代理，聚焦 OWASP Top 10。按严重程度列出风险、证据与修复建议。',
-        }),
-    },
-    {
-      kind: '斜杠命令',
-      title: '/review',
-      meta: '全局命令',
-      desc: '审查当前改动并按严重程度输出问题。',
-      action: () =>
-        onUseCommand({
-          ...EMPTY_COMMAND,
-          id: 'review',
-          trigger: '/review',
-          description: '审查当前改动并按严重程度给出修复建议',
-          body: '审查 git diff 中的全部改动：\n1. 按 严重 / 一般 / 提示 三档列出问题\n2. 每条给出文件:行号与可执行的修复\n3. 标注潜在的安全与性能隐患',
-        }),
-    },
-    {
-      kind: '钩子',
-      title: 'format-before-write',
-      meta: 'PreToolUse',
-      desc: '写入文件前运行格式化命令。',
-      action: () =>
-        onUseHook({
-          ...EMPTY_HOOK,
-          id: 'format-before-write',
-          event: 'PreToolUse',
-          match: 'Edit|Write',
-          description: '写入文件前自动格式化',
-          command: 'prettier -w "$FILE"',
-        }),
-    },
-  ];
-
-  return (
-    <Dialog title="扩展市场" onClose={onClose}>
-      <div className="market-search" style={{ marginBottom: 14 }}>
-        <div className="row gap-sm" style={{ alignItems: 'center' }}>
-          <div className="search grow">
-            <Icon name="search" />
-            <input
-              placeholder="搜索 skills.sh 技能市场（如 review、docs、testing）…"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') void handleSearch();
-              }}
-            />
-          </div>
-          <select
-            className="select"
-            style={{ width: 120 }}
-            value={installScope}
-            onChange={(event) => setInstallScope(event.target.value as 'global' | 'project')}
-          >
-            <option value="global">装到全局</option>
-            <option value="project" disabled={!projectDir}>
-              装到项目
-            </option>
-          </select>
-          <button className="btn btn--sm" onClick={() => void handleSearch()} disabled={searching}>
-            {searching ? '搜索中…' : '搜索'}
-          </button>
-        </div>
-        {results.length > 0 ? (
-          <div className="market-list" style={{ marginTop: 10 }}>
-            {results.map((skill) => {
-              const key = `${skill.source}/${skill.skillId}`;
-              return (
-                <div key={key} className="market-row">
-                  <span className="xcard__ic">
-                    <Icon name="sparkles" />
-                  </span>
-                  <div className="market-row__main">
-                    <div className="row gap-sm">
-                      <b>{skill.name}</b>
-                      <span className="pill">技能</span>
-                      <span className="faint" style={{ fontSize: 12 }}>
-                        {skill.source} · {skill.installs.toLocaleString()} 次安装
-                      </span>
-                    </div>
-                  </div>
-                  <button
-                    className="btn btn--sm"
-                    onClick={() => void handleInstall(skill)}
-                    disabled={installing === key}
-                  >
-                    <Icon name="plus" /> {installing === key ? '安装中…' : '安装'}
-                  </button>
-                </div>
-              );
-            })}
-          </div>
-        ) : searched && !searching ? (
-          <p className="faint" style={{ fontSize: 12, marginTop: 8 }}>
-            没有匹配的技能，换个关键词试试。
-          </p>
-        ) : null}
-      </div>
-      <p className="faint" style={{ fontSize: 12, margin: '0 0 8px' }}>
-        精选模板
-      </p>
-      <div className="market-list">
-        {entries.map((entry) => (
-          <div key={`${entry.kind}-${entry.title}`} className="market-row">
-            <span className="xcard__ic">
-              <Icon
-                name={
-                  entry.kind === 'MCP 服务器'
-                    ? 'plug'
-                    : entry.kind === '子代理'
-                      ? 'bot'
-                      : entry.kind === '斜杠命令'
-                        ? 'code'
-                        : 'terminal'
-                }
-              />
-            </span>
-            <div className="market-row__main">
-              <div className="row gap-sm">
-                <b>{entry.title}</b>
-                <span className="pill">{entry.kind}</span>
-                <span className="faint" style={{ fontSize: 12 }}>
-                  {entry.meta}
-                </span>
-              </div>
-              <p>{entry.desc}</p>
-            </div>
-            <button className="btn btn--sm" onClick={entry.action}>
-              <Icon name="plus" /> 添加
-            </button>
-          </div>
-        ))}
-      </div>
-    </Dialog>
-  );
-}
-
-function McpDialog({
-  draft,
-  onChange,
-  onClose,
-  onSave,
-}: {
-  draft: McpDraft;
-  onChange: (draft: McpDraft) => void;
-  onClose: () => void;
-  onSave: (draft: McpDraft) => void;
-}) {
-  return (
-    <Dialog
-      title="MCP 服务器配置"
-      onClose={onClose}
-      footer={
-        <>
-          <button className="btn btn--ghost" onClick={onClose}>
-            取消
-          </button>
-          <button className="btn btn--primary" onClick={() => onSave(draft)}>
-            保存
-          </button>
-        </>
-      }
-    >
-      <div className="form-grid">
-        <Field label="名称">
-          <input
-            className="input"
-            value={draft.name}
-            onChange={(e) => onChange({ ...draft, name: e.target.value })}
-            placeholder="filesystem"
-          />
-        </Field>
-        <Field label="传输方式">
-          <div className="seg">
-            <button
-              className={draft.transport === 'stdio' ? 'is-active' : ''}
-              onClick={() => onChange({ ...draft, transport: 'stdio' })}
-            >
-              stdio
-            </button>
-            <button
-              className={draft.transport === 'sse' ? 'is-active' : ''}
-              onClick={() => onChange({ ...draft, transport: 'sse', args: '', env: '' })}
-            >
-              SSE
-            </button>
-            <button
-              className={draft.transport === 'http' ? 'is-active' : ''}
-              onClick={() => onChange({ ...draft, transport: 'http', args: '', env: '' })}
-            >
-              HTTP
-            </button>
-          </div>
-        </Field>
-        <Field
-          label={draft.transport === 'stdio' ? '命令' : `${draft.transport.toUpperCase()} URL`}
-        >
-          <input
-            className="input"
-            value={draft.command}
-            onChange={(e) => onChange({ ...draft, command: e.target.value })}
-            placeholder={
-              draft.transport === 'stdio'
-                ? 'npx'
-                : draft.transport === 'sse'
-                  ? 'http://127.0.0.1:3000/sse'
-                  : 'https://example.com/mcp'
-            }
-          />
-        </Field>
-        {draft.transport === 'stdio' ? (
-          <>
-            <Field label="参数（每行一个）">
-              <textarea
-                className="textarea mono"
-                rows={5}
-                value={draft.args}
-                onChange={(e) => onChange({ ...draft, args: e.target.value })}
-              />
-            </Field>
-            <Field label="环境变量（KEY=value，每行一个）">
-              <textarea
-                className="textarea mono"
-                rows={4}
-                value={draft.env}
-                onChange={(e) => onChange({ ...draft, env: e.target.value })}
-              />
-            </Field>
-          </>
-        ) : null}
-      </div>
-    </Dialog>
-  );
-}
-
-function SubagentDialog({
-  draft,
-  modelOptions,
-  projectAvailable,
-  onChange,
-  onClose,
-  onSave,
-}: {
-  draft: SubagentDraft;
-  modelOptions: string[];
-  projectAvailable: boolean;
-  onChange: (draft: SubagentDraft) => void;
-  onClose: () => void;
-  onSave: (draft: SubagentDraft) => void;
-}) {
-  return (
-    <Dialog
-      title="子代理配置"
-      onClose={onClose}
-      footer={
-        <>
-          <button className="btn btn--ghost" onClick={onClose}>
-            取消
-          </button>
-          <button className="btn btn--primary" onClick={() => onSave(draft)}>
-            保存
-          </button>
-        </>
-      }
-    >
-      <div className="form-grid two">
-        <Field label="ID">
-          <input
-            className="input mono"
-            value={draft.id}
-            onChange={(e) => onChange({ ...draft, id: e.target.value })}
-            placeholder="security-reviewer"
-          />
-        </Field>
-        <Field label="名称">
-          <input
-            className="input"
-            value={draft.name}
-            onChange={(e) => onChange({ ...draft, name: e.target.value })}
-            placeholder="安全审查"
-          />
-        </Field>
-        <Field label="模型">
-          <>
-            <input
-              className="input mono"
-              list="subagent-model-options"
-              value={draft.model}
-              onChange={(e) => onChange({ ...draft, model: e.target.value })}
-              placeholder="从模型目录选择或输入官方模型 ID"
-            />
-            <datalist id="subagent-model-options">
-              {modelOptions.map((model) => (
-                <option key={model} value={model} />
-              ))}
-            </datalist>
-          </>
-        </Field>
-        <Field label="作用域">
-          <select
-            className="select"
-            value={draft.scope}
-            onChange={(e) => onChange({ ...draft, scope: e.target.value as 'global' | 'project' })}
-          >
-            <option value="global">全局（~/.claude/agents）</option>
-            <option value="project" disabled={!projectAvailable}>
-              项目（.claude/agents）
-            </option>
-          </select>
-        </Field>
-        <Field label="工具白名单">
-          <input
-            className="input mono"
-            value={draft.tools}
-            onChange={(e) => onChange({ ...draft, tools: e.target.value })}
-          />
-        </Field>
-        <label className="check-row">
-          <input
-            type="checkbox"
-            checked={draft.auto}
-            onChange={(e) => onChange({ ...draft, auto: e.target.checked })}
-          />
-          <span>允许自动委派</span>
-        </label>
-        <Field label="职责">
-          <textarea
-            className="textarea"
-            rows={3}
-            value={draft.role}
-            onChange={(e) => onChange({ ...draft, role: e.target.value })}
-          />
-        </Field>
-        <Field label="系统提示">
-          <textarea
-            className="textarea mono"
-            rows={8}
-            value={draft.prompt}
-            onChange={(e) => onChange({ ...draft, prompt: e.target.value })}
-          />
-        </Field>
-      </div>
-    </Dialog>
-  );
-}
-
-function CommandDialog({
-  draft,
-  onChange,
-  onClose,
-  onSave,
-}: {
-  draft: CommandDraft;
-  onChange: (draft: CommandDraft) => void;
-  onClose: () => void;
-  onSave: (draft: CommandDraft) => void;
-}) {
-  return (
-    <Dialog
-      title="斜杠命令配置"
-      onClose={onClose}
-      footer={
-        <>
-          <button className="btn btn--ghost" onClick={onClose}>
-            取消
-          </button>
-          <button className="btn btn--primary" onClick={() => onSave(draft)}>
-            保存
-          </button>
-        </>
-      }
-    >
-      <div className="form-grid two">
-        <Field label="ID">
-          <input
-            className="input mono"
-            value={draft.id}
-            onChange={(e) => onChange({ ...draft, id: e.target.value })}
-            placeholder="review"
-          />
-        </Field>
-        <Field label="触发器">
-          <input
-            className="input mono"
-            value={draft.trigger}
-            onChange={(e) => onChange({ ...draft, trigger: e.target.value })}
-            placeholder="/review"
-          />
-        </Field>
-        <Field label="作用域">
-          <select
-            className="select"
-            value={draft.scope}
-            onChange={(e) => onChange({ ...draft, scope: e.target.value as 'global' | 'project' })}
-          >
-            <option value="global">全局</option>
-            <option value="project">项目</option>
-          </select>
-        </Field>
-        <Field label="适用引擎">
-          <select
-            className="select"
-            value={draft.engine}
-            onChange={(e) =>
-              onChange({
-                ...draft,
-                engine: e.target.value as 'all' | 'claude-code' | 'codex',
-              })
-            }
-          >
-            <option value="all">全部引擎</option>
-            <option value="claude-code">Claude Code</option>
-            <option value="codex">Codex</option>
-          </select>
-        </Field>
-        <Field label="参数提示">
-          <input
-            className="input mono"
-            value={draft.argumentHint ?? ''}
-            onChange={(e) => onChange({ ...draft, argumentHint: e.target.value })}
-            placeholder="[文件或目录]"
-          />
-        </Field>
-        <label className="check-row">
-          <input
-            type="checkbox"
-            checked={draft.enabled}
-            onChange={(e) => onChange({ ...draft, enabled: e.target.checked })}
-          />
-          <span>启用</span>
-        </label>
-        <Field label="说明">
-          <input
-            className="input"
-            value={draft.description}
-            onChange={(e) => onChange({ ...draft, description: e.target.value })}
-          />
-        </Field>
-        <Field label="模板">
-          <textarea
-            className="textarea mono"
-            rows={8}
-            value={draft.body}
-            onChange={(e) => onChange({ ...draft, body: e.target.value })}
-          />
-        </Field>
-      </div>
-    </Dialog>
-  );
-}
-
-function HookDialog({
-  draft,
-  projectAvailable,
-  onChange,
-  onClose,
-  onSave,
-}: {
-  draft: HookDraft;
-  projectAvailable: boolean;
-  onChange: (draft: HookDraft) => void;
-  onClose: () => void;
-  onSave: (draft: HookDraft) => void;
-}) {
-  return (
-    <Dialog
-      title="钩子配置"
-      onClose={onClose}
-      footer={
-        <>
-          <button className="btn btn--ghost" onClick={onClose}>
-            取消
-          </button>
-          <button className="btn btn--primary" onClick={() => onSave(draft)}>
-            保存
-          </button>
-        </>
-      }
-    >
-      <div className="form-grid two">
-        <Field label="ID">
-          <input
-            className="input mono"
-            value={draft.id}
-            onChange={(e) => onChange({ ...draft, id: e.target.value })}
-            placeholder="format-before-write"
-          />
-        </Field>
-        <Field label="事件">
-          <select
-            className="select"
-            value={draft.event}
-            onChange={(e) => onChange({ ...draft, event: e.target.value as Hook['event'] })}
-          >
-            {HOOK_EVENTS.map((event) => (
-              <option key={event} value={event}>
-                {event}
-              </option>
-            ))}
-          </select>
-        </Field>
-        <Field label="作用域">
-          <select
-            className="select"
-            value={draft.scope}
-            onChange={(e) => onChange({ ...draft, scope: e.target.value as 'global' | 'project' })}
-          >
-            <option value="global">全局（~/.claude/settings.json）</option>
-            <option value="project" disabled={!projectAvailable}>
-              项目（.claude/settings.json）
-            </option>
-          </select>
-        </Field>
-        <Field label="匹配规则">
-          <input
-            className="input mono"
-            value={draft.match}
-            onChange={(e) => onChange({ ...draft, match: e.target.value })}
-          />
-        </Field>
-        <label className="check-row">
-          <input
-            type="checkbox"
-            checked={draft.enabled}
-            onChange={(e) => onChange({ ...draft, enabled: e.target.checked })}
-          />
-          <span>启用</span>
-        </label>
-        <Field label="说明">
-          <input
-            className="input"
-            value={draft.description}
-            onChange={(e) => onChange({ ...draft, description: e.target.value })}
-          />
-        </Field>
-        <Field label="Shell 命令">
-          <textarea
-            className="textarea mono"
-            rows={6}
-            value={draft.command}
-            onChange={(e) => onChange({ ...draft, command: e.target.value })}
-          />
-        </Field>
-      </div>
-    </Dialog>
-  );
-}
-
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <label className="field">
-      <span>{label}</span>
-      {children}
-    </label>
   );
 }
 
@@ -1941,26 +586,29 @@ function SearchBox({
   placeholder,
   value,
   onChange,
+  wide,
 }: {
   placeholder: string;
   value: string;
   onChange: (value: string) => void;
+  wide?: boolean;
 }) {
   return (
-    <div className="search" style={{ width: 260 }}>
+    <label className={'cm-search' + (wide ? ' ex-search--wide' : '')}>
       <Icon name="search" />
       <input
-        placeholder={placeholder}
         value={value}
+        placeholder={placeholder}
+        aria-label={placeholder}
         onChange={(event) => onChange(event.target.value)}
       />
-    </div>
+    </label>
   );
 }
 
 function Switch({
   checked,
-  disabled = false,
+  disabled,
   title,
   onChange,
 }: {
@@ -1970,7 +618,7 @@ function Switch({
   onChange: (checked: boolean) => void;
 }) {
   return (
-    <label className="switch" title={title}>
+    <label className="cm-switch" title={title} onClick={(event) => event.stopPropagation()}>
       <input
         type="checkbox"
         checked={checked}
@@ -1982,114 +630,1511 @@ function Switch({
   );
 }
 
-function ScopePill({ scope }: { scope: 'global' | 'project' }) {
+/** 卡片来源小标签用原型的短文案；market 与 plugin 统一显示「外部」（2026-08-27 决议）。 */
+function sourceLabel(skill: Skill): string {
+  if (skill.source === 'builtin') return '内置';
+  if (skill.source === 'market' || skill.source === 'plugin') return '外部';
+  return '自己创建';
+}
+
+function canUninstall(skill: Skill): boolean {
+  return skill.source !== 'builtin' && skill.source !== 'plugin';
+}
+
+/** 连接器状态胶囊：视图模型 tone → 共享库 cm-status-pill 状态类。 */
+function statusPillClass(tone: 'ok' | 'error' | 'muted'): string {
+  if (tone === 'ok') return ' is-ready';
+  if (tone === 'error') return ' is-danger';
+  return '';
+}
+
+// ===== 技能 Tab =====
+
+function SkillsTab({
+  engine,
+  onEngineChange,
+  skills,
+  loading,
+  error,
+  search,
+  onSearchChange,
+  onRefresh,
+  onOpenSkill,
+  onCreate,
+  onMarket,
+}: {
+  engine: SkillEngine;
+  onEngineChange: (engine: SkillEngine) => void;
+  skills: Skill[];
+  loading: boolean;
+  error: string;
+  search: string;
+  onSearchChange: (value: string) => void;
+  onRefresh: () => void;
+  onOpenSkill: (skill: Skill) => void;
+  onCreate: () => void;
+  onMarket: () => void;
+}) {
+  const filtered = filterSkillsByQuery(skills, search);
+  const sections = groupSkillsBySource(filtered);
+
   return (
-    <span className={scope === 'global' ? 'pill pill--accent' : 'pill'}>
-      {scope === 'global' ? '全局' : '项目'}
+    <section aria-label="技能">
+      <div className="cm-toolbar">
+        <div className="cm-toolbar__left">
+          <div className="cm-segment ex-engine-seg" role="tablist" aria-label="技能引擎">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={engine === 'claude-code'}
+              className={engine === 'claude-code' ? 'is-active' : ''}
+              onClick={() => onEngineChange('claude-code')}
+            >
+              <EngineBrand engine="claude-code" size={14} /> Claude Code
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={engine === 'codex'}
+              className={engine === 'codex' ? 'is-active' : ''}
+              onClick={() => onEngineChange('codex')}
+            >
+              <EngineBrand engine="codex" size={14} /> Codex
+            </button>
+          </div>
+          <SearchBox placeholder="搜索技能" value={search} onChange={onSearchChange} wide />
+        </div>
+        <div className="cm-toolbar__right">
+          <button className="cm-action cm-action--primary" type="button" onClick={onMarket}>
+            <Icon name="upright" /> 从外部安装
+          </button>
+          <button className="cm-action" type="button" onClick={onCreate}>
+            <Icon name="plus" /> 创建技能
+          </button>
+        </div>
+      </div>
+
+      {loading ? (
+        <div className="empty">正在读取{engineLabel(engine)}技能…</div>
+      ) : error ? (
+        <LoadErrorBanner error={error} onRetry={onRefresh} />
+      ) : skills.length === 0 ? (
+        <EmptyState
+          icon="sparkles"
+          title={engineLabel(engine) + ' 还没有技能'}
+          hint="技能来自用户目录与项目目录的 skills 文件夹，也可以从市场安装现成的。"
+          action={{ label: '从外部安装', onClick: onMarket }}
+        />
+      ) : sections.length === 0 ? (
+        <div className="empty">没有匹配的技能，试试调整搜索条件</div>
+      ) : (
+        sections.map((section) => (
+          <section key={section.id} className="cm-section">
+            <div className="cm-section__head">
+              <div>
+                <h2>{section.title}</h2>
+                <p>{section.hint}</p>
+              </div>
+              <span className="cm-source-label">{section.skills.length}</span>
+            </div>
+            <div className="cm-skill-grid">
+              {section.skills.map((skill) => (
+                <SkillCard key={skill.id} skill={skill} engine={engine} onOpen={onOpenSkill} />
+              ))}
+            </div>
+          </section>
+        ))
+      )}
+    </section>
+  );
+}
+
+function SkillCard({
+  skill,
+  engine,
+  onOpen,
+}: {
+  skill: Skill;
+  engine: SkillEngine;
+  onOpen: (skill: Skill) => void;
+}) {
+  return (
+    // 卡片头对齐原型（品牌图标 + 来源标签）；启停入口已按 2026-08-27 反馈从卡片移除
+    <article
+      className={'cm-skill-card' + (skill.enabled ? '' : ' is-off')}
+      onClick={() => onOpen(skill)}
+    >
+      <div className="cm-skill-card__head">
+        <span className="cm-brand cm-brand--icon">
+          <Icon name={skillCardIcon(skill)} />
+        </span>
+        <span className="cm-source-label">{sourceLabel(skill)}</span>
+      </div>
+      <h3>{skill.name}</h3>
+      <p>{skill.description || '（无描述）'}</p>
+      <div className="cm-skill-card__foot">
+        <span className="mono">{triggerText(skill.trigger, engine) || '—'}</span>
+        <span>{skill.scope === 'project' ? '项目' : '全局'}</span>
+      </div>
+    </article>
+  );
+}
+
+function SkillDrawer({
+  skill,
+  engine,
+  source,
+  view,
+  onViewChange,
+  onClose,
+  onReveal,
+  onUninstall,
+}: {
+  skill: Skill;
+  engine: SkillEngine;
+  source: { state: 'loading' | 'ready' | 'error'; file?: SkillSourceFile; error?: string };
+  view: 'preview' | 'source';
+  onViewChange: (view: 'preview' | 'source') => void;
+  onClose: () => void;
+  onReveal: () => void;
+  onUninstall: () => void;
+}) {
+  return (
+    // 原型 #skillDrawer（extensions.html L749-L755）：cm-drawer 结构，React 条件挂载补 is-open
+    <div className="cm-drawer-backdrop is-open ex-drawer-backdrop" onClick={onClose}>
+      <aside
+        className="cm-drawer ex-drawer"
+        role="dialog"
+        aria-modal="true"
+        aria-label={skill.name}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="cm-drawer__head">
+          <div>
+            <h2>{skill.name}</h2>
+            <p>
+              {sourceLabel(skill)} · {engineLabel(engine)} ·{' '}
+              {skill.scope === 'project' ? '项目' : '全局'}
+            </p>
+          </div>
+          <button className="btn-icon" type="button" aria-label="关闭" onClick={onClose}>
+            <Icon name="x" />
+          </button>
+        </div>
+
+        <div className="cm-drawer__body">
+          <div className="cm-subtle-grid">
+            <div className="cm-subtle-stat">
+              <small>触发方式</small>
+              <b className="mono">{triggerText(skill.trigger, engine) || '—'}</b>
+            </div>
+            <div className="cm-subtle-stat">
+              <small>范围</small>
+              <b>{skill.scope === 'project' ? '项目' : '全局'}</b>
+            </div>
+            <div className="cm-subtle-stat">
+              <small>状态</small>
+              <b>
+                {skill.source === 'builtin' ? '内置 · 只读' : skill.enabled ? '已安装' : '已停用'}
+              </b>
+            </div>
+          </div>
+
+          <section className="cm-section">
+            <div className="cm-section__head ex-md-head">
+              <div>
+                <h2>SKILL.md</h2>
+              </div>
+              <div className="cm-segment ex-view-seg">
+                <button
+                  type="button"
+                  aria-pressed={view === 'preview'}
+                  className={view === 'preview' ? 'is-active' : ''}
+                  onClick={() => onViewChange('preview')}
+                >
+                  预览
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={view === 'source'}
+                  className={view === 'source' ? 'is-active' : ''}
+                  onClick={() => onViewChange('source')}
+                >
+                  源码
+                </button>
+              </div>
+            </div>
+            {source.state === 'loading' ? (
+              <div className="empty">正在读取技能文件…</div>
+            ) : source.state === 'error' ? (
+              <div className="empty">读取失败：{source.error}</div>
+            ) : source.file?.truncated ? (
+              <div className="empty">
+                文件超过 256 KiB，为避免卡顿未在软件内展示。可用「打开所在位置」查看原文。
+              </div>
+            ) : view === 'source' ? (
+              <div className="ex-code-source">
+                <pre>{source.file?.content}</pre>
+              </div>
+            ) : (
+              <MarkdownPreview content={source.file?.content ?? ''} />
+            )}
+          </section>
+        </div>
+
+        <div className="cm-panel__foot">
+          <span className="ex-foot-path mono" title={source.file?.path ?? skill.path}>
+            {source.file?.path ?? skill.path}
+          </span>
+          <button className="cm-action" type="button" onClick={onReveal}>
+            <Icon name="folderopen" /> 打开所在位置
+          </button>
+          {canUninstall(skill) ? (
+            <button className="cm-action" type="button" onClick={onUninstall}>
+              <Icon name="trash" /> 卸载
+            </button>
+          ) : null}
+        </div>
+      </aside>
+    </div>
+  );
+}
+
+/** 轻量 Markdown 预览：只做行级结构（标题/列表/段落），不注入 HTML，避免脚本风险。 */
+function MarkdownPreview({ content }: { content: string }) {
+  const blocks: ReactNode[] = [];
+  const lines = content.split('\n');
+  let list: string[] = [];
+  let ordered = false;
+
+  const flushList = () => {
+    if (list.length === 0) return;
+    const items = list.map((item, index) => <li key={index}>{item}</li>);
+    blocks.push(
+      ordered ? <ol key={blocks.length}>{items}</ol> : <ul key={blocks.length}>{items}</ul>,
+    );
+    list = [];
+  };
+
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    const heading = /^(#{1,4})\s+(.*)$/.exec(line);
+    const bullet = /^[-*]\s+(.*)$/.exec(line);
+    const numbered = /^\d+[.)]\s+(.*)$/.exec(line);
+    if (heading) {
+      flushList();
+      const level = heading[1].length;
+      const text = heading[2];
+      blocks.push(
+        level <= 1 ? (
+          <h3 key={blocks.length}>{text}</h3>
+        ) : level === 2 ? (
+          <h4 key={blocks.length}>{text}</h4>
+        ) : (
+          <b key={blocks.length} className="ex-preview-minor">
+            {text}
+          </b>
+        ),
+      );
+    } else if (bullet || numbered) {
+      const isOrdered = Boolean(numbered);
+      if (list.length > 0 && ordered !== isOrdered) flushList();
+      ordered = isOrdered;
+      list.push((numbered ?? bullet)![1]);
+    } else if (line.trim() === '') {
+      flushList();
+    } else {
+      flushList();
+      blocks.push(<p key={blocks.length}>{line}</p>);
+    }
+  }
+  flushList();
+
+  if (blocks.length === 0) {
+    return <div className="ex-skill-preview faint">（文件为空）</div>;
+  }
+  return <div className="ex-skill-preview">{blocks}</div>;
+}
+
+// ===== 创建技能 / 从外部安装 =====
+
+function CreateSkillDialog({
+  engine,
+  projectAvailable,
+  onClose,
+  onSubmit,
+}: {
+  engine: SkillEngine;
+  projectAvailable: boolean;
+  onClose: () => void;
+  onSubmit: (request: CreateSkillRequest) => Promise<void>;
+}) {
+  const [name, setName] = useState('');
+  const [slug, setSlug] = useState('');
+  // 标识跟随名称自动生成；用户改过之后不再覆盖
+  const [slugTouched, setSlugTouched] = useState(false);
+  const [scope, setScope] = useState<'global' | 'project'>('global');
+  const [description, setDescription] = useState('');
+  const [instructions, setInstructions] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const effectiveSlug = slugTouched ? slugifySkillName(slug) : slugifySkillName(name || slug);
+  const trigger = effectiveSlug
+    ? triggerText('/' + effectiveSlug, engine)
+    : engine === 'codex'
+      ? '$标识'
+      : '/标识';
+
+  return (
+    <Dialog
+      title="创建技能"
+      onClose={onClose}
+      footer={
+        <div className="ex-form-actions">
+          <button className="cm-action" type="button" onClick={onClose}>
+            取消
+          </button>
+          <button
+            className="cm-action cm-action--primary"
+            type="button"
+            disabled={busy || !name.trim() || !effectiveSlug}
+            onClick={() => {
+              setBusy(true);
+              void onSubmit({
+                engine,
+                scope,
+                id: effectiveSlug,
+                name: name.trim(),
+                description: description.trim(),
+                instructions,
+              }).finally(() => setBusy(false));
+            }}
+          >
+            {busy ? '创建中…' : '创建技能'}
+          </button>
+        </div>
+      }
+    >
+      {/* 原型 #createSkill（L759）：desc + 触发词预览 跟在标题后 */}
+      <p className="cm-pagehead__desc">保存为当前引擎的标准 SKILL.md。</p>
+      <p className="ex-trigger-preview">
+        {engineLabel(engine)} · 触发 {trigger}
+      </p>
+      <div className="cm-form ex-modal-form">
+        <div className="cm-field">
+          <label>名称</label>
+          <input
+            className="cm-input"
+            value={name}
+            placeholder="例如：发布检查"
+            onChange={(event) => setName(event.target.value)}
+          />
+        </div>
+        <div className="cm-field">
+          <label>标识</label>
+          <input
+            className="cm-input mono"
+            value={slugTouched ? slug : effectiveSlug}
+            placeholder="release-check"
+            onChange={(event) => {
+              setSlugTouched(true);
+              setSlug(event.target.value);
+            }}
+          />
+          <small>只能用小写字母、数字和连字符；会作为目录名，一般不用改。</small>
+        </div>
+        <div className="cm-field">
+          <label>范围</label>
+          <div className="cm-segment ex-scope-seg">
+            <button
+              type="button"
+              aria-pressed={scope === 'global'}
+              className={scope === 'global' ? 'is-active' : ''}
+              onClick={() => setScope('global')}
+            >
+              全局
+            </button>
+            <button
+              type="button"
+              aria-pressed={scope === 'project'}
+              disabled={!projectAvailable}
+              title={projectAvailable ? undefined : '先在设置里配置默认工作目录'}
+              className={scope === 'project' ? 'is-active' : ''}
+              onClick={() => setScope('project')}
+            >
+              当前项目
+            </button>
+          </div>
+          <small className="ex-scope-note">{skillScopeNote(engine, scope)}</small>
+        </div>
+        <div className="cm-field">
+          <label>一句话说明</label>
+          <textarea
+            className="cm-textarea"
+            rows={2}
+            value={description}
+            placeholder="执行项目发布前的版本、构建和产物核对。"
+            onChange={(event) => setDescription(event.target.value)}
+          />
+          <small>会出现在技能卡片和工作区的触发联想里。</small>
+        </div>
+        <div className="cm-field">
+          <label>技能指令</label>
+          <textarea
+            className="cm-textarea mono ex-skill-textarea"
+            rows={6}
+            value={instructions}
+            placeholder={
+              '用 Markdown 写给 Agent 的步骤。\n例如：\n1. 核对版本号与 changelog 是否一致\n2. 跑构建，确认产物可发布'
+            }
+            onChange={(event) => setInstructions(event.target.value)}
+          />
+        </div>
+      </div>
+    </Dialog>
+  );
+}
+
+function MarketDialog({
+  engine,
+  installedIds,
+  projectDir,
+  projectAvailable,
+  onClose,
+  onInstalled,
+  onNotify,
+  onViewInstalled,
+}: {
+  engine: SkillEngine;
+  installedIds: Set<string>;
+  projectDir: string;
+  projectAvailable: boolean;
+  onClose: () => void;
+  onInstalled: () => void | Promise<void>;
+  onNotify: (message: string) => void;
+  onViewInstalled: (skillId: string) => void;
+}) {
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState<MarketSkill[] | null>(null);
+  const [searching, setSearching] = useState(false);
+  const [hotMode, setHotMode] = useState(true);
+  const [installing, setInstalling] = useState<string | null>(null);
+  const [scope, setScope] = useState<'global' | 'project'>('global');
+
+  async function runSearch(keyword: string, hot = false) {
+    if (!keyword.trim()) {
+      onNotify('请输入搜索关键词，数据来自 skills.sh 公开目录');
+      return;
+    }
+    setSearching(true);
+    try {
+      setResults(await marketSearchSkills(keyword.trim()));
+      setHotMode(hot);
+    } catch (err) {
+      console.error('搜索技能市场失败:', err);
+      if (!hot) onNotify(`搜索技能市场失败：${err}`);
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  // 打开即拉取 skills.sh 实时热门（真实安装量数据，非本地伪造），按安装量排序展示。
+  useEffect(() => {
+    void runSearch('skill', true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const shown = results ? [...results].sort((a, b) => b.installs - a.installs) : null;
+
+  async function install(skill: MarketSkill) {
+    setInstalling(skill.skillId);
+    try {
+      await marketInstallSkill(
+        skill.source,
+        skill.skillId,
+        scope,
+        scope === 'project' ? projectDir || undefined : undefined,
+      );
+      onNotify(`已安装 ${skill.name} 到 ${engineLabel(engine)}`);
+      await onInstalled();
+    } catch (err) {
+      console.error('安装技能失败:', err);
+      onNotify(`安装技能失败：${err}`);
+    } finally {
+      setInstalling(null);
+    }
+  }
+
+  return (
+    <Dialog title="从外部安装" onClose={onClose}>
+      {/* 原型 #skillMarket（L757）：desc / 宽搜索 / 安装到范围 / 热门列表 */}
+      <p className="cm-pagehead__desc">安装到 {engineLabel(engine)} · 数据来自 skills.sh</p>
+      <div className="ex-market-bar">
+        <SearchBox
+          placeholder="搜索技能，例如 review、docs、testing"
+          value={query}
+          onChange={setQuery}
+          wide
+        />
+        {/* 搜索按钮为实现适配：skills.sh 需显式查询（2026-08-27 决议：保留） */}
+        <button
+          className="cm-action"
+          type="button"
+          disabled={searching}
+          onClick={() => void runSearch(query)}
+        >
+          搜索
+        </button>
+      </div>
+      <div className="cm-field">
+        <label>安装到</label>
+        <div className="cm-segment ex-scope-seg">
+          <button
+            type="button"
+            aria-pressed={scope === 'global'}
+            className={scope === 'global' ? 'is-active' : ''}
+            onClick={() => setScope('global')}
+          >
+            全局
+          </button>
+          <button
+            type="button"
+            aria-pressed={scope === 'project'}
+            disabled={!projectAvailable}
+            title={projectAvailable ? undefined : '先在设置里配置默认工作目录'}
+            className={scope === 'project' ? 'is-active' : ''}
+            onClick={() => setScope('project')}
+          >
+            当前项目
+          </button>
+        </div>
+        <small className="ex-scope-note">
+          只影响本次安装；当前项目写入工作目录的 .claude\skills（Codex 为 .codex\skills）。
+        </small>
+      </div>
+
+      <div className="cm-list">
+        {searching ? (
+          <div className="empty">正在搜索 skills.sh…</div>
+        ) : shown === null ? (
+          <p className="faint">
+            输入关键词搜索 skills.sh 的公开技能目录；安装会把 SKILL.md 写入本机技能文件夹。
+          </p>
+        ) : (
+          <>
+            <div className="cm-section__head ex-md-head">
+              <div>
+                <h2>{hotMode ? '全站热门' : '搜索结果'}</h2>
+                <p>
+                  {hotMode
+                    ? '按安装量排序 · 结果来自外部市场，不表示当前引擎专属兼容。'
+                    : '结果来自外部市场，不表示当前引擎专属兼容。'}
+                </p>
+              </div>
+            </div>
+            {shown.length === 0 ? (
+              <div className="empty">没有匹配的技能，换个关键词试试。</div>
+            ) : (
+              shown.map((skill) => {
+                const installed = installedIds.has(skill.skillId);
+                return (
+                  <div key={`${skill.source}/${skill.skillId}`} className="cm-list__row">
+                    <span className="cm-brand cm-brand--icon">
+                      <Icon name={marketRowIcon(skill.name)} />
+                    </span>
+                    <div className="cm-list__main">
+                      <b>{skill.name}</b>
+                      <small>
+                        {skill.source} · {skill.installs.toLocaleString()} 次安装
+                      </small>
+                      {skill.description ? (
+                        <p className="ex-market-desc">{skill.description}</p>
+                      ) : null}
+                    </div>
+                    {installed ? (
+                      <button
+                        type="button"
+                        className="cm-action"
+                        onClick={() => onViewInstalled(skill.skillId)}
+                      >
+                        已安装 · 查看
+                      </button>
+                    ) : (
+                      <button
+                        className="cm-action cm-action--primary"
+                        type="button"
+                        disabled={installing === skill.skillId}
+                        onClick={() => void install(skill)}
+                      >
+                        {installing === skill.skillId ? '安装中…' : '安装'}
+                      </button>
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </>
+        )}
+      </div>
+    </Dialog>
+  );
+}
+
+// ===== 连接器 Tab =====
+
+function ConnectorsTab({
+  servers,
+  featured,
+  loading,
+  error,
+  search,
+  onSearchChange,
+  testedTools,
+  onRefresh,
+  onToggle,
+  onAdd,
+  onAddTemplate,
+  onImport,
+  onOpenDrawer,
+  onOpenFeatured,
+  onInstallFeatured,
+  installingFeatured,
+}: {
+  servers: McpServer[];
+  featured: FeaturedCardState[];
+  loading: boolean;
+  error: string;
+  search: string;
+  onSearchChange: (value: string) => void;
+  testedTools: Record<string, McpTool[]>;
+  onRefresh: () => void;
+  onToggle: (server: McpServer, enabled: boolean) => Promise<void>;
+  onAdd: () => void;
+  onAddTemplate: (name: string) => void;
+  onImport: () => void;
+  onOpenDrawer: (name: string) => void;
+  onOpenFeatured: (template: FeaturedConnectorTemplate) => void;
+  onInstallFeatured: (template: FeaturedConnectorTemplate) => Promise<void>;
+  installingFeatured: string | null;
+}) {
+  const keyword = search.trim().toLowerCase();
+  const filteredServers = keyword
+    ? servers.filter((server) =>
+        `${server.name} ${transportLabel(server.transport)} ${server.command}`
+          .toLowerCase()
+          .includes(keyword),
+      )
+    : servers;
+
+  return (
+    <section aria-label="连接器">
+      <div className="cm-toolbar">
+        <div className="cm-toolbar__left">
+          <SearchBox placeholder="搜索连接器" value={search} onChange={onSearchChange} wide />
+        </div>
+        <div className="cm-toolbar__right">
+          <button className="cm-action cm-action--quiet" type="button" onClick={onImport}>
+            <Icon name="code" /> 导入 JSON
+          </button>
+          <button className="cm-action cm-action--primary" type="button" onClick={onAdd}>
+            <Icon name="plus" /> 添加连接器
+          </button>
+        </div>
+      </div>
+
+      {loading ? (
+        <div className="empty">正在读取连接器…</div>
+      ) : error ? (
+        <LoadErrorBanner error={error} onRetry={onRefresh} />
+      ) : (
+        <>
+          {featured.length > 0 ? (
+            <section className="cm-section">
+              <div className="cm-section__head">
+                <div>
+                  <h2>精选</h2>
+                  {/* 分区说明保留实现文案（2026-08-27 决议：②以实现为准） */}
+                  <p>常见连接器的安装模板；安装后会真实写入双引擎配置并检测连接。</p>
+                </div>
+                <span className="cm-source-label">{featured.length}</span>
+              </div>
+              <div className="cm-skill-grid">
+                {featured.map((state) => {
+                  const brandSrc = FEATURED_BRANDS[state.template.name.toLowerCase()];
+                  return (
+                    <article
+                      key={state.template.name}
+                      className="cm-market-card"
+                      onClick={() =>
+                        state.installed
+                          ? onOpenDrawer(state.template.name)
+                          : onOpenFeatured(state.template)
+                      }
+                    >
+                      <span className="cm-brand cm-brand--light">
+                        {brandSrc ? (
+                          <img src={brandSrc} alt="" />
+                        ) : (
+                          <Icon name={state.template.transport === 'http' ? 'shield' : 'plug'} />
+                        )}
+                      </span>
+                      <h3>{state.template.displayName ?? state.template.name}</h3>
+                      <p>{state.template.description}</p>
+                      <div className="cm-market-card__foot">
+                        <span className="cm-market-card__meta">
+                          {transportLabel(state.template.transport)}
+                        </span>
+                        {state.installed && state.enabled ? (
+                          <button
+                            className="cm-action"
+                            type="button"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              onOpenDrawer(state.template.name);
+                            }}
+                          >
+                            已启用
+                          </button>
+                        ) : state.installed ? (
+                          <button
+                            className="cm-action"
+                            type="button"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              onOpenDrawer(state.template.name);
+                            }}
+                          >
+                            已停用
+                          </button>
+                        ) : (state.template.envKeys?.length ?? 0) > 0 ? (
+                          <button
+                            className="cm-action cm-action--primary"
+                            type="button"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              onAddTemplate(state.template.name);
+                            }}
+                          >
+                            安装并配置
+                          </button>
+                        ) : (
+                          <button
+                            className="cm-action cm-action--primary"
+                            type="button"
+                            disabled={installingFeatured === state.template.name}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void onInstallFeatured(state.template);
+                            }}
+                          >
+                            {installingFeatured === state.template.name ? '安装中…' : '安装'}
+                          </button>
+                        )}
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+            </section>
+          ) : null}
+
+          {filteredServers.length > 0 || !keyword ? (
+            <section className="cm-section">
+              <div className="cm-section__head">
+                <div>
+                  <h2>已安装</h2>
+                  {/* 分区说明保留实现文案（2026-08-27 决议：②以实现为准） */}
+                  <p>开关 = 配置保留但不注入引擎；卸载在抽屉里。状态来自最近一次真实检测。</p>
+                </div>
+                <span className="cm-source-label">{filteredServers.length}</span>
+              </div>
+              {filteredServers.length === 0 ? (
+                <EmptyState
+                  icon="plug"
+                  title="还没有连接器"
+                  hint="从精选模板安装，或添加自定义 stdio / http 连接器；也可以粘贴 mcpServers JSON 批量导入。"
+                  action={{ label: '添加连接器', onClick: onAdd }}
+                />
+              ) : (
+                <div className="ex-mcp-card-grid">
+                  {filteredServers.map((server) => {
+                    const pill = server.enabled
+                      ? connectorStatusPill(server)
+                      : { label: '已停用', tone: 'muted' as const };
+                    const tools = testedTools[server.name];
+                    return (
+                      <article
+                        key={server.name}
+                        className={'ex-mcp-card' + (server.enabled ? '' : ' is-off')}
+                        onClick={() => onOpenDrawer(server.name)}
+                      >
+                        <div className="ex-mcp-card__top">
+                          <span className="cm-brand cm-brand--light">
+                            {FEATURED_BRANDS[server.name.toLowerCase()] ? (
+                              <img src={FEATURED_BRANDS[server.name.toLowerCase()]} alt="" />
+                            ) : (
+                              <Icon name={server.transport === 'http' ? 'shield' : 'terminal'} />
+                            )}
+                          </span>
+                          <div className="ex-mcp-card__main">
+                            <b>{server.name}</b>
+                            <span>
+                              {transportLabel(server.transport)} ·{' '}
+                              {tools?.length ?? server.toolCount ?? '?'} 个工具 ·{' '}
+                              {formatTestedAt(server.lastTestedAt) || '未检测'}
+                            </span>
+                          </div>
+                          <span className={'cm-status-pill' + statusPillClass(pill.tone)}>
+                            {pill.label}
+                          </span>
+                          <Switch
+                            checked={server.enabled}
+                            onChange={(enabled) => void onToggle(server, enabled)}
+                          />
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+          ) : null}
+        </>
+      )}
+    </section>
+  );
+}
+
+function ConnectorDrawer({
+  server,
+  featured,
+  tools,
+  testing,
+  onClose,
+  onTest,
+  onDelete,
+  onInstall,
+  onConfigure,
+  installingName,
+}: {
+  server?: McpServer;
+  featured?: FeaturedConnectorTemplate;
+  tools?: McpTool[];
+  testing?: boolean;
+  onClose: () => void;
+  onTest?: () => void;
+  onDelete?: () => void;
+  onInstall?: () => void;
+  onConfigure?: () => void;
+  installingName?: string | null;
+}) {
+  if (featured) {
+    const isHttp = featured.transport === 'http';
+    const needsConfig = (featured.envKeys?.length ?? 0) > 0;
+    const busy = installingName === featured.name;
+    return (
+      // 原型 #mcpDrawer（extensions.html L761）：精选态只有主操作按钮
+      <div className="cm-drawer-backdrop is-open ex-drawer-backdrop" onClick={onClose}>
+        <aside
+          className="cm-drawer ex-drawer"
+          role="dialog"
+          aria-modal="true"
+          aria-label={featured.displayName ?? featured.name}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <div className="cm-drawer__head">
+            <div>
+              <h2>{featured.displayName ?? featured.name}</h2>
+              <p>精选 · {transportLabel(featured.transport)}</p>
+            </div>
+            <button className="btn-icon" type="button" aria-label="关闭" onClick={onClose}>
+              <Icon name="x" />
+            </button>
+          </div>
+
+          <div className="cm-drawer__body">
+            <div className="cm-note">
+              <Icon name={isHttp ? 'shield' : 'terminal'} />
+              {isHttp ? (
+                <span>通过远程地址连接；请求头中的密钥进系统钥匙串，写操作仍走审批。</span>
+              ) : (
+                <span>在本机启动本地进程，不经过账号授权；进程能力仍由当前任务的权限控制。</span>
+              )}
+            </div>
+
+            <section className="cm-section">
+              <div className="cm-section__head">
+                <div>
+                  <h2>同步状态</h2>
+                  {/* 分区说明保留实现文案（2026-08-27 决议：②以实现为准） */}
+                  <p>Helm 一个定义同时写入双引擎；安装后默认启用并自动检测。</p>
+                </div>
+              </div>
+              <div className="cm-subtle-grid">
+                <div className="cm-subtle-stat">
+                  <small>定义范围</small>
+                  <b>Claude Code + Codex</b>
+                </div>
+                <div className="cm-subtle-stat">
+                  <small>注入状态</small>
+                  <b>安装后启用</b>
+                </div>
+                <div className="cm-subtle-stat">
+                  <small>最近检测</small>
+                  <b>未检测</b>
+                </div>
+              </div>
+            </section>
+
+            <section className="cm-section">
+              <div className="cm-section__head">
+                <div>
+                  <h2>工具列表</h2>
+                </div>
+              </div>
+              <p className="faint">安装并授权后可见。</p>
+            </section>
+          </div>
+
+          <div className="cm-panel__foot">
+            <span className="grow" />
+            <button
+              className="cm-action cm-action--primary"
+              type="button"
+              disabled={busy}
+              onClick={needsConfig ? onConfigure : onInstall}
+            >
+              {busy ? '安装中…' : needsConfig ? '安装并配置' : '安装并检测'}
+            </button>
+          </div>
+        </aside>
+      </div>
+    );
+  }
+  if (!server) return null;
+  const pill = connectorStatusPill(server);
+  return (
+    // 原型 #mcpDrawer（extensions.html L761）：已安装态 卸载/检测 + 状态胶囊；
+    // 「编辑」按钮按 2026-08-27 决议移除。
+    <div className="cm-drawer-backdrop is-open ex-drawer-backdrop" onClick={onClose}>
+      <aside
+        className="cm-drawer ex-drawer"
+        role="dialog"
+        aria-modal="true"
+        aria-label={server.name}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="cm-drawer__head">
+          <div>
+            <h2>{server.name}</h2>
+            <p>{transportLabel(server.transport)}</p>
+          </div>
+          <button className="btn-icon" type="button" aria-label="关闭" onClick={onClose}>
+            <Icon name="x" />
+          </button>
+        </div>
+
+        <div className="cm-drawer__body">
+          <div className="cm-note">
+            <Icon name={server.transport === 'http' ? 'shield' : 'terminal'} />
+            {server.transport === 'http' ? (
+              <span>
+                远程连接：配置同时保存到 Claude Code（含请求头）与 Codex（仅 URL，Codex
+                不支持自定义请求头）。
+              </span>
+            ) : (
+              <span>本地进程：连接时在本机启动命令行程序；写操作仍走会话审批。</span>
+            )}
+          </div>
+
+          <section className="cm-section">
+            <div className="cm-section__head">
+              <div>
+                <h2>同步状态</h2>
+                {/* 分区说明保留实现文案（2026-08-27 决议：②以实现为准） */}
+                <p>启用状态与最近一次检测分别核对。</p>
+              </div>
+            </div>
+            <div className="cm-subtle-grid">
+              <div className="cm-subtle-stat">
+                <small>定义范围</small>
+                <b>Claude Code + Codex</b>
+              </div>
+              <div className="cm-subtle-stat">
+                <small>注入状态</small>
+                <b>{server.enabled ? '已启用' : '已停用（配置保留）'}</b>
+              </div>
+              <div className="cm-subtle-stat">
+                <small>最近检测</small>
+                <b>{formatTestedAt(server.lastTestedAt) || '未检测'}</b>
+              </div>
+            </div>
+            {server.lastError ? (
+              <p className="ex-error-line">上次错误：{server.lastError}</p>
+            ) : null}
+          </section>
+
+          <section className="cm-section">
+            <div className="cm-section__head">
+              <div>
+                <h2>工具列表</h2>
+              </div>
+            </div>
+            {testing ? (
+              <p className="faint">正在获取工具列表…</p>
+            ) : tools ? (
+              tools.length === 0 ? (
+                <p className="faint">该连接器没有暴露任何工具。</p>
+              ) : (
+                <div className="ex-tool-list">
+                  {tools.map((tool) => (
+                    <div key={tool.name} className="ex-tool-row">
+                      <span className="ex-tool-dot" />
+                      <div className="ex-tool-main">
+                        <b className="mono">{tool.name}</b>
+                        {tool.description ? (
+                          <small title={tool.description}>{tool.description}</small>
+                        ) : null}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )
+            ) : (
+              <p className="faint">
+                {server.toolCount
+                  ? '上次检测到 ' + server.toolCount + ' 个工具；点「检测」获取本次会话的工具列表。'
+                  : '还没有本次会话内的检测结果；点「检测」获取真实工具列表。'}
+              </p>
+            )}
+          </section>
+        </div>
+
+        <div className="cm-panel__foot">
+          <span className={'cm-status-pill' + statusPillClass(pill.tone)}>{pill.label}</span>
+          <span className="grow" />
+          <button
+            className="cm-action"
+            type="button"
+            disabled={testing || !server.enabled}
+            title={server.enabled ? undefined : '已停用的连接器先启用再检测'}
+            onClick={onTest}
+          >
+            <Icon name="refresh" /> {testing ? '检测中…' : '检测'}
+          </button>
+          <button className="cm-action cm-action--danger" type="button" onClick={onDelete}>
+            <Icon name="trash" /> 卸载
+          </button>
+        </div>
+      </aside>
+    </div>
+  );
+}
+
+// ===== 添加 / 编辑连接器 =====
+
+function ConnectorDialog({
+  draft,
+  onChange,
+  onClose,
+  onSave,
+}: {
+  draft: McpDraft;
+  onChange: (draft: McpDraft) => void;
+  onClose: () => void;
+  onSave: (draft: McpDraft, autoTest: boolean) => Promise<void>;
+}) {
+  const [busy, setBusy] = useState(false);
+  const isHttp = draft.transport === 'http';
+
+  function updateTransport(transport: 'stdio' | 'http') {
+    onChange({ ...draft, transport });
+  }
+
+  return (
+    <Dialog
+      title="添加连接器"
+      onClose={onClose}
+      footer={
+        <div className="ex-form-actions">
+          <button className="cm-action" type="button" onClick={onClose}>
+            取消
+          </button>
+          <button
+            className="cm-action cm-action--primary"
+            type="button"
+            disabled={busy || !draft.name.trim() || !draft.command.trim()}
+            onClick={() => {
+              setBusy(true);
+              void onSave(draft, true).finally(() => setBusy(false));
+            }}
+          >
+            {busy ? '保存中…' : '保存并检测'}
+          </button>
+        </div>
+      }
+    >
+      {/* 原型 #customMcp（L763）：接入方式双卡 + 按传输切换字段 + 键值行分组表 */}
+      <p className="cm-pagehead__desc">保存后分别写入 Claude Code 与 Codex，默认双引擎同步。</p>
+      <div className="cm-form ex-modal-form">
+        <div className="cm-field">
+          <label>名称</label>
+          <input
+            className="cm-input mono"
+            value={draft.name}
+            placeholder="github"
+            onChange={(event) => onChange({ ...draft, name: event.target.value })}
+          />
+        </div>
+
+        <div className="cm-field">
+          <label>接入方式</label>
+          <div className="ex-type-grid">
+            <button
+              type="button"
+              aria-pressed={!isHttp}
+              className={'ex-type-card' + (!isHttp ? ' is-active' : '')}
+              onClick={() => updateTransport('stdio')}
+            >
+              <b>
+                <Icon name="terminal" />
+                本地进程
+              </b>
+              <small>
+                在本机启动一个命令行程序（对应 STDIO），适合 npx / node 启动的开源服务。
+              </small>
+            </button>
+            <button
+              type="button"
+              aria-pressed={isHttp}
+              className={'ex-type-card' + (isHttp ? ' is-active' : '')}
+              onClick={() => updateTransport('http')}
+            >
+              <b>
+                <Icon name="upright" />
+                远程地址
+              </b>
+              <small>连接一个 HTTPS 服务（对应 Streamable HTTP），无需本机安装依赖。</small>
+            </button>
+          </div>
+        </div>
+
+        {isHttp ? (
+          <div className="cm-field">
+            <label>服务地址</label>
+            <input
+              className="cm-input mono"
+              value={draft.command}
+              placeholder="https://example.com/mcp"
+              onChange={(event) => onChange({ ...draft, command: event.target.value })}
+            />
+            {draft.command.trim() &&
+            !draft.command.trim().startsWith('http://') &&
+            !draft.command.trim().startsWith('https://') ? (
+              <small className="ex-error-line">远程地址必须以 http:// 或 https:// 开头</small>
+            ) : null}
+          </div>
+        ) : (
+          <div className="cm-field">
+            <label>启动命令</label>
+            <input
+              className="cm-input mono"
+              value={draft.command}
+              placeholder="npx"
+              onChange={(event) => onChange({ ...draft, command: event.target.value })}
+            />
+            <small>只填可执行文件本身；参数写在下面。</small>
+          </div>
+        )}
+
+        {!isHttp ? (
+          <div className="cm-field">
+            <label>参数（每行一个）</label>
+            <textarea
+              className="cm-textarea mono"
+              rows={3}
+              value={draft.args}
+              placeholder={'-y\n@modelcontextprotocol/server-github'}
+              onChange={(event) => onChange({ ...draft, args: event.target.value })}
+            />
+          </div>
+        ) : null}
+
+        {!isHttp ? (
+          <EnvRowsField
+            label="环境变量（可选）"
+            rows={draft.envRows}
+            onRowsChange={(envRows) => onChange({ ...draft, envRows })}
+            keyPlaceholder="API_KEY"
+            valuePlaceholder="值 · 存入系统钥匙串"
+            addLabel="添加环境变量"
+          />
+        ) : (
+          <EnvRowsField
+            label="请求头（可选）"
+            rows={draft.headerRows}
+            onRowsChange={(headerRows) => onChange({ ...draft, headerRows })}
+            keyPlaceholder="Authorization"
+            valuePlaceholder="Bearer … · 存入系统钥匙串"
+            addLabel="添加请求头"
+            hint="凭证进系统钥匙串；远程连接器不需要环境变量。"
+          />
+        )}
+
+        <p className="ex-keynote">
+          <Icon name="key" />
+          凭证类字段（TOKEN / KEY / SECRET
+          等）的值会写入系统钥匙串用于回填与清理；同时按引擎原生格式同步到本机引擎配置文件供 CLI
+          启动连接器进程。不进入 Helm 数据库、日志或导出包。
+        </p>
+      </div>
+    </Dialog>
+  );
+}
+
+function EnvRowsField({
+  label,
+  rows,
+  onRowsChange,
+  keyPlaceholder = '变量名，如 API_TOKEN',
+  valuePlaceholder = '值',
+  addLabel = '添加一行',
+  hint,
+}: {
+  label: string;
+  rows: EnvRow[];
+  onRowsChange: (rows: EnvRow[]) => void;
+  keyPlaceholder?: string;
+  valuePlaceholder?: string;
+  addLabel?: string;
+  hint?: string;
+}) {
+  function updateRow(index: number, patch: Partial<EnvRow>) {
+    onRowsChange(rows.map((row, i) => (i === index ? { ...row, ...patch } : row)));
+  }
+
+  return (
+    <div className="cm-field">
+      <label>{label}</label>
+      <div className="ex-env">
+        {rows.map((row, index) => {
+          const credential = isCredentialKey(row.key);
+          return (
+            <div key={index} className="ex-env__row">
+              <input
+                className="cm-input mono"
+                value={row.key}
+                placeholder={keyPlaceholder}
+                aria-label="名称"
+                onChange={(event) => updateRow(index, { key: event.target.value })}
+              />
+              <SecretInput
+                value={row.value}
+                credential={credential}
+                placeholder={valuePlaceholder}
+                onChange={(value) => updateRow(index, { value })}
+              />
+              <button
+                type="button"
+                className="btn-icon sm"
+                aria-label="删除此行"
+                onClick={() =>
+                  onRowsChange(
+                    rows.length === 1
+                      ? [{ key: '', value: '' }]
+                      : rows.filter((_, i) => i !== index),
+                  )
+                }
+              >
+                <Icon name="x" />
+              </button>
+            </div>
+          );
+        })}
+        <button
+          type="button"
+          className="ex-env__add"
+          onClick={() => onRowsChange([...rows, { key: '', value: '' }])}
+        >
+          <Icon name="plus" /> {addLabel}
+        </button>
+      </div>
+      {hint ? <small>{hint}</small> : null}
+    </div>
+  );
+}
+
+function SecretInput({
+  value,
+  credential,
+  placeholder,
+  onChange,
+}: {
+  value: string;
+  credential: boolean;
+  placeholder?: string;
+  onChange: (value: string) => void;
+}) {
+  const [revealed, setRevealed] = useState(false);
+  return (
+    <span className="ex-secret">
+      <input
+        type={revealed ? 'text' : 'password'}
+        value={value}
+        placeholder={placeholder ?? (credential ? '值 · 存入系统钥匙串' : '值')}
+        aria-label="值"
+        autoComplete="off"
+        onChange={(event) => onChange(event.target.value)}
+      />
+      <button
+        type="button"
+        className="btn-icon"
+        aria-label={revealed ? '隐藏值' : '显示值'}
+        onClick={() => setRevealed((prev) => !prev)}
+      >
+        <Icon name={revealed ? 'eyeoff' : 'eye'} />
+      </button>
     </span>
   );
 }
 
-function EnginePill({ engine }: { engine: SlashCommand['engine'] }) {
-  const label =
-    engine === 'claude-code' ? 'Claude Code' : engine === 'codex' ? 'Codex' : '全部引擎';
-  return <span className="pill">{label}</span>;
-}
+// ===== JSON 导入 =====
 
-function SourcePill({ source }: { source: SlashCommand['source'] }) {
-  const label =
-    source === 'extension'
-      ? '扩展中心'
-      : source === 'engine-project'
-        ? '项目'
-        : source === 'engine-user'
-          ? '引擎'
-          : '内置';
+function ImportDialog({
+  onClose,
+  onNotify,
+  onChanged,
+}: {
+  onClose: () => void;
+  onNotify: (message: string) => void;
+  onChanged: () => void | Promise<void>;
+}) {
+  const [json, setJson] = useState('');
+  const [results, setResults] = useState<McpImportItemResult[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [retrying, setRetrying] = useState<string | null>(null);
+  const rows: ImportResultRow[] = results ? importResultRows(results) : [];
+
+  async function runImport() {
+    if (!json.trim()) {
+      onNotify('请先粘贴 mcpServers JSON');
+      return;
+    }
+    setBusy(true);
+    try {
+      setResults(await importMcpServers(json));
+      await onChanged();
+    } catch (err) {
+      console.error('导入连接器失败:', err);
+      onNotify(`导入失败：${err}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function retry(row: ImportResultRow) {
+    const original = results?.find(
+      (item) => item.name === row.name && item.status === 'failed' && item.server,
+    );
+    if (!original?.server) return;
+    setRetrying(row.name);
+    try {
+      await saveMcpServer(original.server);
+      setResults((prev) =>
+        (prev ?? []).map((item) =>
+          item.name === row.name ? { ...item, status: 'imported', message: null } : item,
+        ),
+      );
+      onNotify(`${row.name} 已重试写入`);
+      await onChanged();
+    } catch (err) {
+      console.error('重试导入失败:', err);
+      onNotify(`重试失败：${err}`);
+    } finally {
+      setRetrying(null);
+    }
+  }
+
   return (
-    <span className="pill" title={source === 'extension' ? undefined : '引擎原生/内置命令，只读'}>
-      {label}
-    </span>
+    <Dialog
+      title="从 JSON 导入连接器"
+      onClose={onClose}
+      footer={
+        <div className="ex-form-actions">
+          <button className="cm-action" type="button" onClick={onClose}>
+            取消
+          </button>
+          <button
+            className="cm-action cm-action--primary"
+            type="button"
+            disabled={busy}
+            onClick={() => void runImport()}
+          >
+            {busy ? '导入中…' : '导入并检测'}
+          </button>
+        </div>
+      }
+    >
+      {/* 原型 #importMcp（L764）：说明 + mono 大文本域 */}
+      <p className="cm-pagehead__desc">
+        粘贴 Claude Code 的 mcpServers 配置；Helm 会逐项写入双引擎并转换成 Codex
+        TOML。一次可导入多个；type=sse 会跳过并在结果里说明。
+      </p>
+      <textarea
+        className="cm-textarea mono ex-import-textarea"
+        rows={10}
+        value={json}
+        spellCheck={false}
+        placeholder={
+          '{\n  "mcpServers": {\n    "context7": { "type": "http", "url": "https://mcp.context7.com/mcp" }\n  }\n}'
+        }
+        onChange={(event) => setJson(event.target.value)}
+      />
+
+      {results ? (
+        <div className="ex-result-list" aria-live="polite">
+          {rows.length === 0 ? (
+            <div className="empty">没有解析到任何条目。</div>
+          ) : (
+            rows.map((row) => (
+              <div
+                key={row.name || row.message}
+                className={`ex-result-row ex-result-row--${row.status}`}
+              >
+                <Icon
+                  name={
+                    row.status === 'imported'
+                      ? 'checkc'
+                      : row.status === 'skipped'
+                        ? 'info'
+                        : 'alert'
+                  }
+                />
+                <div className="ex-result-row__main">
+                  <b>{row.name}</b>
+                  <span>
+                    {row.status === 'imported' && row.credentialKeys.length > 0
+                      ? `已写入双引擎 · 凭证 ${row.credentialKeys.join('、')} 已存入系统钥匙串`
+                      : row.status === 'imported'
+                        ? '已写入双引擎'
+                        : row.message}
+                  </span>
+                </div>
+                {row.canRetry ? (
+                  <button
+                    className="cm-action"
+                    type="button"
+                    disabled={retrying === row.name}
+                    onClick={() => void retry(row)}
+                  >
+                    {retrying === row.name ? '重试中…' : '重试'}
+                  </button>
+                ) : null}
+              </div>
+            ))
+          )}
+        </div>
+      ) : null}
+    </Dialog>
   );
-}
-
-function eventClass(event: Hook['event']) {
-  if (event === 'PreToolUse') return 'xev--pre';
-  if (event === 'PostToolUse') return 'xev--post';
-  return 'xev--other';
-}
-
-function splitLines(value: string) {
-  return value
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-}
-
-function parseEnv(value: string) {
-  return splitLines(value).reduce<Record<string, string>>((env, line) => {
-    const index = line.indexOf('=');
-    if (index <= 0) return env;
-    env[line.slice(0, index).trim()] = line.slice(index + 1).trim();
-    return env;
-  }, {});
-}
-
-function envToLines(env: Record<string, string>) {
-  return Object.entries(env)
-    .map(([key, value]) => `${key}=${value}`)
-    .join('\n');
-}
-
-function mcpDraftToServer(draft: McpDraft): McpServer {
-  return {
-    name: draft.name.trim(),
-    command: draft.command.trim(),
-    args: draft.transport === 'stdio' ? splitLines(draft.args) : [],
-    env: draft.transport === 'stdio' ? parseEnv(draft.env) : {},
-    transport: draft.transport,
-    enabled: true,
-    status: 'disconnected',
-  };
-}
-
-function mcpServerToDraft(server: McpServer): McpDraft {
-  return {
-    name: server.name,
-    transport: server.transport,
-    command: server.command,
-    args: server.args.join('\n'),
-    env: envToLines(server.env),
-  };
-}
-
-function draftToSubagent(draft: SubagentDraft): Subagent {
-  return { ...draft, id: draft.id.trim(), name: draft.name.trim() || draft.id.trim() };
-}
-
-function subagentToDraft(subagent: Subagent): SubagentDraft {
-  return { ...subagent };
-}
-
-function draftToCommand(draft: CommandDraft): SlashCommand {
-  return {
-    ...draft,
-    id: draft.id.trim(),
-    trigger: draft.trigger.trim().startsWith('/')
-      ? draft.trigger.trim()
-      : `/${draft.trigger.trim()}`,
-    source: 'extension',
-    argumentHint: draft.argumentHint?.trim() || null,
-  };
-}
-
-function commandToDraft(command: SlashCommand): CommandDraft {
-  return { ...command, argumentHint: command.argumentHint ?? '' };
-}
-
-function draftToHook(draft: HookDraft): Hook {
-  return { ...draft, id: draft.id.trim() };
-}
-
-function hookToDraft(hook: Hook): HookDraft {
-  return { ...hook };
 }

@@ -3,12 +3,19 @@ import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   resolve: {
-    alias: {
-      '@helm/protocol': fileURLToPath(new URL('./packages/protocol/src/index.ts', import.meta.url)),
-      '@helm/engine-claude-code': fileURLToPath(
-        new URL('./packages/engine-claude-code/src/index.ts', import.meta.url),
-      ),
-    },
+    alias: [
+      {
+        find: '@helm/protocol',
+        replacement: fileURLToPath(new URL('./packages/protocol/src/index.ts', import.meta.url)),
+      },
+      {
+        find: '@helm/engine-claude-code',
+        replacement: fileURLToPath(
+          new URL('./packages/engine-claude-code/src/index.ts', import.meta.url),
+        ),
+      },
+      { find: /^@\/(.*)/, replacement: fileURLToPath(new URL('./src/$1', import.meta.url)) },
+    ],
   },
   test: {
     fileParallelism: false,

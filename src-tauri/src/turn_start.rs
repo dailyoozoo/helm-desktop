@@ -161,6 +161,18 @@ pub fn build_runtime_route(
         .iter()
         .find(|provider| provider.id == binding.provider_id)
         .ok_or_else(|| format!("找不到绑定服务商：{}", binding.provider_id))?;
+    // 方案 b（用户裁决）：绑定可选角色（role:键），启动时解析为角色对应的模型；
+    // 运行中的 Turn 已冻结解析结果，角色映射变更只影响后续发送。
+    let model_id = match model_id.strip_prefix("role:") {
+        Some(role_key) => provider
+            .role_models
+            .as_ref()
+            .and_then(|role_models| role_models.get(role_key))
+            .map(|model| model.as_str())
+            .filter(|model| !model.trim().is_empty())
+            .ok_or_else(|| format!("角色 {role_key} 未配置对应模型，请在服务商详情中补全"))?,
+        None => model_id,
+    };
     let model_label = config
         .models
         .iter()
@@ -286,6 +298,8 @@ mod tests {
             fast_model: None,
             assistant_model_id: None,
             reasoning_effort: None,
+            thinking_enabled: None,
+            context_1m: None,
             revision: 7,
         };
         let spec = BindingLiveRouteResolver::resolve(
@@ -333,6 +347,8 @@ mod tests {
             fast_model: None,
             assistant_model_id: None,
             reasoning_effort: None,
+            thinking_enabled: None,
+            context_1m: None,
             revision: 1,
         };
         let provider = ProviderConfig {
@@ -345,6 +361,9 @@ mod tests {
             last_test: None,
             protocol: Protocol::OpenAiResponses,
             auth_method: AuthMethod::ApiKey,
+            access_type: None,
+            role_models: None,
+            last_sync_at: None,
         };
         let first = provider_launch_profile_digest(&binding, &provider).unwrap();
         let mut changed = provider.clone();
@@ -370,6 +389,8 @@ mod tests {
             fast_model: None,
             assistant_model_id: None,
             reasoning_effort: None,
+            thinking_enabled: None,
+            context_1m: None,
             revision: 1,
         };
         let provider = ProviderConfig {
@@ -382,6 +403,9 @@ mod tests {
             last_test: None,
             protocol: Protocol::OpenAiResponses,
             auth_method: AuthMethod::OAuth,
+            access_type: None,
+            role_models: None,
+            last_sync_at: None,
         };
         let first = provider_launch_profile_digest(&binding, &provider).unwrap();
         let mut changed = provider.clone();

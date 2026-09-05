@@ -114,18 +114,14 @@ fn safe_effort(value: &str) -> Option<ReasoningEffort> {
 
 fn claude_model_supports_effort(model: &str) -> bool {
     let normalized = model.trim().to_ascii_lowercase().replace('.', "-");
+    // 2026-08-27 用户裁决：档位跟随 Agent（引擎）——按模型家族放行（opus/sonnet/fable
+    // 才有 --effort，haiku 没有），不再维护逐版本白名单；CLI 是否真带 --effort 仍由
+    // --help 实测兜底（claude_reasoning_capability），日期后缀（如 -20250929）不再漏判。
     matches!(normalized.as_str(), "opus" | "sonnet" | "fable")
-        || [
-            "claude-opus-4-6",
-            "claude-opus-4-7",
-            "claude-opus-4-8",
-            "claude-opus-5",
-            "claude-sonnet-4-6",
-            "claude-sonnet-5",
-            "claude-fable-5",
-        ]
-        .iter()
-        .any(|prefix| normalized == *prefix || normalized.starts_with(&format!("{prefix}-")))
+        || normalized.starts_with("claude-opus")
+        || normalized.starts_with("claude-sonnet")
+        || normalized.starts_with("claude-fable")
+        || normalized.starts_with("fable")
 }
 
 pub fn claude_reasoning_capability(model: &str, help: &str) -> ReasoningEffortCapability {
@@ -228,6 +224,23 @@ mod tests {
             claude_cli_effort_args(ReasoningEffort::High),
             vec!["--effort", "high"]
         );
+    }
+
+    #[test]
+    fn claude_effort_gate_follows_model_family_not_point_versions() {
+        for model in [
+            "claude-sonnet-4.6",
+            "claude-sonnet-4-5-20250929",
+            "claude-opus-4-6",
+            "claude-fable-5",
+            "sonnet",
+            "opus",
+        ] {
+            assert!(claude_model_supports_effort(model), "{model}");
+        }
+        for model in ["claude-3-5-haiku-20241022", "claude-haiku-4-5", "glm-4.6"] {
+            assert!(!claude_model_supports_effort(model), "{model}");
+        }
     }
 
     #[test]

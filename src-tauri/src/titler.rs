@@ -85,6 +85,12 @@ async fn generate_title(app: &AppHandle, history_session_id: &str) -> Result<(),
         crate::protocol::EngineId::ClaudeCode => "claude-code",
         crate::protocol::EngineId::Codex => "codex",
     };
+    // Codex 当前没有可证明的原生 no-tools 合同（变更-27I：投递前阻断），自动标题
+    // 无法经真实 CLI 运行；提前跳过，不再跑完整路由/能力探测后才知道不可用。
+    if engine_id == "codex" {
+        eprintln!("[titler] 会话 {history_session_id} 跳过自动起标题：Codex 无 no-tools 合同");
+        return Ok(());
+    }
     let mut committed = None;
     for _ in 0..3 {
         let candidate = provider_store.route_candidate()?;

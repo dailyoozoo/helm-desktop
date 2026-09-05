@@ -15,8 +15,9 @@ use crate::codex_app_server::{
 use crate::parse::parse_claude_line;
 use crate::permission_service::{PermissionService, PermissionSessionContext};
 use crate::protocol::{
-    AgentEvent, ApprovalDecisionOption, CallStatus, Diff, DiffHunk, DiffKind, DiffLine, EngineId,
-    PlanStatus, PlanStep, Role, RuntimeCapabilityAvailability, StopReason, ToolStatus, TurnStage,
+    AgentEvent, ApprovalDecisionOption, CallStatus, ContextCompactionStatus, Diff, DiffHunk,
+    DiffKind, DiffLine, EngineId, PlanStatus, PlanStep, Role, RuntimeCapabilityAvailability,
+    StopReason, ToolStatus, TurnStage,
 };
 use crate::reasoning::ReasoningEffort;
 use crate::sessions::SessionHistoryStore;
@@ -30,7 +31,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -42,6 +43,12 @@ const CODEX_INTERRUPT_RPC_GRACE: Duration = Duration::from_millis(500);
 const CODEX_INTERRUPT_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const RUNTIME_TOOL_STALLED_AFTER: Duration = Duration::from_secs(60);
 const CODEX_SEARCH_CATALOG_FILE: &str = ".helm-model-catalog.json";
+/// 落盘 Profile 目录的「静态文件全量校验通过」标记（内容=当时 revision）。
+/// A 方案第二道省：标记命中即跳过 prompts/skills 455 文件的读回比对（实测 10s+）。
+/// 信任边界：skills/prompts 镜像自用户自己的 ~/.codex（能改写 APPDATA 者同样能改
+/// ~/.codex，不构成额外攻击面）；真正的安全敏感文件——engine-config.toml（脱敏
+/// 路由）、config.toml（Runtime 校验）、清单与 auth.json（密钥检测）——仍然每次强校验。
+const CODEX_PROFILE_STATIC_VERIFIED_FILE: &str = ".helm-static-verified";
 const CODEX_SEARCH_CATALOG_JSON_ENV: &str = "HELM_CODEX_MODEL_CATALOG_JSON";
 const CODEX_SEARCH_CATALOG_DIGEST_ENV: &str = "HELM_CODEX_MODEL_CATALOG_DIGEST";
 #[cfg(target_os = "windows")]
@@ -333,20 +340,14 @@ pub fn codex_sandbox_for_mode(settings_sandbox: &str, mode: TurnMode) -> Result<
     }
 }
 
-pub fn agent_environment_from_settings(settings: &AppSettings) -> Vec<(String, String)> {
-    let mut env = vec![(
-        "HELM_ANONYMOUS_ANALYTICS".to_string(),
-        if settings.general.anonymous_analytics {
-            "1".to_string()
-        } else {
-            "0".to_string()
-        },
-    )];
-    if !settings.general.anonymous_analytics {
-        env.push(("DO_NOT_TRACK".to_string(), "1".to_string()));
-        env.push(("HELM_TELEMETRY_DISABLED".to_string(), "1".to_string()));
-    }
-    env
+pub fn agent_environment_from_settings(_settings: &AppSettings) -> Vec<(String, String)> {
+    // 匿名分析开关已按原型移除（决策记录 §8.2.7「不提供匿名使用分析」）。
+    // 始终为 CLI 注入 DO_NOT_TRACK=1 与遥测关闭，默认保护隐私。
+    vec![
+        ("HELM_ANONYMOUS_ANALYTICS".to_string(), "0".to_string()),
+        ("DO_NOT_TRACK".to_string(), "1".to_string()),
+        ("HELM_TELEMETRY_DISABLED".to_string(), "1".to_string()),
+    ]
 }
 
 struct ApprovalHookFiles {
@@ -406,6 +407,10 @@ struct SessionRuntime {
     /// 回溯/恢复时的重建历史（P2-5）：没有 CLI 会话可 --resume 时，
     /// 下一轮把这份截断历史序列化进 prompt 重新开场，用后即清。
     rebuild_history: Mutex<Vec<crate::sessions::SessionMessage>>,
+    /// 同引擎无损分支（十次反馈）：首轮 `--resume <源> --fork-session` 复制完整历史；
+    /// CLI init 事件回报新 session id 时置回 false，此后轮次回归普通 resume。
+    /// 首轮失败保持 true——用户重发即重试分支语义。
+    pending_native_branch: Mutex<bool>,
     /// 会话级停用的 MCP 服务器名单（变更-11）：非空时下一轮以
     /// `--strict-mcp-config --mcp-config <过滤后配置>` 启动，真实生效。
     disabled_mcp: std::sync::Mutex<Vec<String>>,
@@ -443,6 +448,11 @@ pub struct CodexSession {
     disabled_mcp: Arc<std::sync::Mutex<Vec<String>>>,
     /// Codex CLI 原生 thread id；普通后续轮直接 `exec resume`，不再重复拼接完整历史。
     thread_id: Arc<std::sync::Mutex<Option<String>>>,
+    /// 同引擎无损分支待 fork 的源线程 id（分支首轮专用）；首轮 fork 成功后清空，后续轮回到普通 resume。
+    fork_source_thread_id: Arc<std::sync::Mutex<Option<String>>>,
+    /// 切点分叉：thread/fork 的 lastTurnId（被点回答所属的 Codex 原生轮 id）；
+    /// 首轮 fork 成功后与源线程 id 一同清空。None 表示整段分叉。
+    fork_last_turn_id: Arc<std::sync::Mutex<Option<String>>>,
     /// API Key 模式的临时 CODEX_HOME 归 Session 所有，Turn 只借用路径。
     auth_home: Arc<std::sync::Mutex<Option<CodexAuthHome>>>,
     /// Session 实际使用的 CODEX_HOME。API 接入指向受 Session 所有的快照；
@@ -462,7 +472,7 @@ pub struct CodexSession {
     /// 通知循环向当前 Turn 等待者广播完成或协议错误。
     turn_completions: broadcast::Sender<Result<String, String>>,
     /// 当前 Turn 的任务句柄。Stop 在 Runtime 无法及时排空时必须取消它，
-    /// 否则任务内持有的 WorkspaceExecutionLease 会一直阻塞后续 Turn。
+    /// 否则任务内持有的 RAII 资源不会释放、busy 也不会清除。
     turn_task: Arc<std::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
     terminal_turns: Arc<Mutex<HashMap<String, Result<(), String>>>>,
     terminal_notify: Arc<Notify>,
@@ -580,6 +590,15 @@ async fn abort_codex_turn_task(
     Ok(())
 }
 
+/// 源 EngineProfile 文件树的 stat 指纹（路径+大小+mtime_ns 聚合哈希），
+/// 命中即代表 `~/.codex` 下的 config/prompts/skills 内容未变，可直接复用上次
+/// 读出的文件集合，跳过全量读+逐文件 SHA-256（15MB / 439 文件，实测约 5~10s）。
+#[derive(Clone)]
+struct ProfileFilesCacheEntry {
+    fingerprint: String,
+    files: Vec<(PathBuf, Vec<u8>)>,
+}
+
 /// Helm-owned Codex API EngineProfile。目录只保存经过过滤的配置、扩展快照和
 /// Codex 自己生成的 sandbox 状态；Provider 凭据始终只通过子进程环境传入。
 #[derive(Clone)]
@@ -588,6 +607,10 @@ pub struct CodexRuntimeProfileStore {
     history: SessionHistoryStore,
     profile_lock: Arc<std::sync::Mutex<()>>,
     authorized_workspaces: Arc<std::sync::Mutex<HashMap<String, BTreeSet<String>>>>,
+    /// 源文件树指纹缓存，键为「source 目录 + disabled_mcp」。
+    files_cache: Arc<std::sync::Mutex<HashMap<String, ProfileFilesCacheEntry>>>,
+    /// 本进程内正被活跃 Runtime 使用的 Profile 目录，GC 时绝不回收。
+    active_profiles: Arc<std::sync::Mutex<HashSet<PathBuf>>>,
 }
 
 impl CodexRuntimeProfileStore {
@@ -597,6 +620,8 @@ impl CodexRuntimeProfileStore {
             history,
             profile_lock: Arc::new(std::sync::Mutex::new(())),
             authorized_workspaces: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            files_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            active_profiles: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -643,7 +668,47 @@ impl CodexRuntimeProfileStore {
         workspace_root: Option<&Path>,
         search_catalog: Option<&[u8]>,
     ) -> Result<CodexRuntimeProfile, String> {
-        let mut files = codex_engine_profile_files(source, disabled_mcp)?;
+        // A 方案第一道省：源树（~/.codex 的 config/prompts/skills）指纹命中即复用上次
+        // 读出的文件集合，跳过 439 文件全量读+逐文件 SHA-256（实测 5~10s）。
+        // 指纹只 stat 元数据（毫秒级）；任一文件增删改名或改内容都会翻转指纹，
+        // 因此缓存失效即回落到全量读，不会读到陈旧内容。
+        let mut cache_key = source
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        cache_key.push('\u{0}');
+        cache_key.push_str(&disabled_mcp.join("\u{1}"));
+        // stat 指纹（毫秒级）命中即复用上次读出的文件集合（零内容读）；
+        // 源树任一文件增删改都会翻转指纹，回落全量读，不会用陈旧内容算 revision。
+        let fingerprint = source.map(profile_tree_fingerprint);
+        let mut files = match fingerprint.as_deref() {
+            Some(fp) => {
+                let cached = self
+                    .files_cache
+                    .lock()
+                    .map_err(|_| "Codex Profile 文件缓存锁中毒".to_string())?
+                    .get(&cache_key)
+                    .filter(|entry| entry.fingerprint == fp)
+                    .map(|entry| entry.files.clone());
+                match cached {
+                    Some(files) => files,
+                    None => {
+                        let files = codex_engine_profile_files(source, disabled_mcp)?;
+                        self.files_cache
+                            .lock()
+                            .map_err(|_| "Codex Profile 文件缓存锁中毒".to_string())?
+                            .insert(
+                                cache_key.clone(),
+                                ProfileFilesCacheEntry {
+                                    fingerprint: fp.to_string(),
+                                    files: files.clone(),
+                                },
+                            );
+                        files
+                    }
+                }
+            }
+            None => codex_engine_profile_files(source, disabled_mcp)?,
+        };
         if let Some(search_catalog) = search_catalog {
             files.push((
                 PathBuf::from(CODEX_SEARCH_CATALOG_FILE),
@@ -675,7 +740,7 @@ impl CodexRuntimeProfileStore {
             .profile_lock
             .lock()
             .map_err(|_| "Codex Runtime Profile 锁中毒".to_string())?;
-        let (path, migrating_legacy_profile) = select_codex_runtime_profile_path(
+        let (path, migrating_legacy_profile, static_trusted) = select_codex_runtime_profile_path(
             &self.root,
             &canonical_path,
             &revision,
@@ -708,34 +773,39 @@ impl CodexRuntimeProfileStore {
         };
         fs::create_dir_all(&path)
             .map_err(|error| format!("创建 Codex Runtime Profile 失败：{error}"))?;
-        for (relative, bytes) in files {
-            let destination = if relative == Path::new("config.toml") {
-                path.join("engine-config.toml")
-            } else {
-                path.join(&relative)
-            };
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| format!("创建 Codex Profile 继承目录失败：{error}"))?;
-            }
-            if destination.is_file() {
-                let existing = fs::read(&destination)
-                    .map_err(|error| format!("读取既有 Codex Runtime Profile 失败：{error}"))?;
-                if existing != bytes {
-                    if migrating_legacy_profile && relative == Path::new("config.toml") {
-                        fs::write(&destination, bytes).map_err(|error| {
-                            format!("净化旧 Codex EngineProfile 路由失败：{error}")
-                        })?;
-                    } else {
-                        return Err(format!(
-                            "[codex_runtime_profile_tampered] Codex Runtime Profile 文件与 revision 不一致：{}",
-                            relative.to_string_lossy()
-                        ));
-                    }
+        // static_trusted：候选目录 manifest revision 精确命中且静态标记一致，
+        // select 已确认 engine-config.toml 脱敏路由等价——skills/prompts/目录文件
+        // 此前按同一 revision 全量校验落盘，跳过 455 文件读回比对（实测省 10s+）。
+        if !static_trusted {
+            for (relative, bytes) in &files {
+                let destination = if relative == Path::new("config.toml") {
+                    path.join("engine-config.toml")
+                } else {
+                    path.join(relative)
+                };
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|error| format!("创建 Codex Profile 继承目录失败：{error}"))?;
                 }
-            } else {
-                fs::write(&destination, bytes)
-                    .map_err(|error| format!("写入 Codex Runtime Profile 失败：{error}"))?;
+                if destination.is_file() {
+                    let existing = fs::read(&destination)
+                        .map_err(|error| format!("读取既有 Codex Runtime Profile 失败：{error}"))?;
+                    if existing != *bytes {
+                        if migrating_legacy_profile && relative == Path::new("config.toml") {
+                            fs::write(&destination, bytes).map_err(|error| {
+                                format!("净化旧 Codex EngineProfile 路由失败：{error}")
+                            })?;
+                        } else {
+                            return Err(format!(
+                                "[codex_runtime_profile_tampered] Codex Runtime Profile 文件与 revision 不一致：{}",
+                                relative.to_string_lossy()
+                            ));
+                        }
+                    }
+                } else {
+                    fs::write(&destination, bytes)
+                        .map_err(|error| format!("写入 Codex Runtime Profile 失败：{error}"))?;
+                }
             }
         }
         let engine_config_path = path.join("engine-config.toml");
@@ -788,10 +858,75 @@ impl CodexRuntimeProfileStore {
         if path.join("auth.json").exists() {
             return Err("[codex_runtime_profile_secret_detected] 持久 Runtime Profile 中出现认证文件，已阻止启动".to_string());
         }
+        // 走到这里：要么本次做了全量读回校验/写入（static_trusted=false），要么
+        // 命中已有标记。前者补写标记，让下次恢复免读 455 文件；后者不重复写盘。
+        if !static_trusted {
+            let marker = path.join(CODEX_PROFILE_STATIC_VERIFIED_FILE);
+            if fs::read_to_string(&marker).ok().as_deref() != Some(revision.as_str()) {
+                let _ = fs::write(&marker, revision.as_bytes());
+            }
+        }
+        // 登记为活跃 Profile，GC 时绝不回收正在被 app-server 使用的目录。
+        if let Ok(mut active) = self.active_profiles.lock() {
+            active.insert(path.clone());
+        }
         Ok(CodexRuntimeProfile { path, revision })
+    }
+
+    /// C 方案：回收 `codex-runtime/` 下陈旧 revision 目录（实测会堆到 656MB / 15 份）。
+    /// 保留策略：本进程活跃集合永不回收；其余按目录 mtime 保留最新 `keep` 个，
+    /// 超出且 mtime 早于 24 小时的才删除——新鲜目录可能是强杀残留的孤儿 app-server
+    /// 正在使用，宁可多留一天也不冒险。启动后台延迟调用，不阻塞首屏。
+    pub fn gc_stale_profiles(&self, keep: usize) {
+        let _guard = match self.profile_lock.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return;
+        };
+        let active = self
+            .active_profiles
+            .lock()
+            .map(|set| set.clone())
+            .unwrap_or_default();
+        let mut dirs: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            // 只认带清单的 Helm Profile 目录，跳过遗留/外来目录。
+            if !path.join(".helm-runtime-profile.json").is_file() {
+                continue;
+            }
+            if active.contains(&path) {
+                continue;
+            }
+            let mtime = fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            dirs.push((path, mtime));
+        }
+        if dirs.len() <= keep {
+            return;
+        }
+        dirs.sort_by_key(|(_, mtime)| std::cmp::Reverse(*mtime));
+        let cutoff = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(24 * 60 * 60);
+        for (path, mtime) in dirs.into_iter().skip(keep) {
+            if mtime > cutoff {
+                continue;
+            }
+            let _ = fs::remove_dir_all(&path);
+        }
     }
 }
 
+/// 返回 `(path, migrating_legacy_profile, static_trusted)`。
+/// `static_trusted = true` 表示候选目录的 manifest revision 命中且静态文件校验标记
+/// 与 revision 一致——prompts/skills 落盘内容此前已按同一 revision 全量校验过，
+/// 主循环可跳过 455 文件的读回比对（engine-config.toml/config.toml 仍强校验）。
 fn select_codex_runtime_profile_path(
     profile_root: &Path,
     canonical_path: &Path,
@@ -799,9 +934,9 @@ fn select_codex_runtime_profile_path(
     engine_config: &[u8],
     files: &[(PathBuf, Vec<u8>)],
     disabled_mcp: &[String],
-) -> Result<(PathBuf, bool), String> {
+) -> Result<(PathBuf, bool, bool), String> {
     if !profile_root.is_dir() {
-        return Ok((canonical_path.to_path_buf(), false));
+        return Ok((canonical_path.to_path_buf(), false, false));
     }
     let mut candidates = fs::read_dir(profile_root)
         .map_err(|error| format!("读取 Codex Runtime Profile 目录失败：{error}"))?
@@ -851,18 +986,95 @@ fn select_codex_runtime_profile_path(
                 Ok(config) => config.into_bytes(),
                 Err(_) => continue,
             };
-        if candidate_engine_config != engine_config
-            || !codex_profile_static_files_match(&candidate, files)?
-        {
+        if candidate_engine_config != engine_config {
+            continue;
+        }
+        // 快路径：manifest revision 精确命中 + 静态文件标记命中 → 免读 455 文件。
+        // 标记信任仅到「路径+大小」粒度（stat，毫秒级）：文件被删/被换尺寸仍会
+        // 回落到全量校验，只有同路径同大小的篡改（攻击者需已有 APPDATA 写权限，
+        // 同等权限也能改 ~/.codex 源树本身）不构成额外攻击面。
+        let static_marker_ok = manifest_revision == Some(revision)
+            && fs::read_to_string(candidate.join(CODEX_PROFILE_STATIC_VERIFIED_FILE))
+                .is_ok_and(|marker| marker == revision)
+            && codex_profile_static_files_sizes_match(&candidate, files);
+        if !static_marker_ok && !codex_profile_static_files_match(&candidate, files)? {
             continue;
         }
         let needs_migration = manifest_revision != Some(revision)
             || candidate_engine_config_raw.as_bytes() != engine_config;
         if manifest_revision == Some(revision) {
-            current_candidate = Some((candidate.clone(), needs_migration));
+            current_candidate = Some((
+                candidate.clone(),
+                needs_migration,
+                static_marker_ok && !needs_migration,
+            ));
         }
     }
-    Ok(current_candidate.unwrap_or_else(|| (canonical_path.to_path_buf(), false)))
+    Ok(current_candidate.unwrap_or_else(|| {
+        (canonical_path.to_path_buf(), false, false)
+    }))
+}
+
+/// 信任快路径的廉价守卫：只遍历候选目录 prompts/skills/目录文件的
+/// 「相对路径+大小」（stat，不读内容），与期望集合比对。
+/// 任一文件缺失、多出或改尺寸都会回落全量校验；与 revision 指纹同源，
+/// 内容级篡改（改内容不改大小）由「攻击者需已有 APPDATA 写权限，同等权限
+/// 可直接改 ~/.codex 源」的信任边界吸收，不另设防线。
+fn codex_profile_static_files_sizes_match(candidate: &Path, files: &[(PathBuf, Vec<u8>)]) -> bool {
+    let mut expected = files
+        .iter()
+        .filter(|(path, _)| path != Path::new("config.toml"))
+        .map(|(path, bytes)| (path.to_string_lossy().replace('\\', "/"), bytes.len()))
+        .collect::<Vec<_>>();
+    expected.sort();
+    let mut actual: Vec<(String, usize)> = Vec::new();
+    let mut stack = vec![
+        (candidate.join("prompts"), String::from("prompts")),
+        (candidate.join("skills"), String::from("skills")),
+    ];
+    if let Some(bytes) = files
+        .iter()
+        .find(|(path, _)| path == Path::new(CODEX_SEARCH_CATALOG_FILE))
+        .map(|(_, bytes)| bytes.len())
+    {
+        if fs::metadata(candidate.join(CODEX_SEARCH_CATALOG_FILE))
+            .ok()
+            .filter(|meta| meta.is_file())
+            .is_some_and(|meta| meta.len() as usize == bytes)
+        {
+            actual.push((CODEX_SEARCH_CATALOG_FILE.to_string(), bytes));
+        } else {
+            return false;
+        }
+    } else if candidate.join(CODEX_SEARCH_CATALOG_FILE).exists() {
+        return false;
+    }
+    while let Some((dir, prefix)) = stack.pop() {
+        let Ok(read) = fs::read_dir(&dir) else {
+            if prefix == "prompts" && !dir.is_dir() {
+                continue; // 空 prompts 目录合法：期望集合里也不会有条目
+            }
+            return false;
+        };
+        for item in read.flatten() {
+            let name = item.file_name().to_string_lossy().replace('\\', "/");
+            let relative = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let Ok(meta) = item.metadata() else {
+                return false;
+            };
+            if meta.is_dir() {
+                stack.push((item.path(), relative));
+            } else {
+                actual.push((relative, meta.len() as usize));
+            }
+        }
+    }
+    actual.sort();
+    actual == expected
 }
 
 fn codex_profile_static_files_match(
@@ -1296,6 +1508,19 @@ impl AgentSession {
         }
     }
 
+    /// 触发引擎原生上下文压缩（变更-34/35 · B4）。
+    /// 只有 Codex 提供真实 headless 契约（app-server `thread/compact/start`，2026-08-12 更正）；
+    /// Claude `-p` 无 `/compact` 注入契约，返回明确错误而非伪造按钮。
+    pub async fn compact_context(&self) -> Result<(), String> {
+        match self {
+            AgentSession::Claude(_) => Err(
+                "Claude Code 当前驱动方式（claude -p）无 /compact 注入契约，无法手动压缩"
+                    .to_string(),
+            ),
+            AgentSession::Codex(session) => session.compact_context().await,
+        }
+    }
+
     pub fn close(&self) {
         let _ = self.interrupt();
     }
@@ -1617,12 +1842,20 @@ pub(crate) fn build_command(bin: &str) -> Command {
     }
 }
 
+/// Model-only 调用（分叉摘要/旁路提问/自审）的 Claude 命令构造。
+///
+/// prompt 不进 argv：Windows `CreateProcess` 命令行总长约 32K 字符，长 Ledger 的
+/// 交接 prompt 曾撑爆命令行导致 `[operation_spawn_failed] os error 206`。改为由
+/// 调用方在 spawn 后经 [`write_model_only_prompt`] 把 prompt 全量写入 stdin——
+/// `claude -p` 在没有位置 prompt 参数时从标准输入读取完整输入。该契约的依据是
+/// CLI 自身的报错文案「Input must be provided through stdin or --prompt」（官方
+/// headless 文档同样给出管道用法 `... | claude -p`；仓库内先例见 docs/技术方案.md
+/// 「用户消息以 JSONL 写入 stdin」）。全部隔离/禁用 flag 保持不变。
 pub(crate) fn build_claude_model_only_command(
     bin: &str,
     model: &str,
     env: &[(String, String)],
     cwd: &std::path::Path,
-    prompt: &str,
     reasoning_effort: ReasoningEffort,
 ) -> Result<Command, String> {
     let mut command = build_command(bin);
@@ -1635,7 +1868,7 @@ pub(crate) fn build_claude_model_only_command(
     command
         .current_dir(cwd)
         .kill_on_drop(true)
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .args([
@@ -1649,7 +1882,7 @@ pub(crate) fn build_claude_model_only_command(
             "--disable-slash-commands",
             "--strict-mcp-config",
             "--mcp-config",
-            "{}",
+            "{\"mcpServers\": {}}",
             "--no-session-persistence",
             "--permission-mode",
             "plan",
@@ -1663,8 +1896,162 @@ pub(crate) fn build_claude_model_only_command(
     } else {
         command.env_remove("CLAUDE_CODE_EFFORT_LEVEL");
     }
-    command.arg(prompt);
+    // 不追加任何位置 prompt 参数：prompt 由调用方在 spawn 后经 stdin 写入（见函数注释）。
     Ok(command)
+}
+
+/// spawn 之后把 model-only prompt 全量写入子进程 stdin 并立即关闭。
+///
+/// 必须在 spawn 后调用（stdin 已由 `build_claude_model_only_command` 建立管道）；
+/// 写入完成后立刻 drop 关闭 stdin，让 `claude -p` 读到 EOF 开始推理，避免子进程
+/// 等待剩余输入而挂起。失败时由调用方回收子进程并沿用各自既有错误语义
+/// （`error_tag_prefix` 取 `operation` / `side_query`，与现有错误 tag 分类一致）。
+pub(crate) async fn write_model_only_prompt(
+    child: &mut tokio::process::Child,
+    prompt: &str,
+    error_tag_prefix: &str,
+) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| format!("[{error_tag_prefix}_stdin_missing] Claude CLI stdin 未建立管道"))?;
+    let written = async {
+        stdin.write_all(prompt.as_bytes()).await?;
+        stdin.flush().await?;
+        Ok::<(), std::io::Error>(())
+    }
+    .await;
+    // 无论写入成败都立即关闭 stdin：成功时交付 EOF；失败时不给子进程留悬挂管道。
+    drop(stdin);
+    written.map_err(|error| format!("[{error_tag_prefix}_stdin_write_failed] {error}"))
+}
+
+/// Windows `CreateProcess` 命令行总长硬上限约 32768 字符，超限 spawn 直接以
+/// os error 206（"文件名或扩展名太长"）失败——用户看到的是无法定位的 OS 哑错。
+/// 模型专用路径的 prompt 已走 stdin（见 build_claude_model_only_command 的契约注释），
+/// 正常 argv 远低于上限；本预检在 spawn 前兜底：一旦未来改动把长载荷塞回 argv，
+/// 立即给出带错误 tag 的可定位失败，而不是等 OS 报 206。
+pub(crate) fn ensure_command_line_within_limit(
+    command: &tokio::process::Command,
+    error_tag_prefix: &str,
+) -> Result<(), String> {
+    const MAX_COMMAND_LINE_CHARS: usize = 30_000;
+    let std_command = command.as_std();
+    let total: usize = std_command.get_program().to_string_lossy().chars().count()
+        + std_command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().chars().count() + 1)
+            .sum::<usize>();
+    if total > MAX_COMMAND_LINE_CHARS {
+        return Err(format!(
+            "[{error_tag_prefix}_command_line_too_long] 命令行长度约 {total} 字符，超过 Windows 上限；prompt 必须经 stdin 交付，禁止回填 argv"
+        ));
+    }
+    Ok(())
+}
+
+/// spawn 失败取证（七次反馈）：os error 206 除命令行超限外还可能来自环境块超限、
+/// 程序路径或 cwd 异常——这些输入的实际大小取决于用户机器，远端无法凭代码推断，
+/// 用户侧又只看得到 OS 哑错。本函数把 spawn 全部输入的规模压缩成一行有界诊断串，
+/// 由调用方拼进 spawn 失败消息落库并在 UI 展示：数字直接指认超限来源；
+/// `diag=v2` 标记同时证明运行中的二进制包含本轮诊断代码（旧构建不会出现该标记）。
+///
+/// 仅适用于先 `env_clear()` 再显式注入变量的构造路径（本项目全部 agent spawn 均
+/// 经 `apply_inherited_agent_environment` 如此构造）：此时 `get_envs()` 就是子进程
+/// 完整环境，stable API 也无法读回「父进程继承集减去清除」这一隐式状态。
+pub(crate) fn command_spawn_forensics(command: &tokio::process::Command) -> String {
+    const MAX_LISTED_VARS: usize = 3;
+    const MAX_CWD_CHARS: usize = 160;
+    let std_command = command.as_std();
+    let program = std_command.get_program().to_string_lossy();
+    let args: Vec<String> = std_command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect();
+    let argv_chars: usize = program.chars().count()
+        + args
+            .iter()
+            .map(|arg| arg.chars().count() + 1)
+            .sum::<usize>();
+    let mut env_entries: Vec<(String, usize)> = std_command
+        .get_envs()
+        .filter_map(|(key, value)| {
+            value.map(|value| {
+                (
+                    key.to_string_lossy().to_string(),
+                    key.to_string_lossy().chars().count()
+                        + value.to_string_lossy().chars().count()
+                        + 2,
+                )
+            })
+        })
+        .collect();
+    env_entries.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+    let env_chars: usize = env_entries.iter().map(|(_, size)| size).sum();
+    let top_env = env_entries
+        .iter()
+        .take(MAX_LISTED_VARS)
+        .map(|(key, size)| format!("{key}({size})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let cwd = std_command
+        .get_current_dir()
+        .map(|path| {
+            let text = path.to_string_lossy();
+            if text.chars().count() > MAX_CWD_CHARS {
+                let clipped: String = text.chars().take(MAX_CWD_CHARS - 1).collect();
+                format!("{clipped}…")
+            } else {
+                text.to_string()
+            }
+        })
+        .unwrap_or_else(|| "<inherit>".to_string());
+    format!(
+        "diag=v2 program_len={} args={} argv_chars={} env_vars={} env_chars={} top_env=[{top_env}] cwd={cwd}",
+        program.chars().count(),
+        args.len(),
+        argv_chars,
+        env_entries.len(),
+        env_chars,
+    )
+}
+
+/// spawn 前环境块预检：Windows `CreateProcess` 的环境块上限同为约 32K 字符，超限
+/// 同样以 os error 206 失败且不携带任何可定位信息。继承面已被
+/// `apply_inherited_agent_environment` 收敛为固定白名单，但白名单值（如 PATH）与
+/// 设置页注入的 agent 环境变量仍取决于用户机器；超限时带 tag 并指认最大变量，
+/// 替代 OS 哑错（阈值留出命令行与引号转义的安全余量）。
+pub(crate) fn ensure_env_block_within_limit(
+    command: &tokio::process::Command,
+    error_tag_prefix: &str,
+) -> Result<(), String> {
+    const MAX_ENV_BLOCK_CHARS: usize = 24_000;
+    let entries: Vec<(String, usize)> = command
+        .as_std()
+        .get_envs()
+        .filter_map(|(key, value)| {
+            value.map(|value| {
+                (
+                    key.to_string_lossy().to_string(),
+                    key.to_string_lossy().chars().count()
+                        + value.to_string_lossy().chars().count()
+                        + 2,
+                )
+            })
+        })
+        .collect();
+    let total: usize = entries.iter().map(|(_, size)| size).sum();
+    if total <= MAX_ENV_BLOCK_CHARS {
+        return Ok(());
+    }
+    let largest = entries.iter().max_by_key(|(_, size)| *size).map_or_else(
+        || "unknown".to_string(),
+        |(key, size)| format!("{key}（{size} 字符）"),
+    );
+    Err(format!(
+        "[{error_tag_prefix}_env_block_too_large] 子进程环境块约 {total} 字符，超过 Windows 约 32K 上限的安全阈值；最大变量：{largest}"
+    ))
 }
 
 pub(crate) fn parse_claude_model_only_output(
@@ -1817,14 +2204,26 @@ fn serialize_history_prompt(
 enum CodexAppServerThreadPlan {
     Start,
     Resume(String),
+    /// 无损分支首轮：在服务端按源线程派生新线程，再在新线程上开启本轮（与 Start 对称）。
+    /// 第二参数为切点分叉的原生轮次 id（Some 时 thread/fork 截断到该轮含，None 整段）。
+    Fork(String, Option<String>),
 }
 
 fn codex_app_server_thread_plan(
     native_thread_id: Option<&str>,
+    fork_source_thread_id: Option<&str>,
+    fork_last_turn_id: Option<&str>,
     force_history_rebuild: bool,
 ) -> CodexAppServerThreadPlan {
     if force_history_rebuild {
         CodexAppServerThreadPlan::Start
+    } else if let Some(source) = fork_source_thread_id.filter(|id| !id.is_empty()) {
+        CodexAppServerThreadPlan::Fork(
+            source.to_string(),
+            fork_last_turn_id
+                .filter(|id| !id.is_empty())
+                .map(str::to_string),
+        )
     } else if let Some(thread_id) = native_thread_id.filter(|id| !id.is_empty()) {
         CodexAppServerThreadPlan::Resume(thread_id.to_string())
     } else {
@@ -2073,7 +2472,70 @@ fn normalize_runtime_search_tool_result(event: &AgentEvent) -> AgentEvent {
     event.clone()
 }
 
+static RUNTIME_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// 运行时排查日志：同时打到 stderr（dev 可见）并追加到
+/// `<app_config_dir>/helm-runtime.log`（打包后也持久，便于事后还原现场）。
+/// 不引第三方日志库，保持最小依赖。用于记录每轮 turn 的生死关键节点，
+/// 解决「进程卡死/漏发终态时无法还原现场」的问题。
+pub(crate) fn log_runtime_event(app: &AppHandle, tag: &str, detail: &str) {
+    if let Ok(dir) = app.path().app_config_dir() {
+        let _ = RUNTIME_LOG_PATH.set(dir.join("helm-runtime.log"));
+    }
+    log_runtime_line(tag, detail);
+}
+
+pub(crate) fn log_runtime_line(tag: &str, detail: &str) {
+    let line = format!("[helm-{}] ts={} {}", tag, now_millis(), detail);
+    eprintln!("{}", line);
+    let path = RUNTIME_LOG_PATH.get().cloned().or_else(|| {
+        std::env::var_os("APPDATA").map(|dir| {
+            PathBuf::from(dir)
+                .join("com.helm.desktop")
+                .join("helm-runtime.log")
+        })
+    });
+    if let Some(path) = path {
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, format!("{}\n", line).as_bytes()));
+    }
+}
+
+/// 只记录对诊断「一直进行中/卡死」关键、且非高频流式的事件类型；
+/// message_delta/thinking_delta/tool_progress 等逐块流式事件跳过，避免日志爆炸。
+fn loggable_event_type(event: &AgentEvent) -> Option<&'static str> {
+    match event {
+        AgentEvent::SessionStarted { .. } => Some("session_started"),
+        AgentEvent::MessageDelta { .. } => None,
+        AgentEvent::MessageComplete { .. } => Some("message_complete"),
+        AgentEvent::ThinkingDelta { .. } => None,
+        AgentEvent::ThinkingComplete { .. } => Some("thinking_complete"),
+        AgentEvent::TurnStage { .. } => Some("turn_stage"),
+        AgentEvent::ToolCall { .. } => Some("tool_call"),
+        AgentEvent::ToolProgress { .. } => None,
+        AgentEvent::ToolResult { .. } => Some("tool_result"),
+        AgentEvent::ApprovalRequest { .. } => Some("approval_request"),
+        AgentEvent::PlanUpdate { .. } => Some("plan_update"),
+        AgentEvent::Checkpoint { .. } => Some("checkpoint"),
+        AgentEvent::TokenUsage { .. } => Some("token_usage"),
+        AgentEvent::ContextUsage { .. } => Some("context_usage"),
+        AgentEvent::ContextCompaction { .. } => Some("context_compaction"),
+        AgentEvent::TurnComplete { .. } => Some("turn_complete"),
+        AgentEvent::Error { .. } => Some("error"),
+    }
+}
+
 fn emit_agent_event(app: &AppHandle, history_session_id: &str, event: &AgentEvent) {
+    if let Some(t) = loggable_event_type(event) {
+        let mut detail = format!("history={} type={}", history_session_id, t);
+        if let AgentEvent::SessionStarted { engine, .. } = event {
+            detail.push_str(&format!(" engine={:?}", engine));
+        }
+        log_runtime_event(app, "event-emit", &detail);
+    }
     let context = event_turn_context(history_session_id);
     emit_agent_event_in_turn(
         app,
@@ -2091,8 +2553,9 @@ fn emit_agent_event_in_turn(
     explicit_turn_epoch: Option<u64>,
     event: &AgentEvent,
 ) {
-    let event =
-        crate::redaction::sanitize_agent_event(&normalize_runtime_search_tool_result(event));
+    // 性能：脱敏收敛到两处——TurnSupervisor 入口（覆盖 adapter 与 runtime_registry
+    // 两条提交路径）与落库前。同一条事件此前在同步链上被全量正则扫描 3 次。
+    let event = normalize_runtime_search_tool_result(event);
     let turn_id = explicit_turn_id.map(ToString::to_string);
     let turn_epoch = explicit_turn_epoch;
     if let Some(supervisor) = app.try_state::<crate::turn_supervisor::TurnSupervisor>() {
@@ -2233,6 +2696,58 @@ fn collect_profile_tree(
         }
     }
     Ok(())
+}
+
+/// 只遍历目录项的元数据（路径+大小+mtime_ns），不读文件内容，聚合出稳定指纹。
+/// 覆盖范围与 `codex_engine_profile_files` 的读取集严格一致：config.toml +
+/// prompts/ + skills/。`~/.codex` 下其它高频变化文件（sqlite/日志）不进指纹，
+/// 否则每次恢复都会失效。指纹命中即代表这三处的内容与上次读出时一致（含 mtime
+/// 粒度）；任一文件增删改名都会翻转指纹，回落全量读，不会用陈旧内容算 revision。
+fn profile_tree_fingerprint(source: &Path) -> String {
+    use sha2::Digest as _;
+    let mut entries: Vec<(String, u64, i128)> = Vec::new();
+    fn mtime_ns(meta: &std::fs::Metadata) -> i128 {
+        meta.modified()
+            .ok()
+            .and_then(|v| v.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|v| v.as_nanos() as i128)
+            .unwrap_or(0)
+    }
+    if let Ok(meta) = fs::metadata(source.join("config.toml")) {
+        if meta.is_file() {
+            entries.push(("config.toml".to_string(), meta.len(), mtime_ns(&meta)));
+        }
+    }
+    let mut stack = vec![
+        (source.join("prompts"), "prompts".to_string()),
+        (source.join("skills"), "skills".to_string()),
+    ];
+    while let Some((dir, prefix)) = stack.pop() {
+        let Ok(read) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for item in read.flatten() {
+            let path = item.path();
+            let name = item.file_name().to_string_lossy().replace('\\', "/");
+            let relative = format!("{prefix}/{name}");
+            let Ok(meta) = item.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push((path, relative));
+            } else {
+                entries.push((relative, meta.len(), mtime_ns(&meta)));
+            }
+        }
+    }
+    entries.sort();
+    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+    for (relative, len, mtime) in &entries {
+        hasher.update(relative.as_bytes());
+        hasher.update(len.to_le_bytes());
+        hasher.update(mtime.to_le_bytes());
+    }
+    format!("sha256:{:x}:{}", hasher.finalize(), entries.len())
 }
 
 fn codex_engine_profile_files(
@@ -2451,7 +2966,9 @@ fn codex_runtime_profile_policy(
         return ("read-only", false, CodexApprovalPolicy::Untrusted);
     }
     match profile {
-        PermissionProfile::Standard => ("workspace-write", false, CodexApprovalPolicy::Untrusted),
+        // 标准档开网络：原生 WebSearch 走 Runtime 通道，审批仍保持 Untrusted（Ask）。
+        // 变更-31：standard / auto 都应遵循 Runtime 原生搜索；关网络会把标准档搜索掐死。
+        PermissionProfile::Standard => ("workspace-write", true, CodexApprovalPolicy::Untrusted),
         PermissionProfile::Auto => ("workspace-write", true, CodexApprovalPolicy::OnRequest),
         PermissionProfile::FullAccess => ("danger-full-access", true, CodexApprovalPolicy::Never),
     }
@@ -2495,6 +3012,15 @@ fn build_claude_mcp_config_file(disabled: &[String], out_dir: &Path) -> Result<P
     Ok(path)
 }
 
+/// 单附件注入 prompt 的文本上限（字符）；超出截断并注明。
+const ATTACHMENT_TEXT_CAP: usize = 24_000;
+/// 全部附件累计注入 prompt 的文本上限（字符）；超出后其余附件降级为纯路径列表。
+const ATTACHMENT_TEXT_TOTAL_CAP: usize = 80_000;
+
+/// 把附件内容注入 prompt（2026-08-12 增强）：此前只列出路径让 agent 自行读取，
+/// 二进制 office/pdf 格式 agent 的 Read 工具读不了，内容永远出不来。
+/// 现在文本类直接读入，docx/pptx/xlsx 走 zip+XML 提取文本，pdf 走 pdf-extract；
+/// 图片等无法提取的格式保留路径（视觉能力可读），提取失败回退纯路径列表。
 fn prompt_with_attachments(text: &str, attachments: &[String]) -> String {
     let mounted_paths = attachments
         .iter()
@@ -2507,13 +3033,226 @@ fn prompt_with_attachments(text: &str, attachments: &[String]) -> String {
 
     let mut prompt = String::from(text);
     prompt.push_str("\n\n已挂载上下文：\n");
-    for path in mounted_paths {
-        prompt.push_str("- ");
-        prompt.push_str(path);
+    let mut injected_chars = 0usize;
+    for path in &mounted_paths {
+        let path_obj = Path::new(path);
+        let mut line = format!("- {path}");
+        if path_obj.is_dir() {
+            // 目录只列路径（agent 自行探查）
+        } else {
+            let extraction = if injected_chars < ATTACHMENT_TEXT_TOTAL_CAP {
+                attachment_extract_text(path_obj)
+            } else {
+                None
+            };
+            if let Some((label, content)) = extraction {
+                // 先按单文件上限截断，再按累计上限收口
+                let original_chars = content.chars().count();
+                let mut shown = if original_chars > ATTACHMENT_TEXT_CAP {
+                    content
+                        .chars()
+                        .take(ATTACHMENT_TEXT_CAP)
+                        .collect::<String>()
+                } else {
+                    content
+                };
+                let mut truncated =
+                    shown.chars().count() > ATTACHMENT_TEXT_TOTAL_CAP - injected_chars;
+                if truncated {
+                    shown = shown
+                        .chars()
+                        .take(ATTACHMENT_TEXT_TOTAL_CAP - injected_chars)
+                        .collect();
+                }
+                truncated = truncated || shown.chars().count() < original_chars;
+                line.push_str(&format!(
+                    "\n  {label}{}",
+                    if truncated {
+                        "（内容过长已截断）"
+                    } else {
+                        ""
+                    }
+                ));
+                line.push_str("\n  ");
+                line.push_str(&shown.replace('\n', "\n  "));
+                injected_chars += shown.chars().count();
+            } else {
+                line.push_str("（附件：路径供 agent 读取）");
+            }
+        }
+        prompt.push_str(&line);
         prompt.push('\n');
     }
-    prompt.push_str("\n请在需要时直接读取以上本地路径。");
+    prompt.push_str("\n请优先依据以上挂载内容回答；二进制/图片等未提取内容请自行读取。");
     prompt
+}
+
+/// 尽力从附件路径提取可读文本；失败返回 None（调用方回退路径列表）。
+/// 返回 (展示标签, 提取文本)。
+fn attachment_extract_text(path: &Path) -> Option<(String, String)> {
+    let ext = path
+        .extension()
+        .map(|value| value.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "docx" => {
+            let text = extract_zip_office_text(path, "word/document.xml", "w:p", "docx")?;
+            Some((
+                format!("已提取文本（docx，{} 字符）", text.chars().count()),
+                text,
+            ))
+        }
+        "pptx" => {
+            let text = extract_pptx_text(path)?;
+            Some((
+                format!("已提取文本（pptx，{} 字符）", text.chars().count()),
+                text,
+            ))
+        }
+        "xlsx" => {
+            let text = extract_zip_office_text(path, "xl/sharedStrings.xml", "si", "xlsx")?;
+            Some((
+                format!(
+                    "已提取文本（xlsx 文本单元格，{} 字符）",
+                    text.chars().count()
+                ),
+                text,
+            ))
+        }
+        "pdf" => {
+            let text = pdf_extract::extract_text(path).ok()?;
+            if text.trim().is_empty() {
+                return None;
+            }
+            Some((
+                format!("已提取文本（pdf，{} 字符）", text.chars().count()),
+                text,
+            ))
+        }
+        _ => {
+            // 文本/代码类：直接读入；前 1KB 出现 NUL 视为二进制，不注入
+            let bytes = fs::read(path).ok()?;
+            if bytes.iter().take(1024).any(|byte| *byte == 0) {
+                return None;
+            }
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            if text.trim().is_empty() {
+                return None;
+            }
+            Some((format!("已读入内容（{} 字节）", bytes.len()), text))
+        }
+    }
+}
+
+/// pptx 幻灯片文本：遍历 ppt/slides/slide*.xml，段落分隔后去标签。
+fn extract_pptx_text(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).ok()?;
+    let mut names = (0..archive.len())
+        .filter_map(|index| {
+            archive
+                .by_index(index)
+                .ok()
+                .map(|entry| entry.name().to_string())
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    let mut pages = Vec::new();
+    for name in names {
+        if name.starts_with("ppt/slides/slide") && name.ends_with(".xml") {
+            let mut entry = archive.by_name(&name).ok()?;
+            let mut xml = String::new();
+            std::io::Read::read_to_string(&mut entry, &mut xml).ok()?;
+            let page = strip_xml_text(&xml, "a:p");
+            if !page.trim().is_empty() {
+                pages.push(page.trim().to_string());
+            }
+        }
+    }
+    if pages.is_empty() {
+        return None;
+    }
+    Some(pages.join("\n\n"))
+}
+
+/// 从 zip 内指定 XML 提取文本：段落/条目结束标签换行，剥标签 + 反转义实体。
+fn extract_zip_office_text(
+    path: &Path,
+    entry_name: &str,
+    item_tag: &str,
+    _kind: &str,
+) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).ok()?;
+    let mut entry = archive.by_name(entry_name).ok()?;
+    let mut xml = String::new();
+    std::io::Read::read_to_string(&mut entry, &mut xml).ok()?;
+    let text = strip_xml_text(&xml, item_tag);
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(text)
+}
+
+/// 剥 XML 标签提取可见文本：item_tag 的结束标签转为换行，实体反转义。
+fn strip_xml_text(xml: &str, item_tag: &str) -> String {
+    let paragraph_ends = format!("</{item_tag}>");
+    let with_newlines = xml.replace(&paragraph_ends, "\n");
+    let stripped = regex::Regex::new(r"<[^>]*>")
+        .unwrap()
+        .replace_all(&with_newlines, "")
+        .into_owned();
+    let mut result = String::with_capacity(stripped.len());
+    let mut chars = stripped.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '&' {
+            result.push(ch);
+            continue;
+        }
+        let mut entity = String::new();
+        for next in chars.by_ref() {
+            if next == ';' {
+                break;
+            }
+            entity.push(next);
+        }
+        result.push(match entity.as_str() {
+            "amp" => '&',
+            "lt" => '<',
+            "gt" => '>',
+            "quot" => '"',
+            "apos" => '\'',
+            "nbsp" => ' ',
+            _ => {
+                if let Some(decoded) = decode_numeric_entity(&entity) {
+                    decoded
+                } else {
+                    '&'
+                }
+            }
+        });
+    }
+    let no_blank_lines = result
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    no_blank_lines
+}
+
+/// 解码 &#nnn; / &#xhh; 数字实体；失败返回 None 保留原样。
+fn decode_numeric_entity(entity: &str) -> Option<char> {
+    let value = entity
+        .strip_prefix("#x")
+        .or_else(|| entity.strip_prefix("#X"))
+        .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+        .or_else(|| {
+            entity
+                .strip_prefix('#')
+                .and_then(|dec| dec.parse::<u32>().ok())
+        })?;
+    char::from_u32(value)
 }
 
 fn apply_claude_session_context_args(
@@ -3309,6 +4048,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claude_compact_context_rejects_without_contract() {
+        // Claude 由 `claude -p` 驱动，无 /compact 注入契约（2026-08-12 更正 Codex 后有，
+        // 但 Claude 仍无）。Helm 必须 fail-closed，不能伪造压缩成功。
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = AgentSession::Claude(ClaudeSession {
+            tx,
+            cwd: "D:/repo".to_string(),
+            control: None,
+        });
+        let error = session
+            .compact_context()
+            .await
+            .expect_err("Claude 无压缩契约时必须返回错误");
+        assert!(
+            error.contains("无 /compact 注入契约"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn claude_interrupt_waits_for_manager_terminal_acknowledgement() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let session = AgentSession::Claude(ClaudeSession {
@@ -3515,16 +4274,33 @@ mod tests {
     #[test]
     fn codex_app_server_thread_plan_resumes_normally_and_restarts_after_rewind() {
         assert_eq!(
-            super::codex_app_server_thread_plan(Some("thread-1"), false),
+            super::codex_app_server_thread_plan(Some("thread-1"), None, None, false),
             super::CodexAppServerThreadPlan::Resume("thread-1".to_string())
         );
         assert_eq!(
-            super::codex_app_server_thread_plan(Some("thread-1"), true),
+            super::codex_app_server_thread_plan(Some("thread-1"), None, None, true),
             super::CodexAppServerThreadPlan::Start
         );
         assert_eq!(
-            super::codex_app_server_thread_plan(None, false),
+            super::codex_app_server_thread_plan(None, None, None, false),
             super::CodexAppServerThreadPlan::Start
+        );
+        // 无损分支：fork 计划区分整段（lastTurn None）与切点截断（Some 原生轮 id）。
+        assert_eq!(
+            super::codex_app_server_thread_plan(None, Some("thread-src"), None, false),
+            super::CodexAppServerThreadPlan::Fork("thread-src".to_string(), None)
+        );
+        assert_eq!(
+            super::codex_app_server_thread_plan(
+                None,
+                Some("thread-src"),
+                Some("turn-native-9"),
+                false
+            ),
+            super::CodexAppServerThreadPlan::Fork(
+                "thread-src".to_string(),
+                Some("turn-native-9".to_string())
+            )
         );
         let history = vec![crate::sessions::SessionMessage {
             role: crate::protocol::Role::Assistant,
@@ -3722,7 +4498,7 @@ mod tests {
 
         assert_eq!(
             codex_runtime_profile_policy(TurnMode::Build, PermissionProfile::Standard),
-            ("workspace-write", false, CodexApprovalPolicy::Untrusted)
+            ("workspace-write", true, CodexApprovalPolicy::Untrusted)
         );
         assert_eq!(
             codex_runtime_profile_policy(TurnMode::Build, PermissionProfile::Auto),
@@ -3864,18 +4640,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_interrupt_abort_releases_workspace_lease_before_returning() {
-        let root = std::env::temp_dir().join(format!(
-            "helm-codex-interrupt-lease-{}-{}",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let coordinator = crate::workspace_execution::WorkspaceExecutionCoordinator::default();
-        let lease = coordinator.acquire("stopped", &root).unwrap();
+    async fn codex_interrupt_abort_clears_busy_and_awaits_task() {
         let busy = Arc::new(AtomicBool::new(true));
         let task = tauri::async_runtime::spawn(async move {
-            let _lease = lease;
             std::future::pending::<()>().await;
         });
         let task = std::sync::Mutex::new(Some(task));
@@ -3885,11 +4652,6 @@ mod tests {
             .expect("Stop 兜底取消必须完成任务回收");
 
         assert!(!busy.load(Ordering::Acquire));
-        let next = coordinator
-            .acquire("next", &root)
-            .expect("Stop 返回时同目录 lease 必须已释放");
-        drop(next);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3915,17 +4677,12 @@ mod tests {
     }
 
     #[test]
-    fn agent_environment_reflects_anonymous_analytics_preference() {
-        let mut settings = AppSettings::default();
-        settings.general.anonymous_analytics = false;
-        let env = agent_environment_from_settings(&settings);
+    fn agent_environment_always_opt_out_of_analytics() {
+        // 匿名分析开关移除后，CLI 子进程始终带 DO_NOT_TRACK=1 / HELM_TELEMETRY_DISABLED=1。
+        let env = agent_environment_from_settings(&AppSettings::default());
         assert!(env.contains(&("DO_NOT_TRACK".to_string(), "1".to_string())));
+        assert!(env.contains(&("HELM_TELEMETRY_DISABLED".to_string(), "1".to_string())));
         assert!(env.contains(&("HELM_ANONYMOUS_ANALYTICS".to_string(), "0".to_string())));
-
-        settings.general.anonymous_analytics = true;
-        let env = agent_environment_from_settings(&settings);
-        assert!(!env.iter().any(|(key, _)| key == "DO_NOT_TRACK"));
-        assert!(env.contains(&("HELM_ANONYMOUS_ANALYTICS".to_string(), "1".to_string())));
     }
 
     #[test]
@@ -4121,6 +4878,104 @@ mod tests {
         assert!(prompt.contains("D:\\work\\docs"));
     }
 
+    /// 构造最小 docx/zip：word/document.xml 含两段文本。
+    fn write_mini_docx(path: &std::path::Path) {
+        use std::io::Write;
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        writer.start_file("word/document.xml", options).unwrap();
+        writer
+            .write_all(
+                "<w:document><w:body>\
+                  <w:p><w:r><w:t>你好 &amp; 再见</w:t></w:r></w:p>\
+                  <w:p><w:r><w:t>第二段</w:t></w:r></w:p>\
+                  </w:body></w:document>"
+                    .as_bytes(),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn prompt_with_attachments_injects_text_file_content() {
+        let root = std::env::temp_dir().join(format!(
+            "helm-adapter-attach-text-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("说明.md");
+        std::fs::write(&file, "这是文档正文。\n第二行。").unwrap();
+        let prompt = prompt_with_attachments("按文档回答", &[file.to_string_lossy().to_string()]);
+
+        assert!(prompt.contains("已读入内容（"));
+        assert!(
+            prompt.contains("这是文档正文。\n  第二行。"),
+            "正文应缩进注入：{prompt}"
+        );
+        assert!(prompt.contains("请优先依据以上挂载内容回答"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn prompt_with_attachments_extracts_docx_and_xlsx_text() {
+        let root = std::env::temp_dir().join(format!(
+            "helm-adapter-attach-office-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        // docx：zip 内文本提取
+        let docx = root.join("报告.docx");
+        write_mini_docx(&docx);
+        let prompt = prompt_with_attachments("总结", &[docx.to_string_lossy().to_string()]);
+        assert!(prompt.contains("已提取文本（docx，"), "{prompt}");
+        assert!(prompt.contains("你好 & 再见"), "实体应反转义：{prompt}");
+        assert!(prompt.contains("第二段"), "段落应换行保留：{prompt}");
+
+        // xlsx：sharedStrings 文本提取
+        use std::io::Write as _;
+        let xlsx = root.join("台账.xlsx");
+        let file = std::fs::File::create(&xlsx).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        writer.start_file("xl/sharedStrings.xml", options).unwrap();
+        writer
+            .write_all("<sst><si><t>项目名称</t></si><si><t>预算 100 万</t></si></sst>".as_bytes())
+            .unwrap();
+        writer.finish().unwrap();
+        let prompt = prompt_with_attachments("看台账", &[xlsx.to_string_lossy().to_string()]);
+        assert!(prompt.contains("已提取文本（xlsx"), "{prompt}");
+        assert!(prompt.contains("项目名称"));
+        assert!(prompt.contains("预算 100 万"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn prompt_with_attachments_falls_back_to_path_for_binary() {
+        let root = std::env::temp_dir().join(format!(
+            "helm-adapter-attach-binary-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("logo.png");
+        std::fs::write(&file, [0x89_u8, 0x50, 0x4E, 0x47, 0x00, 0x01, 0x02]).unwrap();
+        let prompt = prompt_with_attachments("看看图", &[file.to_string_lossy().to_string()]);
+
+        assert!(
+            prompt.contains("路径供 agent 读取"),
+            "NUL 二进制不应注入内容：{prompt}"
+        );
+        assert!(!prompt.contains("已读入内容"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn claude_session_context_uses_native_add_dir_arguments() {
         let mut command = tokio::process::Command::new("claude");
@@ -4163,7 +5018,6 @@ mod tests {
             "claude-fixture",
             &[],
             &cwd,
-            "只生成标题",
             crate::reasoning::ReasoningEffort::Auto,
         )
         .unwrap();
@@ -4174,7 +5028,7 @@ mod tests {
             .collect::<Vec<_>>();
         for pair in [
             ["--tools", ""],
-            ["--mcp-config", "{}"],
+            ["--mcp-config", "{\"mcpServers\": {}}"],
             ["--permission-mode", "plan"],
             ["--setting-sources", ""],
         ] {
@@ -4189,6 +5043,200 @@ mod tests {
         ] {
             assert!(args.iter().any(|arg| arg == flag), "缺少 {flag}");
         }
+        // prompt 不再作为位置参数进入 argv（os error 206 回归），改由 stdin 交付：
+        assert!(
+            !args.iter().any(|arg| arg.contains("只生成标题")),
+            "prompt 不得出现在命令行参数中"
+        );
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some(""),
+            "argv 末尾必须是 --setting-sources 的空值，而非 prompt"
+        );
+    }
+
+    /// 预检守卫（六次反馈加固）：超限 argv 在 spawn 前被拦截并带错误 tag；
+    /// 常规短命令不受影响。防止未来改动把长 prompt 塞回 argv 后退化成 OS 哑错。
+    #[test]
+    fn command_line_guard_rejects_overlong_argv_with_tagged_error() {
+        let mut overlong = tokio::process::Command::new("claude");
+        overlong.arg("--print").arg("字".repeat(31_000));
+        let error = super::ensure_command_line_within_limit(&overlong, "operation")
+            .expect_err("超限命令行必须被预检拦截");
+        assert!(
+            error.starts_with("[operation_command_line_too_long]"),
+            "错误必须带 tag 便于前端定位，实际：{error}"
+        );
+
+        let short = tokio::process::Command::new("claude");
+        super::ensure_command_line_within_limit(&short, "operation").expect("常规短命令不应被拦截");
+        let mut normal = tokio::process::Command::new("claude");
+        normal.arg("--print").arg("--model").arg("claude-fixture");
+        super::ensure_command_line_within_limit(&normal, "side_query")
+            .expect("常规模型专用命令不应被拦截");
+    }
+
+    /// 环境块预检（七次反馈加固）：os error 206 也可能来自环境块超限；超限 env 在
+    /// spawn 前被拦截、带错误 tag 并指认最大变量，常规白名单环境不受影响。
+    #[test]
+    fn env_block_guard_rejects_oversized_environment_with_tagged_error() {
+        let mut bloated = tokio::process::Command::new("claude");
+        bloated.env_clear();
+        bloated.env("PATH", "C:\\Windows\\system32");
+        bloated.env("HELM_BLOAT_TEST", "字".repeat(25_000));
+        bloated.env("HELM_SMALL_TEST", "ok");
+        let error = super::ensure_env_block_within_limit(&bloated, "operation")
+            .expect_err("超限环境块必须被预检拦截");
+        assert!(
+            error.starts_with("[operation_env_block_too_large]"),
+            "错误必须带 tag 便于前端定位，实际：{error}"
+        );
+        assert!(
+            error.contains("HELM_BLOAT_TEST"),
+            "错误必须指认最大的环境变量，实际：{error}"
+        );
+
+        let mut normal = tokio::process::Command::new("claude");
+        normal.env_clear();
+        normal.env("PATH", "C:\\Windows\\system32;C:\\Windows");
+        super::ensure_env_block_within_limit(&normal, "side_query")
+            .expect("常规白名单环境不应被拦截");
+    }
+
+    /// 取证串（七次反馈）：spawn 失败消息携带 diag=v2 标记与各输入规模，
+    /// 足以在用户侧一次性定位 206 的真实来源并证明二进制新旧。
+    #[test]
+    fn spawn_forensics_reports_sizes_and_marker() {
+        let mut command = tokio::process::Command::new("claude");
+        command.arg("--print").arg("--model").arg("claude-fixture");
+        command.env_clear();
+        command.env("PATH", "C:\\Windows\\system32;C:\\Windows");
+        command.env(
+            "CLAUDE_CONFIG_DIR",
+            "C:\\Users\\demo\\.helm\\cli-profiles\\claude-subscription",
+        );
+        command.current_dir(std::env::temp_dir());
+        let diag = super::command_spawn_forensics(&command);
+        assert!(diag.starts_with("diag=v2 "), "取证串必须带版本标记：{diag}");
+        assert!(diag.contains("args=3"), "参数计数错误：{diag}");
+        assert!(diag.contains("env_vars=2"), "环境变量计数错误：{diag}");
+        assert!(diag.contains("cwd="), "取证串必须包含 cwd：{diag}");
+        // top_env 按字符数降序：值更长的 CLAUDE_CONFIG_DIR 必须排在 PATH 前。
+        let config_pos = diag.find("top_env=[CLAUDE_CONFIG_DIR(");
+        assert!(config_pos.is_some(), "top_env 必须包含最大变量：{diag}");
+        let path_pos = diag.find("PATH(").expect("top_env 应列出 PATH");
+        assert!(
+            path_pos > config_pos.unwrap(),
+            "top_env 必须按大小降序排列：{diag}"
+        );
+    }
+
+    /// 回归测试（Windows os error 206）：`CreateProcess` 命令行总长约 32767 字符，
+    /// 分叉摘要曾把整份 Ledger prompt 作为 argv 传递导致 spawn 失败。用真实子进程
+    /// 证明：>32K 的 prompt 全文经 `write_model_only_prompt` 从 stdin 到达子进程、
+    /// stdin 正确关闭（子进程能读到 EOF 退出），且命令行参数不含 prompt。
+    #[tokio::test]
+    async fn model_only_prompt_over_32k_is_delivered_via_stdin_never_argv() {
+        let cwd = std::env::temp_dir();
+        let marker = "HELM-FORK-LONG-PROMPT-MARKER";
+        let long_prompt = format!("{marker}{}", "字".repeat(40_000));
+        assert!(long_prompt.chars().count() > 32 * 1024);
+
+        // argv 契约：构造出的 model-only 命令行不包含 prompt，总长度有界；
+        // stdin 显式为管道，供 spawn 后写入。
+        let command = super::build_claude_model_only_command(
+            "claude",
+            "claude-fixture",
+            &[],
+            &cwd,
+            crate::reasoning::ReasoningEffort::Auto,
+        )
+        .unwrap();
+        let joined_args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\u{0}");
+        assert!(
+            !joined_args.contains(marker),
+            "prompt（含其片段）不得出现在命令行参数中"
+        );
+        assert!(
+            joined_args.chars().count() < 32 * 1024,
+            "model-only 固定 argv 必须远小于 CreateProcess 约 32K 上限"
+        );
+        // builder 必须显式把 stdin 设为管道（stable 工具链没有 Stdio getter，用行为级
+        // 断言）：spawn 后 Child.stdin 应为 Some，否则 prompt 无法经 stdin 交付。
+        {
+            #[cfg(windows)]
+            let probe_bin = "cmd";
+            #[cfg(not(windows))]
+            let probe_bin = "sh";
+            let probe = super::build_claude_model_only_command(
+                probe_bin,
+                "claude-fixture",
+                &[],
+                &cwd,
+                crate::reasoning::ReasoningEffort::Auto,
+            )
+            .unwrap()
+            .spawn()
+            .expect("探针子进程必须能启动");
+            assert!(
+                probe.stdin.is_some(),
+                "model-only 命令的 stdin 必须是管道，否则 prompt 无法经 stdin 交付"
+            );
+        }
+
+        // stdin 契约：spawn 真实子进程按字节计数回显，验证 >32K prompt 全量到达
+        // 且写入后 stdin 正确关闭（否则子进程等不到 EOF，外层超时兜底失败）。
+        #[cfg(windows)]
+        let mut echo = {
+            let mut c = tokio::process::Command::new("powershell");
+            c.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$stdin=[Console]::OpenStandardInput();$ms=New-Object System.IO.MemoryStream;$buf=New-Object byte[] 65536;while(($n=$stdin.Read($buf,0,$buf.Length)) -gt 0){$ms.Write($buf,0,$n)};Write-Output $ms.ToArray().Length",
+            ]);
+            c.creation_flags(super::CREATE_NO_WINDOW);
+            c
+        };
+        #[cfg(not(windows))]
+        let mut echo = {
+            let mut c = tokio::process::Command::new("sh");
+            c.args(["-c", "exec wc -c"]);
+            c
+        };
+        echo.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let run = async {
+            let mut child = echo.spawn().expect("回显子进程必须能启动");
+            super::write_model_only_prompt(&mut child, &long_prompt, "test")
+                .await
+                .expect("prompt 必须经 stdin 全量写入");
+            child.wait_with_output().await.expect("等待回显子进程失败")
+        };
+        let output = tokio::time::timeout(std::time::Duration::from_secs(60), run)
+            .await
+            .expect("stdin 未正确关闭会导致子进程等不到 EOF，超时即回归");
+        assert!(
+            output.status.success(),
+            "回显子进程退出码异常：{:?}",
+            output.status
+        );
+        let echoed = String::from_utf8_lossy(&output.stdout);
+        let received_bytes: usize = echoed
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("回显子进程应只输出字节数，实际输出：{echoed}"));
+        assert_eq!(
+            received_bytes,
+            long_prompt.len(),
+            ">32K prompt 必须完整经 stdin 到达子进程，无截断无多余"
+        );
     }
 
     #[test]
@@ -4849,10 +5897,22 @@ mod tests {
 pub(crate) fn classify_error(message: &str) -> Option<String> {
     let lower = message.to_lowercase();
     let kind = if lower.contains("there's an issue with the selected model")
-        || (lower.contains("model") && lower.contains("may not exist or you may not have access"))
+        || lower.contains("model may not exist or you may not have access")
+        || lower.contains("model unavailable")
+        || (lower.contains("model") && lower.contains("unavailable"))
+        || lower.contains("model not found")
+        || lower.contains("model does not exist")
+        || lower.contains("model access")
         || lower.contains("模型不存在")
         || lower.contains("模型不可用")
         || lower.contains("模型授权")
+    {
+        "model_unavailable"
+    } else if lower.contains("用量已达上限")
+        || lower.contains("usagelimitexceeded")
+        || lower.contains("usage limit")
+        || lower.contains("sessionbudgetexceeded")
+        || lower.contains("quota")
     {
         "model_unavailable"
     } else if lower.contains("未设置工作目录") || lower.contains("工作目录不存在") {
@@ -5225,6 +6285,7 @@ async fn run_claude_turn(
     resume: bool,
     mut start_ack: Option<oneshot::Sender<Result<(), String>>>,
 ) {
+    let turn_start_ts = now_millis();
     let _busy_guard = TurnBusyGuard {
         runtime: runtime.clone(),
     };
@@ -5232,6 +6293,18 @@ async fn run_claude_turn(
     // 同一个 Claude session 不能并发跑多个 `claude -p`。审批恢复期间如果又发送新消息，
     // 必须等恢复轮次完整结束，否则 stdout 事件会交叉，UI 状态会卡在 working。
     let _turn_guard = runtime.turn_lock.lock().await;
+
+    log_runtime_event(
+        &runtime.app,
+        "turn-start",
+        &format!(
+            "history={} resume={} prompt_len={} attachments={}",
+            runtime.history_session_id,
+            resume,
+            prompt.as_ref().map(|p| p.chars().count()).unwrap_or(0),
+            attachments.len(),
+        ),
+    );
 
     {
         let running = runtime.running_pid.lock().await;
@@ -5284,26 +6357,8 @@ async fn run_claude_turn(
         .support;
     let current_turn_id = runtime.current_turn_id.lock().await.clone();
 
-    let _workspace_lease = if mode == TurnMode::Build {
-        let coordinator = runtime
-            .app
-            .try_state::<crate::workspace_execution::WorkspaceExecutionCoordinator>();
-        let result = coordinator
-            .ok_or_else(|| "工作目录执行协调器未启动".to_string())
-            .and_then(|coordinator| coordinator.acquire(&runtime.history_session_id, &runtime.cwd));
-        match result {
-            Ok(lease) => Some(lease),
-            Err(message) => {
-                if let Some(ack) = start_ack.take() {
-                    let _ = ack.send(Err(message.clone()));
-                }
-                emit_error(&runtime, message, false).await;
-                return;
-            }
-        }
-    } else {
-        None
-    };
+    // 执行放行：不再对工作目录做独占 lease，同目录的多个会话可并行
+    // （与 claude -p / codex 原生行为一致）；同文件竞争由 diff/检查点展示兜底。
 
     // 新轮次开始时清空被拒绝目标列表（允许重新尝试），并把本轮模式同步给 hook
     if !resume {
@@ -5407,7 +6462,13 @@ async fn run_claude_turn(
     let permission_mode = claude_permission_mode_for_capability(mode, profile, auto_support);
     cmd.args(["--permission-mode", permission_mode]);
     if let Some(sid) = resume_id {
-        cmd.args(["--resume", &sid]);
+        // 同引擎无损分支（十次反馈）：首轮带 --fork-session 把完整历史复制进新 CLI
+        // 会话；成功后 init 事件回报新 session id 并清除标记，后续轮次回归普通 resume。
+        if *runtime.pending_native_branch.lock().await {
+            cmd.args(["--resume", &sid, "--fork-session"]);
+        } else {
+            cmd.args(["--resume", &sid]);
+        }
     }
     if let Some(text) = prompt {
         let current_prompt = prompt_with_attachments(&text, &attachments);
@@ -5584,6 +6645,22 @@ async fn run_claude_turn(
                         ..
                     } => {
                         *stdout_runtime.session_id.lock().await = Some(session_id.clone());
+                        // 将 CLI 回报的原生 session id 落库为 cli_session_id，使 `--fork-session`
+                        // 无损分支在 start_session_branch 中可达（此前该字段从未落库，claude 分叉
+                        // 被静默降级为摘要）；分支首轮 --fork-session 后会回报新 id 覆盖之。
+                        if let Some(history_store) =
+                            stdout_runtime.app.try_state::<SessionHistoryStore>()
+                        {
+                            let _ = history_store.attach_native_thread_to_session(
+                                &stdout_runtime.history_session_id,
+                                session_id,
+                            );
+                        }
+                        // 无损分支首轮成功：CLI 已回报分支出的新 session id，
+                        // 此后轮次回归普通 resume；失败时标记保留供用户重发重试。
+                        if *stdout_runtime.pending_native_branch.lock().await {
+                            *stdout_runtime.pending_native_branch.lock().await = false;
+                        }
                         let capability_snapshot =
                             stdout_runtime.capability_snapshot.lock().await.clone();
                         if let Some(observed) = capabilities.as_mut() {
@@ -5853,11 +6930,32 @@ async fn run_claude_turn(
     let stderr_saw_approval = saw_approval.clone();
     let stderr_saw_session_started = saw_session_started.clone();
     let stderr_last_activity = last_activity_ms.clone();
+    // 认证/配额类失败（欠费、Key 失效、403）在 stream-json 模式下 CLI 可能长期
+    // 挂住不退出，仅 stderr 有错误行；首次命中立即浮出错误，不等进程退出。
     let stderr_task = tokio::spawn(async move {
         let mut buf = String::new();
         let mut lines = BufReader::new(stderr).lines();
+        let mut auth_error_reported = false;
         while let Ok(Some(line)) = lines.next_line().await {
             stderr_last_activity.store(now_millis() as u64, Ordering::Release);
+            if !auth_error_reported
+                && (line.contains("Failed to authenticate")
+                    || line.contains("AccessDenied")
+                    || line.contains("Current user is in debt")
+                    || line.contains("API Error: 4"))
+            {
+                auth_error_reported = true;
+                eprintln!(
+                    "[helm] claude stderr auth/api failure surfaced early: {}",
+                    &line[..line.len().min(200)]
+                );
+                emit_error(
+                    &stderr_runtime,
+                    format!("模型调用被拒绝（认证或账户问题）：{line}"),
+                    false,
+                )
+                .await;
+            }
             // 检测 Hook 的审批通知（兜底通道：常规链路走 stdout 的 deferred_tool_use）
             if line.starts_with("APPROVAL_NEEDED:")
                 && stderr_saw_session_started.load(Ordering::Acquire)
@@ -5909,12 +7007,19 @@ async fn run_claude_turn(
     let watchdog_runtime = runtime.clone();
     let watchdog_activity = last_activity_ms.clone();
     let watchdog = tokio::spawn(async move {
+        // 卡死兜底（修复「进程卡死时 UI 永远显示进行中」）：
+        // 60s 无活动先标记 Stalled 提示用户；若持续 5 分钟仍无任何活动，
+        // 判定为 CLI 进程卡死，主动杀掉进程并发 interrupted 终态，让前端正常收尾、
+        // 用户可重新发送，而不是无限转圈。正常长轮次（生成长代码/跑测试等）不会触发。
         const IDLE_WARN_MS: u64 = 60_000;
+        const IDLE_KILL_MS: u64 = 300_000;
+        let mut stalled_emitted = false;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             let idle =
                 (now_millis() as u64).saturating_sub(watchdog_activity.load(Ordering::Acquire));
-            if idle >= IDLE_WARN_MS {
+            if idle >= IDLE_WARN_MS && !stalled_emitted {
+                stalled_emitted = true;
                 let session_id = watchdog_runtime
                     .session_id
                     .lock()
@@ -5932,6 +7037,28 @@ async fn run_claude_turn(
                         retry_attempt: None,
                     },
                 );
+                log_runtime_event(
+                    &watchdog_runtime.app,
+                    "watchdog",
+                    &format!(
+                        "stalled: history={} 已 {}s 无活动，先提示「卡住」（未强杀，等待 {}s 仍无活动将强制终结）",
+                        watchdog_runtime.history_session_id,
+                        idle / 1000,
+                        IDLE_KILL_MS / 1000,
+                    ),
+                );
+            }
+            if idle >= IDLE_KILL_MS {
+                log_runtime_event(
+                    &watchdog_runtime.app,
+                    "watchdog",
+                    &format!(
+                        "force-kill: history={} 已 {}s 无活动，判定进程卡死，强制终结并发送 interrupted 终态",
+                        watchdog_runtime.history_session_id,
+                        idle / 1000,
+                    ),
+                );
+                interrupt_running(watchdog_runtime.clone()).await;
                 return;
             }
         }
@@ -5959,12 +7086,37 @@ async fn run_claude_turn(
         terminal_candidate.is_some(),
         saw_approval.load(Ordering::Acquire),
     );
+    // 排查日志：进程退出这一刻是「案发现场」——记录退出码与各标志位、最终 disposition，
+    // 日后「一直转圈/卡进行中」可直接从 helm-runtime.log 还原进程究竟怎么退出的。
+    let current_turn = runtime.current_turn_id.lock().await.clone();
+    log_runtime_event(
+        &runtime.app,
+        "turn-end",
+        &format!(
+            "history={} turn={} code={} interrupted={} saw_turn_complete={} has_candidate={} saw_approval={} disposition={:?} elapsed_ms={} stderr_len={} stderr_tail=<{}>",
+            runtime.history_session_id,
+            current_turn,
+            code,
+            runtime.interrupted.load(Ordering::Acquire),
+            saw_turn_complete.load(Ordering::Acquire),
+            terminal_candidate.is_some(),
+            saw_approval.load(Ordering::Acquire),
+            disposition,
+            now_millis().saturating_sub(turn_start_ts),
+            detail.len(),
+            detail.chars().skip(detail.chars().count().saturating_sub(200)).collect::<String>(),
+        ),
+    );
     if disposition == ClaudeExitDisposition::Return && runtime.interrupted.load(Ordering::Acquire) {
+        log_runtime_event(
+            &runtime.app,
+            "turn-end",
+            "disposition=Return(interrupted)，终态由 interrupt_running 另行发出",
+        );
         return;
     }
     if auto_fallback_requested.load(Ordering::Acquire) {
         runtime.auto_compat_attempted.store(true, Ordering::Release);
-        drop(_workspace_lease);
         drop(_turn_guard);
         drop(_busy_guard);
         let retry_spec = runtime.current_turn_spec.lock().await.clone();
@@ -6044,6 +7196,14 @@ async fn run_claude_turn(
         } else {
             format!("：{detail}")
         };
+        log_runtime_event(
+            &runtime.app,
+            "emit",
+            &format!(
+                "emit=error(ProcessError) code={code} stderr_len={}",
+                detail.len()
+            ),
+        );
         emit_error(
             &runtime,
             format!("claude 进程异常退出（code={code}）{cause}{suffix}"),
@@ -6052,14 +7212,33 @@ async fn run_claude_turn(
         .await;
     } else if disposition == ClaudeExitDisposition::EmitCandidate {
         if let Some(event) = terminal_candidate.take() {
+            log_runtime_event(&runtime.app, "emit", "emit=turn_complete(candidate)");
             emit_agent_event(&runtime.app, &runtime.history_session_id, &event);
+        } else {
+            log_runtime_event(
+                &runtime.app,
+                "emit",
+                "emit=NONE(candidate 为 None，未发 turn_complete)",
+            );
         }
     } else if disposition == ClaudeExitDisposition::MissingResult {
         // 进程正常退出但没有输出 result 行（且不是审批 defer 场景）：
         // 同样必须给出终态事件，否则 UI 悬空。
+        log_runtime_event(&runtime.app, "emit", "emit=error(MissingResult)");
         emit_error(
             &runtime,
             "claude 进程已退出，但没有返回本轮结果（可能是 CLI 版本不兼容或输出被截断）"
+                .to_string(),
+            false,
+        )
+        .await;
+    } else if disposition == ClaudeExitDisposition::ApprovalDeferred {
+        // 进程正常退出但存在未决审批且无 result 候选：此前既不发 turn_complete 也不发
+        // error，前端永远停在「进行中」。补一个终态，让 UI 收尾并提示用户重发。
+        log_runtime_event(&runtime.app, "emit", "emit=error(ApprovalDeferred)");
+        emit_error(
+            &runtime,
+            "claude 进程已退出，存在未决审批且未返回本轮结果，本轮已终止。请重新发送这条消息。"
                 .to_string(),
             false,
         )
@@ -6120,6 +7299,7 @@ pub async fn start_claude_with_resume_and_reasoning(
     resume_id: Option<String>,
     history_messages: Vec<crate::sessions::SessionMessage>,
     capability_snapshot: crate::capability_registry::EngineCapabilitySnapshot,
+    pending_native_branch: bool,
 ) -> Result<AgentSession, String> {
     let use_user_setting_source = claude_uses_user_setting_source(&env);
     let hook_files = create_runtime_approval_hook_files()?;
@@ -6164,6 +7344,7 @@ pub async fn start_claude_with_resume_and_reasoning(
         } else {
             Vec::new()
         }),
+        pending_native_branch: Mutex::new(pending_native_branch),
         session_id: Mutex::new(resume_id),
         running_pid: Mutex::new(None),
         turn_lock: Mutex::new(()),
@@ -6599,6 +7780,9 @@ fn spawn_codex_app_server_loops(session: CodexSession, process: Arc<CodexAppServ
 
     let notification_session = session;
     let notification_rpc = process.rpc.clone();
+    // 本轮是否出现过任何可见产出（助手文本 / 工具结果 / 文件变更）。空回复据此判定为失败。
+    let mut saw_content = false;
+    let mut last_output_tokens: Option<u64> = None;
     spawn_agent_task(async move {
         while let Some(notification) = notification_rpc.next_notification().await {
             let notification = match notification {
@@ -6723,6 +7907,52 @@ fn spawn_codex_app_server_loops(session: CodexSession, process: Arc<CodexAppServ
                     }
                 }
             }
+            {
+                let note_method = notification
+                    .get("method")
+                    .and_then(serde_json::Value::as_str);
+                match note_method {
+                    Some("turn/started") => {
+                        saw_content = false;
+                        last_output_tokens = None;
+                    }
+                    Some("thread/tokenUsage/updated") => {
+                        last_output_tokens = notification
+                            .pointer("/params/tokenUsage/last/outputTokens")
+                            .and_then(serde_json::Value::as_u64);
+                    }
+                    Some("item/agentMessage/delta") => {
+                        if notification
+                            .pointer("/params/delta")
+                            .and_then(serde_json::Value::as_str)
+                            .map(|text| !text.is_empty())
+                            .unwrap_or(false)
+                        {
+                            saw_content = true;
+                        }
+                    }
+                    Some("item/completed") => {
+                        let item_type = notification
+                            .pointer("/params/item/type")
+                            .and_then(serde_json::Value::as_str);
+                        if matches!(
+                            item_type,
+                            Some(
+                                "agentMessage"
+                                    | "agent_message"
+                                    | "commandExecution"
+                                    | "fileChange"
+                                    | "webSearch"
+                                    | "mcpToolCall"
+                                    | "dynamicToolCall"
+                            )
+                        ) {
+                            saw_content = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
             if let Some(item_id) = notification
                 .pointer("/params/itemId")
                 .and_then(serde_json::Value::as_str)
@@ -6761,6 +7991,8 @@ fn spawn_codex_app_server_loops(session: CodexSession, process: Arc<CodexAppServ
             let terminal_outcome = codex_app_server_terminal_outcome_with_pending(
                 &notification,
                 pending_tool_summary.as_deref(),
+                saw_content,
+                last_output_tokens,
             );
             // `turn/interrupt` 会让 app-server 先回 `turn/completed`，此时等待审批或
             // 执行中的工具仍是 pending。用户 Stop 已先立下 interrupted 标志，不能再
@@ -6848,6 +8080,11 @@ fn spawn_codex_app_server_loops(session: CodexSession, process: Arc<CodexAppServ
 
 async fn fail_codex_active_turn(session: &CodexSession, error: &str) {
     if let Some(turn_id) = session.current_app_server_turn_id.lock().await.clone() {
+        log_runtime_event(
+            &session.app,
+            "emit",
+            &format!("emit=codex_fail turn={} error=<{}>", turn_id, error),
+        );
         session
             .terminal_turns
             .lock()
@@ -6952,6 +8189,24 @@ impl CodexSession {
         Ok(process)
     }
 
+    /// 触发 Codex 原生上下文压缩（app-server `thread/compact/start`，2026-08-12 更正）。
+    /// 只在无运行中 Turn 时允许（app-server 压缩期间 thread 保持 busy，避免与 Turn 并发）。
+    /// 返回即表示已提交；进度由 app-server 以 `contextCompaction` item 生命周期通知上报，
+    /// Helm 侧不伪造进度事件。
+    async fn compact_context(&self) -> Result<(), String> {
+        if self.busy.load(Ordering::Acquire) {
+            return Err("当前轮次运行中，请先停止再压缩".to_string());
+        }
+        let thread_id = self
+            .thread_id
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .ok_or_else(|| "Codex 会话尚无原生 thread，无法压缩".to_string())?;
+        let process = self.ensure_app_server().await?;
+        process.rpc.compact_thread(&thread_id).await
+    }
+
     async fn run_app_server_turn(
         &self,
         prompt: String,
@@ -6963,6 +8218,14 @@ impl CodexSession {
         let helm_turn_id = spec.turn_id.clone();
         *self.current_helm_turn_id.lock().await = Some(helm_turn_id.clone());
         set_event_turn_context(&self.history_session_id, &helm_turn_id, spec.turn_epoch);
+        log_runtime_event(
+            &self.app,
+            "turn-start",
+            &format!(
+                "engine=codex helm_turn={} epoch={}",
+                helm_turn_id, spec.turn_epoch
+            ),
+        );
         let selected_profile = *self
             .permission_profile
             .lock()
@@ -6980,16 +8243,7 @@ impl CodexSession {
             mode,
             selected_profile,
         );
-        let _workspace_lease = if mode == TurnMode::Build {
-            Some(
-                self.app
-                    .try_state::<crate::workspace_execution::WorkspaceExecutionCoordinator>()
-                    .ok_or_else(|| "工作目录执行协调器未启动".to_string())?
-                    .acquire(&self.history_session_id, &self.cwd)?,
-            )
-        } else {
-            None
-        };
+        // 执行放行：不再对工作目录做独占 lease，同目录会话可并行。
         let mut permission_profile = *self
             .permission_profile
             .lock()
@@ -7028,6 +8282,18 @@ impl CodexSession {
         };
         let runtime_capabilities = self.capability_snapshot.lock().await.runtime_projection();
         let native_search_enabled = codex_native_search_enabled(&self.env);
+        log_runtime_line(
+            "codex-turn-search",
+            &format!(
+                "native_search_enabled={} runtime_web_search={:?} prompt_branch_native={}",
+                native_search_enabled,
+                runtime_capabilities.web_search,
+                matches!(
+                    (native_search_enabled, runtime_capabilities.web_search),
+                    (true, _)
+                )
+            ),
+        );
         let prompt = match (native_search_enabled, runtime_capabilities.web_search) {
             (true, RuntimeCapabilityAvailability::Available) => prompt,
             (true, RuntimeCapabilityAvailability::Unknown) => format!(
@@ -7055,80 +8321,113 @@ impl CodexSession {
         let thread_id = if self.app_server_thread_ready.load(Ordering::Acquire) {
             existing_thread.ok_or_else(|| "Codex app-server thread state is missing".to_string())?
         } else {
-            let thread_id =
-                match codex_app_server_thread_plan(existing_thread.as_deref(), force_rebuild) {
-                    CodexAppServerThreadPlan::Start => {
-                        process
-                            .rpc
-                            .start_thread_with_policy(
-                                &execution_cwd,
-                                &routed_model,
-                                sandbox,
-                                approval_policy,
-                            )
-                            .await?
+            let fork_source = self
+                .fork_source_thread_id
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default();
+            let fork_last_turn = self
+                .fork_last_turn_id
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default();
+            let thread_id = match codex_app_server_thread_plan(
+                existing_thread.as_deref(),
+                fork_source.as_deref(),
+                fork_last_turn.as_deref(),
+                force_rebuild,
+            ) {
+                CodexAppServerThreadPlan::Fork(source, last_turn) => {
+                    let forked = process
+                        .rpc
+                        .fork_thread(&source, last_turn.as_deref())
+                        .await?;
+                    // 分支已拥有独立线程：消费来源行，后续轮次回归普通 resume(forked)。
+                    if let Some(history_store) = self.app.try_state::<SessionHistoryStore>() {
+                        let _ = history_store.clear_session_native_branch(&self.history_session_id);
+                        let _ = history_store
+                            .attach_native_thread_to_session(&self.history_session_id, &forked);
                     }
-                    CodexAppServerThreadPlan::Resume(thread_id) => {
-                        match process
-                            .rpc
-                            .resume_thread_with_policy(
-                                &thread_id,
-                                &execution_cwd,
-                                &routed_model,
-                                sandbox,
-                                approval_policy,
-                            )
-                            .await
-                        {
-                            Ok(thread_id) => thread_id,
-                            Err(error) if is_codex_thread_missing_error(&error) => {
-                                // app-server reports a missing rollout synchronously from
-                                // thread/resume, before the turn stream can trigger the normal
-                                // exec-path fallback. Rebuild from Helm's local history here.
-                                if let Ok(mut guard) = self.thread_id.lock() {
-                                    *guard = None;
-                                }
-                                self.force_history_rebuild.store(true, Ordering::Release);
-                                self.app_server_thread_ready.store(false, Ordering::Release);
-                                prompt = codex_app_server_prompt(true, &history, &base_prompt);
-                                emit_agent_event(
-                                    &self.app,
-                                    &self.history_session_id,
-                                    &AgentEvent::Error {
-                                        session_id: Some(self.history_session_id.clone()),
-                                        message: format!(
+                    if let Ok(mut guard) = self.fork_source_thread_id.lock() {
+                        *guard = None;
+                    }
+                    if let Ok(mut guard) = self.fork_last_turn_id.lock() {
+                        *guard = None;
+                    }
+                    forked
+                }
+                CodexAppServerThreadPlan::Start => {
+                    process
+                        .rpc
+                        .start_thread_with_policy(
+                            &execution_cwd,
+                            &routed_model,
+                            sandbox,
+                            approval_policy,
+                        )
+                        .await?
+                }
+                CodexAppServerThreadPlan::Resume(thread_id) => {
+                    match process
+                        .rpc
+                        .resume_thread_with_policy(
+                            &thread_id,
+                            &execution_cwd,
+                            &routed_model,
+                            sandbox,
+                            approval_policy,
+                        )
+                        .await
+                    {
+                        Ok(thread_id) => thread_id,
+                        Err(error) if is_codex_thread_missing_error(&error) => {
+                            // app-server reports a missing rollout synchronously from
+                            // thread/resume, before the turn stream can trigger the normal
+                            // exec-path fallback. Rebuild from Helm's local history here.
+                            if let Ok(mut guard) = self.thread_id.lock() {
+                                *guard = None;
+                            }
+                            self.force_history_rebuild.store(true, Ordering::Release);
+                            self.app_server_thread_ready.store(false, Ordering::Release);
+                            prompt = codex_app_server_prompt(true, &history, &base_prompt);
+                            emit_agent_event(
+                                &self.app,
+                                &self.history_session_id,
+                                &AgentEvent::Error {
+                                    session_id: Some(self.history_session_id.clone()),
+                                    message: format!(
                                         "Codex 原生 thread 已不存在，将用本地历史重建一次：{error}"
                                     ),
-                                        recoverable: true,
-                                        kind: Some("thread_missing".to_string()),
-                                        stalled_kind: None,
-                                    },
-                                );
-                                emit_agent_event(
-                                    &self.app,
-                                    &self.history_session_id,
-                                    &AgentEvent::TurnStage {
-                                        session_id: self.history_session_id.clone(),
-                                        stage: TurnStage::Retrying,
-                                        ts: now_millis(),
-                                        engine_reported_ttft_ms: None,
-                                        retry_attempt: Some(1),
-                                    },
-                                );
-                                process
-                                    .rpc
-                                    .start_thread_with_policy(
-                                        &execution_cwd,
-                                        &routed_model,
-                                        sandbox,
-                                        approval_policy,
-                                    )
-                                    .await?
-                            }
-                            Err(error) => return Err(error),
+                                    recoverable: true,
+                                    kind: Some("thread_missing".to_string()),
+                                    stalled_kind: None,
+                                },
+                            );
+                            emit_agent_event(
+                                &self.app,
+                                &self.history_session_id,
+                                &AgentEvent::TurnStage {
+                                    session_id: self.history_session_id.clone(),
+                                    stage: TurnStage::Retrying,
+                                    ts: now_millis(),
+                                    engine_reported_ttft_ms: None,
+                                    retry_attempt: Some(1),
+                                },
+                            );
+                            process
+                                .rpc
+                                .start_thread_with_policy(
+                                    &execution_cwd,
+                                    &routed_model,
+                                    sandbox,
+                                    approval_policy,
+                                )
+                                .await?
                         }
+                        Err(error) => return Err(error),
                     }
-                };
+                }
+            };
             if let Ok(mut guard) = self.thread_id.lock() {
                 *guard = Some(thread_id.clone());
             }
@@ -7153,7 +8452,12 @@ impl CodexSession {
             },
         );
         self.tool_item_facts.lock().await.clear();
-        let native_turn_id = process
+        log_runtime_event(
+            &self.app,
+            "codex-rpc",
+            &format!("method=turn/start thread={thread_id} model={routed_model}"),
+        );
+        let native_turn_id = match process
             .rpc
             .start_turn_with_context_policy(
                 &thread_id,
@@ -7166,7 +8470,35 @@ impl CodexSession {
                 approval_policy,
                 &spec.session_context,
             )
-            .await?;
+            .await
+        {
+            Ok(turn_id) => {
+                log_runtime_event(
+                    &self.app,
+                    "codex-rpc",
+                    &format!("method=turn/start ok native_turn={turn_id}"),
+                );
+                turn_id
+            }
+            Err(error) => {
+                log_runtime_event(
+                    &self.app,
+                    "codex-rpc",
+                    &format!("method=turn/start fail error=<{error}>"),
+                );
+                return Err(error);
+            }
+        };
+        // 切点分叉依赖：把原生轮次 id 落库到本轮（turn.native_turn_id），后续从
+        // 对话内分叉时可解析「被点回答 → 原生轮」并作为 thread/fork 的 lastTurnId。
+        // 落库失败不阻断轮次（切点分叉会安全回退为整段分叉）。
+        if let Some(history_store) = self.app.try_state::<SessionHistoryStore>() {
+            let _ = history_store.set_turn_native_id(
+                &self.history_session_id,
+                &spec.turn_id,
+                &native_turn_id,
+            );
+        }
         self.native_turn_contexts.lock().await.insert(
             native_turn_id.clone(),
             helm_turn_id,
@@ -7176,6 +8508,7 @@ impl CodexSession {
         let terminal_wait_started = tokio::time::Instant::now();
         let mut tool_stall_reported = false;
         let mut turn_stall_reported = false;
+        let mut turn_terminal_reported = false;
         let mut pending_terminal_failure = false;
         loop {
             let notified = self.terminal_notify.notified();
@@ -7232,10 +8565,35 @@ impl CodexSession {
                         },
                     );
                 } else if !turn_stall_reported
-                    && terminal_wait_started.elapsed() >= Duration::from_secs(300)
+                    && terminal_wait_started.elapsed() >= Duration::from_secs(60)
                 {
                     turn_stall_reported = true;
                     self.emit_stage(TurnStage::Stalled);
+                    log_runtime_event(
+                        &self.app,
+                        "turn-stall",
+                        &format!("engine=codex turn={} elapsed_s=60", native_turn_id),
+                    );
+                } else if !turn_terminal_reported
+                    && terminal_wait_started.elapsed() >= Duration::from_secs(300)
+                {
+                    turn_terminal_reported = true;
+                    log_runtime_event(
+                        &self.app,
+                        "turn-force-kill",
+                        &format!(
+                            "engine=codex turn={} elapsed_s=300 reason=no_terminal_in_5min",
+                            native_turn_id
+                        ),
+                    );
+                    if let Some(stale_process) = self.app_server.lock().await.take() {
+                        stale_process.shutdown().await;
+                    }
+                    self.app_server_thread_ready.store(false, Ordering::Release);
+                    self.pending_approvals.lock().await.clear();
+                    self.tool_item_facts.lock().await.clear();
+                    fail_codex_active_turn(self, "Codex 本轮超过 5 分钟无任何终态事件，已强制终止")
+                        .await;
                 }
             }
         }
@@ -7411,7 +8769,7 @@ impl CodexSession {
         .is_ok();
         if !drained {
             // Runtime 已经被终止但 app-server RPC 仍可能卡住；取消 Turn 任务本身，
-            // 让其中的 RAII lease（尤其是 WorkspaceExecutionLease）确定释放。
+            // 确保任务内持有的 RAII 资源确定释放。
             abort_codex_turn_task(
                 &self.turn_task,
                 &self.busy,
@@ -7433,6 +8791,8 @@ pub(crate) fn start_codex_with_reasoning(
     env: Vec<(String, String)>,
     history_messages: Vec<crate::sessions::SessionMessage>,
     native_thread_id: Option<String>,
+    fork_source_thread_id: Option<String>,
+    fork_last_turn_id: Option<String>,
     auth_home: Option<CodexAuthHome>,
     subscription_home: Option<PathBuf>,
     capability_snapshot: crate::capability_registry::EngineCapabilitySnapshot,
@@ -7482,6 +8842,8 @@ pub(crate) fn start_codex_with_reasoning(
         interrupted: Arc::new(AtomicBool::new(false)),
         disabled_mcp: Arc::new(std::sync::Mutex::new(Vec::new())),
         thread_id: Arc::new(std::sync::Mutex::new(native_thread_id)),
+        fork_source_thread_id: Arc::new(std::sync::Mutex::new(fork_source_thread_id)),
+        fork_last_turn_id: Arc::new(std::sync::Mutex::new(fork_last_turn_id)),
         auth_home: Arc::new(std::sync::Mutex::new(auth_home)),
         effective_home: Arc::new(std::sync::Mutex::new(effective_home)),
         force_history_rebuild: Arc::new(AtomicBool::new(false)),
@@ -7541,19 +8903,35 @@ fn codex_app_server_terminal_outcome(
     Some((turn_id, outcome))
 }
 
+fn codex_empty_turn_error(output_tokens: Option<u64>) -> String {
+    // 服务端以「完成」结束但没有任何可见产出（空回复）。最常见于中转对 Responses API
+    // 返回了空流，Codex 把它当成成功。这里直接把事实亮出来，不做猜测式包装。
+    match output_tokens {
+        Some(0) => "[codex_turn_empty] 模型本轮未返回任何内容（outputTokens=0）。若服务方对 Responses API 返回了空流，会表现为「成功但无输出」，请检查模型与中转配置。".to_string(),
+        Some(n) => format!("[codex_turn_empty] 本轮以「完成」结束但未包含可见回复（outputTokens={n}）。"),
+        None => "[codex_turn_empty] 本轮以「完成」结束，但没有产生任何助手回复或工具结果。".to_string(),
+    }
+}
+
 fn codex_app_server_terminal_outcome_with_pending(
     notification: &serde_json::Value,
     pending_tool_summary: Option<&str>,
+    saw_content: bool,
+    output_tokens: Option<u64>,
 ) -> Option<(String, Result<(), String>)> {
     let (turn_id, outcome) = codex_app_server_terminal_outcome(notification)?;
-    if outcome.is_ok() && pending_tool_summary.is_some() {
-        return Some((
-            turn_id,
-            Err(format!(
-                "{CODEX_TURN_FAILED_PREFIX} [codex_turn_pending_tools] Codex Turn 已结束，但仍有未完成工具：{}",
-                pending_tool_summary.unwrap_or_default()
-            )),
-        ));
+    if outcome.is_ok() {
+        if let Some(summary) = pending_tool_summary {
+            return Some((
+                turn_id,
+                Err(format!(
+                    "{CODEX_TURN_FAILED_PREFIX} [codex_turn_pending_tools] Codex Turn 已结束，但仍有未完成工具：{summary}"
+                )),
+            ));
+        }
+        if !saw_content {
+            return Some((turn_id, Err(codex_empty_turn_error(output_tokens))));
+        }
     }
     Some((turn_id, outcome))
 }
@@ -7675,73 +9053,37 @@ async fn finish_codex_interrupt_terminal<F>(
 }
 
 pub(crate) fn codex_app_server_failure_message(notification: &serde_json::Value) -> String {
-    let message = notification
-        .pointer("/params/turn/error/message")
+    // 直接把模型/Codex 返回的原始报错（脱敏后）展示给用户，不再逐场景包装成中文套话。
+    let error = notification
+        .pointer("/params/turn/error")
+        .or_else(|| notification.pointer("/params/error"));
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(message) = error
+        .and_then(|e| e.get("message"))
         .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            notification
-                .pointer("/params/error/message")
-                .and_then(serde_json::Value::as_str)
-        })
-        .or_else(|| {
-            notification
-                .pointer("/params/turn/error")
-                .and_then(serde_json::Value::as_str)
-        })
-        .unwrap_or_default();
-    // v2 的结构化详情仅参与分类，不能原样展示，避免泄露 URL、请求 ID 或 header。
-    let additional_details = notification
-        .pointer("/params/turn/error/additionalDetails")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let error_info = notification
-        .pointer("/params/turn/error/codexErrorInfo")
-        .map(serde_json::Value::to_string)
-        .unwrap_or_default();
-    if message.starts_with(CODEX_TURN_FAILED_PREFIX)
-        && message.contains("[codex_turn_pending_tools]")
     {
-        return crate::redaction::redact_text(message)
-            .chars()
-            .take(1000)
-            .collect();
+        if !message.trim().is_empty() {
+            parts.push(message.trim().to_string());
+        }
     }
-    let raw = format!("{message}\n{additional_details}\n{error_info}").to_ascii_lowercase();
-    if raw.contains("unfinished tool") || raw.contains("missing tool result") {
-        "Codex 工具执行未返回结果，已阻止本轮伪成功；请检查当前 Codex 版本的命令执行能力。"
-            .to_string()
-    } else if raw.contains("401") || raw.contains("unauthorized") || raw.contains("authentication")
+    if let Some(details) = error
+        .and_then(|e| e.get("additionalDetails"))
+        .and_then(serde_json::Value::as_str)
     {
-        "Codex 服务商认证失败，请重新验证当前 API 接入。".to_string()
-    } else if raw.contains("403") || raw.contains("forbidden") {
-        "Codex 服务商拒绝了当前请求，请检查账号权限与模型授权。".to_string()
-    } else if raw.contains("model")
-        && (raw.contains("not found")
-            || raw.contains("does not exist")
-            || raw.contains("access")
-            || raw.contains("unavailable"))
-    {
-        "Codex 当前绑定的模型不存在或账号无权访问，请重新同步模型并调整生效绑定。".to_string()
-    } else if raw.contains("429") || raw.contains("rate limit") {
-        "Codex 服务商触发了请求频率限制，请稍后重试。".to_string()
-    } else if raw.contains("usagelimitexceeded") || raw.contains("sessionbudgetexceeded") {
-        "Codex 订阅账号当前用量已达上限，请在官方账号页面确认额度后重试。".to_string()
-    } else if raw.contains("contextwindowexceeded") {
-        "Codex 当前对话超过模型上下文上限，请新建会话或减少输入内容。".to_string()
-    } else if raw.contains("serveroverloaded") || raw.contains("internalservererror") {
-        "Codex 服务暂时繁忙，请稍后重试。".to_string()
-    } else if raw.contains("timeout")
-        || raw.contains("timed out")
-        || raw.contains("connection")
-        || raw.contains("network")
-        || raw.contains("httpconnectionfailed")
-        || raw.contains("responsestreamconnectionfailed")
-        || raw.contains("responsestreamdisconnected")
-        || raw.contains("responsetoomanyfailedattempts")
-    {
-        "Codex 连接服务商失败，请检查网络、代理与服务商可达性。".to_string()
+        if !details.trim().is_empty() {
+            parts.push(details.trim().to_string());
+        }
+    }
+    if let Some(info) = error.and_then(|e| e.get("codexErrorInfo")) {
+        if !info.is_null() {
+            parts.push(serde_json::to_string_pretty(info).unwrap_or_else(|_| info.to_string()));
+        }
+    }
+    let combined = parts.join("\n\n");
+    if combined.trim().is_empty() {
+        "Codex 以失败状态结束，但没有返回可展示的错误详情。".to_string()
     } else {
-        "Codex 轮次失败；服务商未返回可安全展示的详细原因。".to_string()
+        crate::redaction::redact_text(&combined)
     }
 }
 
@@ -7840,7 +9182,10 @@ fn parse_codex_app_server_notification(
             };
             let mut events = Vec::new();
             if status == Some("failed") {
-                let message = codex_app_server_failure_message(notification);
+                let mut message = codex_app_server_failure_message(notification);
+                if let Some(stripped) = message.strip_prefix(CODEX_TURN_FAILED_PREFIX) {
+                    message = stripped.trim_start().to_string();
+                }
                 events.push(AgentEvent::Error {
                     session_id: Some(session_id.to_string()),
                     kind: classify_error(&message),
@@ -7863,6 +9208,26 @@ fn codex_app_server_started_item(session_id: &str, item: &serde_json::Value) -> 
     match item.get("type").and_then(serde_json::Value::as_str) {
         Some("reasoning") => vec![codex_turn_stage(session_id, TurnStage::Reasoning)],
         Some("agentMessage") => vec![codex_turn_stage(session_id, TurnStage::Responding)],
+        // P0-04：Codex contextCompaction item 开始 → running。
+        // app-server 不发独立的 item/started for contextCompaction（某些版本只发 completed），
+        // 但若收到 started，即标记 running。
+        Some("contextCompaction") => {
+            let id = codex_item_id(item)
+                .or_else(|| {
+                    item.get("itemId")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToString::to_string)
+                })
+                .unwrap_or_else(|| format!("compact-{}", now_millis()));
+            vec![AgentEvent::ContextCompaction {
+                session_id: session_id.to_string(),
+                id,
+                status: ContextCompactionStatus::Running,
+                ts: now_millis(),
+                summary: None,
+                error: None,
+            }]
+        }
         Some("commandExecution") => {
             let mut events = vec![codex_turn_stage(session_id, TurnStage::UsingTool)];
             if let Some(id) = codex_item_id(item) {
@@ -8169,6 +9534,45 @@ fn codex_app_server_completed_item(session_id: &str, item: &serde_json::Value) -
                 retryable: Some(false),
                 denial_source: failed.then_some(crate::protocol::ToolDenialSource::Tool),
                 native_denial_code: None,
+            }]
+        }
+        // P0-04：Codex contextCompaction item 完成 → succeeded/failed。
+        // 只使用 app-server 真实上报的字段；summary 缺省不补写虚构内容。
+        Some("contextCompaction") => {
+            let id = codex_item_id(item)
+                .or_else(|| {
+                    item.get("itemId")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToString::to_string)
+                })
+                .unwrap_or_else(|| format!("compact-{}", now_millis()));
+            let status_str = item.get("status").and_then(serde_json::Value::as_str);
+            let failed = matches!(status_str, Some("failed" | "declined"));
+            let summary = item
+                .get("summary")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+                .or_else(|| {
+                    // 某些版本把摘要放在 output/lastSummary 字段
+                    item.get("lastSummary")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToString::to_string)
+                });
+            let error = item
+                .get("error")
+                .filter(|value| !value.is_null())
+                .map(|value| value.to_string());
+            vec![AgentEvent::ContextCompaction {
+                session_id: session_id.to_string(),
+                id,
+                status: if failed {
+                    ContextCompactionStatus::Failed
+                } else {
+                    ContextCompactionStatus::Succeeded
+                },
+                ts: now_millis(),
+                summary,
+                error,
             }]
         }
         _ => Vec::new(),
@@ -8697,22 +10101,21 @@ mod turn_stage_tests {
     }
 
     #[test]
-    fn codex_failed_turn_classifies_structured_details_without_exposing_them() {
+    fn codex_failed_turn_classifies_structured_details_and_shows_raw() {
         let notification = serde_json::json!({"method":"turn/completed","params":{"turn":{
         "id":"turn-2","status":"failed","error":{
             "message":"request rejected",
-            "additionalDetails":"model gpt-private is unavailable at https://secret.example",
+            "additionalDetails":"model gpt-private is unavailable at https://example.com",
             "codexErrorInfo":"badRequest"
         }}}});
         let events = parse_codex_app_server_notification("codex-session", &notification);
         let error = serde_json::to_value(&events[0]).unwrap();
         assert_eq!(error["kind"], "model_unavailable");
-        assert!(error["message"].as_str().unwrap().contains("模型不存在"));
-        assert!(!error["message"]
-            .as_str()
-            .unwrap()
-            .contains("secret.example"));
-        assert!(!error["message"].as_str().unwrap().contains("gpt-private"));
+        let message = error["message"].as_str().unwrap();
+        // 原始报错（含结构化详情）原样展示，便于用户直接定位。
+        assert!(message.contains("request rejected"));
+        assert!(message.contains("model gpt-private is unavailable"));
+        assert!(message.contains("badRequest"));
     }
 
     #[test]
@@ -8723,7 +10126,9 @@ mod turn_stage_tests {
         }}}});
         let events = parse_codex_app_server_notification("codex-session", &notification);
         let error = serde_json::to_value(&events[0]).unwrap();
-        assert!(error["message"].as_str().unwrap().contains("用量已达上限"));
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains("request rejected"));
+        assert!(message.contains("usageLimitExceeded"));
     }
 
     #[test]
@@ -8750,7 +10155,7 @@ mod turn_stage_tests {
                     "id":"turn-1",
                     "status":"failed",
                     "error":{
-                        "message":"model unavailable at https://secret.example/v1 request_id=req-secret Authorization: Bearer secret"
+                        "message":"model unavailable at https://example.com/v1 api_key=sk-HELM_TEST_SECRET_123456 Authorization: Bearer sklAbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
                     },
                     "items":[]
                 }
@@ -8767,8 +10172,9 @@ mod turn_stage_tests {
         assert_eq!(serialized[1]["type"], "turn_complete");
         assert_eq!(serialized[1]["stopReason"], "error");
         let safe_message = serialized[0]["message"].as_str().unwrap();
-        assert!(!safe_message.contains("secret.example"));
-        assert!(!safe_message.contains("req-secret"));
+        assert!(safe_message.contains("model unavailable"));
+        assert!(!safe_message.contains("sk-HELM_TEST_SECRET_123456"));
+        assert!(!safe_message.contains("sklAbCdEfGhIjKlMnOpQrStUvWxYz0123456789"));
         assert!(!safe_message.contains("Bearer"));
 
         let (turn_id, outcome) = codex_app_server_terminal_outcome(&notification).unwrap();
@@ -8797,6 +10203,8 @@ mod turn_stage_tests {
         let (_, outcome) = super::codex_app_server_terminal_outcome_with_pending(
             &notification,
             Some("count=1, stages=executing=1"),
+            true,
+            None,
         )
         .expect("turn completion should be recognized");
         let error = outcome.expect_err("unfinished tool must fail closed");
@@ -9208,5 +10616,165 @@ mod turn_stage_tests {
                 ..
             }] if id == "cmd-1" && output == "exec command rejected by user"
         ));
+    }
+
+    #[test]
+    fn codex_context_compaction_started_emits_running_lifecycle_event() {
+        let events = parse_codex_app_server_notification(
+            "codex-session",
+            &serde_json::json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "compact-1",
+                        "type": "contextCompaction",
+                        "status": "inProgress"
+                    }
+                }
+            }),
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [super::AgentEvent::ContextCompaction {
+                status: crate::protocol::ContextCompactionStatus::Running,
+                id,
+                ..
+            }] if id == "compact-1"
+        ));
+    }
+
+    #[test]
+    fn codex_context_compaction_completed_emits_succeeded_with_real_summary() {
+        let events = parse_codex_app_server_notification(
+            "codex-session",
+            &serde_json::json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "compact-1",
+                        "type": "contextCompaction",
+                        "status": "completed",
+                        "summary": "保留了最近 3 轮对话和文件变更"
+                    }
+                }
+            }),
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [super::AgentEvent::ContextCompaction {
+                status: crate::protocol::ContextCompactionStatus::Succeeded,
+                id,
+                summary: Some(summary),
+                error: None,
+                ..
+            }] if id == "compact-1" && summary.contains("最近 3 轮")
+        ));
+    }
+
+    #[test]
+    fn codex_context_compaction_failed_emits_failed_with_error() {
+        let events = parse_codex_app_server_notification(
+            "codex-session",
+            &serde_json::json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "compact-2",
+                        "type": "contextCompaction",
+                        "status": "failed",
+                        "error": "context window exceeded hard limit"
+                    }
+                }
+            }),
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [super::AgentEvent::ContextCompaction {
+                status: crate::protocol::ContextCompactionStatus::Failed,
+                id,
+                summary: None,
+                error: Some(error),
+                ..
+            }] if id == "compact-2" && error.contains("hard limit")
+        ));
+    }
+
+    #[test]
+    fn codex_failure_message_shows_raw_error_after_redaction() {
+        // 不再包成中文套话，而是把模型/Codex 原始报错（脱敏后）直接展示。
+        let notification = serde_json::json!({
+            "method": "turn/completed",
+            "params": {
+                "turn": {
+                    "status": "failed",
+                    "error": {
+                        "message": "unexpected status 404 Not Found",
+                        "additionalDetails": "<html><head><title>404</title></head><body>nginx</body></html>"
+                    }
+                }
+            }
+        });
+        let message = super::codex_app_server_failure_message(&notification);
+        assert!(
+            message.contains("unexpected status 404 Not Found"),
+            "raw message must be shown: {message}"
+        );
+        assert!(
+            message.contains("nginx"),
+            "additionalDetails must be shown: {message}"
+        );
+    }
+
+    #[test]
+    fn codex_failure_message_redacts_secrets_in_raw_error() {
+        let notification = serde_json::json!({
+            "method": "turn/completed",
+            "params": {
+                "turn": {
+                    "status": "failed",
+                    "error": {
+                        "message": "auth failed: Authorization: Bearer sklAbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+                        "additionalDetails": "sk-HELM_TEST_SECRET_123456"
+                    }
+                }
+            }
+        });
+        let message = super::codex_app_server_failure_message(&notification);
+        assert!(
+            message.contains("auth failed"),
+            "raw context kept: {message}"
+        );
+        assert!(
+            !message.contains("sk-HELM_TEST_SECRET_123456"),
+            "sk- secret redacted: {message}"
+        );
+        assert!(
+            !message.contains("sklAbCdEfGhIjKlMnOpQrStUvWxYz0123456789"),
+            "bearer token redacted: {message}"
+        );
+    }
+
+    #[test]
+    fn codex_empty_turn_is_reported_as_failure() {
+        let notification = serde_json::json!({
+            "method": "turn/completed",
+            "params": {"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}
+        });
+        let (_, outcome) = super::codex_app_server_terminal_outcome_with_pending(
+            &notification,
+            None,
+            false,
+            Some(0),
+        )
+        .expect("turn completion should be recognized");
+        let error = outcome.expect_err("empty successful turn must fail closed");
+        assert!(error.contains("[codex_turn_empty]"));
+        assert!(error.contains("outputTokens=0"));
     }
 }

@@ -45,6 +45,9 @@ pub struct McpServer {
     pub command: String,
     pub args: Vec<String>,
     pub env: std::collections::HashMap<String, String>,
+    /// http 远程连接器的自定义请求头（仅 Claude Code 配置支持；Codex TOML 无此字段）
+    #[serde(default, rename = "headers")]
+    pub headers: std::collections::HashMap<String, String>,
     pub transport: McpTransport,
     pub enabled: bool,
     pub status: McpStatus,
@@ -746,44 +749,104 @@ fn read_skills_from_dir(
             continue;
         }
 
-        // 读取 SKILL.md 或 README.md 获取元信息
-        let skill_md = path.join("SKILL.md");
-        let readme_md = path.join("README.md");
-
-        let meta_file = if skill_md.exists() {
-            skill_md
-        } else if readme_md.exists() {
-            readme_md
-        } else {
+        if skill_id == ".system" {
+            // Codex 内置技能位于 skills/.system/<name>/SKILL.md（嵌套一层），
+            // 递归展开其直接子目录为 Builtin 技能（变更-36）。
+            read_builtin_skills_from_dir(&path, engine, prefix, enabled, skills)?;
             continue;
-        };
+        }
 
-        let content = std::fs::read_to_string(&meta_file).unwrap_or_default();
-
-        // 简单解析：第一个 # 标题作为名称，第一段作为描述
-        let name = extract_title(&content).unwrap_or_else(|| skill_id.clone());
-        let description = extract_description(&content);
-        // 市场安装的技能带 .helm-market.json 标记（变更-05）
-        let source = if path.join(".helm-market.json").exists() {
-            SkillSource::Market
-        } else {
-            SkillSource::Custom
-        };
-
-        skills.push(Skill {
-            trigger: format!("{prefix}{skill_id}"),
-            id: skill_id,
-            name,
-            description,
-            scope: SkillScope::Global,
-            source,
-            enabled,
-            path: path.to_string_lossy().to_string(),
-            engine: engine.to_string(),
-        });
+        push_skill_meta(&path, &skill_id, engine, prefix, enabled, None, skills);
     }
 
     Ok(())
+}
+
+/// 扫描 Codex 内置技能目录（skills/.system/<name>/SKILL.md）：每个直接子目录是一个内置技能。
+fn read_builtin_skills_from_dir(
+    system_dir: &Path,
+    engine: &str,
+    prefix: &str,
+    enabled: bool,
+    skills: &mut Vec<Skill>,
+) -> Result<(), String> {
+    let entries =
+        std::fs::read_dir(system_dir).map_err(|e| format!("读取内置技能目录失败: {}", e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("读取内置技能目录项失败: {}", e))?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let skill_id = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        if skill_id.is_empty() {
+            continue;
+        }
+        push_skill_meta(
+            &path,
+            &skill_id,
+            engine,
+            prefix,
+            enabled,
+            Some(SkillSource::Builtin),
+            skills,
+        );
+    }
+    Ok(())
+}
+
+/// 从技能目录读取 SKILL.md/README.md 元信息并压入技能列表。
+/// `force_source` 为 Some 时覆盖来源判定（内置技能展开用），否则按既有规则判定。
+fn push_skill_meta(
+    path: &Path,
+    skill_id: &str,
+    engine: &str,
+    prefix: &str,
+    enabled: bool,
+    force_source: Option<SkillSource>,
+    skills: &mut Vec<Skill>,
+) {
+    // 读取 SKILL.md 或 README.md 获取元信息
+    let skill_md = path.join("SKILL.md");
+    let readme_md = path.join("README.md");
+
+    let meta_file = if skill_md.exists() {
+        skill_md
+    } else if readme_md.exists() {
+        readme_md
+    } else {
+        return;
+    };
+
+    let content = std::fs::read_to_string(&meta_file).unwrap_or_default();
+
+    // 简单解析：第一个 # 标题作为名称，第一段作为描述
+    let name = extract_title(&content).unwrap_or_else(|| skill_id.to_string());
+    let description = extract_description(&content);
+    // 市场安装的技能带 .helm-market.json 标记（变更-05）
+    let source = force_source.unwrap_or_else(|| {
+        if path.join(".helm-market.json").exists() {
+            SkillSource::Market
+        } else {
+            SkillSource::Custom
+        }
+    });
+
+    skills.push(Skill {
+        trigger: format!("{prefix}{skill_id}"),
+        id: skill_id.to_string(),
+        name,
+        description,
+        scope: SkillScope::Global,
+        source,
+        enabled,
+        path: path.to_string_lossy().to_string(),
+        engine: engine.to_string(),
+    });
 }
 
 /// 把 settings.json 旧 skillsDisabled 键里的技能一次性迁移为目录移动，然后删除该键。
@@ -909,11 +972,248 @@ pub fn toggle_skill_in_dir(skills_dir: &Path, skill_id: &str, enabled: bool) -> 
     }
 }
 
+// ==================== 技能创建 / 源码读取 / 卸载（S7） ====================
+
+/// 文本源码读取上限：超过按截断返回，避免把超大文件灌进 UI。
+pub const MAX_SKILL_SOURCE_BYTES: u64 = 256 * 1024;
+
+/// 创建技能请求（结构化输入；路径由 Helm 按引擎与作用域推导，不接受前端路径）
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CreateSkillRequest {
+    /// claude-code | codex
+    pub engine: String,
+    pub scope: SkillScope,
+    /// 标识/slug，会经 safe_file_stem 归一为目录名
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub instructions: String,
+}
+
+fn normalize_skill_engine(engine: &str) -> Result<&'static str, String> {
+    match engine.trim() {
+        "claude-code" | "claude_code" | "claude" => Ok("claude-code"),
+        "codex" => Ok("codex"),
+        other => Err(format!("未知引擎：{other}")),
+    }
+}
+
+/// 技能目录白名单根：全局与项目级 skills 目录、Claude 插件市场目录。
+/// 创建/读源码/卸载都先经过这里校验，防止越界写或把任意文件当技能读出。
+fn allowed_skill_roots(project_dir: Option<&str>) -> Result<Vec<PathBuf>, String> {
+    let mut roots = vec![
+        claude_dir()?.join("skills"),
+        claude_plugins_marketplaces_dir()?,
+        codex_skills_dir()?,
+    ];
+    if let Some(dir) = project_dir.map(str::trim).filter(|s| !s.is_empty()) {
+        roots.push(project_claude_dir(dir)?.join("skills"));
+        roots.push(PathBuf::from(dir).join(".codex").join("skills"));
+    }
+    Ok(roots)
+}
+
+fn ensure_dir_within_allowed_roots(dir: &Path, project_dir: Option<&str>) -> Result<(), String> {
+    ensure_dir_within_roots(dir, &allowed_skill_roots(project_dir)?)
+}
+
+/// 校验目录落在任一受管根目录内（测试可注入根集合）。
+pub fn ensure_dir_within_roots(dir: &Path, roots: &[PathBuf]) -> Result<(), String> {
+    let canonical = dir
+        .canonicalize()
+        .map_err(|e| format!("解析技能路径失败: {e}"))?;
+    for root in roots {
+        if !root.exists() {
+            continue;
+        }
+        let canonical_root = root
+            .canonicalize()
+            .map_err(|e| format!("解析技能根目录失败: {e}"))?;
+        if canonical.starts_with(&canonical_root) {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "技能路径不在受管目录内，已拒绝操作：{}",
+        dir.display()
+    ))
+}
+
+/// 创建技能：在当前引擎的 skills 目录写入标准 SKILL.md（frontmatter + 正文）。
+/// 目录已存在时 fail-closed，绝不覆盖既有技能。
+pub fn create_skill(
+    request: CreateSkillRequest,
+    project_dir: Option<String>,
+) -> Result<Skill, String> {
+    let engine = normalize_skill_engine(&request.engine)?;
+    let root = match (engine, &request.scope) {
+        ("claude-code", SkillScope::Global) => claude_dir()?.join("skills"),
+        ("codex", SkillScope::Global) => codex_skills_dir()?,
+        (_, SkillScope::Global) => {
+            return Err("未知引擎，无法定位全局技能目录".to_string());
+        }
+        (_, SkillScope::Project) => {
+            let dir = project_dir
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "项目级技能需要提供项目目录".to_string())?;
+            if engine == "codex" {
+                PathBuf::from(dir).join(".codex").join("skills")
+            } else {
+                project_claude_dir(dir)?.join("skills")
+            }
+        }
+    };
+    create_skill_in_root(&root, engine, request)
+}
+
+/// 在指定 skills 根目录创建技能（测试可注入目录）。
+pub fn create_skill_in_root(
+    root: &Path,
+    engine: &str,
+    request: CreateSkillRequest,
+) -> Result<Skill, String> {
+    let engine = normalize_skill_engine(engine)?;
+    let slug = safe_file_stem(&request.id)?;
+    let name = request.name.trim().to_string();
+    if name.is_empty() {
+        return Err("技能名称不能为空".to_string());
+    }
+    let scope = request.scope;
+    let description = request.description.trim().to_string();
+    let skill_dir = root.join(&slug);
+    if skill_dir.exists() {
+        return Err(format!("技能目录已存在：{}", skill_dir.display()));
+    }
+    std::fs::create_dir_all(&skill_dir).map_err(|e| format!("创建技能目录失败: {}", e))?;
+    let content = markdown_with_frontmatter(
+        &[("name", name.clone()), ("description", description.clone())],
+        &["# ", &name, "\n\n", request.instructions.trim()].concat(),
+    );
+    std::fs::write(skill_dir.join("SKILL.md"), content)
+        .map_err(|e| format!("写入 SKILL.md 失败: {}", e))?;
+
+    Ok(Skill {
+        id: slug.clone(),
+        name,
+        description,
+        scope,
+        source: SkillSource::Custom,
+        enabled: true,
+        path: skill_dir.to_string_lossy().to_string(),
+        engine: engine.to_string(),
+        trigger: if engine == "codex" {
+            ["$", &slug].concat()
+        } else {
+            ["/", &slug].concat()
+        },
+    })
+}
+
+/// 技能源码文件（预览/源码抽屉）：内容已脱敏，超限标记 truncated。
+#[derive(Debug, Clone, Serialize)]
+pub struct SkillSourceFile {
+    pub path: String,
+    pub content: String,
+    pub truncated: bool,
+}
+
+/// 定位技能并校验其目录落在受管白名单内。
+fn locate_skill(
+    skill_id: &str,
+    engine: &str,
+    project_dir: Option<String>,
+) -> Result<(Skill, PathBuf), String> {
+    let engine = normalize_skill_engine(engine)?;
+    let skills = list_skills(Some(engine.to_string()), project_dir.clone())?;
+    let skill = skills
+        .into_iter()
+        .find(|skill| skill.id == skill_id)
+        .ok_or_else(|| format!("未找到技能：{skill_id}"))?;
+    let dir = PathBuf::from(&skill.path);
+    ensure_dir_within_allowed_roots(&dir, project_dir.as_deref())?;
+    Ok((skill, dir))
+}
+
+/// 读取技能 SKILL.md 源码：路径白名单 + 大小上限 + 脱敏后返回。
+pub fn read_skill_source(
+    skill_id: &str,
+    engine: &str,
+    project_dir: Option<String>,
+) -> Result<SkillSourceFile, String> {
+    let (_, dir) = locate_skill(skill_id, engine, project_dir)?;
+    read_skill_source_file(&dir)
+}
+
+/// 从技能目录读取源码文件（白名单校验由调用方完成；测试可注入目录）。
+pub fn read_skill_source_file(dir: &Path) -> Result<SkillSourceFile, String> {
+    let skill_md = dir.join("SKILL.md");
+    let file = if skill_md.is_file() {
+        skill_md
+    } else {
+        let readme = dir.join("README.md");
+        if readme.is_file() {
+            readme
+        } else {
+            return Err(format!(
+                "技能目录中没有 SKILL.md 或 README.md：{}",
+                dir.display()
+            ));
+        }
+    };
+    let size = std::fs::metadata(&file)
+        .map_err(|e| format!("读取技能文件元信息失败: {e}"))?
+        .len();
+    if size > MAX_SKILL_SOURCE_BYTES {
+        return Ok(SkillSourceFile {
+            path: file.to_string_lossy().to_string(),
+            content: String::new(),
+            truncated: true,
+        });
+    }
+    let raw = std::fs::read_to_string(&file).map_err(|e| format!("读取技能源码失败: {e}"))?;
+    Ok(SkillSourceFile {
+        path: file.to_string_lossy().to_string(),
+        content: crate::redaction::redact_text(&raw),
+        truncated: false,
+    })
+}
+
+/// 卸载技能：仅允许外部安装与自己创建的技能；内置/插件只读。
+/// 目录必须落在受管白名单内才允许删除。
+pub fn delete_skill(
+    skill_id: &str,
+    engine: &str,
+    project_dir: Option<String>,
+) -> Result<(), String> {
+    let (skill, dir) = locate_skill(skill_id, engine, project_dir)?;
+    if matches!(skill.source, SkillSource::Builtin | SkillSource::Plugin) {
+        return Err(format!(
+            "「{}」是内置/插件提供的技能，只能停用或在来源处管理，不能从这里卸载",
+            skill.name
+        ));
+    }
+    if !dir.is_dir() {
+        return Err(format!("技能目录不存在：{}", dir.display()));
+    }
+    std::fs::remove_dir_all(&dir).map_err(|e| format!("卸载技能失败: {e}"))
+}
+
 /// 列出 MCP 服务器配置（合并 ~/.helm/mcp-status.json 里的最近连接状态）
 pub fn list_mcp_servers() -> Result<Vec<McpServer>, String> {
     migrate_legacy_claude_mcp_config()?;
     let mut servers = list_mcp_servers_from_settings_path(&claude_mcp_config_path()?)?;
     for server in list_mcp_servers_from_codex_config_path(&codex_config_path()?)? {
+        if !servers.iter().any(|existing| existing.name == server.name) {
+            servers.push(server);
+        }
+    }
+    // 已停用的连接器：定义保留在 Helm 自有库，不注入引擎配置；引擎配置里出现同名时以引擎为准
+    let disabled = list_disabled_mcp_servers().unwrap_or_default();
+    for server in disabled {
         if !servers.iter().any(|existing| existing.name == server.name) {
             servers.push(server);
         }
@@ -934,6 +1234,474 @@ pub fn list_mcp_servers() -> Result<Vec<McpServer>, String> {
         }
     }
     Ok(servers)
+}
+
+// ==================== 连接器停用库 / 凭证钥匙串 / JSON 导入（S7） ====================
+
+/// 停用连接器定义库（Helm 自有 JSON）：停用 = 从引擎配置摘除但保留定义，启用 = 写回。
+fn mcp_store_path() -> Result<PathBuf, String> {
+    Ok(home_dir()?.join(".helm").join("mcp-store.json"))
+}
+
+pub fn read_mcp_store(path: &Path) -> Result<HashMap<String, McpServer>, String> {
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("读取连接器停用库失败: {}", e))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| format!("解析连接器停用库失败: {}", e))?;
+    let mut servers = HashMap::new();
+    if let Some(map) = value.get("servers").and_then(|v| v.as_object()) {
+        for (name, server) in map {
+            let mut server: McpServer = serde_json::from_value(server.clone())
+                .map_err(|e| format!("解析停用连接器 {name} 失败: {e}"))?;
+            server.enabled = false;
+            server.status = McpStatus::Disconnected;
+            servers.insert(name.clone(), server);
+        }
+    }
+    Ok(servers)
+}
+
+pub fn write_mcp_store(path: &Path, servers: &HashMap<String, McpServer>) -> Result<(), String> {
+    let mut ordered: Vec<(&String, &McpServer)> = servers.iter().collect();
+    ordered.sort_by(|a, b| a.0.cmp(b.0));
+    let value = serde_json::json!({
+        "servers": ordered
+            .into_iter()
+            .filter_map(|(name, server)| {
+                serde_json::to_value(server)
+                    .ok()
+                    .map(|value| (name.clone(), value))
+            })
+            .collect::<serde_json::Map<String, serde_json::Value>>()
+    });
+    let content =
+        serde_json::to_string_pretty(&value).map_err(|e| format!("序列化连接器停用库失败: {e}"))?;
+    write_shared_config_atomically(path, content.as_bytes())
+        .map_err(|e| format!("写入连接器停用库失败: {e}"))
+}
+
+fn list_disabled_mcp_servers() -> Result<Vec<McpServer>, String> {
+    let path = mcp_store_path()?;
+    let mut servers: Vec<McpServer> = read_mcp_store(&path)?.into_values().collect();
+    servers.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(servers)
+}
+
+/// 启用/停用连接器：停用把定义从引擎配置摘到 ~/.helm/mcp-store.json（配置保留、不注入会话）；
+/// 启用把定义写回双引擎配置。凭证值始终只走钥匙串，停用库里只存字段名不存值。
+pub fn set_mcp_server_enabled(name: &str, enabled: bool) -> Result<(), String> {
+    let path = mcp_store_path()?;
+    // 不整段持锁：后续引擎配置写入各自经 update_settings/update_toml_config 取同一把写锁
+    let mut store = read_mcp_store(&path)?;
+    if enabled {
+        let Some(mut server) = store.remove(name) else {
+            return Err(format!("停用库中没有连接器「{name}」，无法重新启用"));
+        };
+        server.enabled = true;
+        // 钥匙串凭证在停用期间保留；这里把真实值填回定义供引擎启动连接器进程
+        restore_mcp_credential_values(name, &mut server)?;
+        write_mcp_store(&path, &store)?;
+        save_mcp_server(server)?;
+    } else {
+        let servers = list_mcp_servers_from_settings_path(&claude_mcp_config_path()?)?;
+        let mut server = servers
+            .iter()
+            .find(|server| server.name == name)
+            .cloned()
+            .or_else(|| {
+                let codex_path = codex_config_path().ok()?;
+                let list = list_mcp_servers_from_codex_config_path(&codex_path).ok()?;
+                list.into_iter().find(|server| server.name == name)
+            })
+            .ok_or_else(|| format!("引擎配置中没有连接器「{name}」"))?;
+        server.enabled = false;
+        server.status = McpStatus::Disconnected;
+        store.insert(name.to_string(), server);
+        write_mcp_store(&path, &store)?;
+        // 只从引擎配置摘除定义；钥匙串凭证保留，重新启用时直接复用
+        delete_mcp_server_from_settings_path(&claude_mcp_config_path()?, name)?;
+        delete_mcp_server_from_codex_config_path(&codex_config_path()?, name)?;
+        forget_mcp_status(name);
+    }
+    Ok(())
+}
+
+/// 凭证类字段名判定：环境变量/请求头名字含令牌语义时按凭证处理（值进钥匙串，不进日志/导出）。
+pub fn is_credential_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    const MARKERS: [&str; 9] = [
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "API_KEY",
+        "APIKEY",
+        "API-KEY",
+        "CREDENTIAL",
+        "AUTHORIZATION",
+    ];
+    MARKERS.iter().any(|marker| upper.contains(marker))
+}
+
+/// 凭证钥匙串索引（Helm 自有 JSON）：只记录哪个连接器有哪些凭证字段名，绝不记录值。
+fn mcp_credential_index_path() -> Result<PathBuf, String> {
+    Ok(home_dir()?.join(".helm").join("mcp-credentials.json"))
+}
+
+const MCP_KEYRING_SERVICE: &str = "Helm";
+
+fn mcp_credential_account(server: &str, key: &str) -> String {
+    ["mcp:", server, "/", key].concat()
+}
+
+fn read_credential_index(path: &Path) -> Result<HashMap<String, Vec<String>>, String> {
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let content = std::fs::read_to_string(path).map_err(|e| format!("读取凭证索引失败: {}", e))?;
+    serde_json::from_str(&content).map_err(|e| format!("解析凭证索引失败: {}", e))
+}
+
+fn write_credential_index(path: &Path, index: &HashMap<String, Vec<String>>) -> Result<(), String> {
+    let content =
+        serde_json::to_string_pretty(index).map_err(|e| format!("序列化凭证索引失败: {e}"))?;
+    write_shared_config_atomically(path, content.as_bytes())
+        .map_err(|e| format!("写入凭证索引失败: {e}"))
+}
+
+/// 收集连接器定义里的凭证类字段名（env + http 请求头），排序去重。
+pub fn credential_keys_of(server: &McpServer) -> Vec<String> {
+    let mut keys: Vec<String> = server
+        .env
+        .keys()
+        .filter(|key| is_credential_key(key))
+        .cloned()
+        .collect();
+    if server.transport == McpTransport::Http {
+        keys.extend(
+            server
+                .headers
+                .keys()
+                .filter(|key| is_credential_key(key))
+                .cloned(),
+        );
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn keyring_entry(account: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new(MCP_KEYRING_SERVICE, account).map_err(|e| format!("打开钥匙串失败：{e}"))
+}
+
+/// 保存连接器时同步凭证：新值写钥匙串；被移除的字段清钥匙串；索引只记字段名。
+fn sync_mcp_credentials(
+    server_name: &str,
+    server: &McpServer,
+    previous_keys: &[String],
+) -> Result<(), String> {
+    let mut current_keys = credential_keys_of(server);
+    for key in &current_keys {
+        let value = server
+            .env
+            .get(key)
+            .or_else(|| server.headers.get(key))
+            .cloned()
+            .unwrap_or_default();
+        if value.is_empty() {
+            continue;
+        }
+        keyring_entry(&mcp_credential_account(server_name, key))?
+            .set_password(&value)
+            .map_err(|e| format!("写入钥匙串失败：{e}"))?;
+    }
+    for key in previous_keys {
+        if !current_keys.contains(key) {
+            let entry = keyring_entry(&mcp_credential_account(server_name, key))?;
+            match entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => {}
+                Err(e) => return Err(format!("清理钥匙串凭证失败：{e}")),
+            }
+        }
+    }
+    current_keys.sort();
+    current_keys.dedup();
+    let index_path = mcp_credential_index_path()?;
+    let mut index = read_credential_index(&index_path)?;
+    if current_keys.is_empty() {
+        index.remove(server_name);
+    } else {
+        index.insert(server_name.to_string(), current_keys);
+    }
+    write_credential_index(&index_path, &index)
+}
+
+/// 删除连接器时清理钥匙串凭证与索引。
+fn clear_mcp_credentials(server_name: &str) -> Result<(), String> {
+    let index_path = mcp_credential_index_path()?;
+    let mut index = read_credential_index(&index_path)?;
+    if let Some(keys) = index.remove(server_name) {
+        for key in keys {
+            let entry = keyring_entry(&mcp_credential_account(server_name, &key))?;
+            match entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => {}
+                Err(e) => return Err(format!("清理钥匙串凭证失败：{e}")),
+            }
+        }
+        write_credential_index(&index_path, &index)?;
+    }
+    Ok(())
+}
+
+/// 重新启用停用连接器时，把钥匙串里保存的凭证值填回定义（引擎进程需要真实值才能启动连接器）。
+fn restore_mcp_credential_values(server_name: &str, server: &mut McpServer) -> Result<(), String> {
+    let index = read_credential_index(&mcp_credential_index_path()?)?;
+    let Some(keys) = index.get(server_name) else {
+        return Ok(());
+    };
+    for key in keys {
+        let stored = keyring_entry(&mcp_credential_account(server_name, key))?
+            .get_password()
+            .map(Some)
+            .or_else(|error| match error {
+                keyring::Error::NoEntry => Ok(None),
+                error => Err(format!("读取钥匙串失败：{error}")),
+            })?;
+        let Some(value) = stored else {
+            continue;
+        };
+        if server.env.contains_key(key) {
+            server.env.insert(key.clone(), value);
+        } else if server.headers.contains_key(key) {
+            server.headers.insert(key.clone(), value);
+        }
+    }
+    Ok(())
+}
+
+/// 凭证存放状态（不回传值，只回传字段名与是否已入钥匙串）。
+#[derive(Debug, Clone, Serialize)]
+pub struct McpCredentialStatus {
+    pub key: String,
+    pub stored: bool,
+}
+
+pub fn list_mcp_credential_status(server_name: &str) -> Result<Vec<McpCredentialStatus>, String> {
+    let index = read_credential_index(&mcp_credential_index_path()?)?;
+    let keys = index.get(server_name).cloned().unwrap_or_default();
+    Ok(keys
+        .into_iter()
+        .map(|key| {
+            let stored = keyring_entry(&mcp_credential_account(server_name, &key))
+                .and_then(|entry| {
+                    entry
+                        .get_password()
+                        .map(|_| true)
+                        .or_else(|error| match error {
+                            keyring::Error::NoEntry => Ok(false),
+                            error => Err(format!("读取钥匙串失败：{error}")),
+                        })
+                })
+                .unwrap_or(false);
+            McpCredentialStatus { key, stored }
+        })
+        .collect())
+}
+
+/// 单条 JSON 导入结果：imported（已写入双引擎）/ skipped（不支持，说明原因）/ failed（可重试）。
+#[derive(Debug, Clone, Serialize)]
+pub struct McpImportItemResult {
+    pub name: String,
+    /// imported | skipped | failed
+    pub status: String,
+    pub message: Option<String>,
+    /// 凭证类字段名列表（只回传名字，值已进钥匙串）
+    #[serde(rename = "credentialKeys")]
+    pub credential_keys: Vec<String>,
+    /// 规范化后的连接器定义，供失败重试直接调用 save_mcp_server
+    pub server: Option<McpServer>,
+}
+
+#[derive(Debug)]
+pub enum ParsedMcpImport {
+    Server { name: String, server: McpServer },
+    Skipped { name: String, reason: String },
+    Failed { name: String, error: String },
+}
+
+/// 解析 Claude Code 的 mcpServers JSON（也接受裸 name 到 config 映射）。
+/// 产品只支持 stdio/http：type=sse 跳过并说明；缺 command/url 或 URL 非法按失败报告。
+pub fn parse_mcp_import_json(json: &str) -> Result<Vec<ParsedMcpImport>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(json.trim()).map_err(|e| format!("JSON 解析失败：{e}"))?;
+    let empty = serde_json::Map::new();
+    let servers = if let Some(map) = value.get("mcpServers").and_then(|v| v.as_object()) {
+        map
+    } else if let Some(map) = value.as_object() {
+        map
+    } else {
+        &empty
+    };
+    let mut parsed = Vec::new();
+    for (name, config) in servers {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            parsed.push(ParsedMcpImport::Failed {
+                name,
+                error: "服务器名称为空".to_string(),
+            });
+            continue;
+        }
+        let type_field = config
+            .get("type")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_lowercase());
+        if type_field.as_deref() == Some("sse") {
+            parsed.push(ParsedMcpImport::Skipped {
+                name,
+                reason: "产品仅支持 stdio/http 连接器，type=sse 已跳过".to_string(),
+            });
+            continue;
+        }
+        let url = config
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or_default();
+        let command = config
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or_default();
+        let args = config
+            .get("args")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(ToString::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let env = config
+            .get("env")
+            .and_then(|v| v.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect::<HashMap<String, String>>()
+            })
+            .unwrap_or_default();
+        let headers = config
+            .get("headers")
+            .and_then(|v| v.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect::<HashMap<String, String>>()
+            })
+            .unwrap_or_default();
+        let server = if !command.is_empty() {
+            McpServer {
+                name: name.clone(),
+                command: command.to_string(),
+                args,
+                env,
+                headers,
+                transport: McpTransport::Stdio,
+                enabled: true,
+                status: McpStatus::Disconnected,
+                last_tested_at: None,
+                tool_count: None,
+                last_error: None,
+            }
+        } else if !url.is_empty() {
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                parsed.push(ParsedMcpImport::Failed {
+                    name,
+                    error: format!("远程地址必须以 http:// 或 https:// 开头：{url}"),
+                });
+                continue;
+            }
+            McpServer {
+                name: name.clone(),
+                command: url.to_string(),
+                args: Vec::new(),
+                env,
+                headers,
+                transport: McpTransport::Http,
+                enabled: true,
+                status: McpStatus::Disconnected,
+                last_tested_at: None,
+                tool_count: None,
+                last_error: None,
+            }
+        } else {
+            parsed.push(ParsedMcpImport::Failed {
+                name,
+                error: "缺少 command（stdio）或 url（http）字段".to_string(),
+            });
+            continue;
+        };
+        parsed.push(ParsedMcpImport::Server { name, server });
+    }
+    Ok(parsed)
+}
+
+/// 保存连接器并把凭证类字段值同步进钥匙串（previous_keys 用于清理被移除的字段）。
+pub fn save_mcp_server_with_credential_sync(
+    server: &McpServer,
+    previous_keys: &[String],
+) -> Result<(), String> {
+    sync_mcp_credentials(&server.name.trim().to_string(), server, previous_keys)?;
+    save_mcp_server(server.clone())
+}
+
+/// 从 JSON 批量导入连接器：逐项写入双引擎并报告结果；凭证类字段值进钥匙串。
+pub async fn import_mcp_servers(json: String) -> Result<Vec<McpImportItemResult>, String> {
+    let parsed = parse_mcp_import_json(&json)?;
+    let mut results = Vec::new();
+    for item in parsed {
+        match item {
+            ParsedMcpImport::Skipped { name, reason } => results.push(McpImportItemResult {
+                name,
+                status: "skipped".to_string(),
+                message: Some(reason),
+                credential_keys: Vec::new(),
+                server: None,
+            }),
+            ParsedMcpImport::Failed { name, error } => results.push(McpImportItemResult {
+                name,
+                status: "failed".to_string(),
+                message: Some(error),
+                credential_keys: Vec::new(),
+                server: None,
+            }),
+            ParsedMcpImport::Server { name, server } => {
+                let credential_keys = credential_keys_of(&server);
+                match save_mcp_server_with_credential_sync(&server, &[]) {
+                    Ok(()) => results.push(McpImportItemResult {
+                        name,
+                        status: "imported".to_string(),
+                        message: None,
+                        credential_keys,
+                        server: Some(server),
+                    }),
+                    Err(error) => results.push(McpImportItemResult {
+                        name,
+                        status: "failed".to_string(),
+                        message: Some(error),
+                        credential_keys,
+                        server: Some(server),
+                    }),
+                }
+            }
+        }
+    }
+    Ok(results)
 }
 
 /// MCP 最近一次连接测试结果（Helm 自有持久化，不写引擎配置）
@@ -1050,12 +1818,22 @@ pub fn list_mcp_servers_from_settings_path(path: &Path) -> Result<Vec<McpServer>
                         .collect()
                 })
                 .unwrap_or_default();
+            let headers = config
+                .get("headers")
+                .and_then(|v| v.as_object())
+                .map(|obj| {
+                    obj.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
 
             servers.push(McpServer {
                 name: name.clone(),
                 command,
                 args,
                 env,
+                headers,
                 transport,
                 enabled: true,
                 status: McpStatus::Disconnected,
@@ -1138,7 +1916,7 @@ pub fn save_mcp_server_to_settings_path(path: &Path, server: McpServer) -> Resul
     }
 
     let name = server.name.trim().to_string();
-    let config = match server.transport {
+    let mut config = match server.transport {
         McpTransport::Stdio => serde_json::json!({
             "command": server.command.trim(),
             "args": server.args,
@@ -1153,6 +1931,10 @@ pub fn save_mcp_server_to_settings_path(path: &Path, server: McpServer) -> Resul
             "url": server.command.trim()
         }),
     };
+    if server.transport == McpTransport::Http && !server.headers.is_empty() {
+        config["headers"] =
+            serde_json::to_value(&server.headers).map_err(|e| format!("序列化请求头失败: {e}"))?;
+    }
     update_settings(path, move |settings| {
         object_mut(settings, "mcpServers")?.insert(name, config);
         Ok(())
@@ -1162,7 +1944,20 @@ pub fn save_mcp_server_to_settings_path(path: &Path, server: McpServer) -> Resul
 pub fn delete_mcp_server(name: &str) -> Result<(), String> {
     migrate_legacy_claude_mcp_config()?;
     delete_mcp_server_from_settings_path(&claude_mcp_config_path()?, name)?;
-    delete_mcp_server_from_codex_config_path(&codex_config_path()?, name)
+    delete_mcp_server_from_codex_config_path(&codex_config_path()?, name)?;
+    // 同步清理 Helm 侧凭证（钥匙串条目 + 字段名索引），避免留下孤儿凭证
+    let _ = clear_mcp_credentials(name);
+    // 若该连接器在停用库中也有一份定义，一并移除
+    if let Ok(path) = mcp_store_path() {
+        let _guard = shared_config_write_guard();
+        if let Ok(mut store) = read_mcp_store(&path) {
+            if store.remove(name).is_some() {
+                let _ = write_mcp_store(&path, &store);
+            }
+        }
+    }
+    forget_mcp_status(name);
+    Ok(())
 }
 
 pub fn delete_mcp_server_from_settings_path(path: &Path, name: &str) -> Result<(), String> {
@@ -1220,6 +2015,8 @@ pub fn list_mcp_servers_from_codex_config_path(path: &Path) -> Result<Vec<McpSer
                 command,
                 args,
                 env,
+                // Codex config.toml 没有请求头字段；http 连接器在 Claude Code 一侧携带
+                headers: Default::default(),
                 transport: if is_sse {
                     McpTransport::Sse
                 } else {
@@ -2255,6 +3052,41 @@ async fn test_stdio_mcp_connection(
     result
 }
 
+/// 从 stdout 行流里按 id 读 JSON-RPC 响应。
+/// stdio 服务器把启动 banner / 结构化日志混进 stdout 是常态（实测 mcp-atlassian
+/// 前 4 行都是 info 日志 + banner，第 5 行才是 JSON-RPC），非 JSON 行、空行、
+/// 通知/其他 id 的行一律跳过；id 兼容数字与数字字符串两种回显。
+fn read_json_rpc_response_from_lines<T, E>(
+    lines: &mut T,
+    expected_id: i64,
+) -> Result<serde_json::Value, String>
+where
+    T: Iterator<Item = Result<String, E>>,
+    E: std::fmt::Display,
+{
+    loop {
+        let line = lines
+            .next()
+            .ok_or("无响应")?
+            .map_err(|e| format!("读取响应失败: {e}"))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let id = match value.get("id") {
+            Some(serde_json::Value::Number(n)) => n.as_i64(),
+            Some(serde_json::Value::String(s)) => s.parse::<i64>().ok(),
+            _ => None,
+        };
+        if id == Some(expected_id) {
+            return Ok(value);
+        }
+    }
+}
+
 fn stdio_mcp_round_trip(
     mut stdin: std::process::ChildStdin,
     stdout: std::process::ChildStdout,
@@ -2279,12 +3111,17 @@ fn stdio_mcp_round_trip(
     writeln!(stdin, "{}", init_request.to_string())
         .map_err(|e| format!("发送 initialize 失败: {}", e))?;
 
-    // 读取 initialize 响应
+    // 读取 initialize 响应：跳过 banner/日志行，按 id 匹配；
+    // initialize 阶段的 error（凭证错/协议不兼容）直接透出，别拖到含糊的“无响应”
     let mut lines = reader.lines();
-    let _init_response = lines
-        .next()
-        .ok_or("无响应")?
-        .map_err(|e| format!("读取响应失败: {}", e))?;
+    let init_response = read_json_rpc_response_from_lines(&mut lines, 1)?;
+    if let Some(error) = init_response.get("error") {
+        let message = error
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("未知错误");
+        return Err(format!("初始化失败: {message}"));
+    }
 
     // 发送 tools/list 请求
     let tools_request = serde_json::json!({
@@ -2297,15 +3134,17 @@ fn stdio_mcp_round_trip(
     writeln!(stdin, "{}", tools_request.to_string())
         .map_err(|e| format!("发送 tools/list 失败: {}", e))?;
 
-    // 读取 tools/list 响应
-    let tools_response = lines
-        .next()
-        .ok_or("无工具列表响应")?
-        .map_err(|e| format!("读取工具列表失败: {}", e))?;
-
-    let response: serde_json::Value =
-        serde_json::from_str(&tools_response).map_err(|e| format!("解析工具列表失败: {}", e))?;
-    tools_from_mcp_response(&response)
+    // 读取 tools/list 响应：同样跳过 banner/日志行
+    let tools_response = read_json_rpc_response_from_lines(&mut lines, 2)?;
+    // JSON-RPC 错误响应优先透出服务器给的错误信息（而不是笼统的格式错误）
+    if let Some(error) = tools_response.get("error") {
+        let message = error
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("未知错误");
+        return Err(format!("服务器返回错误: {message}"));
+    }
+    tools_from_mcp_response(&tools_response)
 }
 
 async fn test_sse_mcp_connection(server: &McpServer) -> Result<Vec<McpTool>, String> {
@@ -2399,6 +3238,7 @@ async fn test_http_mcp_connection(server: &McpServer) -> Result<Vec<McpTool>, St
     let init_response = post_streamable_http(
         &client,
         url,
+        &server.headers,
         &mut session_id,
         serde_json::json!({
             "jsonrpc": "2.0",
@@ -2419,6 +3259,7 @@ async fn test_http_mcp_connection(server: &McpServer) -> Result<Vec<McpTool>, St
     let _ = post_streamable_http(
         &client,
         url,
+        &server.headers,
         &mut session_id,
         serde_json::json!({
             "jsonrpc": "2.0",
@@ -2431,6 +3272,7 @@ async fn test_http_mcp_connection(server: &McpServer) -> Result<Vec<McpTool>, St
     let tools_response = post_streamable_http(
         &client,
         url,
+        &server.headers,
         &mut session_id,
         serde_json::json!({
             "jsonrpc": "2.0",
@@ -2441,13 +3283,23 @@ async fn test_http_mcp_connection(server: &McpServer) -> Result<Vec<McpTool>, St
     )
     .await?
     .ok_or("MCP HTTP tools/list 无响应")?;
+    // JSON-RPC 错误响应优先透出服务器报错（与 stdio 路径一致）
+    if let Some(error) = tools_response.get("error") {
+        let message = error
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("未知错误");
+        return Err(format!("服务器返回错误: {message}"));
+    }
     tools_from_mcp_response(&tools_response)
 }
 
 /// POST 一条 JSON-RPC 消息并解析响应；通知类消息（无 id）返回 Ok(None)。
+/// extra_headers 为连接器定义里的自定义请求头（http 远程连接器凭证走钥匙串回填）。
 async fn post_streamable_http(
     client: &reqwest::Client,
     url: &str,
+    extra_headers: &HashMap<String, String>,
     session_id: &mut Option<String>,
     payload: serde_json::Value,
 ) -> Result<Option<serde_json::Value>, String> {
@@ -2456,6 +3308,9 @@ async fn post_streamable_http(
         .post(url)
         .header("Accept", "application/json, text/event-stream")
         .json(&payload);
+    for (key, value) in extra_headers {
+        request = request.header(key, value);
+    }
     if let Some(session) = session_id.as_deref() {
         request = request.header("Mcp-Session-Id", session);
     }
@@ -2617,6 +3472,67 @@ fn parse_sse_event(block: &str) -> Option<SseEvent> {
         event,
         data: data.join("\n"),
     })
+}
+
+#[cfg(test)]
+mod mcp_stdio_parse_tests {
+    use super::*;
+
+    /// 还原 mcp-atlassian（v2.1.0）实测 stdout：前 4 行是 info 日志 + banner，
+    /// 第 5 行起才是 JSON-RPC；中间还可能插服务器主动发的通知。
+    #[test]
+    fn skips_banner_and_log_lines_and_matches_by_id() {
+        let lines: Vec<Result<String, std::io::Error>> = vec![
+            Ok(r#"info: Initializing Atlassian MCP Server {"service":"mcp-atlassian"}"#.to_string()),
+            Ok(r#"info: Registered 40 tools {"service":"mcp-atlassian"}"#.to_string()),
+            Ok("Atlassian MCP server v2.1.0 running on stdio".to_string()),
+            Ok(
+                r#"{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"mcp-atlassian"}}}"#
+                    .to_string(),
+            ),
+            Ok(r#"{"jsonrpc":"2.0","method":"notifications/message"}"#.to_string()),
+            Ok(
+                r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"get_confluence_current_user"}]}}"#
+                    .to_string(),
+            ),
+        ];
+        let mut iter = lines.into_iter();
+        let init = read_json_rpc_response_from_lines(&mut iter, 1).unwrap();
+        assert_eq!(init["result"]["serverInfo"]["name"], "mcp-atlassian");
+        let tools = read_json_rpc_response_from_lines(&mut iter, 2).unwrap();
+        let parsed = tools_from_mcp_response(&tools).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "get_confluence_current_user");
+    }
+
+    #[test]
+    fn json_rpc_error_response_surfaces_message() {
+        // 服务器用 JSON-RPC error 明确回错时，必须透出它的报错文案而不是笼统格式错误
+        let lines: Vec<Result<String, std::io::Error>> = vec![
+            Ok(
+                r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"Atlassian API token 无效"}}"#
+                    .to_string(),
+            ),
+        ];
+        let mut iter = lines.into_iter();
+        let response = read_json_rpc_response_from_lines(&mut iter, 2).unwrap();
+        let error = response.get("error").unwrap();
+        let message = error
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("未知错误");
+        assert_eq!(message, "Atlassian API token 无效");
+    }
+
+    #[test]
+    fn id_string_echo_and_stream_end() {
+        let lines: Vec<Result<String, std::io::Error>> =
+            vec![Ok(r#"{"jsonrpc":"2.0","id":"1","result":{}}"#.to_string())];
+        let mut iter = lines.into_iter();
+        assert!(read_json_rpc_response_from_lines(&mut iter, 1).is_ok());
+        // 流结束仍没有目标响应 → 明确报错
+        assert!(read_json_rpc_response_from_lines(&mut iter, 2).is_err());
+    }
 }
 
 fn tools_from_mcp_response(response: &serde_json::Value) -> Result<Vec<McpTool>, String> {
@@ -2878,6 +3794,112 @@ mod atomic_write_tests {
         assert!(legacy.get("mcpServers").is_none());
         assert_eq!(target["mcpServers"]["legacy"]["command"], "legacy");
         assert_eq!(target["mcpServers"]["shared"]["command"], "new");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+}
+
+#[cfg(test)]
+mod skills_scan_tests {
+    use super::*;
+
+    fn temp_skills_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "helm-extension-skills-{label}-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ))
+    }
+
+    fn write_builtin(system_dir: &Path, name: &str, title: &str) {
+        let skill_dir = system_dir.join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("# {title}\n\n内置技能描述"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn system_dir_children_scan_as_builtin_skills() {
+        let directory = temp_skills_dir("system");
+        let system = directory.join(".system");
+        write_builtin(&system, "imagegen", "Image Generation");
+        write_builtin(&system, "web-search", "Web Search");
+        // 无 SKILL.md 的子目录不是技能
+        std::fs::create_dir_all(system.join("empty-dir")).unwrap();
+
+        let skills = list_skills_from_dir_for_engine(&directory, "codex", "$", false).unwrap();
+
+        assert_eq!(skills.len(), 2);
+        let imagegen = skills.iter().find(|skill| skill.id == "imagegen").unwrap();
+        assert_eq!(imagegen.trigger, "$imagegen");
+        assert_eq!(imagegen.source, SkillSource::Builtin);
+        assert_eq!(imagegen.scope, SkillScope::Global);
+        assert_eq!(imagegen.name, "Image Generation");
+        assert!(imagegen.enabled);
+        assert_eq!(imagegen.engine, "codex");
+        let web = skills
+            .iter()
+            .find(|skill| skill.id == "web-search")
+            .unwrap();
+        assert_eq!(web.trigger, "$web-search");
+        assert_eq!(web.source, SkillSource::Builtin);
+        assert!(skills.iter().all(|skill| skill.id != "empty-dir"));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn builtin_skills_merge_and_sort_with_custom_skills_without_duplicates() {
+        let directory = temp_skills_dir("merge");
+        write_builtin(&directory.join(".system"), "imagegen", "ImageGen");
+        let neat = directory.join("neat-freak");
+        std::fs::create_dir_all(&neat).unwrap();
+        std::fs::write(neat.join("SKILL.md"), "# Neat Freak").unwrap();
+        let abc = directory.join("abc");
+        std::fs::create_dir_all(&abc).unwrap();
+        std::fs::write(abc.join("SKILL.md"), "# ABC").unwrap();
+
+        let skills = list_skills_from_dir_for_engine(&directory, "codex", "$", false).unwrap();
+
+        let ids: Vec<&str> = skills.iter().map(|skill| skill.id.as_str()).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "技能中心列表按现有排序规则合并");
+        assert_eq!(ids.len(), 3, "内置与自定义技能合并，无重复");
+        let neat = skills
+            .iter()
+            .find(|skill| skill.id == "neat-freak")
+            .unwrap();
+        assert_eq!(neat.source, SkillSource::Custom);
+        assert_eq!(neat.trigger, "$neat-freak");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn plain_skills_scan_behavior_unchanged_without_system_dir() {
+        let directory = temp_skills_dir("plain");
+        let doc = directory.join("doc");
+        std::fs::create_dir_all(&doc).unwrap();
+        std::fs::write(doc.join("SKILL.md"), "# Doc").unwrap();
+        // 停用区照旧：include_disabled 时列出、enabled=false、来源 Custom
+        let disabled = directory.join(".helm-disabled");
+        let old = disabled.join("old");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("SKILL.md"), "# Old").unwrap();
+
+        let enabled_skills =
+            list_skills_from_dir_for_engine(&directory, "codex", "$", false).unwrap();
+        assert_eq!(enabled_skills.len(), 1);
+        assert_eq!(enabled_skills[0].id, "doc");
+        assert_eq!(enabled_skills[0].source, SkillSource::Custom);
+        assert!(enabled_skills[0].enabled);
+
+        let all = list_skills_from_dir_for_engine(&directory, "codex", "$", true).unwrap();
+        let old = all.iter().find(|skill| skill.id == "old").unwrap();
+        assert!(!old.enabled);
+        assert_eq!(old.source, SkillSource::Custom);
+        assert_eq!(old.trigger, "$old");
         let _ = std::fs::remove_dir_all(directory);
     }
 }

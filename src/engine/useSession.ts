@@ -3,6 +3,7 @@
 // 事件路由（变更-06）：后端信封携带 historyId（稳定线程身份），前端一律按它路由；
 // CLI 侧 sessionId 每轮可能变化（Codex 每轮新 id），只作展示/关联用，不作路由键。
 import { useCallback, useEffect, useReducer, useRef } from 'react';
+import { isTauriRuntime } from '../lib/env';
 import type {
   AgentEvent,
   AgentEventEnvelope,
@@ -20,6 +21,7 @@ import {
   closeSession,
   createSession,
   getTurnSnapshot,
+  appendRuntimeLog,
   interrupt,
   onAgentEvent,
   respondApproval,
@@ -32,7 +34,12 @@ import {
   type PermissionProfile,
 } from './transport';
 import type { SessionDetail, SessionForkSummary } from '../sessions/api';
-import { consumePendingResume, type ResumePayload } from '../sessions/resumeBridge';
+import {
+  consumePendingHistory,
+  consumePendingResume,
+  type HistoryOnlyPayload,
+  type ResumePayload,
+} from '../sessions/resumeBridge';
 import type { SessionDefaults } from '../settings/settingsViewModel';
 
 export interface TurnActivity {
@@ -149,6 +156,15 @@ function setLiveSessionWorking(historyId: string, working: boolean): void {
   notifyLiveChanged();
 }
 
+/** 撤下侧栏「待审批」徽标（9/4）：审批已被用户处理（deny 分支后端事件时序有窗口，
+ *  前端在审批事务提交成功后立即清，allow 分支仍由恢复轮首事件/turn_complete 清理）。 */
+export function clearLiveSessionApproval(historyId: string): void {
+  const entry = liveSessions.get(historyId);
+  if (!entry || !entry.pendingApproval) return;
+  entry.pendingApproval = false;
+  notifyLiveChanged();
+}
+
 function removeLiveSession(historyId: string): void {
   if (liveSessions.delete(historyId)) notifyLiveChanged();
 }
@@ -183,7 +199,9 @@ export function applyEnvelopeToLiveRegistry(envelope: AgentEventEnvelope): void 
   const entry = liveSessions.get(envelope.historyId);
   if (!entry) return;
   const event = envelope.event;
-  if (event.type === 'turn_complete' || event.type === 'error') {
+  // tool_stalled 是可恢复停顿不是轮次终态（9/4）：轮次还在跑，不能置空闲。
+  const isTerminalError = event.type === 'error' && event.kind !== 'tool_stalled';
+  if (event.type === 'turn_complete' || isTerminalError) {
     entry.working = false;
     entry.activity = null;
     entry.pendingApproval = false;
@@ -369,6 +387,15 @@ export type ThreadItem =
       message: string;
       errorKind?: string;
       stalledKind?: string;
+    } & ThreadItemMeta)
+  | ({
+      /** P0-04：Codex 原生上下文压缩生命周期记录（可展开摘要）。 */
+      kind: 'compact';
+      id: string;
+      status: 'submitted' | 'running' | 'succeeded' | 'failed';
+      ts: number;
+      summary?: string;
+      error?: string;
     } & ThreadItemMeta);
 
 export interface SessionState {
@@ -397,10 +424,17 @@ export interface SessionState {
   startedAt: number | null;
   turnActivity: TurnActivity | null;
   turnStartedAt: number | null;
+  /** 本轮累计成本（P0-03）：send 时清零，token_usage 事件累加，
+   * turn_complete 不清零（保留给 StatusBar 直到下一轮 send）。
+   * 无本轮 Usage 事实时为 0，StatusBar 据此省略成本显示。 */
+  turnCostUsd: number;
   /** 会话级停用的 MCP 服务器（变更-11）：下一轮生效，新建/切换会话时清空 */
   disabledMcp: string[];
   runtimeCapabilities?: RuntimeCapabilitySnapshot;
   fork?: SessionForkSummary | null;
+  /** B 方案历史先行：线程已渲染但 CLI 运行时还在后台重建（无句柄）。
+   *  Composer 闸门与启动自动恢复的去重判定都消费这个标记。 */
+  historyOnly?: boolean;
 }
 
 type Action =
@@ -427,6 +461,14 @@ type Action =
   | { type: 'undo_revert' }
   | { type: 'set_cwd'; cwd: string }
   | { type: 'set_disabled_mcp'; disabled: string[] }
+  /** B 方案「历史先行」：CLI 还在后台重建时，先把已拉到的历史渲染出来。
+   *  只填内容、不给句柄——status 恒为 idle、handleId 置空，Composer 由
+   *  Workspace 的恢复闸门（resumingId）挡住，不存在「对着半恢复会话发消息」。 */
+  | {
+      type: 'resume_history';
+      historyId: string;
+      detail: SessionDetail;
+    }
   | {
       type: 'resume_handle';
       handleId: string;
@@ -478,6 +520,7 @@ function initialState(defaults?: SessionDefaults): SessionState {
     startedAt: null,
     turnActivity: null,
     turnStartedAt: null,
+    turnCostUsd: 0,
     disabledMcp: [],
     fork: null,
   };
@@ -500,6 +543,7 @@ export function resetSessionState(_state: SessionState, defaults: SessionDefault
     startedAt: null,
     turnActivity: null,
     turnStartedAt: null,
+    turnCostUsd: 0,
     disabledMcp: [],
     fork: null,
   };
@@ -839,6 +883,9 @@ export function reduceSessionEvent(s: SessionState, e: AgentEvent, turnId?: stri
               }
             : {}),
         },
+        // P0-03：本轮累计成本只在事件信封 turnId 与当前运行中 Turn 匹配时累加。
+        // turnId 缺省（旧协议/历史回放）时退化为累加，保持向后兼容。
+        turnCostUsd: !turnId || s.status !== 'working' ? s.turnCostUsd : s.turnCostUsd + e.costUsd,
       };
 
     case 'context_usage':
@@ -850,6 +897,27 @@ export function reduceSessionEvent(s: SessionState, e: AgentEvent, turnId?: stri
           contextWindow: e.contextWindow ?? s.cost.contextWindow,
         },
       };
+
+    case 'context_compaction': {
+      // P0-04：压缩生命周期。已存在同 id 的 compact item 时更新状态，
+      // 否则追加新记录。终态后迟到事件遵循 Ledger 规则（不重写历史）。
+      const existing = s.items.some((item) => item.kind === 'compact' && item.id === e.id);
+      const base = {
+        kind: 'compact' as const,
+        id: e.id,
+        status: e.status,
+        ts: e.ts,
+        summary: e.summary,
+        error: e.error,
+        ...(turnId ? { turnId } : {}),
+      };
+      const items = existing
+        ? s.items.map((item) =>
+            item.kind === 'compact' && item.id === e.id ? { ...item, ...base } : item,
+          )
+        : [...s.items, base];
+      return { ...s, items };
+    }
 
     case 'turn_complete': {
       // 中断标注（变更-09）：半截流式消息补「已停止」标记，不再静默留存
@@ -890,7 +958,21 @@ export function reduceSessionEvent(s: SessionState, e: AgentEvent, turnId?: stri
       };
     }
 
-    case 'error':
+    case 'error': {
+      // tool_stalled 是「可恢复的停顿」不是终态错误（9/4）：后端 emit 前已发
+      // turn_stage: stalled，底部活动行会显示等待文案并在恢复后随新事件自动切换。
+      // 不再落常驻错误卡——旧实现卡片留在历史里，恢复正常跑后提示仍占一大块。
+      if (e.kind === 'tool_stalled') {
+        if (e.stalledKind === 'waiting_approval') return s; // 审批卡已单独呈现，无需重复
+        return {
+          ...s,
+          status: 'working',
+          turnActivity: {
+            stage: 'stalled',
+            since: Date.now(),
+          },
+        };
+      }
       return {
         ...s,
         status: 'idle',
@@ -908,6 +990,7 @@ export function reduceSessionEvent(s: SessionState, e: AgentEvent, turnId?: stri
           },
         ],
       };
+    }
 
     case 'approval_request': {
       const existing = s.items.some((item) => item.kind === 'approval' && item.id === e.id);
@@ -999,6 +1082,7 @@ export function reduceSessionAction(s: SessionState, a: Action): SessionState {
         startedAt: s.startedAt ?? now,
         turnActivity: { stage: 'preparing', since: now },
         turnStartedAt: now,
+        turnCostUsd: 0,
         items: [
           // 悬空审批作废（变更-07）：发新消息即放弃待审批的工具调用，旧卡不可再点
           ...s.items.map((it) =>
@@ -1103,6 +1187,44 @@ export function reduceSessionAction(s: SessionState, a: Action): SessionState {
     case 'set_cwd':
       // 仅在会话未开始时切换用户选择的工作目录。
       return { ...s, cwd: a.cwd };
+    case 'resume_history':
+      // B 方案历史先行：切换线程身份 + 渲染历史内容，但句柄留空、状态保持 idle。
+      // 事件路由键（historyId）此时已就绪，若后台 CLI 恢复期间有事件到达会落到正确线程。
+      return {
+        ...s,
+        handleId: null,
+        historyOnly: true,
+        historyId: a.historyId,
+        sessionId: a.detail.cliSessionId ?? null,
+        engine: a.detail.engine ?? s.engine,
+        model: a.detail.preferredModel ?? a.detail.model ?? s.model,
+        runtimeModel: a.detail.model ?? s.runtimeModel,
+        cwd: a.detail.cwd ?? s.cwd,
+        runtimeCapabilities: a.detail.runtimeCapabilities ?? s.runtimeCapabilities,
+        fork: a.detail.fork ?? null,
+        status: 'idle',
+        openAssistantId: null,
+        openThinkingId: null,
+        turnActivity: null,
+        turnStartedAt: null,
+        items: itemsFromHistory(a.detail),
+        cost: {
+          inputTokens: a.detail.inputTokens,
+          cachedInputTokens: a.detail.cachedInputTokens ?? 0,
+          cacheWriteInputTokens: a.detail.cacheWriteInputTokens ?? 0,
+          outputTokens: a.detail.outputTokens,
+          costUsd: a.detail.costUsd,
+          ...(a.detail.lastContextTokens != null
+            ? { contextTokens: a.detail.lastContextTokens }
+            : {}),
+          ...(a.detail.lastContextWindow != null
+            ? { contextWindow: a.detail.lastContextWindow }
+            : {}),
+        },
+        startedAt: a.detail.createdAt ? a.detail.createdAt * 1000 : s.startedAt,
+        turnCostUsd: 0,
+        disabledMcp: [],
+      };
     case 'set_disabled_mcp':
       return { ...s, disabledMcp: a.disabled };
     case 'undo_revert':
@@ -1123,6 +1245,7 @@ export function reduceSessionAction(s: SessionState, a: Action): SessionState {
       return {
         ...s,
         handleId: a.handleId,
+        historyOnly: false,
         historyId: a.historyId,
         sessionId: a.detail?.cliSessionId ?? null,
         engine: a.detail?.engine ?? s.engine,
@@ -1155,6 +1278,8 @@ export function reduceSessionAction(s: SessionState, a: Action): SessionState {
             }
           : s.cost,
         startedAt: a.detail?.createdAt ? a.detail.createdAt * 1000 : s.startedAt,
+        // P0-03：恢复历史会话时本轮成本从 0 起算（已结束的轮次没有本轮成本）。
+        turnCostUsd: 0,
         disabledMcp: [],
       };
     default:
@@ -1499,6 +1624,16 @@ export function useSession(defaults?: SessionDefaults) {
     const listener: EnvelopeListener = (envelope) => {
       if (shouldConsumeAgentEvent(historyIdRef.current, envelope)) {
         dispatch({ type: 'event', event: envelope.event, turnId: envelope.turnId });
+      } else if (isTauriRuntime()) {
+        // 排查日志：事件因 historyId 不匹配被丢弃——「后端发了但前端没消费」是
+        // 「一直进行中」的高频根因（resume/换引擎后 historyId 漂移），必须落盘。
+        const cur = historyIdRef.current ?? 'null';
+        const env = envelope.historyId ?? 'null';
+        if (cur !== env) {
+          void appendRuntimeLog(
+            `[helm-frontend-drop] historyId 不匹配已丢弃事件：当前=${cur} 信封=${env} type=${(envelope.event as { type?: string }).type ?? '?'}`,
+          ).catch(() => {});
+        }
       }
     };
     envelopeListeners.add(listener);
@@ -1555,15 +1690,60 @@ export function useSession(defaults?: SessionDefaults) {
         detail: payload.session,
       });
     };
+    // B 方案历史先行：CLI 后台重建期间先渲染线程内容。只填身份与 items，
+    // 句柄保持空——后续 helm:resume-session 到达时 applyResume 升级为完整状态。
+    const applyHistoryOnly = (payload: HistoryOnlyPayload) => {
+      const prevHandle = handleRef.current;
+      const prevHistoryId = historyIdRef.current;
+      if (prevHandle && prevHistoryId && prevHistoryId !== payload.session.id) {
+        // 切换到别的任务：与 applyResume 同口径释放旧句柄（运行中→保活）。
+        releaseHandle(prevHandle, prevHistoryId);
+        handleRef.current = null;
+      } else if (prevHandle && prevHistoryId === payload.session.id) {
+        // 目标会话已有可用句柄：不降级回「无句柄」状态。
+        return;
+      }
+      historyIdRef.current = payload.session.id;
+      dispatch({
+        type: 'resume_history',
+        historyId: payload.session.id,
+        detail: payload.session,
+      });
+    };
     const pending = consumePendingResume();
     if (pending) applyResume(pending);
+    else {
+      const pendingHistoryPayload = consumePendingHistory();
+      if (pendingHistoryPayload) applyHistoryOnly(pendingHistoryPayload);
+    }
     const onResume = (event: Event) => {
       const detail = (event as CustomEvent<ResumePayload>).detail;
       if (!detail?.handleId) return;
       applyResume(detail);
     };
+    const onResumeHistory = (event: Event) => {
+      const detail = (event as CustomEvent<HistoryOnlyPayload>).detail;
+      if (!detail?.session?.id) return;
+      applyHistoryOnly(detail);
+    };
+    // 先行渲染的线程在运行时重建失败时丢弃：仅当仍是该会话且未拿到句柄才回滚，
+    // 避免把已经恢复完成的线程误清空。
+    const onDiscardHistory = (event: Event) => {
+      const sessionId = (event as CustomEvent<{ sessionId?: string }>).detail?.sessionId;
+      if (!sessionId) return;
+      if (handleRef.current || historyIdRef.current !== sessionId) return;
+      historyIdRef.current = null;
+      // reducer 的 reset 在无 defaults 时保留当前 engine/cwd 回落空线程
+      dispatch({ type: 'reset' });
+    };
     window.addEventListener('helm:resume-session', onResume);
-    return () => window.removeEventListener('helm:resume-session', onResume);
+    window.addEventListener('helm:resume-history', onResumeHistory);
+    window.addEventListener('helm:resume-history-discard', onDiscardHistory);
+    return () => {
+      window.removeEventListener('helm:resume-session', onResume);
+      window.removeEventListener('helm:resume-history', onResumeHistory);
+      window.removeEventListener('helm:resume-history-discard', onDiscardHistory);
+    };
   }, []);
 
   const send = useCallback(
@@ -1574,6 +1754,7 @@ export function useSession(defaults?: SessionDefaults) {
       commandText?: string,
       reasoningEffort: ReasoningEffort = 'auto',
       permissionProfile: import('./transport').PermissionProfile = 'standard',
+      fullAccessConfirmed = false,
     ) => {
       const trimmed = text.trim();
       if (!trimmed) return false;
@@ -1599,6 +1780,8 @@ export function useSession(defaults?: SessionDefaults) {
             reasoningEffort,
             mode,
             permissionProfile,
+            fullAccessConfirmed:
+              permissionProfile === 'full_access' ? fullAccessConfirmed : undefined,
           });
           handleRef.current = handle;
           // 新会话的 history id 即句柄 id（后端 bind_history_session(handle, handle)）
@@ -1683,10 +1866,13 @@ export function useSession(defaults?: SessionDefaults) {
     rememberLastWorkspaceSession(null);
   }, []);
 
-  const reset = useCallback(() => {
-    releaseCurrent();
-    dispatch({ type: 'reset', defaults });
-  }, [defaults, releaseCurrent]);
+  const reset = useCallback(
+    (nextDefaults?: SessionDefaults) => {
+      releaseCurrent();
+      dispatch({ type: 'reset', defaults: nextDefaults ?? defaults });
+    },
+    [defaults, releaseCurrent],
+  );
 
   const selectEngine = useCallback(
     (engine: EngineId, model: string) => {
@@ -1756,6 +1942,9 @@ export function useSession(defaults?: SessionDefaults) {
       respond: (id, nextDecision) => respondApproval(handle, id, nextDecision),
       dispatch,
       onResolved: (resolvedDecision) => {
+        // 审批事务已提交（后端账本 pending → applying → resolved），立即撤下
+        // 侧栏「待审批」徽标；deny 后不再有恢复轮事件，主动清理避免悬挂。
+        if (historyIdRef.current) clearLiveSessionApproval(historyIdRef.current);
         if (resolvedDecision === 'deny') return;
         // 后端确认恢复轮已接管后，线程才回到运行中。
         dispatch({ type: 'working' });

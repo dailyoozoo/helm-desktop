@@ -1,51 +1,127 @@
-/* Helm 设计 token —— 唯一真值，从 prototype/assets/app.css 的 :root 抽取。
-   全局用 var(--…) 引用，不复制色值；改 token 改这里。 */
+/* Helm 设计 token —— 唯一真值。
+   视觉命题（决策记录 §6）：安静、紧凑、可信的本地 Agent 工作台。
+   浅灰工作面 + 白色操作区 + 单一冷青蓝强调色。
+   Tailwind v4 通过 @theme 把 CSS 变量注册为工具类（bg-surface / text-fg-2 等）。 */
+@import 'tailwindcss' source('../');
+
+@theme {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-hover: var(--hover);
+  --color-raised: var(--raised);
+
+  --color-border: var(--border);
+  --color-border-2: var(--border-2);
+  --color-line: var(--line);
+
+  --color-fg: var(--fg);
+  --color-fg-2: var(--fg-2);
+  --color-fg-3: var(--fg-3);
+  --color-fg-4: var(--fg-4);
+
+  --color-accent: var(--accent);
+  --color-accent-hi: var(--accent-hi);
+  --color-accent-soft: var(--accent-soft);
+  --color-accent-line: var(--accent-line);
+  --color-on-accent: var(--on-accent);
+
+  --color-success: var(--success);
+  --color-warn: var(--warn);
+  --color-danger: var(--danger);
+  --color-success-soft: var(--success-soft);
+  --color-warn-soft: var(--warn-soft);
+  --color-danger-soft: var(--danger-soft);
+
+  --color-add-bg: var(--add-bg);
+  --color-del-bg: var(--del-bg);
+  --color-add-fg: var(--add-fg);
+  --color-del-fg: var(--del-fg);
+
+  --color-note-bg: var(--note-bg);
+  --color-note-line: var(--note-line);
+
+  --color-agent-bg: var(--agent-bg);
+  --color-agent-line: var(--agent-line);
+  --color-agent-fg: var(--agent-fg);
+
+  --color-term-bg: var(--term-bg);
+  --color-term-fg: var(--term-fg);
+  --color-term-dim: var(--term-dim);
+  --color-term-accent: var(--term-accent);
+  --color-term-ok: var(--term-ok);
+
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+
+  --radius-xs: var(--r-xs);
+  --radius-sm: var(--r-sm);
+  --radius-md: var(--r);
+  --radius-lg: var(--r-lg);
+  --radius-xl: var(--r-xl);
+}
+
 :root {
-  /* surfaces — clean light, faint cool tint */
-  --bg: oklch(98.4% 0.0025 265);
+  /* surfaces — cool neutral gray（2026-08-23 全量回对 prototype/assets/app.css :root） */
+  --bg: oklch(97.8% 0.004 250);
   --surface: oklch(100% 0 0);
-  --surface-2: oklch(96.7% 0.004 265);
-  --hover: oklch(94.4% 0.006 265);
+  --surface-2: oklch(95.5% 0.005 250);
+  --hover: oklch(93.5% 0.006 250);
   --raised: oklch(100% 0 0);
 
-  /* hairlines & lines — dark ink on light */
-  --border: color-mix(in oklch, oklch(45% 0.03 265) 15%, transparent);
-  --border-2: color-mix(in oklch, oklch(45% 0.03 265) 26%, transparent);
-  --line: color-mix(in oklch, oklch(45% 0.03 265) 9%, transparent);
+  /* hairlines — low-contrast dark ink, never competes with content */
+  --border: color-mix(in oklch, oklch(42% 0.01 250) 12%, transparent);
+  --border-2: color-mix(in oklch, oklch(42% 0.01 250) 22%, transparent);
+  --line: color-mix(in oklch, oklch(42% 0.01 250) 7%, transparent);
+  --handle: color-mix(in oklch, oklch(42% 0.01 250) 12%, transparent);
+  --handle-on: var(--accent-line);
 
-  /* text — cool dark ink */
-  --fg: oklch(24% 0.014 265);
-  --fg-2: oklch(40% 0.013 265);
-  --fg-3: oklch(52% 0.012 265);
-  --fg-4: oklch(63% 0.011 265);
+  /* text — neutral cool ink, high readability on light surfaces */
+  --fg: oklch(22% 0.012 250);
+  --fg-2: oklch(38% 0.011 250);
+  --fg-3: oklch(50% 0.01 250);
+  --fg-4: oklch(62% 0.009 250);
 
-  /* accent — electric indigo, action color only (tuned for white text on white bg) */
-  --accent: oklch(55% 0.2 264);
-  --accent-hi: oklch(49% 0.21 264);
-  --accent-soft: color-mix(in oklch, oklch(55% 0.2 264) 11%, transparent);
-  --accent-line: color-mix(in oklch, oklch(55% 0.2 264) 38%, transparent);
+  /* accent — calm teal-blue: professional, quiet, distinct from generic blue/indigo */
+  --accent: oklch(52% 0.12 230);
+  --accent-hi: oklch(46% 0.13 230);
+  --accent-soft: color-mix(in oklch, oklch(52% 0.12 230) 10%, transparent);
+  --accent-line: color-mix(in oklch, oklch(52% 0.12 230) 35%, transparent);
   --on-accent: oklch(99% 0 0);
 
+  /* 分段/Tab 选中底与卡片悬停描边（S9 对齐原型 A8/A9 派生令牌） */
+  --tint-accent: color-mix(in oklch, var(--accent) 10%, var(--bg));
+  --line-accent-hover: color-mix(in oklch, var(--accent) 42%, transparent);
+
   /* status — readable as text on light tints */
-  --success: oklch(53% 0.14 156);
-  --warn: oklch(58% 0.13 65);
-  --danger: oklch(55% 0.21 25);
-  --success-soft: color-mix(in oklch, oklch(53% 0.14 156) 12%, transparent);
-  --warn-soft: color-mix(in oklch, oklch(58% 0.13 65) 14%, transparent);
-  --danger-soft: color-mix(in oklch, oklch(55% 0.21 25) 11%, transparent);
+  --success: oklch(52% 0.12 160);
+  --warn: oklch(58% 0.12 70);
+  --danger: oklch(54% 0.19 25);
+  --success-soft: color-mix(in oklch, oklch(52% 0.12 160) 11%, transparent);
+  --warn-soft: color-mix(in oklch, oklch(58% 0.12 70) 13%, transparent);
+  --danger-soft: color-mix(in oklch, oklch(54% 0.19 25) 10%, transparent);
 
   /* diff */
-  --add-bg: color-mix(in oklch, oklch(53% 0.14 156) 11%, transparent);
-  --del-bg: color-mix(in oklch, oklch(55% 0.21 25) 9%, transparent);
-  --add-fg: oklch(45% 0.13 156);
-  --del-fg: oklch(49% 0.19 25);
+  --add-bg: color-mix(in oklch, oklch(52% 0.12 160) 11%, transparent);
+  --del-bg: color-mix(in oklch, oklch(54% 0.19 25) 9%, transparent);
+  --add-fg: oklch(44% 0.11 160);
+  --del-fg: oklch(48% 0.17 25);
+
+  /* 审阅意见气泡（变更-34 · A2/A3） */
+  --note-bg: color-mix(in oklch, oklch(52% 0.12 230) 6%, var(--surface));
+  --note-line: var(--accent-line);
+
+  /* 子代理卡（变更-34/35 · C1） */
+  --agent-bg: color-mix(in oklch, oklch(55% 0.1 250) 5%, var(--surface));
+  --agent-line: color-mix(in oklch, oklch(55% 0.1 250) 28%, transparent);
+  --agent-fg: oklch(45% 0.08 250);
 
   /* terminal — intentionally dark in a light app (IDE convention); theme-independent */
-  --term-bg: oklch(20.5% 0.014 265);
-  --term-fg: oklch(91% 0.008 265);
-  --term-dim: oklch(66% 0.012 265);
-  --term-accent: oklch(78% 0.13 264);
-  --term-ok: oklch(80% 0.15 156);
+  --term-bg: oklch(19% 0.012 250);
+  --term-fg: oklch(91% 0.006 250);
+  --term-dim: oklch(66% 0.01 250);
+  --term-accent: oklch(75% 0.11 230);
+  --term-ok: oklch(80% 0.13 160);
   --term-line: color-mix(in oklch, white 10%, transparent);
 
   --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', system-ui, sans-serif;
@@ -53,101 +129,129 @@
     'JetBrains Mono', 'SF Mono', 'Cascadia Code', ui-monospace, 'Segoe UI Mono', Menlo, Consolas,
     monospace;
 
+  /* radii —— 与 prototype/assets/app.css 阶梯一致（S9 · U-03）：5 / 7 / 9 / 13 / 18 */
   --r-xs: 5px;
   --r-sm: 7px;
-  --r: 10px;
-  --r-lg: 14px;
-  --r-xl: 20px;
+  --r: 9px;
+  --r-lg: 13px;
+  --r-xl: 18px;
 
-  --rail-w: 56px;
-  --side-w: 282px;
-  --ctx-w: 330px;
-  --titlebar-h: 40px;
+  /* S1 任务型主侧栏：基准 236px（原型 --cm-sidebar）；≤1120px 226px；≤860px 收窄为图标列。 */
+  --rail-w: 236px;
+  --side-w: 272px;
+  --ctx-w: clamp(360px, 34vw, 560px);
+  /* 原型 commercial.css :root --cm-topbar: 48px（全局顶栏真值）。 */
+  --titlebar-h: 48px;
 
-  --shadow-pop: 0 14px 40px -12px rgba(22, 24, 46, 0.2), 0 3px 10px -3px rgba(22, 24, 46, 0.1);
-  --shadow-sm: 0 1px 2px rgba(22, 24, 46, 0.1), 0 0 0 1px rgba(22, 24, 46, 0.035);
+  --shadow-pop: 0 12px 36px -10px rgba(20, 24, 40, 0.16), 0 2px 8px -2px rgba(20, 24, 40, 0.08);
+  --shadow-sm: 0 1px 2px rgba(20, 24, 40, 0.08), 0 0 0 1px rgba(20, 24, 40, 0.03);
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  /* 原型 app.css :root 的 cm- 别名（components.css 消费；2026-08-25 随共享组件库移植）。 */
+  --cm-sidebar: 226px;
+  --cm-topbar: 48px;
+  --cm-content: 1120px;
+  --cm-section-gap: 32px;
+  --cm-surface: var(--surface);
+  --cm-surface-strong: var(--surface-2);
+  --cm-border: var(--border);
+  --cm-muted: color-mix(in oklch, var(--fg) 58%, transparent);
+  --cm-success: var(--success);
+  --cm-warn: var(--warn);
+  --cm-danger: var(--danger);
+  --cm-reveal-delay: 0ms;
 }
 
 :root[data-theme='dark'] {
-  --bg: oklch(19.5% 0.012 265);
-  --surface: oklch(23% 0.013 265);
-  --surface-2: oklch(26.5% 0.014 265);
-  --hover: oklch(30% 0.015 265);
-  --raised: oklch(25% 0.014 265);
+  --bg: oklch(18.5% 0.01 250);
+  --surface: oklch(22% 0.011 250);
+  --surface-2: oklch(25.5% 0.012 250);
+  --hover: oklch(29% 0.013 250);
+  --raised: oklch(24% 0.011 250);
 
-  --border: color-mix(in oklch, oklch(85% 0.02 265) 14%, transparent);
-  --border-2: color-mix(in oklch, oklch(85% 0.02 265) 24%, transparent);
-  --line: color-mix(in oklch, oklch(85% 0.02 265) 8%, transparent);
+  --border: color-mix(in oklch, oklch(82% 0.01 250) 13%, transparent);
+  --border-2: color-mix(in oklch, oklch(82% 0.01 250) 23%, transparent);
+  --line: color-mix(in oklch, oklch(82% 0.01 250) 7%, transparent);
+  --handle: color-mix(in oklch, oklch(82% 0.01 250) 12%, transparent);
+  --handle-on: var(--accent-line);
 
-  --fg: oklch(93% 0.008 265);
-  --fg-2: oklch(81% 0.01 265);
-  --fg-3: oklch(68% 0.011 265);
-  --fg-4: oklch(55% 0.011 265);
+  --fg: oklch(92% 0.006 250);
+  --fg-2: oklch(80% 0.008 250);
+  --fg-3: oklch(67% 0.009 250);
+  --fg-4: oklch(54% 0.008 250);
 
-  --accent: oklch(64% 0.19 264);
-  --accent-hi: oklch(70% 0.17 264);
+  --accent: oklch(63% 0.11 230);
+  --accent-hi: oklch(69% 0.1 230);
 
-  --accent-soft: color-mix(in oklch, oklch(64% 0.19 264) 17%, transparent);
-  --accent-line: color-mix(in oklch, oklch(64% 0.19 264) 42%, transparent);
+  --accent-soft: color-mix(in oklch, oklch(63% 0.11 230) 16%, transparent);
+  --accent-line: color-mix(in oklch, oklch(63% 0.11 230) 40%, transparent);
+  --tint-accent: color-mix(in oklch, var(--accent) 16%, var(--bg));
 
-  --success: oklch(72% 0.14 156);
-  --warn: oklch(76% 0.13 65);
-  --danger: oklch(68% 0.19 25);
-  --success-soft: color-mix(in oklch, oklch(72% 0.14 156) 16%, transparent);
-  --warn-soft: color-mix(in oklch, oklch(76% 0.13 65) 17%, transparent);
-  --danger-soft: color-mix(in oklch, oklch(68% 0.19 25) 16%, transparent);
+  --success: oklch(71% 0.12 160);
+  --warn: oklch(75% 0.12 70);
+  --danger: oklch(67% 0.18 25);
+  --success-soft: color-mix(in oklch, oklch(71% 0.12 160) 15%, transparent);
+  --warn-soft: color-mix(in oklch, oklch(75% 0.12 70) 16%, transparent);
+  --danger-soft: color-mix(in oklch, oklch(67% 0.18 25) 15%, transparent);
 
-  --add-bg: color-mix(in oklch, oklch(72% 0.14 156) 14%, transparent);
-  --del-bg: color-mix(in oklch, oklch(68% 0.19 25) 12%, transparent);
-  --add-fg: oklch(78% 0.13 156);
-  --del-fg: oklch(75% 0.16 25);
+  --add-bg: color-mix(in oklch, oklch(71% 0.12 160) 13%, transparent);
+  --del-bg: color-mix(in oklch, oklch(67% 0.18 25) 11%, transparent);
+  --add-fg: oklch(77% 0.11 160);
+  --del-fg: oklch(74% 0.15 25);
 
-  --shadow-pop: 0 14px 40px -12px rgba(0, 0, 0, 0.55), 0 3px 10px -3px rgba(0, 0, 0, 0.35);
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.04);
+  --note-bg: color-mix(in oklch, oklch(63% 0.11 230) 10%, var(--surface));
+  --note-line: var(--accent-line);
+
+  --agent-bg: color-mix(in oklch, oklch(65% 0.08 250) 10%, var(--surface));
+  --agent-line: color-mix(in oklch, oklch(65% 0.08 250) 32%, transparent);
+  --agent-fg: oklch(75% 0.06 250);
+
+  --shadow-pop: 0 12px 36px -10px rgba(0, 0, 0, 0.5), 0 2px 8px -2px rgba(0, 0, 0, 0.3);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(255, 255, 255, 0.04);
 }
 
 @media (prefers-color-scheme: dark) {
   :root[data-theme='system'] {
-    --bg: oklch(19.5% 0.012 265);
-    --surface: oklch(23% 0.013 265);
-    --surface-2: oklch(26.5% 0.014 265);
-    --hover: oklch(30% 0.015 265);
-    --raised: oklch(25% 0.014 265);
+    --bg: oklch(18.5% 0.01 250);
+    --surface: oklch(22% 0.011 250);
+    --surface-2: oklch(25.5% 0.012 250);
+    --hover: oklch(29% 0.013 250);
+    --raised: oklch(24% 0.011 250);
 
-    --border: color-mix(in oklch, oklch(85% 0.02 265) 14%, transparent);
-    --border-2: color-mix(in oklch, oklch(85% 0.02 265) 24%, transparent);
-    --line: color-mix(in oklch, oklch(85% 0.02 265) 8%, transparent);
+    --border: color-mix(in oklch, oklch(82% 0.01 250) 13%, transparent);
+    --border-2: color-mix(in oklch, oklch(82% 0.01 250) 23%, transparent);
+    --line: color-mix(in oklch, oklch(82% 0.01 250) 7%, transparent);
 
-    --fg: oklch(93% 0.008 265);
-    --fg-2: oklch(81% 0.01 265);
-    --fg-3: oklch(68% 0.011 265);
-    --fg-4: oklch(55% 0.011 265);
+    --fg: oklch(92% 0.006 250);
+    --fg-2: oklch(80% 0.008 250);
+    --fg-3: oklch(67% 0.009 250);
+    --fg-4: oklch(54% 0.008 250);
 
-    --accent: oklch(64% 0.19 264);
-    --accent-hi: oklch(70% 0.17 264);
+    --accent: oklch(63% 0.11 230);
+    --accent-hi: oklch(69% 0.1 230);
 
-    --accent-soft: color-mix(in oklch, oklch(64% 0.19 264) 17%, transparent);
-    --accent-line: color-mix(in oklch, oklch(64% 0.19 264) 42%, transparent);
+    --accent-soft: color-mix(in oklch, oklch(63% 0.11 230) 16%, transparent);
+    --accent-line: color-mix(in oklch, oklch(63% 0.11 230) 40%, transparent);
+    --tint-accent: color-mix(in oklch, var(--accent) 16%, var(--bg));
 
-    --success: oklch(72% 0.14 156);
-    --warn: oklch(76% 0.13 65);
-    --danger: oklch(68% 0.19 25);
-    --success-soft: color-mix(in oklch, oklch(72% 0.14 156) 16%, transparent);
-    --warn-soft: color-mix(in oklch, oklch(76% 0.13 65) 17%, transparent);
-    --danger-soft: color-mix(in oklch, oklch(68% 0.19 25) 16%, transparent);
+    --success: oklch(71% 0.12 160);
+    --warn: oklch(75% 0.12 70);
+    --danger: oklch(67% 0.18 25);
+    --success-soft: color-mix(in oklch, oklch(71% 0.12 160) 15%, transparent);
+    --warn-soft: color-mix(in oklch, oklch(75% 0.12 70) 16%, transparent);
+    --danger-soft: color-mix(in oklch, oklch(67% 0.18 25) 15%, transparent);
 
-    --add-bg: color-mix(in oklch, oklch(72% 0.14 156) 14%, transparent);
-    --del-bg: color-mix(in oklch, oklch(68% 0.19 25) 12%, transparent);
-    --add-fg: oklch(78% 0.13 156);
-    --del-fg: oklch(75% 0.16 25);
+    --add-bg: color-mix(in oklch, oklch(71% 0.12 160) 13%, transparent);
+    --del-bg: color-mix(in oklch, oklch(67% 0.18 25) 11%, transparent);
+    --add-fg: oklch(77% 0.11 160);
+    --del-fg: oklch(74% 0.15 25);
 
-    --shadow-pop: 0 14px 40px -12px rgba(0, 0, 0, 0.55), 0 3px 10px -3px rgba(0, 0, 0, 0.35);
-    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.04);
+    --agent-bg: color-mix(in oklch, oklch(65% 0.08 250) 10%, var(--surface));
+    --agent-line: color-mix(in oklch, oklch(65% 0.08 250) 32%, transparent);
+    --agent-fg: oklch(75% 0.06 250);
+
+    --shadow-pop: 0 12px 36px -10px rgba(0, 0, 0, 0.5), 0 2px 8px -2px rgba(0, 0, 0, 0.3);
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(255, 255, 255, 0.04);
   }
-}
-
-:root[data-density='compact'] {
-  --side-w: 258px;
-  --ctx-w: 306px;
-  --titlebar-h: 38px;
 }

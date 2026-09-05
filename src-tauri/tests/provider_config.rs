@@ -29,6 +29,9 @@ fn anthropic_provider() -> ProviderConfig {
         last_test: None,
         protocol: Protocol::Anthropic,
         auth_method: AuthMethod::ApiKey,
+        access_type: None,
+        role_models: None,
+        last_sync_at: None,
     }
 }
 
@@ -43,6 +46,9 @@ fn openai_provider() -> ProviderConfig {
         last_test: None,
         protocol: Protocol::OpenAiResponses,
         auth_method: AuthMethod::ApiKey,
+        access_type: None,
+        role_models: None,
+        last_sync_at: None,
     }
 }
 
@@ -53,6 +59,8 @@ fn change_27c_binding() -> BindingConfig {
         primary_model: "claude-sonnet-4.6".into(),
         fast_model: None,
         assistant_model_id: None,
+        thinking_enabled: None,
+        context_1m: None,
         reasoning_effort: None,
         revision: 0,
     }
@@ -227,6 +235,7 @@ fn claude_model() -> ModelConfig {
         display_name: "claude-sonnet-4.6".to_string(),
         input_price_per_mtok: 3.0,
         output_price_per_mtok: 15.0,
+        cached_input_price_per_mtok: None,
         price_source: Some(PriceSource::Manual),
         enabled: true,
         context_window: None,
@@ -241,6 +250,7 @@ fn claude_fast_model() -> ModelConfig {
         display_name: "claude-haiku-4.6".to_string(),
         input_price_per_mtok: 1.0,
         output_price_per_mtok: 5.0,
+        cached_input_price_per_mtok: None,
         price_source: Some(PriceSource::Manual),
         enabled: true,
         context_window: None,
@@ -255,6 +265,7 @@ fn codex_model() -> ModelConfig {
         display_name: "gpt-5-codex".to_string(),
         input_price_per_mtok: 1.25,
         output_price_per_mtok: 10.0,
+        cached_input_price_per_mtok: None,
         price_source: Some(PriceSource::Builtin),
         enabled: true,
         context_window: None,
@@ -290,6 +301,9 @@ fn provider_api_key_is_stored_as_key_ref_not_plaintext() {
         last_test: None,
         protocol: Protocol::Anthropic,
         auth_method: AuthMethod::ApiKey,
+        access_type: None,
+        role_models: None,
+        last_sync_at: None,
     };
 
     store
@@ -323,6 +337,9 @@ fn saving_provider_without_new_key_preserves_existing_key_ref() {
                 last_test: None,
                 protocol: Protocol::Anthropic,
                 auth_method: AuthMethod::ApiKey,
+                access_type: None,
+                role_models: None,
+                last_sync_at: None,
             },
             Some("sk-ant-secret-value"),
         )
@@ -340,6 +357,9 @@ fn saving_provider_without_new_key_preserves_existing_key_ref() {
                 last_test: None,
                 protocol: Protocol::Anthropic,
                 auth_method: AuthMethod::ApiKey,
+                access_type: None,
+                role_models: None,
+                last_sync_at: None,
             },
             None,
         )
@@ -379,6 +399,9 @@ fn provider_secret_can_be_revealed_from_secret_store_by_provider_id() {
                 last_test: None,
                 protocol: Protocol::Anthropic,
                 auth_method: AuthMethod::ApiKey,
+                access_type: None,
+                role_models: None,
+                last_sync_at: None,
             },
             Some("sk-ant-secret-value"),
         )
@@ -426,6 +449,9 @@ fn saving_provider_does_not_persist_key_ref_when_secret_cannot_be_read_back() {
             last_test: None,
             protocol: Protocol::Anthropic,
             auth_method: AuthMethod::ApiKey,
+            access_type: None,
+            role_models: None,
+            last_sync_at: None,
         },
         Some("sk-ant-secret-value"),
     );
@@ -500,6 +526,7 @@ fn parse_synced_models_preserves_existing_model_metadata() {
         display_name: "GPT-5 Codex".to_string(),
         input_price_per_mtok: 1.25,
         output_price_per_mtok: 10.0,
+        cached_input_price_per_mtok: None,
         price_source: Some(PriceSource::Manual),
         enabled: false,
         context_window: None,
@@ -799,6 +826,9 @@ fn provider_last_test_can_be_recorded_after_reachability_test() {
                 last_test: None,
                 protocol: Protocol::OpenAiResponses,
                 auth_method: AuthMethod::ApiKey,
+                access_type: None,
+                role_models: None,
+                last_sync_at: None,
             },
             None,
         )
@@ -837,6 +867,7 @@ fn default_engine_and_model_round_trip_through_config() {
             default_model: "claude-sonnet-4.6".to_string(),
             status: EngineStatus::Ready,
             version: Some("1.0.0".to_string()),
+            env_vars: None,
         })
         .unwrap();
     store
@@ -892,6 +923,7 @@ fn model_enablement_round_trips_through_config() {
             display_name: "claude-sonnet-4.6".to_string(),
             input_price_per_mtok: 3.0,
             output_price_per_mtok: 15.0,
+            cached_input_price_per_mtok: None,
             price_source: Some(PriceSource::Manual),
             enabled: false,
             context_window: None,
@@ -925,6 +957,9 @@ fn deleting_provider_removes_related_models_and_keeps_valid_defaults() {
                 last_test: None,
                 protocol: Protocol::Anthropic,
                 auth_method: AuthMethod::ApiKey,
+                access_type: None,
+                role_models: None,
+                last_sync_at: None,
             },
             None,
         )
@@ -936,6 +971,7 @@ fn deleting_provider_removes_related_models_and_keeps_valid_defaults() {
             display_name: "custom-model".to_string(),
             input_price_per_mtok: 1.0,
             output_price_per_mtok: 2.0,
+            cached_input_price_per_mtok: None,
             price_source: Some(PriceSource::Manual),
             enabled: true,
             context_window: None,
@@ -954,6 +990,9 @@ fn deleting_provider_removes_related_models_and_keeps_valid_defaults() {
                 last_test: None,
                 protocol: Protocol::OpenAiChat,
                 auth_method: AuthMethod::Local,
+                access_type: None,
+                role_models: None,
+                last_sync_at: None,
             },
             None,
         )
@@ -965,6 +1004,7 @@ fn deleting_provider_removes_related_models_and_keeps_valid_defaults() {
             display_name: "fallback-model".to_string(),
             input_price_per_mtok: 0.0,
             output_price_per_mtok: 0.0,
+            cached_input_price_per_mtok: None,
             price_source: Some(PriceSource::Manual),
             enabled: true,
             context_window: None,
@@ -978,6 +1018,8 @@ fn deleting_provider_removes_related_models_and_keeps_valid_defaults() {
             primary_model: "fallback-model".to_string(),
             fast_model: None,
             assistant_model_id: None,
+            thinking_enabled: None,
+            context_1m: None,
             reasoning_effort: None,
             revision: 0,
         })
@@ -1065,6 +1107,8 @@ fn save_binding_rejects_provider_protocol_that_engine_does_not_accept() {
         primary_model: "gpt-5-codex".to_string(),
         fast_model: None,
         assistant_model_id: None,
+        thinking_enabled: None,
+        context_1m: None,
         reasoning_effort: None,
         revision: 0,
     });
@@ -1088,6 +1132,8 @@ fn save_binding_requires_model_to_belong_to_provider_and_be_enabled() {
         primary_model: "claude-sonnet-4.6".to_string(),
         fast_model: None,
         assistant_model_id: None,
+        thinking_enabled: None,
+        context_1m: None,
         reasoning_effort: None,
         revision: 0,
     });
@@ -1100,6 +1146,7 @@ fn save_binding_requires_model_to_belong_to_provider_and_be_enabled() {
             display_name: "gpt-disabled".to_string(),
             input_price_per_mtok: 1.0,
             output_price_per_mtok: 2.0,
+            cached_input_price_per_mtok: None,
             price_source: Some(PriceSource::Manual),
             enabled: false,
             context_window: None,
@@ -1112,6 +1159,8 @@ fn save_binding_requires_model_to_belong_to_provider_and_be_enabled() {
         primary_model: "gpt-disabled".to_string(),
         fast_model: None,
         assistant_model_id: None,
+        thinking_enabled: None,
+        context_1m: None,
         reasoning_effort: None,
         revision: 0,
     });
@@ -1132,6 +1181,8 @@ fn save_binding_persists_valid_binding() {
             primary_model: "gpt-5-codex".to_string(),
             fast_model: Some("gpt-5-codex".to_string()),
             assistant_model_id: None,
+            thinking_enabled: None,
+            context_1m: None,
             reasoning_effort: None,
             revision: 0,
         })
@@ -1167,6 +1218,7 @@ fn save_binding_accepts_same_model_id_from_selected_provider() {
                 display_name: "gpt-5.5".to_string(),
                 input_price_per_mtok: 0.0,
                 output_price_per_mtok: 0.0,
+                cached_input_price_per_mtok: None,
                 price_source: None,
                 enabled: true,
                 context_window: None,
@@ -1183,6 +1235,7 @@ fn save_binding_accepts_same_model_id_from_selected_provider() {
                 display_name: "gpt-5.5".to_string(),
                 input_price_per_mtok: 0.0,
                 output_price_per_mtok: 0.0,
+                cached_input_price_per_mtok: None,
                 price_source: None,
                 enabled: true,
                 context_window: None,
@@ -1198,6 +1251,8 @@ fn save_binding_accepts_same_model_id_from_selected_provider() {
             primary_model: "gpt-5.5".to_string(),
             fast_model: Some("gpt-5.5".to_string()),
             assistant_model_id: None,
+            thinking_enabled: None,
+            context_1m: None,
             reasoning_effort: None,
             revision: 0,
         })
@@ -1229,6 +1284,8 @@ fn equivalent_env_matches_provider_protocol_and_binding_models() {
             primary_model: "claude-sonnet-4.6".to_string(),
             fast_model: Some("claude-haiku-4.6".to_string()),
             assistant_model_id: None,
+            thinking_enabled: None,
+            context_1m: None,
             reasoning_effort: None,
             revision: 0,
         })
@@ -1276,6 +1333,8 @@ fn launch_env_resolves_secret_value_without_persisting_plaintext() {
             primary_model: "claude-sonnet-4.6".to_string(),
             fast_model: Some("claude-haiku-4.6".to_string()),
             assistant_model_id: None,
+            thinking_enabled: None,
+            context_1m: None,
             reasoning_effort: None,
             revision: 0,
         })
@@ -1316,6 +1375,8 @@ fn codex_launch_env_includes_wire_api_hint_but_equivalent_env_does_not() {
         .save_provider(
             ProviderConfig {
                 protocol: Protocol::OpenAiChat,
+                role_models: None,
+                last_sync_at: None,
                 ..openai_provider()
             },
             Some("sk-openai-runtime-secret"),
@@ -1328,6 +1389,8 @@ fn codex_launch_env_includes_wire_api_hint_but_equivalent_env_does_not() {
         primary_model: "gpt-5-codex".to_string(),
         fast_model: None,
         assistant_model_id: None,
+        thinking_enabled: None,
+        context_1m: None,
         reasoning_effort: None,
         revision: 0,
     };
@@ -1360,6 +1423,9 @@ fn launch_env_normalizes_custom_openai_base_url_to_v1() {
                 last_test: None,
                 protocol: Protocol::OpenAiResponses,
                 auth_method: AuthMethod::ApiKey,
+                access_type: None,
+                role_models: None,
+                last_sync_at: None,
             },
             Some("sk-openai-runtime-secret"),
         )
@@ -1371,6 +1437,7 @@ fn launch_env_normalizes_custom_openai_base_url_to_v1() {
             display_name: "GPT-5 Codex".to_string(),
             input_price_per_mtok: 1.25,
             output_price_per_mtok: 10.0,
+            cached_input_price_per_mtok: None,
             price_source: Some(PriceSource::Builtin),
             enabled: true,
             context_window: None,
@@ -1385,6 +1452,8 @@ fn launch_env_normalizes_custom_openai_base_url_to_v1() {
             primary_model: "gpt-5-codex".to_string(),
             fast_model: None,
             assistant_model_id: None,
+            thinking_enabled: None,
+            context_1m: None,
             reasoning_effort: None,
             revision: 0,
         })
@@ -1475,6 +1544,8 @@ fn subscription_provider_is_ready_without_key_and_uses_cli_login() {
             primary_model: "claude-sonnet-4.6".to_string(),
             fast_model: None,
             assistant_model_id: None,
+            thinking_enabled: None,
+            context_1m: None,
             reasoning_effort: None,
             revision: 0,
         })
@@ -1516,6 +1587,8 @@ fn subscription_codex_provider_leaves_profile_selection_to_the_runtime() {
             primary_model: "gpt-5-codex".to_string(),
             fast_model: None,
             assistant_model_id: None,
+            thinking_enabled: None,
+            context_1m: None,
             reasoning_effort: None,
             revision: 0,
         })
@@ -1583,6 +1656,8 @@ fn api_key_provider_without_saved_key_fails_launch_env_loudly() {
             primary_model: "claude-sonnet-4.6".to_string(),
             fast_model: None,
             assistant_model_id: None,
+            thinking_enabled: None,
+            context_1m: None,
             reasoning_effort: None,
             revision: 0,
         })
@@ -1635,6 +1710,8 @@ fn deleting_bound_provider_is_rejected_without_mutating_config_or_secret() {
             primary_model: "claude-sonnet-4.6".to_string(),
             fast_model: None,
             assistant_model_id: None,
+            thinking_enabled: None,
+            context_1m: None,
             reasoning_effort: None,
             revision: 0,
         })
@@ -1824,19 +1901,48 @@ fn model_selection_cannot_disable_models_used_by_binding() {
             primary_model: primary.id.clone(),
             fast_model: Some(fast.id.clone()),
             assistant_model_id: None,
+            thinking_enabled: None,
+            context_1m: None,
             reasoning_effort: None,
             revision: 0,
         })
         .unwrap();
 
-    let primary_error = store
+    // 2026-09-03：在用模型允许改/关，绑定自动改到仍启用的那条，不再报「请先更改引擎绑定」。
+    let retarget_primary = store
         .save_provider_model_selection("openai", &[fast.id.clone()])
-        .unwrap_err();
-    assert!(primary_error.contains("主模型"));
-    let fast_error = store
+        .unwrap();
+    let binding = retarget_primary
+        .bindings
+        .iter()
+        .find(|binding| binding.engine_id == "codex")
+        .unwrap();
+    assert_eq!(binding.primary_model, fast.id);
+    assert_eq!(binding.fast_model.as_deref(), Some(fast.id.as_str()));
+
+    store
+        .save_binding(BindingConfig {
+            engine_id: "codex".to_string(),
+            provider_id: "openai".to_string(),
+            primary_model: primary.id.clone(),
+            fast_model: Some(fast.id.clone()),
+            assistant_model_id: None,
+            thinking_enabled: None,
+            context_1m: None,
+            reasoning_effort: None,
+            revision: 0,
+        })
+        .unwrap();
+    let retarget_fast = store
         .save_provider_model_selection("openai", &[primary.id.clone()])
-        .unwrap_err();
-    assert!(fast_error.contains("快速模型"));
+        .unwrap();
+    let binding = retarget_fast
+        .bindings
+        .iter()
+        .find(|binding| binding.engine_id == "codex")
+        .unwrap();
+    assert_eq!(binding.primary_model, primary.id);
+    assert_eq!(binding.fast_model.as_deref(), Some(primary.id.as_str()));
 
     let saved = store
         .save_provider_model_selection("openai", &[primary.id, fast.id])
@@ -1914,6 +2020,8 @@ fn subscription_equivalent_and_launch_env_do_not_claim_or_inject_secret() {
         primary_model: "sonnet".to_string(),
         fast_model: Some("haiku".to_string()),
         assistant_model_id: None,
+        thinking_enabled: None,
+        context_1m: None,
         reasoning_effort: None,
         revision: 0,
     };

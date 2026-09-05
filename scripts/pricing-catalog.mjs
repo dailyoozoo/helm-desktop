@@ -87,6 +87,14 @@ function standardBase(model) {
   return model?.tiers?.standard?.bands?.[0];
 }
 
+/* 上游对账（models.dev 社区库，官方牌价口径）：字段同构（input/output/cache_read/cache_write，
+  均为每百万 token），只对厂商官方入口比对；聚合中转报价不入库。 */
+const UPSTREAM_VENDORS = {
+  anthropic: { provider: 'anthropic', idFilter: null },
+  openai: { provider: 'openai', idFilter: /^gpt-/ },
+  deepseek: { provider: 'deepseek', idFilter: null },
+  moonshot: { provider: 'moonshot', idFilter: null },
+};
 async function checkUpstream() {
   const response = await fetch('https://models.dev/api.json', {
     headers: { accept: 'application/json', 'user-agent': 'helm-pricing-audit/1' },
@@ -94,44 +102,55 @@ async function checkUpstream() {
   });
   if (!response.ok) fail(`models.dev 返回 HTTP ${response.status}`);
   const providers = await response.json();
-  const openai = providers.openai?.models ?? {};
+  let missingTotal = 0;
   const drift = [];
-  const missing = [];
-  const localOpenAi = new Map(
-    catalog.models
-      .filter((model) => model.vendor === 'openai')
-      .map((model) => [model.modelId, model]),
-  );
-  for (const [modelId, upstream] of Object.entries(openai)) {
-    if (!modelId.startsWith('gpt-')) continue;
-    const local = localOpenAi.get(modelId);
-    if (!local) {
-      missing.push(modelId);
+  for (const [vendor, rule] of Object.entries(UPSTREAM_VENDORS)) {
+    const upstreamModels = providers[rule.provider]?.models ?? {};
+    if (!Object.keys(upstreamModels).length) {
+      console.log(`[pricing-catalog] 上游缺少 ${rule.provider} 入口，跳过`);
       continue;
     }
-    const base = standardBase(local);
-    const cost = upstream.cost ?? {};
-    if (
-      Number.isFinite(cost.input) &&
-      Number.isFinite(cost.output) &&
-      (base.input !== cost.input || base.output !== cost.output)
-    ) {
-      drift.push({
-        modelId,
-        local: [base.input, base.output],
-        upstream: [cost.input, cost.output],
-      });
+    const localByVendor = new Map(
+      catalog.models
+        .filter((model) => model.vendor === vendor)
+        .map((model) => [model.modelId, model]),
+    );
+    const missing = [];
+    for (const [modelId, upstream] of Object.entries(upstreamModels)) {
+      if (rule.idFilter && !rule.idFilter.test(modelId)) continue;
+      const local = localByVendor.get(modelId);
+      if (!local) {
+        missing.push(modelId);
+        continue;
+      }
+      const base = standardBase(local);
+      const cost = upstream.cost ?? {};
+      if (!Number.isFinite(cost.input) || !Number.isFinite(cost.output)) continue;
+      const drifted =
+        base.input !== cost.input ||
+        base.output !== cost.output ||
+        (Number.isFinite(cost.cache_read) && base.cachedInput !== cost.cache_read) ||
+        (Number.isFinite(cost.cache_write) && base.cacheWrite !== cost.cache_write);
+      if (drifted) {
+        drift.push({
+          vendor,
+          modelId,
+          local: [base.input, base.cachedInput ?? null, base.output],
+          upstream: [cost.input, cost.cache_read ?? null, cost.output],
+        });
+      }
     }
-  }
-  if (missing.length) {
-    console.log(`[pricing-catalog] 上游发现 ${missing.length} 个未收录 OpenAI 模型：`);
-    console.log(missing.sort().join('\n'));
+    if (missing.length) {
+      missingTotal += missing.length;
+      console.log(`[pricing-catalog] 上游发现 ${missing.length} 个未收录 ${vendor} 模型：`);
+      console.log(missing.sort().join('\n'));
+    }
   }
   if (drift.length) {
     console.log('[pricing-catalog] 上游价格差异（仅提示，必须回到官方来源审核）：');
     console.log(JSON.stringify(drift, null, 2));
   }
-  if (missing.length || drift.length) process.exitCode = 2;
+  if (missingTotal || drift.length) process.exitCode = 2;
 }
 
 validateCatalog(catalog);

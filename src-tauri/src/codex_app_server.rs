@@ -4,11 +4,13 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 const MAX_PENDING_REQUESTS: usize = 256;
+const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -510,33 +512,36 @@ fn trace_outbound(value: &serde_json::Value) {
     if let Some(method) = value.get("method").and_then(serde_json::Value::as_str) {
         let mut detail = String::new();
         if matches!(method, "thread/start" | "turn/start") {
-            if let Some(cwd) = value.pointer("/params/cwd").and_then(serde_json::Value::as_str) {
+            if let Some(cwd) = value
+                .pointer("/params/cwd")
+                .and_then(serde_json::Value::as_str)
+            {
                 detail.push_str(&format!(" cwd={cwd:?}"));
             }
             if let Some(policy) = value.pointer("/params/sandboxPolicy") {
                 if let Some(r#type) = policy.get("type").and_then(serde_json::Value::as_str) {
                     detail.push_str(&format!(" sandboxPolicy.type={:?}", r#type));
                 }
-                if let Some(roots) = policy.get("writableRoots").and_then(serde_json::Value::as_array) {
-                    let roots: Vec<&str> = roots
-                        .iter()
-                        .filter_map(serde_json::Value::as_str)
-                        .collect();
+                if let Some(roots) = policy
+                    .get("writableRoots")
+                    .and_then(serde_json::Value::as_array)
+                {
+                    let roots: Vec<&str> =
+                        roots.iter().filter_map(serde_json::Value::as_str).collect();
                     detail.push_str(&format!(" writableRoots={roots:?}"));
                 }
             }
-            if let Some(approval_policy) =
-                value.pointer("/params/approvalPolicy").and_then(serde_json::Value::as_str)
+            if let Some(approval_policy) = value
+                .pointer("/params/approvalPolicy")
+                .and_then(serde_json::Value::as_str)
             {
                 detail.push_str(&format!(" approvalPolicy={approval_policy:?}"));
             }
-        } else if let Some(command) = value.get("params").and_then(|params| {
-            params.get("command").and_then(serde_json::Value::as_str)
-        }) {
-            detail.push_str(&format!(
-                " command_len={}",
-                command.chars().count()
-            ));
+        } else if let Some(command) = value
+            .get("params")
+            .and_then(|params| params.get("command").and_then(serde_json::Value::as_str))
+        {
+            detail.push_str(&format!(" command_len={}", command.chars().count()));
         }
         eprintln!("[codex-trace] outbound request id={id} method={method}{detail}");
     } else if value.get("result").is_some() {
@@ -602,8 +607,9 @@ fn trace_inbound(value: &serde_json::Value) {
                         " additionalPermissions.keys={:?}",
                         additional.keys().collect::<Vec<_>>()
                     ));
-                    if let Some(fs) =
-                        additional.get("fileSystem").and_then(serde_json::Value::as_object)
+                    if let Some(fs) = additional
+                        .get("fileSystem")
+                        .and_then(serde_json::Value::as_object)
                     {
                         detail.push_str(&format!(" fileSystem={fs:?}"));
                     }
@@ -748,7 +754,10 @@ pub async fn spawn_codex_app_server(mut command: Command) -> Result<CodexAppServ
     if let Some(stderr) = child.stderr.take() {
         transport_tasks.push(tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
-            while matches!(lines.next_line().await, Ok(Some(_))) {}
+            while let Ok(Some(line)) = lines.next_line().await {
+                let preview: String = line.chars().take(400).collect();
+                crate::adapter::log_runtime_line("codex-stderr", &format!("line=<{}>", preview));
+            }
         }));
     }
     let (rpc, rpc_tasks) = start_rpc_transport_tracked(stdout, stdin);
@@ -903,6 +912,35 @@ impl CodexRpcClient {
         required_nested_id(&result, "/thread/id", "thread/resume")
     }
 
+    /// 触发 Codex 原生上下文压缩（2026-08-12 更正：Codex app-server 官方 RPC
+    /// `thread/compact/start`，返回 `{}` 立即，进度经 `contextCompaction` item 生命周期上报）。
+    pub async fn compact_thread(&self, thread_id: &str) -> Result<(), String> {
+        let result = self
+            .request(
+                "thread/compact/start",
+                serde_json::json!({ "threadId": thread_id }),
+            )
+            .await?;
+        let _ = result;
+        Ok(())
+    }
+
+    /// Codex 原生无损分叉（OpenAI Codex App Server 官方 RPC `thread/fork`）：
+    /// 按 `threadId` 在服务端派生新线程，完整历史被复制；可选 `lastTurnId` 截断到指定轮次（含）。
+    /// 返回服务端派生的新线程 id，后续轮次直接 `resume` 该新线程即可（无损、无摘要）。
+    pub async fn fork_thread(
+        &self,
+        thread_id: &str,
+        last_turn_id: Option<&str>,
+    ) -> Result<String, String> {
+        let mut params = serde_json::json!({ "threadId": thread_id });
+        if let Some(last_turn_id) = last_turn_id {
+            params["lastTurnId"] = serde_json::Value::String(last_turn_id.to_string());
+        }
+        let result = self.request("thread/fork", params).await?;
+        required_nested_id(&result, "/thread/id", "thread/fork")
+    }
+
     pub async fn start_turn(
         &self,
         thread_id: &str,
@@ -1035,9 +1073,20 @@ impl CodexRpcClient {
             self.inner.pending.lock().await.remove(&id);
             return Err(error);
         }
-        response_rx
-            .await
-            .map_err(|_| "Codex app-server response channel closed".to_string())?
+        match tokio::time::timeout(RPC_REQUEST_TIMEOUT, response_rx).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => {
+                self.inner.pending.lock().await.remove(&id);
+                Err("Codex app-server response channel closed".to_string())
+            }
+            Err(_) => {
+                self.inner.pending.lock().await.remove(&id);
+                Err(format!(
+                    "Codex app-server {method} 超过 {} 秒无响应",
+                    RPC_REQUEST_TIMEOUT.as_secs()
+                ))
+            }
+        }
     }
 
     pub async fn respond(
@@ -1067,6 +1116,14 @@ impl CodexRpcClient {
             .await
             .map_err(|_| "Codex app-server writer acknowledgement was dropped".to_string())?
     }
+}
+
+fn json_rpc_numeric_id(value: Option<&serde_json::Value>) -> Option<u64> {
+    let value = value?;
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|id| u64::try_from(id).ok()))
+        .or_else(|| value.as_str()?.parse().ok())
 }
 
 fn required_nested_id(
@@ -1147,10 +1204,67 @@ where
             };
             trace_inbound(&event);
             if event.get("method").is_some() && event.get("id").is_some() {
+                let method = event
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                if method == "currentTime/read" {
+                    if let Some(request_id) = event.get("id").cloned() {
+                        let (written, acknowledged) = oneshot::channel();
+                        let response = serde_json::json!({
+                            "id": request_id,
+                            "result": {
+                                "unixTimestampMs": now_millis(),
+                            }
+                        });
+                        if reader_inner
+                            .outbound
+                            .send(OutboundMessage {
+                                value: response,
+                                written,
+                            })
+                            .is_ok()
+                        {
+                            let _ = acknowledged.await;
+                        }
+                    }
+                    continue;
+                }
+                if method == "mcpServer/elicitation/request" {
+                    // MCP elicitation：MCP server（如 tavily）经 Codex 转发，向 client
+                    // 征询继续/补充信息。此前 Helm 不识别 → 回 -32602 → Codex 判工具
+                    // 调用失败（且误报成 "user rejected"），MCP 搜索通道整条被堵死。
+                    // 按 MCP 规范回 accept（空 content）：放行的只是 server 侧的这次
+                    // 征询应答，不涉及 Codex exec/patch 审批——那些仍走
+                    // item/*/requestApproval 进权限内核，本分支不绕过任何审批。
+                    if let Some(request_id) = event.get("id").cloned() {
+                        let (written, acknowledged) = oneshot::channel();
+                        let response = serde_json::json!({
+                            "id": request_id,
+                            "result": {"action": "accept", "content": {}}
+                        });
+                        if reader_inner
+                            .outbound
+                            .send(OutboundMessage {
+                                value: response,
+                                written,
+                            })
+                            .is_ok()
+                        {
+                            let _ = acknowledged.await;
+                        }
+                    }
+                    continue;
+                }
                 let contract_error = server_request_contract_error(&event);
                 let request_id = event.get("id").cloned();
                 let mut parsed = parse_approval_request(event).map_err(|_| contract_error.clone());
                 if parsed.is_err() {
+                    crate::adapter::log_runtime_line(
+                        "codex-rpc",
+                        &format!("unmanaged method={method} error={contract_error}"),
+                    );
                     if let Some(request_id) = request_id {
                         let code = if contract_error == "[codex_server_request_unrecognized]" {
                             -32601
@@ -1173,9 +1287,7 @@ where
                             let _ = acknowledged.await;
                         }
                     }
-                    let _ = approval_tx.send(Err(contract_error.clone()));
-                    let _ = notification_tx.send(Err(contract_error));
-                    break;
+                    continue;
                 }
                 if let Ok(CodexApprovalRequest::FileChange(request)) = &mut parsed {
                     request.correlated_paths = file_paths_by_item
@@ -1193,7 +1305,7 @@ where
                 let _ = notification_tx.send(Ok(event));
                 continue;
             }
-            let Some(id) = event.get("id").and_then(serde_json::Value::as_u64) else {
+            let Some(id) = json_rpc_numeric_id(event.get("id")) else {
                 continue;
             };
             let Some(waiter) = reader_inner.pending.lock().await.remove(&id) else {
@@ -1446,6 +1558,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_thread_issues_thread_compact_start_rpc() {
+        let (client_stream, server_stream) = tokio::io::duplex(16 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_stream);
+        let (server_read, mut server_write) = tokio::io::split(server_stream);
+        let client = start_rpc_transport(client_read, client_write);
+        let compact_client = client.clone();
+        let compact = tokio::spawn(async move { compact_client.compact_thread("thr_b").await });
+
+        let mut server_lines = BufReader::new(server_read).lines();
+        let request: serde_json::Value =
+            serde_json::from_str(&server_lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(request["method"], "thread/compact/start");
+        assert_eq!(request["params"]["threadId"], "thr_b");
+        let request_id = request["id"].clone();
+        server_write
+            .write_all(format!("{{\"id\":{request_id},\"result\":{{}}}}\n").as_bytes())
+            .await
+            .unwrap();
+        compact.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fork_thread_issues_thread_fork_rpc_and_returns_new_id() {
+        let (client_stream, server_stream) = tokio::io::duplex(16 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_stream);
+        let (server_read, mut server_write) = tokio::io::split(server_stream);
+        let client = start_rpc_transport(client_read, client_write);
+        let fork_client = client.clone();
+        let fork = tokio::spawn(async move { fork_client.fork_thread("thr_src", None).await });
+
+        let mut server_lines = BufReader::new(server_read).lines();
+        let request: serde_json::Value =
+            serde_json::from_str(&server_lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(request["method"], "thread/fork");
+        assert_eq!(request["params"]["threadId"], "thr_src");
+        let request_id = request["id"].clone();
+        server_write
+            .write_all(
+                format!(
+                    "{{\"id\":{request_id},\"result\":{{\"thread\":{{\"id\":\"thr_forked\"}}}}}}\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fork.await.unwrap().unwrap(), "thr_forked");
+    }
+
+    #[tokio::test]
+    async fn compact_thread_propagates_rpc_error() {
+        let (client_stream, server_stream) = tokio::io::duplex(16 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_stream);
+        let (server_read, mut server_write) = tokio::io::split(server_stream);
+        let client = start_rpc_transport(client_read, client_write);
+        let compact_client = client.clone();
+        let compact =
+            tokio::spawn(async move { compact_client.compact_thread("thr_missing").await });
+
+        let mut server_lines = BufReader::new(server_read).lines();
+        let request: serde_json::Value =
+            serde_json::from_str(&server_lines.next_line().await.unwrap().unwrap()).unwrap();
+        let request_id = request["id"].clone();
+        server_write
+            .write_all(
+                format!(
+                    "{{\"id\":{request_id},\"error\":{{\"code\":-32601,\"message\":\"method not found\"}}}}\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let error = compact.await.unwrap().unwrap_err();
+        assert!(
+            error.contains("method not found"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn reader_correlates_file_paths_before_dispatching_the_following_approval() {
         let (client_stream, mut server_stream) = tokio::io::duplex(4096);
         let (read, write) = tokio::io::split(client_stream);
@@ -1512,9 +1703,6 @@ mod tests {
             .await
             .unwrap();
 
-        let error = client.next_approval_request().await.unwrap().unwrap_err();
-        assert_eq!(error, "[codex_server_request_unrecognized]");
-        assert!(!error.contains("raw-secret"));
         let mut response_lines = BufReader::new(server_read).lines();
         let response: serde_json::Value =
             serde_json::from_str(&response_lines.next_line().await.unwrap().unwrap()).unwrap();
@@ -1528,20 +1716,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rpc_transport_classifies_legacy_approval_methods_without_payload_details() {
-        let (client_stream, mut server_stream) = tokio::io::duplex(1024);
+    async fn rpc_transport_answers_current_time_without_breaking_the_stream() {
+        let (client_stream, server_stream) = tokio::io::duplex(1024);
         let (client_read, client_write) = tokio::io::split(client_stream);
+        let (server_read, mut server_write) = tokio::io::split(server_stream);
+        let _client = start_rpc_transport(client_read, client_write);
+        server_write
+            .write_all(b"{\"id\":7,\"method\":\"currentTime/read\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        let mut response_lines = BufReader::new(server_read).lines();
+        let response: serde_json::Value =
+            serde_json::from_str(&response_lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(response["id"], 7);
+        assert!(response["result"]["unixTimestampMs"].as_i64().unwrap() > 0);
+    }
+
+    #[test]
+    fn json_rpc_numeric_id_accepts_number_and_string() {
+        assert_eq!(
+            super::json_rpc_numeric_id(Some(&serde_json::json!(3))),
+            Some(3)
+        );
+        assert_eq!(
+            super::json_rpc_numeric_id(Some(&serde_json::json!("12"))),
+            Some(12)
+        );
+        assert_eq!(
+            super::json_rpc_numeric_id(Some(&serde_json::json!("x"))),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_transport_classifies_legacy_approval_methods_without_payload_details() {
+        let (client_stream, server_stream) = tokio::io::duplex(1024);
+        let (client_read, client_write) = tokio::io::split(client_stream);
+        let (server_read, mut server_write) = tokio::io::split(server_stream);
         let client = start_rpc_transport(client_read, client_write);
-        server_stream
+        server_write
             .write_all(
                 b"{\"id\":91,\"method\":\"execCommandApproval\",\"params\":{\"command\":[\"raw-secret\"]}}\n",
             )
             .await
             .unwrap();
 
-        let error = client.next_approval_request().await.unwrap().unwrap_err();
-        assert_eq!(error, "[codex_legacy_exec_approval_unhandled]");
-        assert!(!error.contains("raw-secret"));
+        let mut response_lines = BufReader::new(server_read).lines();
+        let response: serde_json::Value =
+            serde_json::from_str(&response_lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(response["id"], 91);
+        assert_eq!(
+            response["error"]["message"],
+            "[codex_legacy_exec_approval_unhandled]"
+        );
+        assert!(!response.to_string().contains("raw-secret"));
     }
 
     #[tokio::test]

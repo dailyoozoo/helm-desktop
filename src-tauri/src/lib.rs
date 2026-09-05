@@ -25,10 +25,12 @@ pub mod reasoning;
 mod redaction;
 pub mod runtime_registry;
 pub mod sandbox_ceiling;
+pub mod self_review;
 pub mod session_actor;
 pub mod session_context;
 pub mod sessions;
 pub mod settings;
+pub mod settings_about;
 pub mod snapshots;
 pub mod subscription_profiles;
 pub mod titler;
@@ -37,7 +39,6 @@ pub mod turn_start;
 pub mod turn_supervisor;
 pub mod updater;
 pub mod util;
-pub mod workspace_execution;
 
 #[cfg(test)]
 mod tests {
@@ -67,40 +68,45 @@ mod tests {
 
 use capability_registry::EngineCapabilityRegistry;
 use commands::{
-    add_session_context, approval_response, cancel_background_operation, clear_permission_audit,
-    close_session, create_permission_deny_rule, create_session, delete_hook, delete_mcp_server,
-    delete_provider_config, delete_session, delete_slash_command, delete_subagent,
+    add_session_context, append_runtime_log, approval_response, cancel_background_operation,
+    clear_permission_audit, close_session, compact_context, create_permission_deny_rule,
+    create_session, create_skill, delete_hook, delete_mcp_server, delete_provider_config,
+    delete_provider_model, delete_session, delete_skill, delete_slash_command, delete_subagent,
     export_permission_audit, get_active_session, get_background_operation, get_budget,
     get_daily_usage, get_equivalent_env, get_permission_audit_summary, get_permission_rules,
     get_provider_config, get_reasoning_effort_capability, get_session_history, get_top_sessions,
-    get_turn_snapshot, get_usage_by_model, get_usage_by_provider, get_usage_stats, interrupt,
-    list_folders, list_hooks, list_mcp_servers, list_session_contexts, list_sessions, list_skills,
+    get_turn_snapshot, get_usage_breakdown, get_usage_stats, import_mcp_servers, interrupt,
+    list_folders, list_hooks, list_mcp_credential_status, list_mcp_servers,
+    list_provider_models_config, list_session_contexts, list_sessions, list_skills,
     list_slash_commands, list_subagents, market_install_skill, market_search_skills,
-    read_engine_config_file, remove_permission_rule, remove_session_context, rename_session,
-    restore_checkpoint, resume_session, retry_background_operation, reveal_provider_secret,
-    save_binding_config, save_engine_config, save_hook, save_mcp_server, save_model_config,
-    save_pasted_image, save_provider_config, save_provider_model_selection, save_slash_command,
-    save_subagent, search_workspace_files, send_message, set_budget, set_folder_collapsed,
-    set_session_mcp_disabled, set_session_permission_profile, set_session_pinned,
-    set_session_turn_preference, start_session_fork, sync_provider_models_config,
-    test_engine_config, test_mcp_connection, test_provider_config, toggle_skill, undo_revert,
+    read_engine_config_file, read_skill_source, remove_permission_rule, remove_session_context,
+    rename_provider_model, rename_session, restore_checkpoint, resume_session,
+    retry_background_operation, reveal_provider_secret, review_changes, save_binding_config,
+    save_engine_config, save_hook, save_mcp_server, save_model_config, save_pasted_image,
+    save_provider_config, save_provider_model_selection, save_provider_models_config,
+    save_slash_command, save_subagent,
+    search_workspace_files, send_message, set_budget, set_folder_collapsed, set_mcp_server_enabled,
+    set_session_archived, set_session_mcp_disabled, set_session_permission_profile,
+    set_session_pinned, set_session_turn_preference, side_query, start_session_branch,
+    start_session_fork, sync_provider_models_config, test_engine_config, test_mcp_connection,
+    test_provider_config, test_provider_draft_config, toggle_skill, undo_revert,
     write_engine_config_file, SessionStore,
 };
-use installer::install_cli_engine;
+use installer::{detect_workspace_deps, install_cli_engine, install_git, install_node};
 use permission_service::PermissionService;
 use pricing::PricingCatalogStore;
 use pricing::{
-    delete_model_price_override, get_pricing_catalog_status, get_provider_pricing_preference,
-    import_pricing_catalog, list_model_price_overrides, refresh_pricing_catalog,
-    save_model_price_override, save_provider_pricing_preference,
+    delete_model_price_override, get_pricing_catalog_entries, get_pricing_catalog_status,
+    get_provider_pricing_preference, import_pricing_catalog, list_model_price_overrides,
+    refresh_pricing_catalog, save_model_price_override, save_provider_pricing_preference,
 };
 use providers::{KeyringSecretStore, ProviderStore};
 use runtime_registry::RuntimeRegistry;
 use sessions::SessionHistoryStore;
 use settings::{
-    detect_cli_engine, detect_cli_login, export_app_settings, get_readiness_report,
-    get_update_status, import_app_settings, load_app_settings, load_app_settings_from_store,
-    login_cli_account, logout_cli_account, save_app_settings, select_directory,
+    detect_cli_engine, detect_cli_login, get_readiness_report, get_update_status,
+    load_app_settings, load_app_settings_from_store, login_cli_account, logout_cli_account,
+    save_app_settings, select_directory,
 };
 use subscription_profiles::SubscriptionProfileStore;
 use tauri::Manager;
@@ -128,10 +134,19 @@ pub fn run() {
             let pricing_store = PricingCatalogStore::new(config_dir.clone());
             app.manage(pricing_store.clone());
             let history_store = SessionHistoryStore::new(config_dir.join("sessions.sqlite"));
-            app.manage(adapter::CodexRuntimeProfileStore::new(
-                config_dir.clone(),
-                history_store.clone(),
-            ));
+            let codex_profile_store =
+                adapter::CodexRuntimeProfileStore::new(config_dir.clone(), history_store.clone());
+            // C 方案（回收陈旧 Profile）：启动 30s 后后台清理，保留最新 5 份 +
+            // 活跃集合 + 24h 内的目录（防误杀强杀残留的孤儿 app-server 在用的 HOME）。
+            // 不抢首屏、不阻塞恢复路径；失败静默（下次启动再试）。
+            {
+                let store = codex_profile_store.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    let _ = tokio::task::spawn_blocking(move || store.gc_stale_profiles(5)).await;
+                });
+            }
+            app.manage(codex_profile_store);
             app.manage(EngineCapabilityRegistry::new(history_store.clone()));
             let permission_service =
                 tauri::async_runtime::block_on(PermissionService::start(history_store.clone()))
@@ -187,7 +202,6 @@ pub fn run() {
             Ok(())
         })
         .manage(SessionStore::default())
-        .manage(workspace_execution::WorkspaceExecutionCoordinator::default())
         .invoke_handler(tauri::generate_handler![
             create_session,
             list_folders,
@@ -196,6 +210,7 @@ pub fn run() {
             delete_session,
             rename_session,
             set_session_pinned,
+            set_session_archived,
             list_sessions,
             get_active_session,
             get_session_history,
@@ -209,6 +224,7 @@ pub fn run() {
             approval_response,
             set_session_mcp_disabled,
             search_workspace_files,
+            side_query,
             save_pasted_image,
             get_permission_rules,
             create_permission_deny_rule,
@@ -217,10 +233,13 @@ pub fn run() {
             clear_permission_audit,
             export_permission_audit,
             interrupt,
+            compact_context,
             get_background_operation,
             start_session_fork,
+            start_session_branch,
             cancel_background_operation,
-            retry_background_operation,
+retry_background_operation,
+            review_changes,
             get_turn_snapshot,
             restore_checkpoint,
             undo_revert,
@@ -228,27 +247,37 @@ pub fn run() {
             reveal_provider_secret,
             save_provider_config,
             delete_provider_config,
+            delete_provider_model,
             save_engine_config,
             save_model_config,
             save_provider_model_selection,
+            save_provider_models_config,
+            rename_provider_model,
             save_binding_config,
             get_equivalent_env,
             read_engine_config_file,
             write_engine_config_file,
             test_provider_config,
+            test_provider_draft_config,
+            list_provider_models_config,
             sync_provider_models_config,
             test_engine_config,
             get_reasoning_effort_capability,
             get_usage_stats,
-            get_usage_by_model,
-            get_usage_by_provider,
+            get_usage_breakdown,
             get_daily_usage,
             get_top_sessions,
             get_budget,
             set_budget,
             list_skills,
             toggle_skill,
+            create_skill,
+            read_skill_source,
+            delete_skill,
             list_mcp_servers,
+            set_mcp_server_enabled,
+            import_mcp_servers,
+            list_mcp_credential_status,
             test_mcp_connection,
             save_mcp_server,
             delete_mcp_server,
@@ -265,12 +294,11 @@ pub fn run() {
             market_install_skill,
             load_app_settings,
             save_app_settings,
-            export_app_settings,
-            import_app_settings,
             get_update_status,
             check_for_update,
             install_update,
             get_pricing_catalog_status,
+            get_pricing_catalog_entries,
             refresh_pricing_catalog,
             import_pricing_catalog,
             list_model_price_overrides,
@@ -283,13 +311,23 @@ pub fn run() {
             login_cli_account,
             logout_cli_account,
             install_cli_engine,
+            detect_workspace_deps,
+            install_node,
+            install_git,
             get_readiness_report,
             select_directory,
+            settings_about::get_platform_info,
+            settings_about::get_log_dir_info,
+            settings_about::export_diagnostics_bundle,
+            settings_about::list_importable_histories,
+            settings_about::import_history,
             git::get_git_branch,
             git::get_git_status,
             git::get_git_staged,
             file_preview::read_file_preview,
-            file_preview::open_path_in_system
+            file_preview::open_path_in_system,
+            file_preview::open_external_url,
+            append_runtime_log
         ])
         .on_window_event(|window, event| {
             // 关闭行为（变更-12）：closeToTray 开启 → 隐藏到托盘（后台会话继续跑）；

@@ -1,19 +1,12 @@
 import type { ThreadItem } from '../engine/useSession';
+import { isSubagentToolName } from './items/taskViewModel';
 
 export type ThreadRenderEntry =
   | { kind: 'item'; item: ThreadItem }
-  | { kind: 'tool-group'; id: string; items: Extract<ThreadItem, { kind: 'tool' }>[] };
+  | { kind: 'tool-group'; id: string; items: Extract<ThreadItem, { kind: 'tool' }>[] }
+  | { kind: 'subagent'; id: string; items: Extract<ThreadItem, { kind: 'tool' }>[] };
 
-export type TurnProcessEntry = {
-  kind: 'turn-process';
-  id: string;
-  turnId: string;
-  entries: ThreadRenderEntry[];
-  completed: boolean;
-  terminalStatus?: 'succeeded' | 'failed' | 'interrupted';
-};
-
-export type ThreadLayoutEntry = ThreadRenderEntry | TurnProcessEntry;
+export type ThreadLayoutEntry = ThreadRenderEntry;
 
 const TERMINAL_TOOL_NAMES = new Set([
   'bash',
@@ -25,16 +18,27 @@ const TERMINAL_TOOL_NAMES = new Set([
   'run_terminal_cmd',
 ]);
 
-const DELIVERY_TOOL_NAMES = new Set(['write', 'edit', 'multiedit', 'notebookedit']);
-
 export function isTerminalToolName(name: string): boolean {
   return TERMINAL_TOOL_NAMES.has(name.toLowerCase());
 }
 
-/** Diff 和终端是需要始终直接可见的交付物，不能被工具组默认折叠。 */
-export function isStandaloneTool(item: Extract<ThreadItem, { kind: 'tool' }>): boolean {
-  const name = item.name.toLowerCase();
-  return Boolean(item.diff) || isTerminalToolName(name) || DELIVERY_TOOL_NAMES.has(name);
+/**
+ * 失败工具例外（TurnProcess 渲染契约「失败卡等 children 常驻可见、不依赖整轮折叠」）：
+ * 独立失败工具由 ToolBlock 提成 [data-kind="fail"] > .failc 就地展开卡，作为 children
+ * 渲染在可折叠过程体之外——收起的轮次也保持失败可见（2026-09-04 视觉矩阵断言锚定）。
+ * 口径与 TurnProcess 的 isActualFailure / ToolGroup 的 isDenied 一致：
+ * status=error 且 outcome 非拒绝、非 auto_review 复核态（这些保持过程区内联呈现）。
+ */
+export function isLiftedFailureEntry(entry: ThreadRenderEntry): boolean {
+  if (entry.kind !== 'item' || entry.item.kind !== 'tool') return false;
+  const item = entry.item;
+  return (
+    item.status === 'error' &&
+    item.outcome !== 'auto_review_unavailable' &&
+    item.outcome !== 'auto_review_parse_error' &&
+    item.outcome !== 'auto_review_blocked' &&
+    item.outcome !== 'runtime_denied'
+  );
 }
 
 /** 只聚合同一 Turn 中相邻的工具调用，交付物和正文会明确切断分组。 */
@@ -48,9 +52,21 @@ export function groupThreadItems(items: ThreadItem[]): ThreadRenderEntry[] {
       index += 1;
       continue;
     }
-    if (isStandaloneTool(item)) {
-      entries.push({ kind: 'item', item });
-      index += 1;
+    // 子代理工具（C1）：连续的同 Turn 子代理合入一张并行子代理卡
+    if (isSubagentToolName(item.name)) {
+      const group = [item];
+      let next = index + 1;
+      while (next < items.length) {
+        const candidate = items[next];
+        if (candidate.kind !== 'tool') break;
+        if (!isSubagentToolName(candidate.name)) break;
+        if (candidate.turnId !== item.turnId) break;
+        if (Boolean(item.reverted) !== Boolean(candidate.reverted)) break;
+        group.push(candidate);
+        next += 1;
+      }
+      entries.push({ kind: 'subagent', id: group[0].id, items: group });
+      index = next;
       continue;
     }
     const group = [item];
@@ -58,7 +74,6 @@ export function groupThreadItems(items: ThreadItem[]): ThreadRenderEntry[] {
     while (next < items.length) {
       const candidate = items[next];
       if (candidate.kind !== 'tool') break;
-      if (isStandaloneTool(candidate)) break;
       if (candidate.turnId !== item.turnId) break;
       if (Boolean(item.reverted) !== Boolean(candidate.reverted)) break;
       group.push(candidate);
@@ -75,66 +90,11 @@ export function groupThreadItems(items: ThreadItem[]): ThreadRenderEntry[] {
 }
 
 /**
- * 在 ToolGroup 之上派生纯视图层 Turn 过程容器。最终答复和所有交付物仍留在容器外，
- * 容器只收纳同一稳定 Turn 中连续的 thinking、过程正文、普通单工具和 ToolGroup。
+ * 渲染形态 B（WorkBuddy 模式，ADR 0019）：工具/思考/diff 按真实时序就地交错，
+ * 不再抽进过程胶囊重排。直接返回 groupThreadItems 结果（thinking/tool/tool-group/
+ * subagent/assistant 均为就地条目）；轮次分组交由 Thread.groupIntoTurnBlocks 按
+ * user/turnId 完成。
  */
 export function layoutThreadItems(items: ThreadItem[]): ThreadLayoutEntry[] {
-  const grouped = groupThreadItems(items);
-  const finalAssistants = new Map<string, Extract<ThreadItem, { kind: 'assistant' }>>();
-
-  for (const item of items) {
-    if (item.kind !== 'assistant' || !item.turnId) continue;
-    finalAssistants.set(item.turnId, item);
-  }
-
-  const isProcessEntry = (entry: ThreadRenderEntry): string | null => {
-    if (entry.kind === 'tool-group') return entry.items[0]?.turnId ?? null;
-    const item = entry.item;
-    if (!item.turnId) return null;
-    if (item.kind === 'thinking') return item.turnId;
-    if (item.kind === 'tool' && !isStandaloneTool(item)) return item.turnId;
-    if (item.kind === 'assistant' && finalAssistants.get(item.turnId)?.id !== item.id) {
-      return item.turnId;
-    }
-    return null;
-  };
-
-  const processEntries = new Map<string, ThreadRenderEntry[]>();
-  for (const entry of grouped) {
-    const turnId = isProcessEntry(entry);
-    if (!turnId) continue;
-    const entries = processEntries.get(turnId) ?? [];
-    entries.push(entry);
-    processEntries.set(turnId, entries);
-  }
-
-  const result: ThreadLayoutEntry[] = [];
-  const emitted = new Set<string>();
-  for (const entry of grouped) {
-    const turnId = isProcessEntry(entry);
-    if (!turnId) {
-      result.push(entry);
-      continue;
-    }
-    if (emitted.has(turnId)) continue;
-    emitted.add(turnId);
-    const entries = processEntries.get(turnId) ?? [entry];
-    const firstId = entry.kind === 'tool-group' ? entry.id : entry.item.id;
-    const finalAssistant = finalAssistants.get(turnId);
-    const terminalStatus =
-      entries
-        .flatMap((entry) => (entry.kind === 'tool-group' ? entry.items : [entry.item]))
-        .find((item) => item.turnStatus)?.turnStatus ?? finalAssistant?.turnStatus;
-    result.push({
-      kind: 'turn-process',
-      id: `turn-process-${firstId}`,
-      turnId,
-      entries,
-      completed:
-        terminalStatus === 'succeeded' ||
-        (terminalStatus == null && Boolean(finalAssistant && !finalAssistant.interrupted)),
-      ...(terminalStatus ? { terminalStatus } : {}),
-    });
-  }
-  return result;
+  return groupThreadItems(items);
 }

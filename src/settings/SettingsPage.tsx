@@ -1,83 +1,74 @@
-import { useState, useEffect, useRef } from 'react';
-import { listen } from '@tauri-apps/api/event';
-import { open } from '@tauri-apps/plugin-dialog';
+import { Fragment, useState, useEffect, useRef, type CSSProperties } from 'react';
 import { Icon } from '../shell/icons';
 import { showResultToast } from '../components/toast';
-import {
-  loadSettings,
-  saveSettings,
-  detectEngine,
-  installCliEngine,
-  selectDirectory,
-  getUpdateStatus,
-  exportSettings,
-  importSettings,
-  getPermissionRules,
-  createPermissionDenyRule,
-  removePermissionRule,
-  getPermissionAuditSummary,
-  exportPermissionAudit,
-  clearPermissionAudit,
-  checkForUpdate,
-  installUpdate,
-  type UpdateCheckResult,
-  type PermissionAuditSummary,
-} from './api';
-import { type AppSettings, DEFAULT_SETTINGS, type UpdateStatus } from './types';
+import { loadSettings, saveSettings, selectDirectory, getPermissionRules } from './api';
+import { type AppSettings, DEFAULT_SETTINGS } from './types';
 import { applyAppearanceSettings } from './appearance';
-import { listMcpServers, type McpServer } from '../extensions/extensionsApi';
-import {
-  engineConfigWithDetection,
-  mcpServerCommand,
-  mcpStatusLabel,
-  pricingFeedUrlsFromDraft,
-  updateStatusSummary,
-} from './settingsViewModel';
 import { shortcutFromKeyboardEvent, shortcutLabel } from './shortcuts';
 import type { PageId } from '../shell/Rail';
-import {
-  getProviderConfig,
-  getPricingCatalogStatus,
-  importPricingCatalog,
-  refreshPricingCatalog,
-  saveEngineConfig,
-  type PricingCatalogStatus,
-} from '../providers/api';
 import { LatestSerialSaver, type SaveState } from './latestSerialSaver';
-import { describePermissionRule, type PermissionRule } from './permissionRules';
+import { TasksTab } from './TasksTab';
+import { AboutTab } from './AboutTab';
+import { AuthorizationDrawer } from './AuthorizationDrawer';
 
-type SettingTab = 'general' | 'engines' | 'permissions' | 'mcp' | 'appearance' | 'keyboard';
+/**
+ * 设置页信息架构（S8）：对齐原型 settings.html 的五个一级 Tab。
+ * 引擎/权限/MCP 等真实能力保留在对应 Tab 的分区与抽屉中，不删除任何后端接线。
+ */
+type SettingTab = 'general' | 'tasks' | 'theme' | 'keyboard' | 'about';
 
-const ACCENT_COLORS = [
-  { name: '靛蓝', base: 'oklch(55% 0.2 264)', hi: 'oklch(49% 0.21 264)' },
-  { name: '紫罗兰', base: 'oklch(53% 0.23 300)', hi: 'oklch(47% 0.24 300)' },
-  { name: '蓝色', base: 'oklch(54% 0.15 235)', hi: 'oklch(48% 0.16 235)' },
-  { name: '翠绿', base: 'oklch(53% 0.14 162)', hi: 'oklch(47% 0.15 162)' },
-  { name: '琥珀', base: 'oklch(64% 0.14 70)', hi: 'oklch(58% 0.15 70)' },
-  { name: '玫红', base: 'oklch(56% 0.21 14)', hi: 'oklch(50% 0.22 14)' },
+/** 旧 sessionStorage 值（引擎/权限/MCP/外观）映射到新五 Tab，避免恢复到已合并的入口。 */
+const LEGACY_TAB_MAP: Record<string, SettingTab> = {
+  general: 'general',
+  engines: 'general',
+  permissions: 'general',
+  mcp: 'general',
+  appearance: 'theme',
+  theme: 'theme',
+  tasks: 'tasks',
+  keyboard: 'keyboard',
+  about: 'about',
+};
+
+/** 把权限规则的 createdAt 时间戳格式化成「M月D日」，对齐原型 settings.html 授权入口的「最近更新于」。 */
+function formatRuleDate(timestamp: number): string {
+  const date = new Date(timestamp);
+  return `${date.getMonth() + 1}月${date.getDate()}日`;
+}
+
+/** 颜色主题（原型 settings.html colorThemes）：六套命名强调色，默认海洋蓝（与 tokens.css 默认一致）。 */
+const COLOR_THEMES = [
+  { name: '海洋蓝', base: 'oklch(52% 0.12 230)', hi: 'oklch(46% 0.13 230)' },
+  { name: '翡翠绿', base: 'oklch(52% 0.12 160)', hi: 'oklch(46% 0.13 160)' },
+  { name: '琥珀金', base: 'oklch(58% 0.12 70)', hi: 'oklch(52% 0.13 70)' },
+  { name: '玫瑰红', base: 'oklch(54% 0.19 25)', hi: 'oklch(48% 0.2 25)' },
+  { name: '紫罗兰', base: 'oklch(55% 0.2 300)', hi: 'oklch(49% 0.21 300)' },
+  { name: '石墨灰', base: 'oklch(50% 0.03 250)', hi: 'oklch(44% 0.04 250)' },
 ];
 
 export function SettingsPage({
   initialSettings,
   onSettingsChange,
   onNavigate,
-  externalSaveState,
+  onOpenWorkspace,
 }: {
   initialSettings?: AppSettings;
   onSettingsChange?: (settings: AppSettings) => void;
   onNavigate?: (page: PageId) => void;
+  /** 「全部任务」打开任务后跳转工作台。 */
+  onOpenWorkspace?: () => void;
   externalSaveState?: SaveState;
 } = {}) {
   const [tab, setTab] = useState<SettingTab>(() => {
-    const requested = sessionStorage.getItem('helm:settings-tab') as SettingTab | null;
+    const requested = sessionStorage.getItem('helm:settings-tab');
     sessionStorage.removeItem('helm:settings-tab');
-    return requested ?? 'general';
+    return (requested && LEGACY_TAB_MAP[requested]) || 'general';
   });
   const [settings, setSettings] = useState<AppSettings>(() => initialSettings ?? DEFAULT_SETTINGS);
   const [loading, setLoading] = useState(!initialSettings);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loadAttempt, setLoadAttempt] = useState(0);
-  const [localSaveState, setLocalSaveState] = useState<SaveState>('idle');
+  const [, setLocalSaveState] = useState<SaveState>('idle');
   const mountedRef = useRef(true);
   const saverRef = useRef<LatestSerialSaver<AppSettings> | null>(null);
   if (!saverRef.current) {
@@ -131,10 +122,10 @@ export function SettingsPage({
     });
   };
 
-  if (loading) return <div className="setlayout">加载中...</div>;
+  if (loading) return <div className="cm-settings-layout">加载中...</div>;
   if (loadError) {
     return (
-      <div className="setlayout">
+      <div className="cm-settings-layout">
         <div className="settings-load-state" role="alert">
           <Icon name="alert" />
           <div>
@@ -150,88 +141,43 @@ export function SettingsPage({
   }
 
   return (
-    <div className="setlayout">
-      <nav className="snav">
-        <div className="snav__t">设置</div>
-        <div className={`snav__save is-${externalSaveState ?? localSaveState}`} aria-live="polite">
-          {(externalSaveState ?? localSaveState) === 'pending'
-            ? '等待保存'
-            : (externalSaveState ?? localSaveState) === 'saving'
-              ? '保存中…'
-              : (externalSaveState ?? localSaveState) === 'saved'
-                ? '已保存'
-                : (externalSaveState ?? localSaveState) === 'error'
-                  ? '保存失败'
-                  : ''}
-        </div>
-        <button
-          type="button"
-          className={tab === 'general' ? 'is-active' : ''}
-          onClick={() => setTab('general')}
-        >
-          <Icon name="sliders" /> 通用
-        </button>
-        <button
-          type="button"
-          className={tab === 'engines' ? 'is-active' : ''}
-          onClick={() => setTab('engines')}
-        >
-          <Icon name="zap" /> 引擎
-        </button>
-        <button
-          type="button"
-          className={tab === 'permissions' ? 'is-active' : ''}
-          onClick={() => setTab('permissions')}
-        >
-          <Icon name="shield" /> 权限
-        </button>
-        <button
-          type="button"
-          className={tab === 'mcp' ? 'is-active' : ''}
-          onClick={() => setTab('mcp')}
-        >
-          <Icon name="plug" /> MCP 服务器
-        </button>
-        <button
-          type="button"
-          className={tab === 'appearance' ? 'is-active' : ''}
-          onClick={() => setTab('appearance')}
-        >
-          <Icon name="palette" /> 外观
-        </button>
-        <button
-          type="button"
-          className={tab === 'keyboard' ? 'is-active' : ''}
-          onClick={() => setTab('keyboard')}
-        >
-          <Icon name="keyboard" /> 快捷键
-        </button>
-      </nav>
+    <div className="cm-settings-layout">
+      <aside className="cm-settings-sidebar" aria-label="设置导航">
+        <nav className="cm-settings-tabs" aria-label="设置分类">
+          {(
+            [
+              { key: 'general', icon: 'settings2', label: '通用' },
+              { key: 'tasks', icon: 'inbox', label: '全部任务' },
+              { key: 'theme', icon: 'palette', label: '主题' },
+              { key: 'keyboard', icon: 'keyboard', label: '快捷键' },
+              { key: 'about', icon: 'info', label: '关于' },
+            ] as const
+          ).map((entry) => (
+            <button
+              key={entry.key}
+              type="button"
+              className={tab === entry.key ? 'is-active' : ''}
+              aria-current={tab === entry.key ? 'page' : undefined}
+              onClick={() => setTab(entry.key)}
+            >
+              <Icon name={entry.icon} /> {entry.label}
+            </button>
+          ))}
+        </nav>
+      </aside>
 
-      <div className="setscroll">
-        <div className="setbody">
+      <div className="cm-settings-main">
+        <div className="cm-settings-content">
           {tab === 'general' && (
-            <GeneralTab
-              settings={settings.general}
-              update={updateSettings}
-              flushSettings={() => saverRef.current?.flush() ?? Promise.resolve()}
-              onNotify={notify}
-            />
+            <GeneralTab settings={settings.general} update={updateSettings} onNotify={notify} />
           )}
-          {tab === 'engines' && (
-            <EnginesTab
-              settings={settings.engines}
-              update={updateSettings}
-              onNavigate={onNavigate}
-            />
-          )}
-          {tab === 'permissions' && <PermissionsTab />}
-          {tab === 'mcp' && <McpSummaryTab onNavigate={onNavigate} />}
-          {tab === 'appearance' && (
-            <AppearanceTab settings={settings.appearance} update={updateSettings} />
-          )}
+          {tab === 'tasks' && <TasksTab onOpenWorkspace={onOpenWorkspace} />}
+          {tab === 'theme' && <ThemeTab settings={settings.appearance} update={updateSettings} />}
           {tab === 'keyboard' && (
             <KeyboardTab settings={settings.shortcuts} update={updateSettings} />
+          )}
+          {tab === 'about' && (
+            <AboutTab settings={settings} update={updateSettings} onNavigate={onNavigate} />
           )}
         </div>
       </div>
@@ -242,105 +188,36 @@ export function SettingsPage({
 function GeneralTab({
   settings,
   update,
-  flushSettings,
   onNotify,
 }: {
   settings: AppSettings['general'];
   update: (updater: (prev: AppSettings) => AppSettings) => void;
-  flushSettings: () => Promise<void>;
   onNotify: (message: string) => void;
 }) {
-  const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
-  const [pricingStatus, setPricingStatus] = useState<PricingCatalogStatus | null>(null);
-  const [pricingBusy, setPricingBusy] = useState(false);
-  const [pricingFeedDraft, setPricingFeedDraft] = useState(() =>
-    settings.pricingFeedUrls.join('\n'),
-  );
-  useEffect(() => {
-    setPricingFeedDraft(settings.pricingFeedUrls.join('\n'));
-  }, [settings.pricingFeedUrls]);
-
-  const commitPricingFeedDraft = () => {
-    const pricingFeedUrls = pricingFeedUrlsFromDraft(pricingFeedDraft);
-    if (
-      pricingFeedUrls.length === settings.pricingFeedUrls.length &&
-      pricingFeedUrls.every((url, index) => url === settings.pricingFeedUrls[index])
-    ) {
-      return;
-    }
-    update((prev) => ({
-      ...prev,
-      general: { ...prev.general, pricingFeedUrls },
-    }));
-  };
-
+  // 已保存授权抽屉（S8）：承接原「权限」Tab 的真实能力
+  const [authDrawerOpen, setAuthDrawerOpen] = useState(false);
+  // 授权入口展示真实数量与最近更新日期（对齐原型 settings.html 的 cm-auth-entry）。
+  const [authSummary, setAuthSummary] = useState<{ count: number; lastUpdated: number | null }>({
+    count: 0,
+    lastUpdated: null,
+  });
   useEffect(() => {
     let active = true;
-    getUpdateStatus()
-      .then((status) => {
-        if (active) setUpdateStatus(status);
-      })
-      .catch(() => {
+    getPermissionRules()
+      .then((rules) => {
         if (!active) return;
-        setUpdateStatus({
-          currentVersion: '0.0.0',
-          channel: settings.autoUpdateChannel,
-          canCheck: false,
-          message: '浏览器预览环境无法检查更新；当前仅保存更新通道偏好。',
-        });
-      });
-    return () => {
-      active = false;
-    };
-  }, [settings.autoUpdateChannel, settings.updateFeedUrl]);
-
-  useEffect(() => {
-    let active = true;
-    getPricingCatalogStatus()
-      .then((status) => {
-        if (active) setPricingStatus(status);
+        const lastUpdated = rules.length
+          ? rules.reduce((max, rule) => Math.max(max, rule.createdAt), 0)
+          : null;
+        setAuthSummary({ count: rules.length, lastUpdated });
       })
       .catch(() => {
-        if (active) setPricingStatus(null);
+        if (active) setAuthSummary({ count: 0, lastUpdated: null });
       });
     return () => {
       active = false;
     };
-  }, []);
-
-  const refreshPricing = async () => {
-    setPricingBusy(true);
-    try {
-      // 镜像输入走 400ms 串行保存；立即点击更新时先刷盘，避免后端读到旧地址。
-      await flushSettings();
-      const status = await refreshPricingCatalog();
-      setPricingStatus(status);
-      onNotify(`价格目录已更新至 ${status.catalogVersion}`);
-    } catch (error) {
-      onNotify(`更新价格目录失败：${error instanceof Error ? error.message : String(error)}`);
-    } finally {
-      setPricingBusy(false);
-    }
-  };
-
-  const importPricing = async () => {
-    try {
-      const selected = await open({
-        title: '选择签名价格目录',
-        multiple: false,
-        filters: [{ name: 'Helm 价格目录', extensions: ['json'] }],
-      });
-      if (typeof selected !== 'string') return;
-      setPricingBusy(true);
-      const status = await importPricingCatalog(selected);
-      setPricingStatus(status);
-      onNotify(`离线价格目录已导入：${status.catalogVersion}`);
-    } catch (error) {
-      onNotify(`导入价格目录失败：${error instanceof Error ? error.message : String(error)}`);
-    } finally {
-      setPricingBusy(false);
-    }
-  };
+  }, [authDrawerOpen]);
 
   const handleBrowse = async () => {
     try {
@@ -357,1044 +234,195 @@ function GeneralTab({
     }
   };
 
-  const handleExport = async () => {
-    try {
-      await exportSettings();
-      onNotify('设置已导出');
-    } catch (error) {
-      console.error('Failed to export settings', error);
-      onNotify(`导出设置失败：${error instanceof Error ? error.message : String(error)}`);
-    }
-  };
-
-  const handleImport = async () => {
-    try {
-      const imported = await importSettings();
-      if (imported) {
-        update(() => imported);
-        applyAppearanceSettings(imported.appearance);
-        onNotify('设置已导入并应用');
-      }
-    } catch (error) {
-      console.error('Failed to import settings', error);
-      onNotify(`导入设置失败：${error instanceof Error ? error.message : String(error)}`);
-    }
-  };
-
   return (
     <section>
-      <div className="sgroup">
-        <div className="sgroup__t">通用</div>
-        <div className="sgroup__d">工作区默认设置与启动行为。</div>
-        <div className="field" style={{ marginBottom: '18px' }}>
-          <label>工作区名称</label>
-          <input
-            className="input"
-            value={settings.workspaceName}
-            onChange={(e) =>
-              update((prev) => ({
-                ...prev,
-                general: { ...prev.general, workspaceName: e.target.value },
-              }))
-            }
-          />
-        </div>
-        <div className="field" style={{ marginBottom: '4px' }}>
-          <label>默认工作目录</label>
-          <div className="row gap-sm">
-            <input
-              className="input mono"
-              value={settings.defaultDirectory}
-              onChange={(e) =>
-                update((prev) => ({
-                  ...prev,
-                  general: { ...prev.general, defaultDirectory: e.target.value },
-                }))
-              }
-            />
-            <button className="btn btn--subtle" onClick={handleBrowse}>
-              <Icon name="folder" /> 浏览
-            </button>
+      <div className="cm-section">
+        <div className="cm-section__head">
+          <div>
+            <h2>
+              <Icon name="zap" /> 新任务
+            </h2>
+            <p>这些选项只提供默认偏好，任务发送前仍可在 Composer 调整。</p>
           </div>
         </div>
-        <div className="srow2">
-          <div className="srow2__m">
-            <b>启动时重新打开上次会话</b>
-            <small>直接回到你上次所在的对话线程。</small>
-          </div>
-          <label className="switch srow2__c">
-            <input
-              type="checkbox"
-              checked={settings.reopenLastSession}
-              onChange={(e) =>
-                update((prev) => ({
-                  ...prev,
-                  general: { ...prev.general, reopenLastSession: e.target.checked },
-                }))
-              }
-            />
-            <i />
-          </label>
-        </div>
-        <div className="srow2">
-          <div className="srow2__m">
-            <b>会话自动起标题</b>
-            <small>
-              首轮结束后通过当前引擎的快速模型生成标题与摘要（会把首轮内容发给当前绑定服务商）。
-            </small>
-          </div>
-          <label className="switch srow2__c">
-            <input
-              type="checkbox"
-              checked={settings.autoTitleSessions}
-              onChange={(e) =>
-                update((prev) => ({
-                  ...prev,
-                  general: { ...prev.general, autoTitleSessions: e.target.checked },
-                }))
-              }
-            />
-            <i />
-          </label>
-        </div>
-        <div className="srow2">
-          <div className="srow2__m">
-            <b>关闭时最小化到托盘</b>
-            <small>
-              点关闭按钮时隐藏到系统托盘而不是退出，后台会话继续运行；从托盘菜单可显示窗口或真正退出。
-            </small>
-          </div>
-          <label className="switch srow2__c">
-            <input
-              type="checkbox"
-              checked={settings.closeToTray ?? false}
-              onChange={(e) =>
-                update((prev) => ({
-                  ...prev,
-                  general: { ...prev.general, closeToTray: e.target.checked },
-                }))
-              }
-            />
-            <i />
-          </label>
-        </div>
-        <div className="srow2">
-          <div className="srow2__m">
-            <b>系统通知</b>
-            <small>轮次完成或出错时弹出 Windows 原生通知，即使 Helm 在后台也能收到提醒。</small>
-          </div>
-          <label className="switch srow2__c">
-            <input
-              type="checkbox"
-              checked={settings.notifications?.enabled ?? true}
-              onChange={(e) =>
-                update((prev) => ({
-                  ...prev,
-                  general: {
-                    ...prev.general,
-                    notifications: { enabled: e.target.checked },
-                  },
-                }))
-              }
-            />
-            <i />
-          </label>
-        </div>
-        <div className="srow2">
-          <div className="srow2__m">
-            <b>匿名使用分析</b>
-            <small>
-              控制 Helm 与子进程匿名诊断环境；关闭后会为 CLI 写入
-              DO_NOT_TRACK=1。绝不包含提示词或代码。
-            </small>
-          </div>
-          <label className="switch srow2__c">
-            <input
-              type="checkbox"
-              checked={settings.anonymousAnalytics}
-              onChange={(e) =>
-                update((prev) => ({
-                  ...prev,
-                  general: { ...prev.general, anonymousAnalytics: e.target.checked },
-                }))
-              }
-            />
-            <i />
-          </label>
-        </div>
-        <div className="srow2">
-          <div className="srow2__m">
-            <b>设置备份</b>
-            <small>导出当前设置，或从本地文件恢复。</small>
-          </div>
-          <div className="row gap-sm srow2__c">
-            <button className="btn btn--subtle btn--sm" onClick={handleExport} type="button">
-              <Icon name="upright" /> 导出
-            </button>
-            <button className="btn btn--subtle btn--sm" onClick={handleImport} type="button">
-              <Icon name="down" /> 导入
-            </button>
-          </div>
-        </div>
-        <div className="srow2">
-          <div className="srow2__m">
-            <b>自动更新</b>
-            <small>
-              {updateStatus ? updateStatusSummary(updateStatus) : '正在读取当前版本与更新通道…'}
-            </small>
-          </div>
-          <div className="seg srow2__c">
-            <button
-              className={settings.autoUpdateChannel === 'stable' ? 'is-active' : ''}
-              onClick={() =>
-                update((prev) => ({
-                  ...prev,
-                  general: { ...prev.general, autoUpdateChannel: 'stable' },
-                }))
-              }
-            >
-              稳定版
-            </button>
-            <button
-              className={settings.autoUpdateChannel === 'beta' ? 'is-active' : ''}
-              onClick={() =>
-                update((prev) => ({
-                  ...prev,
-                  general: { ...prev.general, autoUpdateChannel: 'beta' },
-                }))
-              }
-            >
-              测试版
-            </button>
-          </div>
-        </div>
-        <div className="field" style={{ marginTop: '12px' }}>
-          <label>更新发布源</label>
-          <input
-            className="input mono"
-            value={settings.updateFeedUrl}
-            onChange={(e) =>
-              update((prev) => ({
-                ...prev,
-                general: { ...prev.general, updateFeedUrl: e.target.value },
-              }))
-            }
-            placeholder="https://updates.example.com/helm/latest.json"
-          />
-        </div>
-        <UpdateActions feedConfigured={settings.updateFeedUrl.trim().length > 0} />
-        <div className="srow2" style={{ marginTop: '18px' }}>
-          <div className="srow2__m">
-            <b>价格目录自动更新</b>
-            <small>
-              当前 {pricingStatus?.catalogVersion ?? '内置目录'} ·
-              {pricingStatus?.source === 'cache' ? ' 已验证缓存' : ' 安装包内置'}
-              {pricingStatus?.stale ? ' · 已超过新鲜度阈值' : ''}
-              {pricingStatus?.lastError ? ` · 上次更新失败：${pricingStatus.lastError}` : ''}
-            </small>
-          </div>
-          <label className="switch srow2__c">
-            <input
-              type="checkbox"
-              checked={settings.pricingAutoUpdate}
-              onChange={(event) =>
-                update((prev) => ({
-                  ...prev,
-                  general: { ...prev.general, pricingAutoUpdate: event.target.checked },
-                }))
-              }
-            />
-            <i />
-          </label>
-        </div>
-        <div className="field" style={{ marginTop: '12px' }}>
-          <label>价格目录镜像（每行一个，国内主镜像在前）</label>
-          <textarea
-            className="input mono"
-            rows={3}
-            value={pricingFeedDraft}
-            onChange={(event) => setPricingFeedDraft(event.target.value)}
-            onBlur={commitPricingFeedDraft}
-            placeholder="https://国内镜像.example.com/helm/pricing-catalog.json"
-          />
-          <div className="hint">
-            留空时会尝试读取更新发布源同目录下的
-            pricing-catalog.json；所有镜像不可达时继续使用本地目录。
-          </div>
-        </div>
-        <div className="row gap-sm" style={{ marginTop: '10px' }}>
-          <button
-            className="btn btn--subtle btn--sm"
-            disabled={pricingBusy}
-            onClick={() => void refreshPricing()}
-            type="button"
-          >
-            <Icon name="refresh" /> {pricingBusy ? '处理中…' : '立即更新价格'}
-          </button>
-          <button
-            className="btn btn--subtle btn--sm"
-            disabled={pricingBusy}
-            onClick={() => void importPricing()}
-            type="button"
-          >
-            <Icon name="down" /> 导入离线目录
-          </button>
-        </div>
-        <div className="srow2">
-          <div className="srow2__m">
-            <b>预算遇到缺价模型</b>
-            <small>严格模式会在预算启用时阻止缺价模型发送，避免成本被静默低估。</small>
-          </div>
-          <div className="seg srow2__c">
-            <button
-              className={settings.pricingUnknownPolicy === 'warn' ? 'is-active' : ''}
-              onClick={() =>
-                update((prev) => ({
-                  ...prev,
-                  general: { ...prev.general, pricingUnknownPolicy: 'warn' },
-                }))
-              }
-            >
-              提醒
-            </button>
-            <button
-              className={settings.pricingUnknownPolicy === 'block' ? 'is-active' : ''}
-              onClick={() =>
-                update((prev) => ({
-                  ...prev,
-                  general: { ...prev.general, pricingUnknownPolicy: 'block' },
-                }))
-              }
-            >
-              严格
-            </button>
-          </div>
-        </div>
-        <div className="field" style={{ marginTop: '12px' }}>
-          <label>价格目录新鲜度阈值（天）</label>
-          <input
-            className="input mono"
-            type="number"
-            min="1"
-            max="3650"
-            value={settings.pricingMaxAgeDays}
-            onChange={(event) =>
-              update((prev) => ({
-                ...prev,
-                general: {
-                  ...prev.general,
-                  pricingMaxAgeDays: Math.max(1, Number(event.target.value || '30')),
-                },
-              }))
-            }
-          />
-        </div>
-      </div>
-    </section>
-  );
-}
-
-/** 真实更新链路（P2-1）：检查 → 展示新版本 → 下载安装（进度来自 update-progress 事件） */
-function UpdateActions({ feedConfigured }: { feedConfigured: boolean }) {
-  const [checking, setChecking] = useState(false);
-  const [installing, setInstalling] = useState(false);
-  const [available, setAvailable] = useState<UpdateCheckResult | null>(null);
-  const [progress, setProgress] = useState<{ downloaded: number; total: number | null } | null>(
-    null,
-  );
-
-  useEffect(() => {
-    if (!installing) return;
-    let unlisten: (() => void) | null = null;
-    let active = true;
-    void listen<{ downloaded?: number; total?: number | null; finished?: boolean }>(
-      'update-progress',
-      (event) => {
-        if (!active) return;
-        if (event.payload.finished) {
-          setProgress(null);
-          return;
-        }
-        setProgress({
-          downloaded: event.payload.downloaded ?? 0,
-          total: event.payload.total ?? null,
-        });
-      },
-    ).then((stop) => {
-      if (active) unlisten = stop;
-      else stop();
-    });
-    return () => {
-      active = false;
-      unlisten?.();
-    };
-  }, [installing]);
-
-  const handleCheck = async () => {
-    setChecking(true);
-    setAvailable(null);
-    try {
-      const result = await checkForUpdate();
-      if (result.available) {
-        setAvailable(result);
-        showResultToast(`发现新版本 v${result.version ?? ''}`);
-      } else {
-        showResultToast(`当前已是最新版本（v${result.currentVersion}）`);
-      }
-    } catch (error) {
-      showResultToast(`检查更新失败：${error instanceof Error ? error.message : String(error)}`);
-    } finally {
-      setChecking(false);
-    }
-  };
-
-  const handleInstall = async () => {
-    setInstalling(true);
-    setProgress(null);
-    try {
-      await installUpdate();
-      // 成功路径应用会自动重启，走不到这里
-    } catch (error) {
-      showResultToast(`安装更新失败：${error instanceof Error ? error.message : String(error)}`);
-      setInstalling(false);
-      setProgress(null);
-    }
-  };
-
-  const progressText =
-    progress && progress.total
-      ? `下载中 ${Math.min(100, Math.round((progress.downloaded / progress.total) * 100))}%`
-      : '下载中…';
-
-  return (
-    <div className="row gap-sm" style={{ marginTop: '12px', alignItems: 'center' }}>
-      <button
-        className="btn btn--subtle btn--sm"
-        type="button"
-        disabled={!feedConfigured || checking || installing}
-        title={feedConfigured ? undefined : '先填写更新发布源'}
-        onClick={handleCheck}
-      >
-        <Icon name="refresh" /> {checking ? '检查中…' : '检查更新'}
-      </button>
-      {available?.available ? (
-        <button
-          className="btn btn--primary btn--sm"
-          type="button"
-          disabled={installing}
-          onClick={handleInstall}
-        >
-          <Icon name="down" /> {installing ? progressText : `下载并安装 v${available.version}`}
-        </button>
-      ) : null}
-      {available?.notes ? (
-        <span className="faint" style={{ fontSize: 12 }}>
-          {available.notes}
-        </span>
-      ) : null}
-    </div>
-  );
-}
-
-function EnginesTab({
-  settings,
-  update,
-  onNavigate,
-}: {
-  settings: AppSettings['engines'];
-  update: (updater: (prev: AppSettings) => AppSettings) => void;
-  onNavigate?: (page: PageId) => void;
-}) {
-  const [detecting, setDetecting] = useState<'claude-code' | 'codex' | null>(null);
-  const [installingEngine, setInstallingEngine] = useState<'claude-code' | 'codex' | null>(null);
-  const [detectErrors, setDetectErrors] = useState<
-    Partial<Record<'claude-code' | 'codex', string>>
-  >({});
-
-  // 一键安装（P3-4）：真实 npm install -g 官方包，成功后自动复检并同步引擎配置
-  const handleInstall = async (engine: 'claude-code' | 'codex') => {
-    setInstallingEngine(engine);
-    try {
-      const result = await installCliEngine(engine);
-      showResultToast(
-        `${engine === 'claude-code' ? 'Claude Code' : 'Codex'} 已安装（${result.version}）`,
-      );
-      await handleDetect(engine);
-    } catch (error) {
-      showResultToast(`一键安装失败：${error instanceof Error ? error.message : String(error)}`);
-    } finally {
-      setInstallingEngine(null);
-    }
-  };
-
-  const handleDetect = async (engine: 'claude-code' | 'codex') => {
-    setDetecting(engine);
-    setDetectErrors((prev) => ({ ...prev, [engine]: undefined }));
-    try {
-      const result = await detectEngine(engine);
-      const configKey = engine === 'claude-code' ? 'claudeCode' : 'codex';
-      update((prev) => ({
-        ...prev,
-        engines: {
-          ...prev.engines,
-          [configKey]: {
-            ...prev.engines[configKey],
-            executablePath: result.path,
-            version: result.version,
-            detected: true,
-          },
-        },
-      }));
-      try {
-        const config = await getProviderConfig();
-        const engineConfig = config.engines.find((item) => item.id === engine);
-        if (engineConfig) {
-          await saveEngineConfig(engineConfigWithDetection(engineConfig, result));
-        }
-      } catch (syncError) {
-        console.error('Failed to sync engine config', syncError);
-        showResultToast('检测成功，但同步引擎配置失败，服务商页的引擎状态可能未更新');
-      }
-    } catch (error) {
-      const bin = engine === 'claude-code' ? 'claude' : 'codex';
-      setDetectErrors((prev) => ({
-        ...prev,
-        [engine]: `未检测到 ${bin} CLI（${String(error)}）。请先安装并确认 ${bin} 在 PATH 中，然后重新检测。`,
-      }));
-    } finally {
-      setDetecting(null);
-    }
-  };
-
-  return (
-    <section>
-      <div className="sgroup">
-        <div className="sgroup__t">引擎</div>
-        <div className="sgroup__d">
-          Helm 通过这些 CLI 工作。完整目录请查看{' '}
-          <a
-            href="#providers"
-            style={{ color: 'var(--accent-hi)' }}
-            onClick={(event) => {
-              event.preventDefault();
-              onNavigate?.('providers');
-            }}
-          >
-            服务商与模型
-          </a>
-          。
-        </div>
-        <div className="srow2">
-          <div className="srow2__m">
-            <b>新会话默认引擎</b>
-            <small>当你点击"新建会话"而未指定引擎时使用。</small>
-          </div>
-          <div className="seg srow2__c">
-            <button
-              className={settings.defaultEngine === 'claude-code' ? 'is-active' : ''}
-              onClick={() =>
-                update((prev) => ({
-                  ...prev,
-                  engines: { ...prev.engines, defaultEngine: 'claude-code' },
-                }))
-              }
-            >
-              Claude Code
-            </button>
-            <button
-              className={settings.defaultEngine === 'codex' ? 'is-active' : ''}
-              onClick={() =>
-                update((prev) => ({
-                  ...prev,
-                  engines: { ...prev.engines, defaultEngine: 'codex' },
-                }))
-              }
-            >
-              Codex
-            </button>
-          </div>
-        </div>
-        <div className="srow2">
-          <div className="srow2__m">
-            <b>Claude Code 可执行文件</b>
-            <small className="mono">
-              {settings.claudeCode.detected
-                ? `已检测 · ${settings.claudeCode.executablePath} · ${settings.claudeCode.version}`
-                : '未检测'}
-            </small>
-            {detectErrors['claude-code'] ? (
-              <small style={{ color: 'var(--danger, #e5484d)' }}>
-                {detectErrors['claude-code']}
-              </small>
-            ) : null}
-          </div>
-          <div className="row gap-sm srow2__c">
-            {!settings.claudeCode.detected ? (
-              <button
-                className="btn btn--primary btn--sm"
-                onClick={() => void handleInstall('claude-code')}
-                disabled={installingEngine !== null || detecting === 'claude-code'}
-              >
-                <Icon name="down" /> {installingEngine === 'claude-code' ? '安装中…' : '一键安装'}
-              </button>
-            ) : null}
-            <button
-              className="btn btn--subtle btn--sm"
-              onClick={() => handleDetect('claude-code')}
-              disabled={detecting === 'claude-code' || installingEngine === 'claude-code'}
-            >
-              <Icon name="refresh" /> {detecting === 'claude-code' ? '检测中…' : '重新检测'}
-            </button>
-          </div>
-        </div>
-        <div className="srow2">
-          <div className="srow2__m">
-            <b>新会话默认模式</b>
-            <small>新会话发送框初始选中的模式；对话中可随时按轮切换（构建/计划/询问）。</small>
-          </div>
-          <div className="seg srow2__c">
-            {(['build', 'plan'] as const).map((mode) => {
-              // 存量兼容（变更-04 §0.3）：旧值 auto/ask 都视为构建，只有 plan 视为计划
-              const active =
-                mode === 'plan'
-                  ? settings.claudeCode.permissionMode === 'plan'
-                  : settings.claudeCode.permissionMode !== 'plan';
-              return (
-                <button
-                  key={mode}
-                  className={active ? 'is-active' : ''}
-                  onClick={() =>
-                    update((prev) => ({
-                      ...prev,
-                      engines: {
-                        ...prev.engines,
-                        claudeCode: {
-                          ...prev.engines.claudeCode,
-                          permissionMode: mode === 'plan' ? 'plan' : 'auto',
-                        },
-                      },
-                    }))
-                  }
-                >
-                  {mode === 'plan' ? '计划' : '构建'}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-        <div className="srow2">
-          <div className="srow2__m">
-            <b>Codex 可执行文件</b>
-            <small className="mono">
-              {settings.codex.detected
-                ? `已检测 · ${settings.codex.executablePath} · ${settings.codex.version}`
-                : '未检测'}
-            </small>
-            {detectErrors['codex'] ? (
-              <small style={{ color: 'var(--danger, #e5484d)' }}>{detectErrors['codex']}</small>
-            ) : null}
-          </div>
-          <div className="row gap-sm srow2__c">
-            {!settings.codex.detected ? (
-              <button
-                className="btn btn--primary btn--sm"
-                onClick={() => void handleInstall('codex')}
-                disabled={installingEngine !== null || detecting === 'codex'}
-              >
-                <Icon name="down" /> {installingEngine === 'codex' ? '安装中…' : '一键安装'}
-              </button>
-            ) : null}
-            <button
-              className="btn btn--subtle btn--sm"
-              onClick={() => handleDetect('codex')}
-              disabled={detecting === 'codex' || installingEngine === 'codex'}
-            >
-              <Icon name="refresh" /> {detecting === 'codex' ? '检测中…' : '重新检测'}
-            </button>
-          </div>
-        </div>
-      </div>
-    </section>
-  );
-}
-
-function PermissionsTab() {
-  const [denyEngine, setDenyEngine] = useState<'all' | 'claude-code' | 'codex'>('all');
-  const [denyCapability, setDenyCapability] = useState<
-    | 'file_read'
-    | 'directory_list'
-    | 'file_write'
-    | 'process_exec'
-    | 'network_request'
-    | 'mcp_invoke'
-  >('process_exec');
-  const [denyTarget, setDenyTarget] = useState('');
-  const [denyProjectRoot, setDenyProjectRoot] = useState('');
-  const [creatingDeny, setCreatingDeny] = useState(false);
-  // SQLite Permission Ledger 是持久权限的事实真值；旧字符串清单只在后端迁移兼容。
-  const [permissionRules, setPermissionRules] = useState<PermissionRule[]>([]);
-  const [auditSummary, setAuditSummary] = useState<PermissionAuditSummary | null>(null);
-  const [permissionLoadError, setPermissionLoadError] = useState<string | null>(null);
-  const [auditLoadError, setAuditLoadError] = useState<string | null>(null);
-  const [includeAuditResources, setIncludeAuditResources] = useState(false);
-  const [confirmClearAudit, setConfirmClearAudit] = useState(false);
-
-  useEffect(() => {
-    let active = true;
-    getPermissionRules()
-      .then((rules) => {
-        if (active) setPermissionRules(rules);
-      })
-      .catch((error: unknown) => {
-        setPermissionLoadError(error instanceof Error ? error.message : '读取持久权限失败');
-      });
-    getPermissionAuditSummary()
-      .then((summary) => {
-        if (active) setAuditSummary(summary);
-      })
-      .catch((error: unknown) => {
-        setAuditLoadError(error instanceof Error ? error.message : '读取权限审计失败');
-      });
-    return () => {
-      active = false;
-    };
-  }, []);
-
-  const revokePermissionRule = async (rule: PermissionRule) => {
-    try {
-      const result = await removePermissionRule(rule.id);
-      setPermissionRules(result.rules);
-      showResultToast(
-        result.revocationTooLateCount > 0
-          ? `已撤销规则；${result.revocationTooLateCount} 个操作已开始，无法追回，已写入审计`
-          : `已撤销「${describePermissionRule(rule).title}」`,
-      );
-    } catch (error) {
-      showResultToast(`撤销失败：${error instanceof Error ? error.message : String(error)}`);
-    }
-  };
-
-  const createDenyRule = async () => {
-    setCreatingDeny(true);
-    try {
-      const target = denyTarget.trim();
-      const operation =
-        denyCapability === 'process_exec' || denyCapability === 'mcp_invoke' ? target : '';
-      const resourcePattern = operation ? '' : target;
-      setPermissionRules(
-        await createPermissionDenyRule({
-          engine: denyEngine === 'all' ? null : denyEngine,
-          capability: denyCapability,
-          operation: operation || null,
-          resourcePattern: resourcePattern || null,
-          projectRoot: denyProjectRoot.trim() || null,
-        }),
-      );
-      setDenyTarget('');
-      showResultToast('显式拒绝规则已创建');
-    } catch (error) {
-      showResultToast(
-        `创建拒绝规则失败：${error instanceof Error ? error.message : String(error)}`,
-      );
-    } finally {
-      setCreatingDeny(false);
-    }
-  };
-
-  const exportAudit = async () => {
-    try {
-      const path = await exportPermissionAudit(includeAuditResources);
-      if (path) showResultToast(`权限审计已导出：${path}`);
-    } catch (error) {
-      showResultToast(`导出失败：${error instanceof Error ? error.message : String(error)}`);
-    }
-  };
-
-  const clearAudit = async () => {
-    if (!confirmClearAudit) {
-      setConfirmClearAudit(true);
-      return;
-    }
-    try {
-      setAuditSummary(await clearPermissionAudit());
-      setConfirmClearAudit(false);
-      showResultToast('已清除可安全删除的权限审计；正在执行的记录会保留');
-    } catch (error) {
-      showResultToast(`清除失败：${error instanceof Error ? error.message : String(error)}`);
-    }
-  };
-
-  return (
-    <section>
-      <div className="sgroup">
-        <div className="sgroup__t" style={{ fontSize: '15px' }}>
-          显式拒绝
-        </div>
-        <div className="sgroup__d">
-          进入 Helm 权限裁决的动作不能用允许规则覆盖拒绝规则。Runtime
-          自行执行且不发审批的动作不会进入这里，全部放开时尤其需要谨慎。
-        </div>
-        <div className="row gap-sm" style={{ marginTop: 12, flexWrap: 'wrap' }}>
-          <select
-            className="input"
-            value={denyEngine}
-            onChange={(event) => setDenyEngine(event.target.value as typeof denyEngine)}
-          >
-            <option value="all">所有引擎</option>
-            <option value="claude-code">Claude Code</option>
-            <option value="codex">Codex</option>
-          </select>
-          <select
-            className="input"
-            value={denyCapability}
-            onChange={(event) => setDenyCapability(event.target.value as typeof denyCapability)}
-          >
-            <option value="file_read">读取文件</option>
-            <option value="directory_list">浏览目录</option>
-            <option value="file_write">修改文件</option>
-            <option value="process_exec">执行命令</option>
-            <option value="network_request">访问网络</option>
-            <option value="mcp_invoke">调用 MCP</option>
-          </select>
-          <input
-            className="input mono"
-            value={denyTarget}
-            onChange={(event) => setDenyTarget(event.target.value)}
-            placeholder="命令可执行词、MCP 工具、路径或 URL；留空拒绝整类能力"
-          />
-        </div>
-        <div className="row gap-sm" style={{ marginTop: 8 }}>
-          <input
-            className="input mono"
-            value={denyProjectRoot}
-            onChange={(event) => setDenyProjectRoot(event.target.value)}
-            placeholder="项目目录；留空对所有项目生效"
-          />
-          <button
-            className="btn btn--subtle btn--sm"
-            type="button"
-            onClick={async () => {
-              const selected = await selectDirectory();
-              if (selected) setDenyProjectRoot(selected);
-            }}
-          >
-            <Icon name="folder" /> 选择项目
-          </button>
-          <button
-            className="btn btn--danger btn--sm"
-            type="button"
-            disabled={creatingDeny}
-            onClick={() => void createDenyRule()}
-          >
-            <Icon name="plus" /> {creatingDeny ? '创建中…' : '创建拒绝规则'}
-          </button>
-        </div>
-      </div>
-      <div className="sgroup">
-        <div className="sgroup__t" style={{ fontSize: '15px' }}>
-          持久权限规则
-        </div>
-        <div className="sgroup__d">
-          Helm 按引擎、具体能力、路径和作用域记录授权；可在这里随时撤销。
-        </div>
-        {permissionLoadError ? (
-          <div className="settings-inline-error" role="alert">
-            <span>{permissionLoadError}</span>
-            <button
-              className="btn btn--subtle btn--sm"
-              type="button"
-              onClick={() => {
-                setPermissionLoadError(null);
-                void getPermissionRules()
-                  .then(setPermissionRules)
-                  .catch((error: unknown) =>
-                    setPermissionLoadError(
-                      error instanceof Error ? error.message : '读取持久权限失败',
-                    ),
-                  );
-              }}
-            >
-              重试
-            </button>
-          </div>
-        ) : null}
-        <div className="allowlist">
-          {permissionRules.map((rule) => {
-            const description = describePermissionRule(rule);
-            return (
-              <div className="allowlist__row" key={rule.id}>
-                <div>
-                  <code>{description.title}</code>
-                  <div className="sgroup__d" style={{ marginTop: 2 }}>
-                    {description.meta}
-                  </div>
-                </div>
-                <button
-                  className="btn-icon sm"
-                  title="撤销权限规则"
-                  onClick={() => void revokePermissionRule(rule)}
-                  type="button"
-                >
-                  <Icon name="x" />
-                </button>
-              </div>
-            );
-          })}
-          {!permissionLoadError && permissionRules.length === 0 ? (
-            <div className="allowlist__empty">
-              暂无持久规则——审批卡上选择「总是允许」后会出现在这里
+        <div className="cm-detail-card">
+          <div className="cm-option-row">
+            <div className="cm-option-row__main">
+              <b>新任务默认目录</b>
+              <small>默认带出上次使用的工作目录。</small>
             </div>
-          ) : null}
-        </div>
-      </div>
-      <div className="sgroup">
-        <div className="sgroup__t" style={{ fontSize: '15px' }}>
-          权限审计
-        </div>
-        <div className="sgroup__d">
-          默认保留 {auditSummary?.retentionDays ?? 90}{' '}
-          天；导出默认只包含资源摘要，不包含路径、URL、Prompt 或文件内容。
-        </div>
-        {auditLoadError ? (
-          <div className="settings-inline-error" role="alert">
-            <span>{auditLoadError}</span>
-            <button
-              className="btn btn--subtle btn--sm"
-              type="button"
-              onClick={() => {
-                setAuditLoadError(null);
-                void getPermissionAuditSummary()
-                  .then(setAuditSummary)
-                  .catch((error: unknown) =>
-                    setAuditLoadError(error instanceof Error ? error.message : '读取权限审计失败'),
-                  );
-              }}
-            >
-              重试
+            <button className="cm-action" type="button" onClick={() => void handleBrowse()}>
+              <span className="mono">{settings.defaultDirectory || '选择目录…'}</span>
+              <Icon name="folderopen" />
             </button>
           </div>
-        ) : null}
-        <div className="srow2">
-          <div className="srow2__m">
-            <b>{auditSummary ? `${auditSummary.recordCount} 条审计记录` : '正在读取审计记录…'}</b>
-            <small>撤销已启动规则会标记为“撤销过晚”，不会伪装成已追回。</small>
-          </div>
-          <div className="row gap-sm srow2__c">
-            <label className="check-row" title="仅在确有排障需要时开启">
+          <div className="cm-option-row">
+            <div className="cm-option-row__main">
+              <b>自动生成任务标题</b>
+              <small>快速模型不可用时使用首条指令摘要，不阻塞主任务。</small>
+            </div>
+            <label className="cm-switch">
               <input
                 type="checkbox"
-                checked={includeAuditResources}
-                onChange={(event) => setIncludeAuditResources(event.target.checked)}
+                checked={settings.autoTitleSessions}
+                onChange={(e) =>
+                  update((prev) => ({
+                    ...prev,
+                    general: { ...prev.general, autoTitleSessions: e.target.checked },
+                  }))
+                }
               />
-              导出路径与 URL 明文
+              <i />
             </label>
-            <button
-              className="btn btn--subtle btn--sm"
-              type="button"
-              onClick={() => void exportAudit()}
-            >
-              导出审计
-            </button>
-            <button
-              className={confirmClearAudit ? 'btn btn--danger btn--sm' : 'btn btn--subtle btn--sm'}
-              type="button"
-              onClick={() => void clearAudit()}
-              onBlur={() => setConfirmClearAudit(false)}
-            >
-              {confirmClearAudit ? '再次点击确认清除' : '清除审计'}
-            </button>
+          </div>
+          <div className="cm-option-row">
+            <div className="cm-option-row__main">
+              <b>启动时恢复退出前任务</b>
+              <small>没有可恢复任务时直接进入新任务。</small>
+            </div>
+            <label className="cm-switch">
+              <input
+                type="checkbox"
+                checked={settings.reopenLastSession}
+                onChange={(e) =>
+                  update((prev) => ({
+                    ...prev,
+                    general: { ...prev.general, reopenLastSession: e.target.checked },
+                  }))
+                }
+              />
+              <i />
+            </label>
           </div>
         </div>
       </div>
-    </section>
-  );
-}
 
-function McpSummaryTab({ onNavigate }: { onNavigate?: (page: PageId) => void }) {
-  const [servers, setServers] = useState<McpServer[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let active = true;
-    listMcpServers()
-      .then((next) => {
-        if (!active) return;
-        setServers(next);
-        setError(null);
-      })
-      .catch((err: unknown) => {
-        if (!active) return;
-        setServers([]);
-        setError(err instanceof Error ? err.message : '无法读取 MCP 服务器');
-      })
-      .finally(() => {
-        if (active) setLoading(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, []);
-
-  return (
-    <section>
-      <div className="sgroup">
-        <div className="sgroup__t">MCP 服务器</div>
-        <div className="sgroup__d">Model Context Protocol 服务器为每个引擎扩展额外工具。</div>
-        <p className="muted" style={{ fontSize: '12.5px', marginBottom: '14px' }}>
-          MCP 服务器现已集中在「扩展中心」统一管理。
-          <button
-            className="btn btn--sm"
-            style={{ marginLeft: '8px' }}
-            onClick={() => onNavigate?.('extensions')}
-            type="button"
-          >
-            <Icon name="puzzle" /> 前往扩展中心
-          </button>
-        </p>
-        {loading ? <div className="empty">加载 MCP 服务器...</div> : null}
-        {error ? (
-          <div className="empty" style={{ color: 'var(--danger)' }}>
-            {error}
+      <div className="cm-section">
+        <div className="cm-section__head">
+          <div>
+            <h2>
+              <Icon name="monitor" /> 桌面行为
+            </h2>
+            <p>后台任务状态保持可见，不静默终止运行中的任务。</p>
           </div>
-        ) : null}
-        {!loading && !error && servers.length === 0 ? (
-          <div className="empty">暂无 MCP 服务器</div>
-        ) : null}
-        {servers.map((server) => {
-          const connected = server.status === 'connected';
-          return (
-            <div className="srow2" key={server.name}>
-              <div className="srow2__m">
-                <b>{server.name}</b>
-                <small className="mono">
-                  {mcpServerCommand(server) || server.transport} · {mcpStatusLabel(server.status)}
-                </small>
-              </div>
-              <div className="row gap-sm srow2__c">
-                <span className={connected ? 'pill pill--success' : 'pill'}>
-                  <span className={connected ? 'dot dot--on' : 'dot dot--off'}></span>
-                  {mcpStatusLabel(server.status)}
-                </span>
-                <span className="pill">{server.enabled ? '配置启用' : '配置停用'}</span>
-              </div>
+        </div>
+        <div className="cm-detail-card">
+          <div className="cm-option-row">
+            <div className="cm-option-row__main">
+              <b>关闭主窗口时最小化到托盘</b>
+              <small>选择退出且仍有任务运行时会再次确认。</small>
             </div>
-          );
-        })}
-        <button
-          className="btn btn--primary"
-          style={{ marginTop: '18px' }}
-          onClick={() => onNavigate?.('extensions')}
-          type="button"
-        >
-          <Icon name="plus" /> 添加 MCP 服务器
+            <label className="cm-switch">
+              <input
+                type="checkbox"
+                checked={settings.closeToTray ?? false}
+                onChange={(e) =>
+                  update((prev) => ({
+                    ...prev,
+                    general: { ...prev.general, closeToTray: e.target.checked },
+                  }))
+                }
+              />
+              <i />
+            </label>
+          </div>
+          <div className="cm-option-row">
+            <div className="cm-option-row__main">
+              <b>系统通知</b>
+              <small>任务完成、失败或需要你处理时发送通知。</small>
+            </div>
+            <label className="cm-switch">
+              <input
+                type="checkbox"
+                checked={settings.notifications?.enabled ?? true}
+                onChange={(e) =>
+                  update((prev) => ({
+                    ...prev,
+                    general: {
+                      ...prev.general,
+                      notifications: { enabled: e.target.checked },
+                    },
+                  }))
+                }
+              />
+              <i />
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <div className="cm-section">
+        <div className="cm-section__head">
+          <div>
+            <h2>
+              <Icon name="sparkles" /> 对话体验
+            </h2>
+            <p>控制最终结果的呈现方式。</p>
+          </div>
+        </div>
+        <div className="cm-detail-card">
+          <div className="cm-option-row">
+            <div className="cm-option-row__main">
+              <b>生成式 UI</b>
+              <small>
+                允许最终结果使用交互式可视化输出。默认关闭，关闭时不会注入 Widget
+                指引；渲染能力将在后续版本接入，当前仅保存偏好。
+              </small>
+            </div>
+            <label className="cm-switch">
+              <input
+                type="checkbox"
+                checked={settings.generativeUi ?? false}
+                onChange={(e) =>
+                  update((prev) => ({
+                    ...prev,
+                    general: { ...prev.general, generativeUi: e.target.checked },
+                  }))
+                }
+              />
+              <i />
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <div className="cm-section">
+        <div className="cm-section__head">
+          <div>
+            <h2>
+              <Icon name="shield" /> 授权
+            </h2>
+            <p>这里只管理审批时已经保存的跨任务授权，不提供危险全局开关。</p>
+          </div>
+        </div>
+        <button className="st-auth-entry" type="button" onClick={() => setAuthDrawerOpen(true)}>
+          <span className="st-auth-entry__icon">
+            <Icon name="shield" />
+          </span>
+          <span className="st-auth-entry__main">
+            <b>已保存授权</b>
+            <small>
+              {authSummary.count > 0
+                ? `${authSummary.count} 项${authSummary.lastUpdated ? ' · 最近更新于 ' + formatRuleDate(authSummary.lastUpdated) : ''}`
+                : '暂无持久规则——审批卡上选择「总是允许」后会出现在这里'}
+            </small>
+          </span>
+          <span className="st-auth-entry__arrow">
+            <Icon name="right" />
+          </span>
         </button>
       </div>
+
+      {authDrawerOpen ? <AuthorizationDrawer onClose={() => setAuthDrawerOpen(false)} /> : null}
     </section>
   );
 }
 
-function AppearanceTab({
+/**
+ * 主题 Tab（S8）：外观模式、强调色与密度等真实偏好，外加跟随实际 token
+ * 的即时预览卡——预览只消费 tokens.css 变量，主题/强调色切换时同步变化。
+ */
+function ThemeTab({
   settings,
   update,
 }: {
@@ -1421,125 +449,210 @@ function AppearanceTab({
     };
   }, [settings, update]);
 
+  const [colorMenuOpen, setColorMenuOpen] = useState(false);
+
+  // 原型 cm-color-select 下拉：点击外部关闭。
+  useEffect(() => {
+    if (!colorMenuOpen) return;
+    const close = (event: MouseEvent) => {
+      if (!(event.target instanceof Element) || !event.target.closest('.cm-color-select-wrap')) {
+        setColorMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', close);
+    return () => document.removeEventListener('mousedown', close);
+  }, [colorMenuOpen]);
+
   const handleAccentClick = (color: { base: string; hi: string }) => {
     update((prev) => ({ ...prev, appearance: { ...prev.appearance, accentColor: color } }));
   };
 
-  const selectedIdx = ACCENT_COLORS.findIndex(
+  const selectedColorTheme = COLOR_THEMES.find(
     (c) => c.base === settings.accentColor.base && c.hi === settings.accentColor.hi,
   );
+  const selectedAccentName = selectedColorTheme?.name ?? '自定义';
+  const themeModeLabel =
+    settings.theme === 'light' ? '浅色' : settings.theme === 'dark' ? '深色' : '跟随系统';
 
   return (
     <section>
-      <div className="sgroup">
-        <div className="sgroup__t">外观</div>
-        <div className="sgroup__d">调整桌面客户端的外观。强调色会立即应用到各处。</div>
-        <div className="srow2">
-          <div className="srow2__m">
-            <b>主题</b>
-            <small>浅色专为共享屏幕和演示而调校。跟随系统会遵循你的操作系统设置。</small>
+      <div className="cm-section">
+        <div className="cm-section__head">
+          <div>
+            <h2>
+              <Icon name="slidershorizontal" /> 主题模式
+            </h2>
+            <p>跟随系统会根据系统外观自动切换浅色或深色。</p>
           </div>
-          <div className="seg seg3 srow2__c">
-            {(['light', 'dark', 'system'] as const).map((theme) => (
+        </div>
+        <div className="cm-detail-card">
+          <div className="cm-option-row">
+            <div className="cm-option-row__main">
+              <b>外观模式</b>
+              <small>选择浅色、深色或跟随系统。</small>
+            </div>
+            <div className="cm-theme-mode-grid">
+              {(['light', 'dark', 'system'] as const).map((theme) => (
+                <button
+                  key={theme}
+                  className={
+                    settings.theme === theme ? 'cm-theme-mode-card is-active' : 'cm-theme-mode-card'
+                  }
+                  onClick={() =>
+                    update((prev) => ({
+                      ...prev,
+                      appearance: { ...prev.appearance, theme },
+                    }))
+                  }
+                >
+                  <Icon name={theme === 'light' ? 'sun' : theme === 'dark' ? 'moon' : 'monitor'} />{' '}
+                  {theme === 'light' ? '浅色' : theme === 'dark' ? '深色' : '跟随系统'}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="cm-section">
+        <div className="cm-section__head">
+          <div>
+            <h2>
+              <Icon name="palette" /> 颜色主题
+            </h2>
+            <p>选择强调色方案，所有按钮、链接和选中态会同步变化。</p>
+          </div>
+        </div>
+        <div className="cm-detail-card">
+          <div className="cm-option-row">
+            <div className="cm-option-row__main">
+              <b>强调色</b>
+              <small>点击选择配色方案。</small>
+            </div>
+            <div className="u-relative cm-color-select-wrap">
               <button
-                key={theme}
-                className={settings.theme === theme ? 'is-active' : ''}
-                onClick={() =>
-                  update((prev) => ({
-                    ...prev,
-                    appearance: { ...prev.appearance, theme },
-                  }))
-                }
+                className="cm-color-select"
+                type="button"
+                aria-haspopup="listbox"
+                aria-expanded={colorMenuOpen}
+                onClick={() => setColorMenuOpen((open) => !open)}
               >
-                {theme === 'light' ? '浅色' : theme === 'dark' ? '深色' : '跟随系统'}
+                <span
+                  className="cm-color-select__dot"
+                  style={{ '--swatch': settings.accentColor.base } as CSSProperties}
+                />
+                <span className="cm-color-select__name">{selectedAccentName}</span>
+                <code className="cm-color-select__code">{settings.accentColor.base}</code>
+                <span className="cm-color-select__arrow">
+                  <Icon name="chevrondown" />
+                </span>
               </button>
-            ))}
+              {colorMenuOpen ? (
+                <div className="cm-color-dropdown is-open" role="listbox" aria-label="颜色主题">
+                  {COLOR_THEMES.map((theme) => (
+                    <button
+                      key={theme.name}
+                      className={
+                        'cm-color-dropdown__item' +
+                        (theme.base === settings.accentColor.base ? ' is-active' : '')
+                      }
+                      type="button"
+                      role="option"
+                      aria-selected={theme.base === settings.accentColor.base}
+                      onClick={() => {
+                        handleAccentClick(theme);
+                        setColorMenuOpen(false);
+                      }}
+                    >
+                      <span className="cm-color-dropdown__dot" style={{ background: theme.base }} />
+                      <span className="cm-color-dropdown__name">{theme.name}</span>
+                      <code className="cm-color-dropdown__code">{theme.base}</code>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
           </div>
         </div>
-        <div className="srow2">
-          <div className="srow2__m">
-            <b>强调色</b>
-            <small>用于操作、聚焦边框和激活状态。</small>
-          </div>
-          <div className="swatches srow2__c">
-            {ACCENT_COLORS.map((color, idx) => (
-              <button
-                key={idx}
-                className={`sw ${selectedIdx === idx ? 'is-on' : ''}`}
-                style={{ background: color.base }}
-                title={color.name}
-                onClick={() => handleAccentClick(color)}
-              />
-            ))}
+      </div>
+
+      <div className="cm-section">
+        <div className="cm-section__head">
+          <div>
+            <h2>
+              <Icon name="eye" /> 预览
+            </h2>
+            <p>实时查看当前主题效果。</p>
           </div>
         </div>
-        <div className="srow2">
-          <div className="srow2__m">
-            <b>界面密度</b>
-            <small>紧凑模式可在会话侧边栏和表格中容纳更多内容。</small>
+        <div className="cm-detail-card">
+          <div className="cm-option-row cm-option-row--preview">
+            <div className="cm-option-row__main">
+              <b>效果预览</b>
+              <small>
+                {themeModeLabel} · {selectedAccentName}
+              </small>
+            </div>
+            <ThemePreview />
           </div>
-          <div className="seg srow2__c">
-            {(['compact', 'comfortable'] as const).map((density) => (
-              <button
-                key={density}
-                className={settings.uiDensity === density ? 'is-active' : ''}
-                onClick={() =>
-                  update((prev) => ({
-                    ...prev,
-                    appearance: { ...prev.appearance, uiDensity: density },
-                  }))
-                }
-              >
-                {density === 'compact' ? '紧凑' : '舒适'}
-              </button>
-            ))}
-          </div>
-        </div>
-        <div className="srow2">
-          <div className="srow2__m">
-            <b>等宽字体</b>
-            <small>用于代码、差异对比、模型 ID 和终端。</small>
-          </div>
-          <select
-            className="select srow2__c"
-            style={{ width: '180px' }}
-            value={settings.monospaceFont}
-            onChange={(e) =>
-              update((prev) => ({
-                ...prev,
-                appearance: { ...prev.appearance, monospaceFont: e.target.value },
-              }))
-            }
-          >
-            <option>JetBrains Mono</option>
-            <option>SF Mono</option>
-            <option>Cascadia Code</option>
-            <option>IBM Plex Mono</option>
-          </select>
-        </div>
-        <div className="srow2">
-          <div className="srow2__m">
-            <b>减弱动效</b>
-            <small>尽量减少动画和过渡效果。</small>
-          </div>
-          <label className="switch srow2__c">
-            <input
-              type="checkbox"
-              checked={settings.reduceMotion}
-              onChange={(e) =>
-                update((prev) => ({
-                  ...prev,
-                  appearance: { ...prev.appearance, reduceMotion: e.target.checked },
-                }))
-              }
-            />
-            <i />
-          </label>
         </div>
       </div>
     </section>
   );
 }
+
+/** 主题预览（S8）：纯 token 消费，无独立状态；随 data-theme/--accent 全局变量实时变化。 */
+function ThemePreview() {
+  return (
+    <div className="cm-theme-preview" role="img" aria-label="主题即时预览">
+      <div className="cm-theme-preview__side">
+        <div className="cm-theme-preview__dot" />
+        <div className="cm-theme-preview__nav is-on" />
+        <div className="cm-theme-preview__nav" />
+        <div className="cm-theme-preview__nav" />
+        <div className="cm-theme-preview__nav" />
+      </div>
+      <div className="cm-theme-preview__main">
+        <div className="cm-theme-preview__head">任务工作区</div>
+        <div className="cm-theme-preview__bubble">
+          已完成登录与授权流程检查。
+          <div className="cm-theme-preview__line" />
+          <div className="cm-theme-preview__line" style={{ width: '72%' }} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** 可修改快捷键注册表（严格对齐原型 settings.html shortcutList 的 4 项）。 */
+const SHORTCUT_ENTRIES = [
+  {
+    action: '命令面板',
+    key: 'commandPalette',
+    icon: 'search',
+    desc: '快速查找命令、跳转页面或打开任务',
+  },
+  {
+    action: '新任务',
+    key: 'newSession',
+    icon: 'plus',
+    desc: '从任意页面快速打开新任务编辑器',
+  },
+  {
+    action: '显示 / 隐藏右侧工作区',
+    key: 'toggleContext',
+    icon: 'panelright',
+    desc: '切换交付物区的可见性',
+  },
+  {
+    action: '停止当前任务',
+    key: 'stop',
+    icon: 'octagon',
+    desc: '中断正在运行的 Agent 轮次',
+  },
+] as const;
+
+type ShortcutEntry = (typeof SHORTCUT_ENTRIES)[number];
 
 function KeyboardTab({
   settings,
@@ -1549,20 +662,12 @@ function KeyboardTab({
   update: (updater: (prev: AppSettings) => AppSettings) => void;
 }) {
   const [recordingKey, setRecordingKey] = useState<keyof AppSettings['shortcuts'] | null>(null);
-  const shortcuts = [
-    { action: '命令面板', key: 'commandPalette' },
-    { action: '新建会话', key: 'newSession' },
-    { action: '导航前缀', key: 'navigationPrefix' },
-    { action: '总览', key: 'home', prefix: true },
-    { action: '打开工作区', key: 'workspace', prefix: true },
-    { action: '服务商与模型', key: 'providers', prefix: true },
-    { action: '会话历史', key: 'sessions', prefix: true },
-    { action: '扩展中心', key: 'extensions', prefix: true },
-    { action: '用量与成本', key: 'usage', prefix: true },
-    { action: '设置', key: 'settings', prefix: true },
-    { action: '切换上下文面板', key: 'toggleContext' },
-    { action: '切换引擎', key: 'cycleEngine' },
-  ] as const;
+  const [blockedConflict, setBlockedConflict] = useState<{
+    key: keyof AppSettings['shortcuts'];
+    action: string;
+  } | null>(null);
+
+  const shortcuts = SHORTCUT_ENTRIES;
 
   const updateShortcut = (key: keyof AppSettings['shortcuts'], value: string) => {
     update((prev) => ({ ...prev, shortcuts: { ...prev.shortcuts, [key]: value } }));
@@ -1570,104 +675,242 @@ function KeyboardTab({
 
   const resetShortcuts = () => {
     update((prev) => ({ ...prev, shortcuts: DEFAULT_SETTINGS.shortcuts }));
+    setBlockedConflict(null);
   };
 
-  const displayKeys = (shortcut: (typeof shortcuts)[number]) => {
-    const value = settings[shortcut.key];
-    return 'prefix' in shortcut && shortcut.prefix
-      ? [settings.navigationPrefix, ...shortcutLabel(value)]
-      : shortcutLabel(value);
+  const shortcutValue = (shortcut: ShortcutEntry) => settings[shortcut.key] ?? '';
+
+  /** 冲突口径（变更-12）：前缀行按 g+键 归一，普通行按完整组合归一；同一绑定只允许一个动作。 */
+  const bindingId = (shortcut: ShortcutEntry, value: string) =>
+    ('prefix' in shortcut && shortcut.prefix ? 'g+' : '') + value.trim().toLowerCase();
+
+  const conflictActionFor = (shortcut: ShortcutEntry, value: string): string | null => {
+    const id = bindingId(shortcut, value);
+    if (!id) return null;
+    for (const other of shortcuts) {
+      if (other.key === shortcut.key) continue;
+      const otherValue = shortcutValue(other);
+      if (otherValue.trim() !== '' && bindingId(other, otherValue) === id) return other.action;
+    }
+    return null;
   };
 
-  // 冲突检测（变更-12）：同一按键被多个动作绑定时先到先得，后者永远不触发——必须可见
-  const bindingCounts = new Map<string, number>();
-  for (const shortcut of shortcuts) {
-    const value = (settings[shortcut.key] ?? '').trim().toLowerCase();
-    if (!value) continue;
-    const full = 'prefix' in shortcut && shortcut.prefix ? `g+${value}` : value;
-    bindingCounts.set(full, (bindingCounts.get(full) ?? 0) + 1);
-  }
-  const isConflicting = (shortcut: (typeof shortcuts)[number]) => {
-    const value = (settings[shortcut.key] ?? '').trim().toLowerCase();
-    if (!value) return false;
-    const full = 'prefix' in shortcut && shortcut.prefix ? `g+${value}` : value;
-    return (bindingCounts.get(full) ?? 0) > 1;
-  };
+  // 录制（决策记录 §8.4.3）：点击键位开始，Esc 取消，Backspace/Delete 清除；
+  // 冲突在当前行就地提示并阻止保存，不只依赖被动标记。
+  useEffect(() => {
+    if (!recordingKey) return;
+    const shortcut = shortcuts.find((entry) => entry.key === recordingKey);
+    if (!shortcut) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.key === 'Escape') {
+        setRecordingKey(null);
+        setBlockedConflict(null);
+        return;
+      }
+      if (event.key === 'Backspace' || event.key === 'Delete') {
+        update((prev) => ({
+          ...prev,
+          shortcuts: { ...prev.shortcuts, [shortcut.key]: '' },
+        }));
+        setRecordingKey(null);
+        setBlockedConflict(null);
+        return;
+      }
+      if (['Control', 'Shift', 'Alt', 'Meta'].includes(event.key)) return;
+      const value = shortcutFromKeyboardEvent(event);
+      if (!value) return;
+      const id = ('prefix' in shortcut && shortcut.prefix ? 'g+' : '') + value.trim().toLowerCase();
+      const conflictEntry = shortcuts.find((other) => {
+        if (other.key === shortcut.key) return false;
+        const otherValue = (settings[other.key] ?? '').trim().toLowerCase();
+        if (!otherValue) return false;
+        return ('prefix' in other && other.prefix ? 'g+' : '') + otherValue === id;
+      });
+      if (conflictEntry) {
+        setBlockedConflict({ key: shortcut.key, action: conflictEntry.action });
+        setRecordingKey(null);
+        return;
+      }
+      update((prev) => ({
+        ...prev,
+        shortcuts: { ...prev.shortcuts, [shortcut.key]: value },
+      }));
+      setRecordingKey(null);
+      setBlockedConflict(null);
+    };
+    const onMouseDown = (event: MouseEvent) => {
+      if (!(event.target instanceof Element)) return;
+      if (event.target.closest(`[data-shortcut-key="${shortcut.key}"]`)) return;
+      setRecordingKey(null);
+      setBlockedConflict(null);
+    };
+    document.addEventListener('keydown', onKeyDown, true);
+    document.addEventListener('mousedown', onMouseDown);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown, true);
+      document.removeEventListener('mousedown', onMouseDown);
+    };
+  }, [recordingKey, settings, shortcuts, update]);
 
   return (
     <section>
-      <div className="sgroup">
-        <div className="sgroup__t">快捷键</div>
-        <div className="sgroup__d">应用中可用的快捷键绑定。</div>
-        {shortcuts.map((s) => (
-          <div key={s.action} className="kbdrow">
-            <span>{s.action}</span>
-            <span className="keys">
-              {displayKeys(s).map((k, index) => (
-                <span key={`${s.action}-${k}-${index}`} className="kbd">
-                  {k}
-                </span>
-              ))}
-              {isConflicting(s) ? (
-                <span
-                  className="pill pill--warn"
-                  title="该按键被多个动作绑定，只有排在前面的动作会触发"
-                >
-                  冲突
-                </span>
-              ) : null}
-            </span>
-            <button
-              className={
-                'btn btn--subtle btn--sm mono' + (recordingKey === s.key ? ' is-active' : '')
-              }
-              type="button"
-              aria-label={`录制${s.action}快捷键`}
-              onClick={() => setRecordingKey(s.key)}
-              onKeyDown={(event) => {
-                if (recordingKey !== s.key) return;
-                event.preventDefault();
-                event.stopPropagation();
-                if (event.key === 'Escape') {
-                  setRecordingKey(null);
-                  return;
-                }
-                const value = shortcutFromKeyboardEvent(event);
-                if (!value) return;
-                updateShortcut(s.key, value);
-                setRecordingKey(null);
-              }}
-            >
-              {recordingKey === s.key ? '请按快捷键…' : '修改'}
-            </button>
+      <div className="cm-section">
+        <div className="cm-section__head cm-shortcut-section-head">
+          <div>
+            <h2>
+              <Icon name="keyboard" /> 可修改快捷键
+            </h2>
+            <p>点击键位卡片开始录制，Esc 取消；冲突会即时提示。</p>
           </div>
-        ))}
-        <div className="kbdrow">
-          <span>发送消息</span>
-          <span className="row gap-sm">
-            <span className="keys">
-              <span className="kbd">Enter</span>
-            </span>
-            <span className="faint" style={{ fontSize: 11 }}>
-              固定
-            </span>
-          </span>
+          <button className="cm-action" type="button" onClick={resetShortcuts}>
+            <Icon name="refresh" /> 全部恢复默认
+          </button>
         </div>
-        <div className="kbdrow">
-          <span>插入换行</span>
-          <span className="row gap-sm">
-            <span className="keys">
-              <span className="kbd">Shift</span>
-              <span className="kbd">Enter</span>
-            </span>
-            <span className="faint" style={{ fontSize: 11 }}>
-              固定
-            </span>
-          </span>
+        {shortcuts.map((s) => {
+          const value = shortcutValue(s);
+          const recording = recordingKey === s.key;
+          const blocked = blockedConflict?.key === s.key ? blockedConflict.action : null;
+          const conflictText = blocked ?? conflictActionFor(s, value);
+          const prefixKey = 'prefix' in s && s.prefix ? settings.navigationPrefix : null;
+          const parts = shortcutLabel(value);
+          return (
+            <div
+              key={s.action}
+              className={
+                'cm-shortcut-card' +
+                (recording ? ' is-recording' : '') +
+                (conflictText ? ' is-conflict' : '')
+              }
+              data-shortcut-key={s.key}
+            >
+              <span className="cm-shortcut-card__icon">
+                <Icon name={s.icon} />
+              </span>
+              <div className="cm-shortcut-card__main">
+                <b>{s.action}</b>
+                <small>{s.desc}</small>
+                {conflictText ? (
+                  <span className="cm-shortcut-card__conflict" role="alert">
+                    与「{conflictText}」冲突
+                  </span>
+                ) : null}
+              </div>
+              <div className="cm-shortcut-card__right">
+                <button
+                  className="cm-shortcut-keys"
+                  type="button"
+                  aria-label={`录制${s.action}快捷键`}
+                  onClick={() => {
+                    setRecordingKey(recording ? null : s.key);
+                    setBlockedConflict(null);
+                  }}
+                >
+                  {recording ? (
+                    <span className="cm-key cm-key--placeholder">按下组合键…</span>
+                  ) : parts.length === 0 ? (
+                    <span className="cm-key cm-key--placeholder">未设置</span>
+                  ) : (
+                    <>
+                      {prefixKey ? <span className="cm-key">{prefixKey}</span> : null}
+                      {parts.map((part, index) => (
+                        <Fragment key={`${s.key}-${part}-${index}`}>
+                          {index > 0 ? <span className="cm-key cm-key--plus">+</span> : null}
+                          <span className="cm-key">{part}</span>
+                        </Fragment>
+                      ))}
+                    </>
+                  )}
+                </button>
+                {value ? (
+                  <button
+                    className="cm-shortcut-clear"
+                    type="button"
+                    title="清除"
+                    aria-label={`清除${s.action}快捷键`}
+                    onClick={() => {
+                      updateShortcut(s.key, '');
+                      setBlockedConflict(null);
+                    }}
+                  >
+                    <Icon name="x" />
+                  </button>
+                ) : null}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="cm-section">
+        <div className="cm-section__head">
+          <div>
+            <h2>
+              <Icon name="lock" /> 固定交互
+            </h2>
+            <p>与输入框和选择弹层行为一致，不支持修改。</p>
+          </div>
         </div>
-        <button className="btn btn--subtle btn--sm" type="button" onClick={resetShortcuts}>
-          <Icon name="refresh" /> 恢复默认
-        </button>
+        <div className="cm-detail-card cm-shortcut-fixed">
+          <div className="cm-option-row">
+            <div className="cm-option-row__main">
+              <b>发送 / 换行</b>
+              <small>
+                <span className="cm-shortcut-fixed-keys">
+                  <span className="cm-key">Enter</span>
+                </span>
+                <span className="cm-key cm-key--sep">发送</span>
+                <span className="cm-shortcut-fixed-keys">
+                  <span className="cm-key">Shift</span>
+                  <span className="cm-key cm-key--plus">+</span>
+                  <span className="cm-key">Enter</span>
+                </span>
+                <span className="cm-key cm-key--sep">换行</span>
+              </small>
+            </div>
+            <span className="cm-source-label">固定</span>
+          </div>
+          <div className="cm-option-row">
+            <div className="cm-option-row__main">
+              <b>选择弹层项</b>
+              <small>
+                <span className="cm-shortcut-fixed-keys">
+                  <span className="cm-key">↑</span>
+                  <span className="cm-key">↓</span>
+                </span>
+                <span className="cm-key cm-key--sep">选择</span>
+                <span className="cm-shortcut-fixed-keys">
+                  <span className="cm-key">Enter</span>
+                  <span className="cm-key cm-key--sep">/</span>
+                  <span className="cm-key">Tab</span>
+                </span>
+                <span className="cm-key cm-key--sep">确认</span>
+                <span className="cm-shortcut-fixed-keys">
+                  <span className="cm-key">Esc</span>
+                </span>
+                <span className="cm-key cm-key--sep">关闭</span>
+              </small>
+            </div>
+            <span className="cm-source-label">固定</span>
+          </div>
+          <div className="cm-option-row">
+            <div className="cm-option-row__main">
+              <b>输入触发</b>
+              <small>
+                <span className="cm-shortcut-fixed-keys">
+                  <span className="cm-key">/</span>
+                </span>
+                <span className="cm-key cm-key--sep">命令与 Skills</span>
+                <span className="cm-shortcut-fixed-keys">
+                  <span className="cm-key">@</span>
+                </span>
+                <span className="cm-key cm-key--sep">文件引用</span>
+              </small>
+            </div>
+            <span className="cm-source-label">固定</span>
+          </div>
+        </div>
       </div>
     </section>
   );

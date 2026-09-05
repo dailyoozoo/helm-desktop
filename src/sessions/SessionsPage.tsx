@@ -1,22 +1,34 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { EngineId } from '@helm/protocol';
 import { getSessionHistory, listFolders, listSessions, resumeSession } from './api';
-import { deleteSession, renameSession, setSessionPinned } from './api';
+import {
+  deleteSession,
+  renameSession,
+  setFolderCollapsed,
+  setSessionArchived,
+  setSessionPinned,
+} from './api';
 import { liveSessionHandle } from '../engine/useSession';
 import { Chip } from '../components/Chip';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { Dialog } from '../components/Dialog';
 import { Icon } from '../shell/icons';
-import type { SessionFolder, SessionStatus, SessionSummary } from './sessionTypes';
-import { publishResume } from './resumeBridge';
+import { EngineBrand } from '../shell/EngineBrand';
+import type { SessionFolder, SessionSummary } from './sessionTypes';
+import type { SessionStatusFilter } from './sessionViewModel';
+import { discardHistoryPreview, publishHistoryOnly, publishResume } from './resumeBridge';
+import { sidebarStatusCounts } from '../workspace/SessionSidebar';
 import {
+  changeScaleText,
   costText,
+  currentActionText,
+  derivedStatusKey,
+  derivedStatusLabelForSession,
   engineLabel,
   filterSessions,
   relativeTimeText,
   sessionStats,
   sortSessions,
-  statusLabel,
   tokenText,
   type SessionSortKey,
   type SortDirection,
@@ -25,18 +37,23 @@ import './sessions.css';
 
 interface SessionsPageProps {
   onOpenWorkspace: () => void;
-  onNewSession: () => void;
 }
 
-export function SessionsPage({ onOpenWorkspace, onNewSession }: SessionsPageProps) {
+/** 一个项目分组：folder 元信息 + 该分组下的会话列表。 */
+interface ProjectGroup {
+  folder: SessionFolder | null;
+  sessions: SessionSummary[];
+}
+
+export function SessionsPage({ onOpenWorkspace }: SessionsPageProps) {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [folders, setFolders] = useState<SessionFolder[]>([]);
-  const [folderId, setFolderId] = useState('all');
   const [query, setQuery] = useState('');
   const [engine, setEngine] = useState<EngineId | 'all'>('all');
-  const [status, setStatus] = useState<SessionStatus | 'all'>('all');
+  const [status, setStatus] = useState<SessionStatusFilter>('all');
   const [sortKey, setSortKey] = useState<SessionSortKey>('recent');
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
+  const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [resumingId, setResumingId] = useState<string | null>(null);
@@ -56,10 +73,12 @@ export function SessionsPage({ onOpenWorkspace, onNewSession }: SessionsPageProp
         if (!mountedRef.current || requestId !== requestRef.current) return;
         setSessions(next);
         setFolders(nextFolders);
+        // 同步后端 collapsed 状态到本地 Set
+        setCollapsedFolders(new Set(nextFolders.filter((f) => f.collapsed).map((f) => f.id)));
       })
       .catch((err: unknown) => {
         if (!mountedRef.current || requestId !== requestRef.current) return;
-        setError(err instanceof Error ? err.message : '无法读取会话历史');
+        setError(err instanceof Error ? err.message : '无法读取任务历史');
       })
       .finally(() => {
         if (mountedRef.current && requestId === requestRef.current) setLoading(false);
@@ -94,14 +113,53 @@ export function SessionsPage({ onOpenWorkspace, onNewSession }: SessionsPageProp
 
   const visibleSessions = useMemo(() => {
     const filtered = filterSessions(sessions, { query, engine, status });
-    return sortSessions(
-      folderId === 'all' ? filtered : filtered.filter((session) => session.folderId === folderId),
-      sortKey,
-      sortDirection,
-    );
-  }, [engine, folderId, query, sessions, sortDirection, sortKey, status]);
+    return sortSessions(filtered, sortKey, sortDirection);
+  }, [engine, query, sessions, sortDirection, sortKey, status]);
 
   const stats = useMemo(() => sessionStats(sessions), [sessions]);
+
+  const statusCounts = useMemo(() => sidebarStatusCounts(sessions), [sessions]);
+
+  // 按 folderId 分组——没有 folderId 的会话归入"其他"分组
+  const projectGroups = useMemo<ProjectGroup[]>(() => {
+    const byFolder = new Map<string, SessionSummary[]>();
+    const noFolder: SessionSummary[] = [];
+    for (const session of visibleSessions) {
+      const fid = session.folderId;
+      if (!fid) {
+        noFolder.push(session);
+      } else {
+        const list = byFolder.get(fid);
+        if (list) list.push(session);
+        else byFolder.set(fid, [session]);
+      }
+    }
+    const groups: ProjectGroup[] = folders.map((folder) => ({
+      folder,
+      sessions: byFolder.get(folder.id) ?? [],
+    }));
+    // 有会话但无对应 folder 记录的，也作为分组展示
+    for (const [fid, list] of byFolder) {
+      if (!folders.some((f) => f.id === fid)) {
+        groups.push({
+          folder: {
+            id: fid,
+            name: fid,
+            sortOrder: 999,
+            collapsed: false,
+            locked: false,
+            createdAt: 0,
+          },
+          sessions: list,
+        });
+      }
+    }
+    // 有会话但没有 folderId 的
+    if (noFolder.length) {
+      groups.push({ folder: null, sessions: noFolder });
+    }
+    return groups.filter((g) => g.sessions.length > 0);
+  }, [folders, visibleSessions]);
 
   const changeSort = (key: SessionSortKey) => {
     if (sortKey === key) {
@@ -112,22 +170,44 @@ export function SessionsPage({ onOpenWorkspace, onNewSession }: SessionsPageProp
     }
   };
 
+  const clearRowError = useCallback((sessionId: string) => {
+    setRowErrors((current) => {
+      if (!current[sessionId]) return current;
+      const next = { ...current };
+      delete next[sessionId];
+      return next;
+    });
+  }, []);
+
   const openSession = async (sessionId: string) => {
-    // 恢复期间全表禁点（B1-4）：并发触发第二次 resume 会为同一 CLI 会话拉起双运行时
     if (resumingId) return;
     setResumingId(sessionId);
     try {
       const session = await getSessionHistory(sessionId);
-      // 复用存活句柄（可靠性检查 A5）：后台仍在跑的会话不再启动第二个运行时，
-      // 否则同一 CLI 会话会出现双进程且旧轮次永久失控。
       const live = liveSessionHandle(sessionId);
-      const handleId = live ?? (await resumeSession(sessionId));
-      publishResume({ handleId, session });
+      if (live) {
+        publishResume({ handleId: live, session });
+        onOpenWorkspace();
+        return;
+      }
+      // B 方案历史先行：先跳工作区并渲染线程，CLI 在后台重建；
+      // 重建失败回滚先行渲染并把错误留在本页行内。
+      publishHistoryOnly({ session });
       onOpenWorkspace();
+      try {
+        const handleId = await resumeSession(sessionId);
+        publishResume({ handleId, session });
+      } catch (err) {
+        discardHistoryPreview(sessionId);
+        setRowErrors((current) => ({
+          ...current,
+          [sessionId]: err instanceof Error ? err.message : '恢复任务失败',
+        }));
+      }
     } catch (err) {
       setRowErrors((current) => ({
         ...current,
-        [sessionId]: err instanceof Error ? err.message : '恢复会话失败',
+        [sessionId]: err instanceof Error ? err.message : '恢复任务失败',
       }));
     } finally {
       setResumingId(null);
@@ -143,11 +223,28 @@ export function SessionsPage({ onOpenWorkspace, onNewSession }: SessionsPageProp
           item.id === session.id ? { ...item, pinned: !session.pinned } : item,
         ),
       );
-      setRowErrors((current) => ({ ...current, [session.id]: '' }));
+      clearRowError(session.id);
     } catch (err) {
       setRowErrors((current) => ({
         ...current,
         [session.id]: err instanceof Error ? err.message : '更新置顶状态失败',
+      }));
+    }
+  };
+
+  const toggleArchived = async (session: SessionSummary) => {
+    setMenuSessionId(null);
+    const next = !session.archived;
+    try {
+      await setSessionArchived(session.id, next);
+      setSessions((current) =>
+        current.map((item) => (item.id === session.id ? { ...item, archived: next } : item)),
+      );
+      clearRowError(session.id);
+    } catch (err) {
+      setRowErrors((current) => ({
+        ...current,
+        [session.id]: err instanceof Error ? err.message : '更新归档状态失败',
       }));
     }
   };
@@ -159,6 +256,7 @@ export function SessionsPage({ onOpenWorkspace, onNewSession }: SessionsPageProp
       setSessions((current) =>
         current.map((item) => (item.id === renameTarget.id ? { ...item, title } : item)),
       );
+      clearRowError(renameTarget.id);
       setRenameTarget(null);
     } catch (err) {
       setRowErrors((current) => ({
@@ -174,122 +272,130 @@ export function SessionsPage({ onOpenWorkspace, onNewSession }: SessionsPageProp
     try {
       await deleteSession(deleteTarget.id);
       setSessions((current) => current.filter((item) => item.id !== deleteTarget.id));
+      clearRowError(deleteTarget.id);
       setDeleteTarget(null);
     } catch (err) {
       setRowErrors((current) => ({
         ...current,
-        [deleteTarget.id]: err instanceof Error ? err.message : '删除会话失败',
+        [deleteTarget.id]: err instanceof Error ? err.message : '删除任务失败',
       }));
       setDeleteTarget(null);
     }
   };
 
+  const toggleFolder = useCallback(
+    (folderId: string) => {
+      const next = new Set(collapsedFolders);
+      if (next.has(folderId)) next.delete(folderId);
+      else next.add(folderId);
+      setCollapsedFolders(next);
+      // 同步到后端（fire-and-forget）
+      void setFolderCollapsed(folderId, next.has(folderId));
+    },
+    [collapsedFolders],
+  );
+
+  const sortChips: { key: SessionSortKey; label: string }[] = [
+    { key: 'recent', label: '最近活跃' },
+    { key: 'messages', label: '消息' },
+    { key: 'tokens', label: 'Token' },
+    { key: 'change', label: '变更' },
+    { key: 'cost', label: '花费' },
+  ];
+
+  const statusChips: { key: SessionStatusFilter; label: string; count: number }[] = [
+    { key: 'all', label: '全部', count: statusCounts.all },
+    { key: 'waiting_approval', label: '等审批', count: statusCounts.waiting_approval },
+    { key: 'running', label: '运行中', count: statusCounts.running },
+    { key: 'failed', label: '失败', count: statusCounts.failed },
+    { key: 'archived', label: '已归档', count: statusCounts.archived },
+  ];
+
   return (
     <main className="main">
       <div className="page scroll">
-        <div className="page__head">
-          <div>
-            <div className="page__title">会话历史</div>
-            <div className="page__sub">跨项目、引擎与模型的全部会话，可搜索、可恢复。</div>
-          </div>
-          <button className="btn btn--primary" type="button" onClick={onNewSession}>
-            新建会话
-          </button>
-        </div>
-
-        <div className="sessions-wrap">
-          <div className="sessions-stats">
-            <Stat label="会话" value={String(stats.totalSessions)} detail="全部历史" />
-            <Stat
-              label="活跃引擎"
-              value={String(stats.activeEngines)}
-              detail="Claude Code · Codex"
-            />
-            <Stat label="计费 token" value={tokenText(stats.totalTokens)} detail="含缓存重读" />
-            <Stat label="花费" value={costText(stats.totalCostUsd)} detail="累计成本" />
-          </div>
-          <p className="faint" style={{ fontSize: '11.5px', margin: '-12px 0 18px' }}>
-            统计为全部会话的累计口径，不随下方筛选变化。
-          </p>
-
-          <div className="sessions-filterbar">
-            <div className="search sessions-search">
-              <Icon name="search" />
-              <input
-                value={query}
-                placeholder="搜索会话、模型或路径..."
-                onChange={(event) => setQuery(event.target.value)}
-              />
+        <div className="sessions-page">
+          {/* ── 工具栏：搜索 + 状态筛选 + 引擎筛选 + 排序 ── */}
+          <div className="sessions-toolbar">
+            <div className="sessions-toolbar-row">
+              <div className="search sessions-search">
+                <Icon name="search" />
+                <input
+                  value={query}
+                  placeholder="搜索任务、模型或路径..."
+                  onChange={(event) => setQuery(event.target.value)}
+                />
+              </div>
+              <div className="grow" />
+              <div className="sessions-sort-group">
+                {sortChips.map((chip) => (
+                  <SortChip
+                    key={chip.key}
+                    active={sortKey === chip.key}
+                    direction={sortKey === chip.key ? sortDirection : 'desc'}
+                    onClick={() => changeSort(chip.key)}
+                  >
+                    {chip.label}
+                  </SortChip>
+                ))}
+              </div>
             </div>
-            <Chip
-              className="sessions-chip"
-              active={engine === 'all'}
-              onClick={() => setEngine('all')}
-            >
-              全部引擎
-            </Chip>
-            <Chip
-              className="sessions-chip"
-              active={engine === 'claude-code'}
-              onClick={() => setEngine('claude-code')}
-            >
-              Claude Code
-            </Chip>
-            <Chip
-              className="sessions-chip"
-              active={engine === 'codex'}
-              onClick={() => setEngine('codex')}
-            >
-              Codex
-            </Chip>
-            <div className="grow" />
-            <Chip
-              className="sessions-chip"
-              active={status === 'all'}
-              onClick={() => setStatus('all')}
-            >
-              全部
-            </Chip>
-            <Chip
-              className="sessions-chip"
-              active={status === 'active'}
-              onClick={() => setStatus('active')}
-            >
-              活跃
-            </Chip>
-            <Chip
-              className="sessions-chip"
-              active={status === 'idle'}
-              onClick={() => setStatus('idle')}
-            >
-              空闲
-            </Chip>
-            <Chip
-              className="sessions-chip"
-              active={status === 'done'}
-              onClick={() => setStatus('done')}
-            >
-              已完成
-            </Chip>
+            <div className="sessions-toolbar-row">
+              <div className="sessions-filter-group">
+                {statusChips.map((chip) => (
+                  <Chip
+                    key={chip.key}
+                    className="sessions-chip"
+                    active={status === chip.key}
+                    onClick={() => setStatus(chip.key)}
+                  >
+                    {chip.label}
+                    {chip.count > 0 ? (
+                      <span className="sessions-chip-count">{chip.count}</span>
+                    ) : null}
+                  </Chip>
+                ))}
+              </div>
+              <div className="grow" />
+              <div className="sessions-filter-group">
+                <Chip
+                  className="sessions-chip"
+                  active={engine === 'all'}
+                  onClick={() => setEngine('all')}
+                >
+                  全部引擎
+                </Chip>
+                <Chip
+                  className="sessions-chip"
+                  active={engine === 'claude-code'}
+                  onClick={() => setEngine('claude-code')}
+                >
+                  Claude Code
+                </Chip>
+                <Chip
+                  className="sessions-chip"
+                  active={engine === 'codex'}
+                  onClick={() => setEngine('codex')}
+                >
+                  Codex
+                </Chip>
+              </div>
+            </div>
           </div>
-          <div className="sessions-folder-filters" aria-label="按文件夹筛选">
-            <Chip
-              className="sessions-chip"
-              active={folderId === 'all'}
-              onClick={() => setFolderId('all')}
-            >
-              全部文件夹
-            </Chip>
-            {folders.map((folder) => (
-              <Chip
-                key={folder.id}
-                active={folderId === folder.id}
-                onClick={() => setFolderId(folder.id)}
-                title={folder.cwd ?? folder.name}
-              >
-                <Icon name="folder" /> {folder.name}
-              </Chip>
-            ))}
+
+          {/* ── 摘要条 ── */}
+          <div className="sessions-summary-bar">
+            <span>
+              {visibleSessions.length} / {sessions.length} 个任务
+            </span>
+            <span className="sessions-summary-dot" />
+            <span>{statusCounts.running} 运行中</span>
+            <span className="sessions-summary-dot" />
+            <span>{statusCounts.waiting_approval} 待审批</span>
+            <span className="sessions-summary-dot" />
+            <span>{tokenText(stats.totalTokens)} token</span>
+            <span className="sessions-summary-dot" />
+            <span>{costText(stats.totalCostUsd)}</span>
           </div>
 
           {error ? (
@@ -301,200 +407,93 @@ export function SessionsPage({ onOpenWorkspace, onNewSession }: SessionsPageProp
             </div>
           ) : null}
 
-          <div className="card sessions-table-card">
-            <table className="table sessions-table">
-              <thead>
-                <tr>
-                  <th>会话</th>
-                  <th>引擎</th>
-                  <th className="sessions-col-hide">模型</th>
-                  <th className="sessions-col-hide">
-                    <SortButton
-                      active={sortKey === 'messages'}
-                      direction={sortKey === 'messages' ? sortDirection : 'desc'}
-                      onClick={() => changeSort('messages')}
-                    >
-                      消息
-                    </SortButton>
-                  </th>
-                  <th>
-                    <SortButton
-                      active={sortKey === 'tokens'}
-                      direction={sortKey === 'tokens' ? sortDirection : 'desc'}
-                      onClick={() => changeSort('tokens')}
-                    >
-                      计费 token
-                    </SortButton>
-                  </th>
-                  <th className="sessions-col-hide">
-                    <SortButton
-                      active={sortKey === 'cost'}
-                      direction={sortKey === 'cost' ? sortDirection : 'desc'}
-                      onClick={() => changeSort('cost')}
-                    >
-                      花费
-                    </SortButton>
-                  </th>
-                  <th>
-                    <SortButton
-                      active={sortKey === 'recent'}
-                      direction={sortKey === 'recent' ? sortDirection : 'desc'}
-                      onClick={() => changeSort('recent')}
-                    >
-                      最近活跃
-                    </SortButton>
-                  </th>
-                  <th />
-                </tr>
-              </thead>
-              <tbody>
-                {loading ? (
-                  <tr>
-                    <td colSpan={8} className="sessions-empty" aria-live="polite">
-                      正在读取会话历史…
-                    </td>
-                  </tr>
-                ) : visibleSessions.length ? (
-                  visibleSessions.map((session) => (
-                    <tr className="sessions-row" key={session.id}>
-                      <td>
-                        <button
-                          className="sessions-title sessions-open"
-                          type="button"
-                          onClick={() => void openSession(session.id)}
-                          disabled={resumingId !== null}
-                          title={
-                            resumingId && resumingId !== session.id
-                              ? '正在恢复另一个会话，请稍候'
-                              : undefined
-                          }
-                        >
-                          <b>{session.title}</b>
-                          <small className="sessions-title-meta">
-                            <span>
-                              <Icon name="folder" />
-                              {folders.find((folder) => folder.id === session.folderId)?.name ??
-                                '默认'}
-                            </span>
-                            <span>{session.cwd || '未设置工作目录'}</span>
-                          </small>
-                          {rowErrors[session.id] ? (
-                            <small className="sessions-row-error" role="alert">
-                              {rowErrors[session.id]}
-                            </small>
-                          ) : null}
-                        </button>
-                      </td>
-                      <td>
-                        <span className="row gap-sm">
-                          <Icon
-                            name={session.engine === 'codex' ? 'cpu' : 'zap'}
-                            style={{
-                              width: 14,
-                              height: 14,
-                              color: session.engine === 'codex' ? 'var(--fg-2)' : 'var(--warn)',
-                            }}
-                          />
-                          <span>{engineLabel(session.engine)}</span>
-                        </span>
-                      </td>
-                      <td className="sessions-col-hide mono">{session.model || '默认模型'}</td>
-                      <td className="sessions-col-hide mono">{session.messageCount}</td>
-                      <td className="mono" title="跨轮累计计费 token，包含缓存读取和缓存写入">
-                        {tokenText(session.inputTokens + session.outputTokens)}
-                      </td>
-                      <td className="sessions-col-hide mono">{costText(session.costUsd)}</td>
-                      <td>{relativeTimeText(session.updatedAt)}</td>
-                      <td className="sessions-action">
-                        <div className="sessions-actions">
-                          <button
-                            className="btn btn--subtle btn--sm sessions-resume"
-                            type="button"
-                            disabled={resumingId !== null}
-                            title={
-                              resumingId && resumingId !== session.id
-                                ? '正在恢复另一个会话，请稍候'
-                                : undefined
-                            }
-                            onClick={() => void openSession(session.id)}
-                          >
-                            {resumingId === session.id ? '恢复中…' : '恢复'}
-                          </button>
-                          <span className={`sessions-pill is-${session.status}`}>
-                            {statusLabel(session.status)}
-                          </span>
-                          <div className="sessions-menu-wrap">
-                            <button
-                              className="btn-icon sm"
-                              type="button"
-                              aria-label={`管理会话 ${session.title}`}
-                              aria-expanded={menuSessionId === session.id}
-                              onClick={() =>
-                                setMenuSessionId((current) =>
-                                  current === session.id ? null : session.id,
-                                )
-                              }
-                            >
-                              <Icon name="more" />
-                            </button>
-                            {menuSessionId === session.id ? (
-                              <div className="menu sessions-row-menu">
-                                <button type="button" onClick={() => void togglePinned(session)}>
-                                  <Icon name="flag" /> {session.pinned ? '取消置顶' : '置顶'}
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    setMenuSessionId(null);
-                                    setRenameTarget(session);
-                                  }}
-                                >
-                                  <Icon name="edit" /> 重命名
-                                </button>
-                                <button
-                                  className="is-danger"
-                                  type="button"
-                                  onClick={() => {
-                                    setMenuSessionId(null);
-                                    setDeleteTarget(session);
-                                  }}
-                                >
-                                  <Icon name="x" /> 删除
-                                </button>
-                              </div>
-                            ) : null}
-                          </div>
-                        </div>
-                      </td>
-                    </tr>
-                  ))
-                ) : (
-                  <tr>
-                    <td colSpan={8} className="sessions-empty">
-                      没有符合筛选条件的会话
-                      <br />
+          {/* ── 按项目分组的任务列表 ── */}
+          <div className="sessions-groups">
+            {loading ? (
+              <div className="sessions-loading" aria-live="polite">
+                正在读取任务历史…
+              </div>
+            ) : projectGroups.length ? (
+              projectGroups.map((group) => {
+                const folderId = group.folder?.id ?? '__nofolder';
+                const collapsed = collapsedFolders.has(folderId);
+                const folderName = group.folder?.name ?? '其他';
+                const folderCwd = group.folder?.cwd ?? null;
+                return (
+                  <section className="sessions-group" key={folderId}>
+                    <div className="sessions-group__head">
                       <button
-                        className="btn btn--sm"
+                        className="sessions-group__toggle"
                         type="button"
-                        style={{ marginTop: 10 }}
-                        onClick={() => {
-                          setQuery('');
-                          setEngine('all');
-                          setStatus('all');
-                          setFolderId('all');
-                        }}
+                        aria-expanded={!collapsed}
+                        title={folderCwd ?? folderName}
+                        onClick={() => toggleFolder(folderId)}
                       >
-                        清除筛选
+                        <Icon name={collapsed ? 'right' : 'down'} />
+                        <Icon name="folder" />
+                        <span className="sessions-group__name">{folderName}</span>
+                        <small className="sessions-group__count">{group.sessions.length}</small>
                       </button>
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
+                      <div className="sessions-group__meta">
+                        {folderCwd ? (
+                          <span className="mono sessions-group__cwd">{folderCwd}</span>
+                        ) : null}
+                        <span>
+                          最近活动{' '}
+                          {relativeTimeText(Math.max(...group.sessions.map((s) => s.updatedAt)))}
+                        </span>
+                      </div>
+                    </div>
+                    {!collapsed ? (
+                      <div className="sessions-group__body">
+                        {group.sessions.map((session) => (
+                          <TaskCard
+                            key={session.id}
+                            session={session}
+                            resuming={resumingId !== null}
+                            resumingThis={resumingId === session.id}
+                            menuOpen={menuSessionId === session.id}
+                            rowError={rowErrors[session.id]}
+                            onOpen={() => void openSession(session.id)}
+                            onMenu={(open) =>
+                              setMenuSessionId((cur) =>
+                                open ? session.id : cur === session.id ? null : cur,
+                              )
+                            }
+                            onTogglePinned={() => void togglePinned(session)}
+                            onToggleArchived={() => void toggleArchived(session)}
+                            onRename={() => setRenameTarget(session)}
+                            onDelete={() => setDeleteTarget(session)}
+                          />
+                        ))}
+                      </div>
+                    ) : null}
+                  </section>
+                );
+              })
+            ) : (
+              <div className="sessions-empty">
+                <div className="empty--cta">
+                  <div className="empty__ic">
+                    <Icon name="search" />
+                  </div>
+                  <b>没有符合条件的任务</b>
+                  <p>调整搜索词或筛选条件后再试。</p>
+                  <button
+                    className="btn btn--sm"
+                    type="button"
+                    onClick={() => {
+                      setQuery('');
+                      setEngine('all');
+                      setStatus('all');
+                    }}
+                  >
+                    清除筛选
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
-          <p className="sessions-count">
-            显示 {visibleSessions.length} / {sessions.length} 个会话
-          </p>
         </div>
       </div>
       {renameTarget ? (
@@ -506,7 +505,7 @@ export function SessionsPage({ onOpenWorkspace, onNewSession }: SessionsPageProp
       ) : null}
       {deleteTarget ? (
         <ConfirmDialog
-          title="删除会话"
+          title="删除任务"
           body={`确定删除「${deleteTarget.title}」吗？消息、用量与检查点将一并删除，此操作不可撤销。`}
           confirmLabel="删除"
           onCancel={() => setDeleteTarget(null)}
@@ -516,6 +515,133 @@ export function SessionsPage({ onOpenWorkspace, onNewSession }: SessionsPageProp
     </main>
   );
 }
+
+// ── 任务卡 ──
+
+interface TaskCardProps {
+  session: SessionSummary;
+  resuming: boolean;
+  resumingThis: boolean;
+  menuOpen: boolean;
+  rowError?: string;
+  onOpen: () => void;
+  onMenu: (open: boolean) => void;
+  onTogglePinned: () => void;
+  onToggleArchived: () => void;
+  onRename: () => void;
+  onDelete: () => void;
+}
+
+const TaskCard = function TaskCard({
+  session,
+  resuming,
+  resumingThis,
+  menuOpen,
+  rowError,
+  onOpen,
+  onMenu,
+  onTogglePinned,
+  onToggleArchived,
+  onRename,
+  onDelete,
+}: TaskCardProps) {
+  const action = currentActionText(session);
+  const changes = changeScaleText(session);
+  const statusKey = derivedStatusKey(session);
+  const statusLabel = derivedStatusLabelForSession(session);
+
+  return (
+    <div className={'tcard' + (session.archived ? ' is-archived' : '')}>
+      <button
+        className="tcard__main"
+        type="button"
+        onClick={onOpen}
+        disabled={resuming}
+        title={resuming && !resumingThis ? '正在恢复另一个任务，请稍候' : undefined}
+      >
+        <div className="tcard__title-row">
+          {session.pinned ? (
+            <Icon
+              name="flag"
+              className="tcard__pin"
+              style={{ width: 12, height: 12, color: 'var(--accent-hi)' }}
+            />
+          ) : null}
+          <b className="tcard__title">{session.title}</b>
+          <span className={`sessions-pill is-${statusKey}`}>{statusLabel}</span>
+        </div>
+        <div className="tcard__sub">
+          {action ? (
+            <span className="tcard__action">
+              <Icon name="zap" />
+              {action}
+            </span>
+          ) : session.summary ? (
+            <span className="tcard__summary">{session.summary}</span>
+          ) : null}
+        </div>
+        <div className="tcard__meta">
+          <span className="tcard__engine">
+            <EngineBrand engine={session.engine} size={12} />
+            {engineLabel(session.engine)}
+          </span>
+          {session.model ? <span className="mono tcard__model">{session.model}</span> : null}
+          {changes ? <span className="mono tcard__changes">{changes}</span> : null}
+          <span className="tcard__tokens" title="跨轮累计计费 token">
+            {tokenText(session.inputTokens + session.outputTokens)}
+          </span>
+          <span className="tcard__cost">{costText(session.costUsd)}</span>
+          <span className="tcard__time">{relativeTimeText(session.updatedAt)}</span>
+        </div>
+        {rowError ? (
+          <div className="tcard__error" role="alert">
+            {rowError}
+          </div>
+        ) : null}
+      </button>
+      <div className="tcard__actions">
+        <button
+          className="btn btn--subtle btn--sm"
+          type="button"
+          disabled={resuming}
+          title={resuming && !resumingThis ? '正在恢复另一个任务，请稍候' : undefined}
+          onClick={onOpen}
+        >
+          {resumingThis ? '恢复中…' : '恢复'}
+        </button>
+        <div className="sessions-menu-wrap">
+          <button
+            className="btn-icon sm"
+            type="button"
+            aria-label={`管理任务 ${session.title}`}
+            aria-expanded={menuOpen}
+            onClick={() => onMenu(!menuOpen)}
+          >
+            <Icon name="more" />
+          </button>
+          {menuOpen ? (
+            <div className="menu sessions-row-menu">
+              <button type="button" onClick={onTogglePinned}>
+                <Icon name="flag" /> {session.pinned ? '取消置顶' : '置顶'}
+              </button>
+              <button type="button" onClick={onToggleArchived}>
+                <Icon name="folderopen" /> {session.archived ? '取消归档' : '归档'}
+              </button>
+              <button type="button" onClick={onRename}>
+                <Icon name="edit" /> 重命名
+              </button>
+              <button className="is-danger" type="button" onClick={onDelete}>
+                <Icon name="x" /> 删除
+              </button>
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ── 子组件 ──
 
 function RenameDialog({
   initialValue,
@@ -529,7 +655,8 @@ function RenameDialog({
   const [value, setValue] = useState(initialValue);
   return (
     <Dialog
-      title="重命名会话"
+      title="重命名任务"
+      size="xs"
       onClose={onCancel}
       footer={
         <>
@@ -549,7 +676,7 @@ function RenameDialog({
     >
       <input
         className="input"
-        aria-label="会话标题"
+        aria-label="任务标题"
         value={value}
         onChange={(event) => setValue(event.target.value)}
         onKeyDown={(event) => {
@@ -561,17 +688,7 @@ function RenameDialog({
   );
 }
 
-function Stat({ label, value, detail }: { label: string; value: string; detail: string }) {
-  return (
-    <div className="card sessions-stat">
-      <div className="sessions-stat-label">{label}</div>
-      <div className="sessions-stat-value">{value}</div>
-      <div className="sessions-stat-detail">{detail}</div>
-    </div>
-  );
-}
-
-function SortButton({
+function SortChip({
   active,
   direction = 'desc',
   children,
@@ -584,14 +701,21 @@ function SortButton({
 }) {
   return (
     <button
-      className={'sessions-sort' + (active ? ' is-active' : '')}
+      className={'sessions-sort-chip' + (active ? ' is-active' : '')}
       type="button"
       onClick={onClick}
     >
       {children}
-      <span style={active && direction === 'asc' ? { transform: 'rotate(180deg)' } : undefined}>
-        ↓
-      </span>
+      {active ? (
+        <Icon
+          name="down"
+          style={{
+            width: 11,
+            height: 11,
+            transform: direction === 'asc' ? 'rotate(180deg)' : undefined,
+          }}
+        />
+      ) : null}
     </button>
   );
 }

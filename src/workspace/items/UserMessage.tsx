@@ -1,55 +1,30 @@
 import { memo, useState } from 'react';
 import { Icon } from '../../shell/icons';
 import { Markdown, copyText } from '../../lib/markdown';
-import type { PermissionProfile, TurnMode } from '../../engine/transport';
 
-const MODE_LABEL: Record<Exclude<TurnMode, 'build'>, string> = {
-  plan: '计划',
-  ask: '询问',
-};
-
-const PROFILE_LABEL: Record<PermissionProfile, string> = {
-  standard: '标准',
-  auto: '自动执行',
-  full_access: '全部放开',
-};
-
+/**
+ * 用户消息（对齐原型 ws.js 用户气泡）：右对齐浅蓝纯气泡，无头像无名字行。
+ * 气泡下方 .user-meta 收弱化的复制按钮（批次①裁决「复制按钮保留、弱化收纳」，
+ * 2026-09-02 落地）：hover 消息才渐显，复制成功 1.5s 内以 .is-on 态保持可见。
+ */
 export const UserMessage = memo(function UserMessage({
   text,
-  mode,
-  permissionProfile,
   className,
 }: {
   text: string;
-  /** 计划/询问轮次显示模式徽标（变更-04 B.2）；构建不传 */
-  mode?: TurnMode;
-  /** 每轮实际权限档位；实时消息与 schema v17 历史恢复共用。 */
-  permissionProfile?: PermissionProfile;
   className?: string;
 }) {
   const [copied, setCopied] = useState(false);
   return (
-    <div className={className ? `item ws-msg ${className}` : 'item ws-msg'}>
-      <div className="item__gut">
-        <div className="avatar avatar--sm">我</div>
-      </div>
+    <div className={className ? `item ws-msg ${className}` : 'item ws-msg'} data-kind="user">
       <div className="item__main">
-        <div className="role">
-          你
-          {mode && mode !== 'build' ? (
-            <span className="pill user-mode-pill">{MODE_LABEL[mode]}</span>
-          ) : null}
-          {permissionProfile ? (
-            <span
-              className={`pill user-permission-pill user-permission-pill--${permissionProfile}`}
-              title="本轮权限档位"
-            >
-              {PROFILE_LABEL[permissionProfile]}
-            </span>
-          ) : null}
+        <div className="user-text">
+          <Markdown text={text} />
+        </div>
+        <div className="user-meta">
           <button
             type="button"
-            className="ws-msg-copy"
+            className={'ai-action' + (copied ? ' is-on' : '')}
             title="复制消息"
             aria-label="复制消息"
             onClick={async () => {
@@ -61,9 +36,6 @@ export const UserMessage = memo(function UserMessage({
           >
             <Icon name={copied ? 'checkc' : 'copy'} />
           </button>
-        </div>
-        <div className="user-text">
-          <Markdown text={text} />
         </div>
       </div>
     </div>

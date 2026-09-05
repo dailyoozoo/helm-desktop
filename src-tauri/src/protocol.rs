@@ -62,6 +62,20 @@ pub enum StopReason {
     Error,
 }
 
+/// Codex 上下文压缩生命周期状态（P0-04）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ContextCompactionStatus {
+    /// RPC 已提交，等待 app-server 确认。
+    Submitted,
+    /// app-server 已开始压缩（item/started）。
+    Running,
+    /// 压缩完成（item/completed status=completed）。
+    Succeeded,
+    /// 压缩失败（item/completed status=failed）。
+    Failed,
+}
+
 /// `tool_call` 的状态恒为 `pending`（与协议一致）。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -304,6 +318,22 @@ pub enum AgentEvent {
         context_tokens: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         context_window: Option<u64>,
+    },
+    /// Codex 原生上下文压缩生命周期（P0-04）。
+    /// 状态机：submitted（RPC 已提交）→ running → succeeded/failed。
+    #[serde(rename_all = "camelCase")]
+    ContextCompaction {
+        session_id: String,
+        /// 压缩记录稳定身份（Codex item id；无 item id 时由后端合成）。
+        id: String,
+        status: ContextCompactionStatus,
+        ts: i64,
+        /// succeeded 时的真实摘要正文；app-server 未提供则缺省。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        /// failed 时的真实错误原因。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     #[serde(rename_all = "camelCase")]
     TurnComplete {

@@ -1,32 +1,44 @@
 import React from 'react';
-import { Icon } from '../shell/icons';
-import { useDialogBehavior } from './useDialogBehavior';
+import {
+  Dialog as ShadcnDialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+} from '@/components/ui/dialog';
 
-/** 通用模态外壳（modal-overlay/modal-panel），Esc 关闭、焦点管理由 useDialogBehavior 提供。 */
-export function Dialog({
-  title,
-  children,
-  footer,
-  onClose,
-}: {
+interface DialogProps {
   title: string;
   children: React.ReactNode;
   footer?: React.ReactNode;
   onClose: () => void;
-}) {
-  const dialogRef = useDialogBehavior(onClose);
+  /** 弹窗宽度档：md=620（默认，对齐 cm-modal）/ sm=560 / xs=400（确认卡，对齐 wsconfirm）。 */
+  size?: 'md' | 'sm' | 'xs';
+}
+
+const SIZE_CLASS: Record<NonNullable<DialogProps['size']>, string> = {
+  md: '',
+  sm: 'cm-modal--sm',
+  xs: 'cm-modal--xs',
+};
+
+/** 通用模态外壳，基于 shadcn Dialog（Radix UI）。Esc 关闭、焦点管理由 Radix 提供。 */
+export function Dialog({ title, children, footer, onClose, size = 'md' }: DialogProps) {
   return (
-    <div className="modal-overlay" role="dialog" aria-modal="true" aria-label={title}>
-      <div className="modal-panel" ref={dialogRef} tabIndex={-1}>
-        <div className="modal-panel__head">
-          <b>{title}</b>
-          <button className="btn-icon sm" onClick={onClose} aria-label="关闭">
-            <Icon name="x" />
-          </button>
-        </div>
-        <div className="modal-panel__body">{children}</div>
-        {footer ? <div className="modal-panel__foot">{footer}</div> : null}
-      </div>
-    </div>
+    <ShadcnDialog
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+    >
+      {/* 无正文描述时向 Radix 显式声明 aria-describedby 缺省，避免无意义警告。 */}
+      <DialogContent showClose aria-describedby={undefined} className={SIZE_CLASS[size]}>
+        <DialogHeader>
+          <DialogTitle>{title}</DialogTitle>
+        </DialogHeader>
+        {children}
+        {footer ? <DialogFooter>{footer}</DialogFooter> : null}
+      </DialogContent>
+    </ShadcnDialog>
   );
 }

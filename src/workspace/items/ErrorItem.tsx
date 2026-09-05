@@ -1,4 +1,4 @@
-import { memo, useState } from 'react';
+import { memo } from 'react';
 import { Icon } from '../../shell/icons';
 
 /** 错误分类 → 人话标题 / 修复建议 / 修复动作（可靠性检查 §4.5）。 */
@@ -73,7 +73,7 @@ export const ErrorItem = memo(function ErrorItem({
   const meta = errorKind ? ERROR_KIND_META[errorKind] : undefined;
   const stalledMeta =
     errorKind === 'tool_stalled' && stalledKind ? STALLED_KIND_META[stalledKind] : undefined;
-  const [showDetail, setShowDetail] = useState(false);
+  const displayMessage = message.replace(/^\[codex_probe_tool_surface_[a-z_]+\]\s*/i, '');
 
   return (
     <div className="item">
@@ -83,9 +83,12 @@ export const ErrorItem = memo(function ErrorItem({
           <Icon name="alert" className="ws-error__icon" />
           <div className="ws-error__body">
             {meta ? (
+              <div className="prose ws-error__title">{stalledMeta?.title ?? meta.title}</div>
+            ) : null}
+            <div className="prose ws-error__detail">{displayMessage}</div>
+            {meta ? (
               <>
-                <div className="prose ws-error__title">{stalledMeta?.title ?? meta.title}</div>
-                <div className="prose">{stalledMeta?.hint ?? meta.hint}</div>
+                <div className="prose ws-error__hint">{stalledMeta?.hint ?? meta.hint}</div>
                 <div className="ws-error__actions">
                   {meta.action?.page ? (
                     <button
@@ -102,19 +105,9 @@ export const ErrorItem = memo(function ErrorItem({
                       {meta.action.label}
                     </button>
                   ) : null}
-                  <button
-                    type="button"
-                    className="btn btn--sm"
-                    onClick={() => setShowDetail((v) => !v)}
-                  >
-                    {showDetail ? '收起详情' : '查看详情'}
-                  </button>
                 </div>
-                {showDetail ? <div className="prose ws-error__detail">{message}</div> : null}
               </>
-            ) : (
-              <div className="prose ws-error__title">{message}</div>
-            )}
+            ) : null}
           </div>
         </div>
       </div>

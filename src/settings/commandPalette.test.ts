@@ -60,7 +60,7 @@ describe('command palette view model', () => {
     ).toEqual(['新建会话']);
     expect(
       filterCommandPaletteCommands(paletteCommands, '扩展').map((command) => command.title),
-    ).toEqual(['扩展中心', '管理 MCP 服务器', '管理技能 Skills', '管理子代理', '斜杠命令与钩子']);
+    ).toEqual(['扩展中心', '管理技能', '管理连接器']);
   });
 
   it('converts a session to a command', () => {

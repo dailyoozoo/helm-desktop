@@ -3,7 +3,7 @@ import type { AppConfig } from '../providers/api';
 import { getProviderConfig } from '../providers/api';
 import { listFolders, listSessions } from '../sessions/api';
 import { Icon } from '../shell/icons';
-import { useDialogBehavior } from '../components/useDialogBehavior';
+import { Dialog as ShadcnDialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { commandPaletteResults, type CommandPaletteCommand } from './commandPalette';
 
 export function CommandPaletteView({
@@ -22,7 +22,6 @@ export function CommandPaletteView({
   const [providers, setProviders] = useState<AppConfig['providers']>([]);
   const inputRef = useRef<HTMLInputElement>(null);
   const activeItemRef = useRef<HTMLButtonElement>(null);
-  const dialogRef = useDialogBehavior(onClose, open);
 
   useEffect(() => {
     if (!open) return;
@@ -108,26 +107,18 @@ export function CommandPaletteView({
 
   let lastGroup = '';
 
+  if (!open) return null;
   return (
-    <div
-      className={'palette-overlay' + (open ? ' open' : '')}
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget) onClose();
+    <ShadcnDialog
+      open
+      onOpenChange={(isOpen) => {
+        if (!isOpen) onClose();
       }}
     >
-      <div
-        ref={dialogRef}
-        className="palette"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="command-palette-title"
-        tabIndex={-1}
-      >
+      <DialogContent showClose={false} className="top-[15%] max-w-xl translate-y-0 gap-0 p-0">
+        <DialogTitle className="sr-only">命令面板</DialogTitle>
         <div className="palette__in">
           <Icon name="search" />
-          <span id="command-palette-title" className="sr-only">
-            命令面板
-          </span>
           <input
             ref={inputRef}
             type="text"
@@ -162,7 +153,7 @@ export function CommandPaletteView({
             );
           })}
         </div>
-      </div>
-    </div>
+      </DialogContent>
+    </ShadcnDialog>
   );
 }

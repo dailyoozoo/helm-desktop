@@ -76,6 +76,7 @@ function sessionState(overrides: Partial<SessionState> = {}): SessionState {
     startedAt: 1,
     turnActivity: { stage: 'preparing', since: 1 },
     turnStartedAt: 1,
+    turnCostUsd: 0,
     disabledMcp: [],
     ...overrides,
   };
@@ -542,6 +543,259 @@ describe('reduceSessionEvent plan_update', () => {
   });
 });
 
+describe('turnCostUsd（本轮累计成本，P0-03）', () => {
+  function baseState(): SessionState {
+    return sessionState();
+  }
+
+  it('send 清零 turnCostUsd，token_usage 累加进本轮', () => {
+    // 第二轮 send：turnCostUsd 归零
+    const afterSend = reduceSessionAction(
+      { ...baseState(), turnCostUsd: 0.5 },
+      {
+        type: 'send',
+        id: 'u-2',
+        text: '第二轮',
+        attachments: [],
+        mode: 'build',
+        permissionProfile: 'standard',
+      },
+    );
+    expect(afterSend.turnCostUsd).toBe(0);
+    // token_usage 事件带 turnId 匹配 → 累加进 turnCostUsd
+    const afterUsage = reduceSessionEvent(
+      afterSend,
+      {
+        type: 'token_usage',
+        sessionId: 'cli-current',
+        inputTokens: 100,
+        outputTokens: 10,
+        costUsd: 0.03,
+      },
+      'turn-2',
+    );
+    expect(afterUsage.turnCostUsd).toBe(0.03);
+    expect(afterUsage.cost.costUsd).toBe(0.03);
+  });
+
+  it('第二轮不混入第一轮成本（turnId 匹配才累加）', () => {
+    // 第一轮：turnCostUsd 累计 0.05
+    let s = reduceSessionAction(
+      { ...baseState(), turnCostUsd: 0 },
+      {
+        type: 'send',
+        id: 'u-1',
+        text: '第一轮',
+        attachments: [],
+        mode: 'build',
+        permissionProfile: 'standard',
+      },
+    );
+    s = reduceSessionEvent(
+      s,
+      {
+        type: 'token_usage',
+        sessionId: 'cli-current',
+        inputTokens: 100,
+        outputTokens: 10,
+        costUsd: 0.05,
+      },
+      'turn-1',
+    );
+    expect(s.turnCostUsd).toBe(0.05);
+
+    // 第一轮结束
+    s = reduceSessionEvent(
+      s,
+      {
+        type: 'turn_complete',
+        sessionId: 'cli-current',
+        stopReason: 'end',
+      },
+      'turn-1',
+    );
+    expect(s.turnCostUsd).toBe(0.05); // turn_complete 不清零
+
+    // 第二轮 send：turnCostUsd 清零
+    s = reduceSessionAction(s, {
+      type: 'send',
+      id: 'u-2',
+      text: '第二轮',
+      attachments: [],
+      mode: 'build',
+      permissionProfile: 'standard',
+    });
+    expect(s.turnCostUsd).toBe(0);
+
+    // 第二轮 token_usage with turn-2 → 只累加本轮
+    s = reduceSessionEvent(
+      s,
+      {
+        type: 'token_usage',
+        sessionId: 'cli-current',
+        inputTokens: 50,
+        outputTokens: 5,
+        costUsd: 0.01,
+      },
+      'turn-2',
+    );
+    expect(s.turnCostUsd).toBe(0.01);
+    // 会话累计成本包含两轮
+    expect(s.cost.costUsd).toBeCloseTo(0.06, 10);
+  });
+
+  it('resume_handle 重置 turnCostUsd 为 0', () => {
+    const resumed = reduceSessionAction(
+      { ...baseState(), turnCostUsd: 0.99 },
+      {
+        type: 'resume_handle',
+        handleId: 'handle-2',
+        historyId: 'history-2',
+        working: false,
+      },
+    );
+    expect(resumed.turnCostUsd).toBe(0);
+  });
+});
+
+describe('历史先行（resume_history，B 方案）', () => {
+  const detail = {
+    id: 'h-preview',
+    cliSessionId: 'cli-preview',
+    title: '先行渲染',
+    engine: 'codex',
+    model: 'gpt-5-codex',
+    cwd: 'D:\\work\\demo',
+    status: 'done',
+    createdAt: 1_700,
+    updatedAt: 2,
+    messageCount: 1,
+    inputTokens: 10,
+    outputTokens: 5,
+    costUsd: 0.01,
+    messages: [{ role: 'user', text: '继续', ts: 1000 }],
+    toolCalls: [],
+    checkpoints: [],
+    approvals: [],
+  } as unknown as Parameters<typeof itemsFromHistory>[0];
+
+  it('只渲染历史、置空句柄并标记 historyOnly，status 恒为 idle', () => {
+    const preview = reduceSessionAction(
+      sessionState({ handleId: 'stale-handle', historyId: 'stale', status: 'working' }),
+      { type: 'resume_history', historyId: 'h-preview', detail: detail as never },
+    );
+    expect(preview.handleId).toBeNull();
+    expect(preview.historyOnly).toBe(true);
+    expect(preview.historyId).toBe('h-preview');
+    expect(preview.status).toBe('idle');
+    expect(preview.items.length).toBeGreaterThan(0);
+    expect(preview.turnCostUsd).toBe(0);
+  });
+
+  it('后续 resume_handle 清除 historyOnly 并挂上真实句柄', () => {
+    const preview = reduceSessionAction(sessionState(), {
+      type: 'resume_history',
+      historyId: 'h-preview',
+      detail: detail as never,
+    });
+    const resumed = reduceSessionAction(preview, {
+      type: 'resume_handle',
+      handleId: 'handle-real',
+      historyId: 'h-preview',
+      working: false,
+      detail: detail as never,
+    });
+    expect(resumed.historyOnly).toBe(false);
+    expect(resumed.handleId).toBe('handle-real');
+  });
+});
+
+describe('context_compaction 生命周期（P0-04）', () => {
+  function baseState(): SessionState {
+    return sessionState();
+  }
+
+  it('running 事件追加一条 compact 记录', () => {
+    const next = reduceSessionEvent(baseState(), {
+      type: 'context_compaction',
+      sessionId: 'cli-current',
+      id: 'compact-1',
+      status: 'running',
+      ts: 1_000,
+    });
+    const compact = next.items.find((it) => it.kind === 'compact');
+    expect(compact).toMatchObject({
+      kind: 'compact',
+      id: 'compact-1',
+      status: 'running',
+      ts: 1_000,
+    });
+  });
+
+  it('succeeded 事件更新已有 compact 记录的状态和摘要', () => {
+    let s = reduceSessionEvent(baseState(), {
+      type: 'context_compaction',
+      sessionId: 'cli-current',
+      id: 'compact-1',
+      status: 'running',
+      ts: 1_000,
+    });
+    s = reduceSessionEvent(s, {
+      type: 'context_compaction',
+      sessionId: 'cli-current',
+      id: 'compact-1',
+      status: 'succeeded',
+      ts: 2_000,
+      summary: '保留了最近 3 轮对话',
+    });
+    const compact = s.items.find((it) => it.kind === 'compact');
+    expect(compact).toMatchObject({
+      kind: 'compact',
+      id: 'compact-1',
+      status: 'succeeded',
+      ts: 2_000,
+      summary: '保留了最近 3 轮对话',
+    });
+  });
+
+  it('failed 事件记录错误原因', () => {
+    const s = reduceSessionEvent(baseState(), {
+      type: 'context_compaction',
+      sessionId: 'cli-current',
+      id: 'compact-2',
+      status: 'failed',
+      ts: 3_000,
+      error: 'context window exceeded hard limit',
+    });
+    const compact = s.items.find((it) => it.kind === 'compact');
+    expect(compact).toMatchObject({
+      kind: 'compact',
+      id: 'compact-2',
+      status: 'failed',
+      error: 'context window exceeded hard limit',
+    });
+  });
+
+  it('同 id 的 compact 记录不重复追加，只更新', () => {
+    let s = reduceSessionEvent(baseState(), {
+      type: 'context_compaction',
+      sessionId: 'cli-current',
+      id: 'compact-1',
+      status: 'running',
+      ts: 1_000,
+    });
+    s = reduceSessionEvent(s, {
+      type: 'context_compaction',
+      sessionId: 'cli-current',
+      id: 'compact-1',
+      status: 'succeeded',
+      ts: 2_000,
+    });
+    const compacts = s.items.filter((it) => it.kind === 'compact');
+    expect(compacts).toHaveLength(1);
+  });
+});
+
 describe('轮次活动追踪', () => {
   it('local send immediately records a truthful preparing stage and turn start time', () => {
     vi.useFakeTimers();
@@ -835,6 +1089,7 @@ describe('resetSessionState', () => {
       startedAt: 1,
       turnActivity: { stage: 'responding', since: 2 },
       turnStartedAt: 2,
+      turnCostUsd: 0,
       disabledMcp: [],
     };
 

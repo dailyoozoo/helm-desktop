@@ -25,6 +25,7 @@ function activeState(kind: 'thinking' | 'tool'): SessionState {
       ? { stage: 'reasoning', since: Date.now() }
       : { stage: 'using_tool', since: Date.now(), toolName: 'Read', target: 'README.md' },
     turnStartedAt: Date.now(),
+    turnCostUsd: 0,
     disabledMcp: [],
   };
 }
@@ -103,18 +104,17 @@ describe('Thread activity rendering', () => {
     expect(markup).toMatch(/aria-live="off"[^>]*>（已用时 9 秒）<\/span>/);
   });
 
-  it('connects the thinking toggle to its body with expanded ARIA state', () => {
+  it('renders the live thinking block while reasoning is in progress', () => {
     const markup = renderThread(activeState('thinking'));
-    const controlId = markup.match(/aria-controls="([^"]+)"/)?.[1];
 
-    expect(markup).toContain('aria-expanded="true"');
-    expect(controlId).toBeTruthy();
-    expect(markup).toContain(`id="${controlId}"`);
+    expect(markup).toContain('think is-live');
+    expect(markup).toContain('正在思考…');
   });
 
   it('最终答复流式输出期间保持同 Turn 过程容器展开', () => {
     const state = activeState('thinking');
     state.items = [
+      { kind: 'user', id: 'user-1', text: '处理', mode: 'build', turnId: 'turn-1' },
       { kind: 'thinking', id: 'thinking-1', text: '分析', done: true, turnId: 'turn-1' },
       { kind: 'assistant', id: 'assistant-1', text: '正在输出', turnId: 'turn-1' },
     ];
@@ -122,7 +122,7 @@ describe('Thread activity rendering', () => {
     state.openThinkingId = null;
 
     const markup = renderThread(state);
-    expect(markup).toContain('turn-process__box');
+    expect(markup).toContain('turn-process');
     expect(markup).toContain('aria-expanded="true"');
   });
 
@@ -137,8 +137,119 @@ describe('Thread activity rendering', () => {
     state.openThinkingId = null;
 
     const markup = renderThread(state);
-    expect(markup).toContain('turn-process__box');
+    expect(markup).toContain('turn-process');
     expect(markup).toContain('aria-expanded="true"');
     expect(markup).not.toContain('>已完成</span>');
+  });
+
+  it('纯文本轮次结束后显示已完成，不留下空的过程容器', () => {
+    const state = activeState('thinking');
+    state.status = 'idle';
+    state.openAssistantId = null;
+    state.openThinkingId = null;
+    state.turnActivity = null;
+    state.items = [
+      { kind: 'user', id: 'user-1', text: '请只回复两个字：OK', mode: 'build', turnId: 'turn-1' },
+      { kind: 'assistant', id: 'assistant-1', text: 'OK', turnId: 'turn-1' },
+    ];
+
+    const markup = renderThread(state);
+    expect(markup).toContain('>已完成</span>');
+    expect(markup).not.toContain('>进行中</span>');
+    expect(markup).not.toContain('is-live');
+    expect(markup).not.toContain('turn-process__body');
+  });
+});
+
+/**
+ * 交付物行的「触碰文件」口径（2026-08-30 用户报告）：查天气这类轮次跑过一条 shell
+ * 命令，却冒出「查看全部文件 1」。根因是统计用了 toolTarget——它为了给工具抬头兜底，
+ * 会把 Bash 命令行、Grep pattern、URL 当成目标。这里正反两向锁死口径。
+ */
+function completedTurn(tools: SessionState['items']): SessionState {
+  const state = activeState('tool');
+  state.status = 'idle';
+  state.openAssistantId = null;
+  state.openThinkingId = null;
+  state.turnActivity = null;
+  state.items = [
+    { kind: 'user', id: 'user-1', text: '上海天气怎么样', mode: 'build', turnId: 'turn-1' },
+    ...tools,
+    { kind: 'assistant', id: 'assistant-1', text: '这是回答。', turnId: 'turn-1' },
+  ];
+  return state;
+}
+
+function renderCompleted(state: SessionState): string {
+  return renderToStaticMarkup(
+    <Thread
+      state={state}
+      onApprove={() => {}}
+      onRestoreCheckpoint={() => {}}
+      onUndoRevert={() => {}}
+      onOpenPane={() => {}}
+    />,
+  );
+}
+
+describe('Thread 交付物行 · 触碰文件口径', () => {
+  it('只跑过 shell 命令的轮次不显示交付物入口', () => {
+    const markup = renderCompleted(
+      completedTurn([
+        {
+          kind: 'tool',
+          id: 'tool-1',
+          name: 'Bash',
+          input: { command: 'pwsh.exe -Command \'echo "websearch probe"\'' },
+          status: 'success',
+          turnId: 'turn-1',
+        },
+      ]),
+    );
+    expect(markup).not.toContain('查看全部文件');
+    expect(markup).not.toContain('查看修改记录');
+    expect(markup).not.toContain('deliverables');
+  });
+
+  it('Grep 的搜索模式与抓取 URL 都不算触碰文件', () => {
+    const markup = renderCompleted(
+      completedTurn([
+        {
+          kind: 'tool',
+          id: 'tool-1',
+          name: 'Grep',
+          input: { pattern: 'TODO|FIXME' },
+          status: 'success',
+          turnId: 'turn-1',
+        },
+        {
+          kind: 'tool',
+          id: 'tool-2',
+          name: 'WebFetch',
+          input: { url: 'https://example.com/a.txt' },
+          status: 'success',
+          turnId: 'turn-1',
+        },
+      ]),
+    );
+    expect(markup).not.toContain('查看全部文件');
+    expect(markup).not.toContain('deliverables');
+  });
+
+  it('真正读过文件的轮次仍然显示「查看全部文件」', () => {
+    const markup = renderCompleted(
+      completedTurn([
+        {
+          kind: 'tool',
+          id: 'tool-1',
+          name: 'Read',
+          input: { file_path: 'D:/work/demo/README.md' },
+          status: 'success',
+          turnId: 'turn-1',
+        },
+      ]),
+    );
+    expect(markup).toContain('deliverables');
+    expect(markup).toContain('查看全部文件');
   });
 });

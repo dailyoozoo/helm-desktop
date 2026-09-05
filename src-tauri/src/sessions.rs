@@ -78,6 +78,33 @@ pub struct SessionSummary {
     /// 用户为下一 Turn 选择的推理强度；空值表示跟随当前 Binding 缺省。
     #[serde(default)]
     pub preferred_reasoning_effort: Option<String>,
+    /// 已归档（变更-34/35 · 切片7 · F1）：可逆标记，区别于删除；归档会话保留历史与用量。
+    #[serde(default)]
+    pub archived: bool,
+    /// 会话卡「当前在做什么」（切片7 · F2）：最新一个未完成工具名；None = 无进行中工具。
+    #[serde(default)]
+    pub current_tool: Option<String>,
+    /// 「当前在做什么」的目标摘要（如正在写的文件路径），与 current_tool 配套。
+    #[serde(default)]
+    pub current_target: Option<String>,
+    /// 跨轮累计变更规模（切片7 · F2）：+N -M 由真实 diff 行数聚合，无 diff 为 0。
+    #[serde(default)]
+    pub change_additions: u64,
+    #[serde(default)]
+    pub change_deletions: u64,
+    /// 存在未决审批（切片7 · F1 等审批筛选）：派生自 approval 表的 pending 行。
+    #[serde(default)]
+    pub pending_approval: bool,
+    /// 最近一轮是否失败（切片7 · F1 失败筛选）：派生自最近 turn_snapshot 状态。
+    #[serde(default)]
+    pub last_turn_failed: bool,
+    /// 分叉来源标题快照（主侧栏「分叉自 X」副行）：派生自 session_fork × handoff，非分叉为 None。
+    #[serde(default)]
+    pub forked_from: Option<String>,
+    /// 最新轮次的真实状态（主侧栏任务行状态徽标）：取最近 turn_snapshot.status
+    /// （running/waiting_approval/stalled/succeeded/failed/interrupted）；从未跑过 Turn 为 None。
+    #[serde(default)]
+    pub last_turn_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -369,6 +396,28 @@ pub struct NewSessionRecord {
     pub created_at: i64,
 }
 
+/// 历史对话导入（S8）：一条来自外部 Agent 记录文件的纯文本消息。
+/// 只允许 user/assistant 两种角色；ts 为毫秒（message.ts 口径）。
+#[derive(Debug, Clone)]
+pub struct ImportedHistoryMessage {
+    pub role: String,
+    pub text: String,
+    pub ts_millis: i64,
+}
+
+impl ImportedHistoryMessage {
+    pub fn new(role: &str, text: impl Into<String>, ts_millis: i64) -> Result<Self, String> {
+        if !matches!(role, "user" | "assistant") {
+            return Err(format!("不支持导入的消息角色：{role}"));
+        }
+        Ok(Self {
+            role: role.to_string(),
+            text: text.into(),
+            ts_millis,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CostResolution {
     cost_usd: f64,
@@ -573,6 +622,61 @@ impl SessionHistoryStore {
             .map(|(session, _)| session)
     }
 
+    /// 历史对话导入（S8）：创建一条纯本地记录会话并写入导入消息。
+    /// 与 Runtime 会话不同：不触碰 active_session_id、不写 Turn/Usage，
+    /// 消息 turn_id 保持 NULL（历史内容不是本轮 Runtime 事实）。
+    pub fn import_history_session(
+        &self,
+        record: NewSessionRecord,
+        title: &str,
+        messages: &[ImportedHistoryMessage],
+    ) -> Result<String, String> {
+        if messages.is_empty() {
+            return Err("没有可写入的导入消息".to_string());
+        }
+        let (canonical_cwd, cwd_key) = canonical_folder_cwd(&record.cwd)?;
+        let _guard = self.write_guard()?;
+        let conn = self.open()?;
+        let tx = conn.unchecked_transaction().map_err(db_err)?;
+        let (folder_id, _created) = resolve_or_create_cwd_folder(&tx, &canonical_cwd, &cwd_key)?;
+        let last_ts = messages
+            .iter()
+            .map(|message| message.ts_millis)
+            .max()
+            .unwrap_or(record.created_at);
+        tx.execute(
+            "INSERT INTO session
+             (id, cli_session_id, title, engine, model, cwd, status, created_at, updated_at,
+              folder_id, archived, title_manual)
+             VALUES (?1, NULL, ?2, ?3, ?4, ?5, 'done', ?6, ?7, ?8, 0, 1)",
+            params![
+                record.id,
+                title,
+                engine_to_str(record.engine),
+                record.model,
+                canonical_cwd,
+                record.created_at,
+                last_ts / 1000,
+                folder_id
+            ],
+        )
+        .map_err(db_err)?;
+        for message in messages {
+            tx.execute(
+                "INSERT INTO message (session_id, role, text, ts) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    record.id,
+                    message.role.as_str(),
+                    message.text,
+                    message.ts_millis
+                ],
+            )
+            .map_err(db_err)?;
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(record.id)
+    }
+
     /// 与 `create_session_for_cwd` 相同，但额外返回本次事务新建的项目 Folder id，
     /// 供 Runtime 启动失败时精确回滚空 Folder。
     pub(crate) fn create_session_for_cwd_tracked(
@@ -665,7 +769,33 @@ impl SessionHistoryStore {
                    COALESCE(u.cached_input_tokens, 0),
                    COALESCE(u.cache_write_input_tokens, 0),
                    s.last_context_tokens, s.last_context_window,
-                   s.preferred_model, s.preferred_reasoning_effort
+                   s.preferred_model, s.preferred_reasoning_effort,
+                   s.archived,
+                   (SELECT tc.name FROM tool_call tc
+                     WHERE tc.session_id = s.id AND tc.status = 'pending'
+                     ORDER BY tc.ts DESC LIMIT 1),
+                   (SELECT tc.input_json FROM tool_call tc
+                     WHERE tc.session_id = s.id AND tc.status = 'pending'
+                     ORDER BY tc.ts DESC LIMIT 1),
+                   COALESCE((SELECT SUM(CASE WHEN json_extract(j.value, '$.kind') = 'add' THEN 1 ELSE 0 END)
+                             FROM tool_call d, json_each(d.diff_json, '$.hunks') h, json_each(h.value, '$.lines') j
+                             WHERE d.session_id = s.id AND d.diff_json IS NOT NULL
+                               AND json_valid(d.diff_json)), 0),
+                   COALESCE((SELECT SUM(CASE WHEN json_extract(j.value, '$.kind') = 'del' THEN 1 ELSE 0 END)
+                             FROM tool_call d, json_each(d.diff_json, '$.hunks') h, json_each(h.value, '$.lines') j
+                             WHERE d.session_id = s.id AND d.diff_json IS NOT NULL
+                               AND json_valid(d.diff_json)), 0),
+                   EXISTS (SELECT 1 FROM approval a
+                           WHERE a.session_id = s.id AND a.status = 'pending'),
+                   COALESCE((SELECT ts.status FROM turn_snapshot ts
+                             WHERE ts.history_session_id = s.id
+                             ORDER BY ts.turn_epoch DESC, ts.updated_at DESC LIMIT 1), '') = 'failed',
+                   (SELECT ts.status FROM turn_snapshot ts
+                      WHERE ts.history_session_id = s.id
+                      ORDER BY ts.turn_epoch DESC, ts.updated_at DESC LIMIT 1),
+                   (SELECT h.source_title_snapshot FROM session_fork f
+                      JOIN handoff h ON h.id = f.handoff_id
+                      WHERE f.target_session_id = s.id)
                  FROM session s
                  LEFT JOIN (
                    SELECT session_id, COUNT(*) AS message_count
@@ -711,7 +841,33 @@ impl SessionHistoryStore {
                    COALESCE((SELECT SUM(cached_input_tokens) FROM usage WHERE session_id = s.id), 0),
                    COALESCE((SELECT SUM(cache_write_input_tokens) FROM usage WHERE session_id = s.id), 0),
                    s.last_context_tokens, s.last_context_window,
-                   s.preferred_model, s.preferred_reasoning_effort
+                   s.preferred_model, s.preferred_reasoning_effort,
+                   s.archived,
+                   (SELECT tc.name FROM tool_call tc
+                     WHERE tc.session_id = s.id AND tc.status = 'pending'
+                     ORDER BY tc.ts DESC LIMIT 1),
+                   (SELECT tc.input_json FROM tool_call tc
+                     WHERE tc.session_id = s.id AND tc.status = 'pending'
+                     ORDER BY tc.ts DESC LIMIT 1),
+                   COALESCE((SELECT SUM(CASE WHEN json_extract(j.value, '$.kind') = 'add' THEN 1 ELSE 0 END)
+                             FROM tool_call d, json_each(d.diff_json, '$.hunks') h, json_each(h.value, '$.lines') j
+                             WHERE d.session_id = s.id AND d.diff_json IS NOT NULL
+                               AND json_valid(d.diff_json)), 0),
+                   COALESCE((SELECT SUM(CASE WHEN json_extract(j.value, '$.kind') = 'del' THEN 1 ELSE 0 END)
+                             FROM tool_call d, json_each(d.diff_json, '$.hunks') h, json_each(h.value, '$.lines') j
+                             WHERE d.session_id = s.id AND d.diff_json IS NOT NULL
+                               AND json_valid(d.diff_json)), 0),
+                   EXISTS (SELECT 1 FROM approval a
+                           WHERE a.session_id = s.id AND a.status = 'pending'),
+                   COALESCE((SELECT ts.status FROM turn_snapshot ts
+                             WHERE ts.history_session_id = s.id
+                             ORDER BY ts.turn_epoch DESC, ts.updated_at DESC LIMIT 1), '') = 'failed',
+                   (SELECT ts.status FROM turn_snapshot ts
+                      WHERE ts.history_session_id = s.id
+                      ORDER BY ts.turn_epoch DESC, ts.updated_at DESC LIMIT 1),
+                   (SELECT h.source_title_snapshot FROM session_fork f
+                      JOIN handoff h ON h.id = f.handoff_id
+                      WHERE f.target_session_id = s.id)
                  FROM session s
                  WHERE s.id = ?1",
                 params![local_id],
@@ -2725,6 +2881,8 @@ impl SessionHistoryStore {
             | AgentEvent::TurnStage { .. }
             | AgentEvent::ToolProgress { .. }
             | AgentEvent::PlanUpdate { .. } => Ok(()),
+            // P0-04：压缩生命周期事件当前不单独落库；实时 UI 由前端 reducer 渲染。
+            AgentEvent::ContextCompaction { .. } => Ok(()),
             AgentEvent::ApprovalRequest {
                 session_id,
                 id,
@@ -2795,6 +2953,23 @@ impl SessionHistoryStore {
         self.record_event_for_session_internal(history_session_id, turn_id, false, event)
     }
 
+    /// 不落库的事件类型：这些分支在本函数尾部 match 里最终都返回 `Ok(())`，
+    /// 即「什么都不写」。此前判定发生在 `open()` 与两次查询之后，导致
+    /// 合批后约 30 条/秒的 delta 每条都白付一次脱敏 + 建连接 + 查 turn 状态的成本。
+    /// 注意：新增不落库分支时，必须同步维护本函数与下方 match。
+    fn is_unpersisted_event(event: &AgentEvent) -> bool {
+        matches!(
+            event,
+            AgentEvent::MessageDelta { .. }
+                | AgentEvent::ThinkingDelta { .. }
+                | AgentEvent::ThinkingComplete { .. }
+                | AgentEvent::TurnStage { .. }
+                | AgentEvent::ToolProgress { .. }
+                | AgentEvent::PlanUpdate { .. }
+                | AgentEvent::ContextCompaction { .. }
+        )
+    }
+
     fn record_event_for_session_internal(
         &self,
         history_session_id: &str,
@@ -2802,6 +2977,10 @@ impl SessionHistoryStore {
         legacy_compat: bool,
         event: &AgentEvent,
     ) -> Result<(), String> {
+        // 性能：不落库的事件在脱敏与开连接之前短路，语义与尾部 match 完全一致。
+        if Self::is_unpersisted_event(event) {
+            return Ok(());
+        }
         let event = crate::redaction::sanitize_agent_event(event);
         if let Some(turn_id) = turn_id {
             let conn = self.open()?;
@@ -3178,6 +3357,8 @@ impl SessionHistoryStore {
             | AgentEvent::TurnStage { .. }
             | AgentEvent::ToolProgress { .. }
             | AgentEvent::PlanUpdate { .. } => Ok(()),
+            // P0-04：压缩生命周期事件当前不单独落库；实时 UI 由前端 reducer 渲染。
+            AgentEvent::ContextCompaction { .. } => Ok(()),
             // 审批请求落库（变更-07）：切走/重启后审批卡可重建，不再永久悬置
             AgentEvent::ApprovalRequest {
                 id,
@@ -5028,7 +5209,7 @@ impl SessionHistoryStore {
         Ok(snapshot_refs)
     }
 
-    /// 重命名会话（变更-12）：手动改名后不再被自动起标题覆盖（title 已非「未命名会话」）
+    /// 重命名会话（变更-12）：手动改名后不再被自动起标题覆盖（title_manual 标记）。
     pub fn rename_session(&self, session_id: &str, title: &str) -> Result<(), String> {
         let trimmed = title.trim();
         if trimmed.is_empty() {
@@ -5038,7 +5219,7 @@ impl SessionHistoryStore {
         let conn = self.open()?;
         let local_id = self.resolve_local_id(&conn, session_id)?;
         conn.execute(
-            "UPDATE session SET title = ?1 WHERE id = ?2",
+            "UPDATE session SET title = ?1, title_manual = 1 WHERE id = ?2",
             params![trimmed, local_id],
         )
         .map_err(db_err)?;
@@ -5053,6 +5234,19 @@ impl SessionHistoryStore {
         conn.execute(
             "UPDATE session SET pinned = ?1 WHERE id = ?2",
             params![pinned as i64, local_id],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// 归档/取消归档（变更-34/35 · 切片7 · F1）：可逆标记，保留历史与用量，区别于删除。
+    pub fn set_session_archived(&self, session_id: &str, archived: bool) -> Result<(), String> {
+        let _guard = self.write_guard()?;
+        let conn = self.open()?;
+        let local_id = self.resolve_local_id(&conn, session_id)?;
+        conn.execute(
+            "UPDATE session SET archived = ?1 WHERE id = ?2",
+            params![archived as i64, local_id],
         )
         .map_err(db_err)?;
         Ok(())
@@ -5530,6 +5724,253 @@ impl SessionHistoryStore {
         Ok(())
     }
 
+    /// 回填 Codex `turn/start` 返回的原生轮次 id（切点分叉依赖）。仅在首轮 fork 前
+    /// 每轮记录；找不到对应 turn 行时静默忽略（不阻断轮次）。
+    pub fn set_turn_native_id(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        native_turn_id: &str,
+    ) -> Result<(), String> {
+        let _guard = self.write_guard()?;
+        let conn = self.open()?;
+        let local_id = self.resolve_local_id(&conn, session_id)?;
+        conn.execute(
+            "UPDATE turn SET native_turn_id = ?3
+              WHERE history_session_id = ?1 AND turn_id = ?2",
+            params![local_id, turn_id, native_turn_id],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// 解析源会话某轮（Helm turn id）对应的 Codex 原生轮次 id，用于 thread/fork 截断。
+    pub fn native_turn_id_for_session_turn(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<String>, String> {
+        let conn = self.open()?;
+        let local_id = self.resolve_local_id(&conn, session_id)?;
+        let value = conn
+            .query_row(
+                "SELECT native_turn_id FROM turn
+                  WHERE history_session_id = ?1 AND turn_id = ?2",
+                params![local_id, turn_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(db_err)?
+            .flatten();
+        Ok(value)
+    }
+
+    /// 登记同引擎无损分支（十次反馈）：分支会话首轮流以 `--resume <源> --fork-session`
+    /// 复制完整历史；行在分支创建时写入，作为来源审计保留（不随首轮消费删除）。
+    pub fn record_session_native_branch(
+        &self,
+        session_id: &str,
+        source_session_id: &str,
+        source_cli_session_id: &str,
+        boundary_native_turn_id: Option<&str>,
+        boundary_helm_turn_id: Option<&str>,
+    ) -> Result<(), String> {
+        let _guard = self.write_guard()?;
+        let conn = self.open()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO session_native_branch
+             (session_id, source_session_id, source_cli_session_id, created_at,
+              boundary_native_turn_id, boundary_helm_turn_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                session_id,
+                source_session_id,
+                source_cli_session_id,
+                now_millis(),
+                boundary_native_turn_id,
+                boundary_helm_turn_id,
+            ],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// 读取分支会话的源链接；非分支会话返回 None。
+    /// 返回四元组 `(源会话, 源CLI会话, 切点原生轮id?, 切点Helm轮id?)`——后两位为
+    /// 切点分叉边界（左栏整段分叉时为 None）。
+    pub fn load_session_native_branch(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(String, String, Option<String>, Option<String>)>, String> {
+        let conn = self.open()?;
+        let row = conn
+            .query_row(
+                "SELECT source_session_id, source_cli_session_id,
+                        boundary_native_turn_id, boundary_helm_turn_id
+                 FROM session_native_branch WHERE session_id = ?1",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(db_err)?;
+        Ok(row)
+    }
+
+    /// 首轮无损分支成功后消费来源行：分支已拥有独立线程，后续轮次回归普通 resume，
+    /// 不再重复 fork。来源审计由 `session.forked_from` 保留，本行仅作"待 fork"标记。
+    pub fn clear_session_native_branch(&self, session_id: &str) -> Result<(), String> {
+        let _guard = self.write_guard()?;
+        let conn = self.open()?;
+        let local_id = self.resolve_local_id(&conn, session_id)?;
+        conn.execute(
+            "DELETE FROM session_native_branch WHERE session_id = ?1",
+            params![local_id],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// 同引擎无损分支的历史可见性（2026-09-02）：把源会话未被回溯的消息与附件原样
+    /// 复制进分支会话。此前分支会话只有引擎/模型/cwd，界面看不到分叉前的对话
+    /// （历史只存在于 CLI 侧 fork 出的线程里），用户会以为「分叉出来是空的/不对」。
+    /// **只复制消息，不复制 turn / 用量 / 检查点**——分支会话自首轮起才记账，
+    /// 避免同一段历史在两条会话里重复计入用量（TurnLedger 有界、可重放红线）。
+    /// 复制的消息 `turn_id` 置空：分支会话 turns 表里没有对应轮次，不留悬空引用
+    /// （前端 `turnId` 本就可选，缺省按历史回放渲染，见 `useSession.ts`）。
+    pub fn clone_messages_into_session(
+        &self,
+        source_session_id: &str,
+        target_session_id: &str,
+    ) -> Result<usize, String> {
+        self.clone_messages_into_session_upto(source_session_id, target_session_id, None)
+    }
+
+    /// 带切点的历史复制（切点分叉）：`upto_helm_turn_id` 为 Some 时，只复制
+    /// `started_at <= 该轮 started_at` 的消息（即该轮提问与该轮回答及之前）；
+    /// None 时等价于整段复制。晚于切点落库的消息（如该轮之后的轮次）全部跳过。
+    /// 无 turn_id 的遗留消息按 `ts`（秒）与切点轮 `started_at`（毫秒）比较兜底。
+    pub fn clone_messages_into_session_upto(
+        &self,
+        source_session_id: &str,
+        target_session_id: &str,
+        upto_helm_turn_id: Option<&str>,
+    ) -> Result<usize, String> {
+        let _guard = self.write_guard()?;
+        let conn = self.open()?;
+        let source_id = self.resolve_local_id(&conn, source_session_id)?;
+        let target_id = self.resolve_local_id(&conn, target_session_id)?;
+        // 切点截断：以「截止线 rowid」为准按 id 顺序复制。一个轮次的用户提问与该轮
+        // 回答都带同一 turn_id，`MAX(id) WHERE turn_id=切点` 即该轮最后一条落库消息；
+        // 切点轮之前的所有消息 id 更小，一并纳入。无切点时截止线取 i64::MAX（整段复制）。
+        // 若切点轮消息缺失 turn_id（历史遗留），退回按轮 started_at 比较（同为毫秒）。
+        let cutoff_id: i64 = match upto_helm_turn_id {
+            Some(turn_id) => {
+                let by_turn: Option<i64> = conn
+                    .query_row(
+                        "SELECT MAX(id) FROM message
+                          WHERE session_id = ?1 AND reverted = 0 AND turn_id = ?2",
+                        params![source_id, turn_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(db_err)?;
+                if let Some(id) = by_turn {
+                    id
+                } else {
+                    let started_at: Option<i64> = conn
+                        .query_row(
+                            "SELECT started_at FROM turn
+                              WHERE history_session_id = ?1 AND turn_id = ?2",
+                            params![source_id, turn_id],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(db_err)?;
+                    let started_at = started_at
+                        .ok_or_else(|| "切点 Turn 在源会话中不存在，无法按切点分叉".to_string())?;
+                    conn.query_row(
+                        "SELECT MAX(id) FROM message
+                          WHERE session_id = ?1 AND reverted = 0 AND ts <= ?2",
+                        params![source_id, started_at],
+                        |row| row.get::<_, Option<i64>>(0),
+                    )
+                    .map_err(db_err)?
+                    .ok_or_else(|| "切点之前没有任何消息，无法按切点分叉".to_string())?
+                }
+            }
+            None => i64::MAX,
+        };
+        let rows = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, role, text, ts, turn_id FROM message
+                      WHERE session_id = ?1 AND reverted = 0 AND id <= ?2 ORDER BY id ASC",
+                )
+                .map_err(db_err)?;
+            let mapped = stmt
+                .query_map(params![source_id, cutoff_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                })
+                .map_err(db_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_err)?;
+            mapped
+        };
+        for (message_id, role, text, ts, _source_turn_id) in &rows {
+            conn.execute(
+                "INSERT INTO message (session_id, role, text, ts, reverted, turn_id)
+                 VALUES (?1, ?2, ?3, ?4, 0, NULL)",
+                params![target_id, role, text, ts],
+            )
+            .map_err(db_err)?;
+            let new_message_id = conn.last_insert_rowid();
+            let attachments: Vec<(String, i64, String, String)> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT turn_id, ordinal, source_path, path_digest
+                           FROM message_attachment WHERE message_id = ?1 ORDER BY ordinal ASC",
+                    )
+                    .map_err(db_err)?;
+                let mapped = stmt
+                    .query_map(params![message_id], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    })
+                    .map_err(db_err)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(db_err)?;
+                mapped
+            };
+            for (turn_id, ordinal, source_path, path_digest) in attachments {
+                conn.execute(
+                    "INSERT INTO message_attachment
+                     (id, message_id, session_id, turn_id, ordinal, source_path, path_digest)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        format!("attachment-{:032x}", rand::random::<u128>()),
+                        new_message_id,
+                        target_id,
+                        turn_id,
+                        ordinal,
+                        source_path,
+                        path_digest,
+                    ],
+                )
+                .map_err(db_err)?;
+            }
+        }
+        Ok(rows.len())
+    }
+
     /// 回溯后作废旧的 CLI 会话 id：下次恢复不再 `--resume`，改用截断历史重建上下文（P2-5）
     pub fn clear_cli_session(&self, session_id: &str) -> Result<(), String> {
         let _guard = self.write_guard()?;
@@ -5596,10 +6037,19 @@ impl SessionHistoryStore {
     }
 
     // 用量统计查询
+    /// S4 冻结：用量查询只接受路线图四个时间范围；窗口谓词统一为 ts >= cutoff AND ts <= now，
+    /// 保证 7/30/90/365 天在 stats/daily/breakdown/top 各查询间边界一致。
+    fn usage_window(&self, days: u32) -> Result<(i64, i64), String> {
+        if !matches!(days, 7 | 30 | 90 | 365) {
+            return Err(format!("用量查询范围仅支持 7/30/90/365 天，收到 {days}"));
+        }
+        let now = now_seconds();
+        Ok((now - (days as i64 * 86400), now))
+    }
+
     pub fn get_usage_stats(&self, days: u32) -> Result<UsageStats, String> {
         let conn = self.open()?;
-        let now = now_seconds();
-        let cutoff_ts = now - (days as i64 * 86400);
+        let (cutoff_ts, now) = self.usage_window(days)?;
         let previous_cutoff_ts = cutoff_ts - (days as i64 * 86400);
 
         let mut stmt = conn
@@ -5609,6 +6059,8 @@ impl SessionHistoryStore {
                     COALESCE(SUM(input_tokens), 0),
                     COALESCE(SUM(output_tokens), 0),
                     COUNT(DISTINCT id),
+                    COALESCE(SUM(cached_input_tokens), 0),
+                    COALESCE(SUM(cache_write_input_tokens), 0),
                     COALESCE(SUM(CASE WHEN cost_kind = 'actual' THEN cost_usd ELSE 0 END), 0.0),
                     COALESCE(SUM(CASE WHEN cost_kind = 'estimated' THEN cost_usd ELSE 0 END), 0.0),
                     COALESCE(SUM(CASE WHEN cost_kind = 'subscription' THEN 1 ELSE 0 END), 0),
@@ -5625,13 +6077,15 @@ impl SessionHistoryStore {
             input_tokens,
             output_tokens,
             request_count,
+            cached_input_tokens,
+            cache_write_input_tokens,
             actual_cost,
             estimated_cost,
             subscription_count,
             unknown_count,
             legacy_cost,
             legacy_count,
-        ): (f64, i64, i64, i64, f64, f64, i64, i64, f64, i64) = stmt
+        ): (f64, i64, i64, i64, i64, i64, f64, f64, i64, i64, f64, i64) = stmt
             .query_row(params![cutoff_ts, now], |row| {
                 Ok((
                     row.get(0)?,
@@ -5644,6 +6098,8 @@ impl SessionHistoryStore {
                     row.get(7)?,
                     row.get(8)?,
                     row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
                 ))
             })
             .map_err(db_err)?;
@@ -5677,6 +6133,8 @@ impl SessionHistoryStore {
             total_tokens: (input_tokens + output_tokens) as u64,
             input_tokens: input_tokens as u64,
             output_tokens: output_tokens as u64,
+            cached_input_tokens: cached_input_tokens as u64,
+            cache_write_input_tokens: cache_write_input_tokens as u64,
             request_count: request_count as u32,
             session_count: session_count as u32,
             actual_cost,
@@ -5692,99 +6150,97 @@ impl SessionHistoryStore {
         })
     }
 
-    pub fn get_usage_by_model(&self, days: u32) -> Result<Vec<ModelUsage>, String> {
+    /// S4 冻结的统一分组聚合：dimension = model / engine / provider。
+    /// 每行同时返回请求次数、输入/输出 token、缓存分子（cached_input_tokens，分母为同组 input_tokens）
+    /// 与成本类型计数。engine 归属：会话行取 session.engine，后台操作行取
+    /// operation_execution_spec.engine_id；provider 维度保留 P3-6 语义——优先 usage 写入时固化的
+    /// provider_id，v12 以前的旧记录回退 session.provider_id，都为空归入空 key。
+    /// 组内全部是 cost_kind = legacy（只有金额、没有 token 证据）时 token 字段返回 null，不估算。
+    pub fn get_usage_breakdown(
+        &self,
+        days: u32,
+        dimension: UsageBreakdownDimension,
+    ) -> Result<Vec<UsageBreakdownRow>, String> {
         let conn = self.open()?;
-        let now = now_seconds();
-        let cutoff_ts = now - (days as i64 * 86400);
+        let (cutoff_ts, now) = self.usage_window(days)?;
+
+        let engine_expr = "COALESCE(s.engine, spec.engine_id, '')";
+        let key_expr = match dimension {
+            UsageBreakdownDimension::Model => "u.model",
+            UsageBreakdownDimension::Engine => engine_expr,
+            // P3-6：真实 provider_id 归属，不再按模型名推断
+            UsageBreakdownDimension::Provider => {
+                "COALESCE(NULLIF(u.provider_id, ''), s.provider_id, '')"
+            }
+        };
+        let group_expr = match dimension {
+            UsageBreakdownDimension::Model => format!("{key_expr}, {engine_expr}"),
+            _ => key_expr.to_string(),
+        };
 
         let total_cost: f64 = conn
             .query_row(
-                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM usage WHERE ts >= ?1",
-                params![cutoff_ts],
+                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM usage WHERE ts >= ?1 AND ts <= ?2",
+                params![cutoff_ts, now],
                 |row| row.get(0),
             )
             .map_err(db_err)?;
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT
-                    u.model,
-                    s.engine,
-                    COUNT(DISTINCT u.id) as request_count,
-                    SUM(u.input_tokens) as input_tokens,
-                    SUM(u.output_tokens) as output_tokens,
-                    SUM(u.cost_usd) as cost_usd
-                 FROM usage u
-                 LEFT JOIN session s ON u.session_id = s.id
-                 WHERE u.ts >= ?1
-                 GROUP BY u.model, s.engine
-                 ORDER BY cost_usd DESC",
-            )
-            .map_err(db_err)?;
+        let sql = format!(
+            "SELECT
+                {key_expr} AS group_key,
+                {engine_expr} AS group_engine,
+                COUNT(*) AS request_count,
+                SUM(u.cost_usd) AS cost_usd,
+                CASE WHEN SUM(CASE WHEN u.cost_kind != 'legacy' THEN 1 ELSE 0 END) > 0
+                     THEN COALESCE(SUM(u.input_tokens), 0) END AS input_tokens,
+                CASE WHEN SUM(CASE WHEN u.cost_kind != 'legacy' THEN 1 ELSE 0 END) > 0
+                     THEN COALESCE(SUM(u.output_tokens), 0) END AS output_tokens,
+                CASE WHEN SUM(CASE WHEN u.cost_kind != 'legacy' THEN 1 ELSE 0 END) > 0
+                     THEN COALESCE(SUM(u.cached_input_tokens), 0) END AS cached_input_tokens,
+                CASE WHEN SUM(CASE WHEN u.cost_kind != 'legacy' THEN 1 ELSE 0 END) > 0
+                     THEN COALESCE(SUM(u.cache_write_input_tokens), 0) END AS cache_write_input_tokens,
+                SUM(CASE WHEN u.cost_kind = 'actual' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN u.cost_kind = 'estimated' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN u.cost_kind = 'subscription' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN u.cost_kind = 'unknown' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN u.cost_kind = 'legacy' THEN 1 ELSE 0 END)
+             FROM usage u
+             LEFT JOIN session s ON u.session_id = s.id
+             LEFT JOIN operation_execution_spec spec ON u.operation_id = spec.operation_id
+             WHERE u.ts >= ?1 AND u.ts <= ?2
+             GROUP BY {group_expr}
+             ORDER BY cost_usd DESC"
+        );
 
+        let mut stmt = conn.prepare(&sql).map_err(db_err)?;
         let rows = stmt
-            .query_map(params![cutoff_ts], |row| {
-                let cost: f64 = row.get(5)?;
+            .query_map(params![cutoff_ts, now], |row| {
+                let cost: f64 = row.get(3)?;
                 let share = if total_cost > 0.0 {
                     cost / total_cost
                 } else {
                     0.0
                 };
-                Ok(ModelUsage {
-                    model: row.get(0)?,
-                    engine: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                Ok(UsageBreakdownRow {
+                    key: row.get(0)?,
+                    engine: row.get(1)?,
                     request_count: row.get::<_, i64>(2)? as u32,
-                    input_tokens: row.get::<_, i64>(3)? as u64,
-                    output_tokens: row.get::<_, i64>(4)? as u64,
+                    input_tokens: row.get::<_, Option<i64>>(4)?.map(|v| v.max(0) as u64),
+                    output_tokens: row.get::<_, Option<i64>>(5)?.map(|v| v.max(0) as u64),
+                    cached_input_tokens: row.get::<_, Option<i64>>(6)?.map(|v| v.max(0) as u64),
+                    cache_write_input_tokens: row
+                        .get::<_, Option<i64>>(7)?
+                        .map(|v| v.max(0) as u64),
                     cost_usd: cost,
                     share,
-                })
-            })
-            .map_err(db_err)?;
-
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)
-    }
-
-    /// 按服务商聚合用量（P3-6）：优先使用 usage 写入时固化的 provider_id，
-    /// v12 以前的老记录回退到 session.provider_id；两者都为空时归入空 key。
-    pub fn get_usage_by_provider(&self, days: u32) -> Result<Vec<ProviderUsage>, String> {
-        let conn = self.open()?;
-        let now = now_seconds();
-        let cutoff_ts = now - (days as i64 * 86400);
-
-        let total_cost: f64 = conn
-            .query_row(
-                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM usage WHERE ts >= ?1",
-                params![cutoff_ts],
-                |row| row.get(0),
-            )
-            .map_err(db_err)?;
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT
-                    COALESCE(NULLIF(u.provider_id, ''), s.provider_id, '') as resolved_provider_id,
-                    SUM(u.cost_usd) as cost_usd
-                 FROM usage u
-                 LEFT JOIN session s ON u.session_id = s.id
-                 WHERE u.ts >= ?1
-                 GROUP BY COALESCE(NULLIF(u.provider_id, ''), s.provider_id, '')
-                 ORDER BY cost_usd DESC",
-            )
-            .map_err(db_err)?;
-
-        let rows = stmt
-            .query_map(params![cutoff_ts], |row| {
-                let cost: f64 = row.get(1)?;
-                let share = if total_cost > 0.0 {
-                    cost / total_cost
-                } else {
-                    0.0
-                };
-                Ok(ProviderUsage {
-                    provider: row.get(0)?,
-                    cost_usd: cost,
-                    share,
+                    cost_kinds: UsageCostKindCounts {
+                        actual: row.get::<_, i64>(8)? as u32,
+                        estimated: row.get::<_, i64>(9)? as u32,
+                        subscription: row.get::<_, i64>(10)? as u32,
+                        unknown: row.get::<_, i64>(11)? as u32,
+                        legacy: row.get::<_, i64>(12)? as u32,
+                    },
                 })
             })
             .map_err(db_err)?;
@@ -5858,13 +6314,42 @@ impl SessionHistoryStore {
                 "UPDATE session
                  SET preferred_model = ?1, preferred_reasoning_effort = ?2, updated_at = ?3
                  WHERE id = ?4",
-                params![model_id, reasoning_effort, now_millis(), local_id],
+                // session.updated_at 维持秒（与分叉创建的 now_seconds() 同口径）：
+                // 此前误用 now_millis()，会让改过偏好的会话在侧栏永远置顶且显示「刚刚」。
+                params![model_id, reasoning_effort, now_seconds(), local_id],
             )
             .map_err(db_err)?;
         if changed != 1 {
             return Err("更新 Session 下一轮偏好失败".to_string());
         }
         Ok(())
+    }
+
+    /// 模型改名后批量纠正会话偏好（2026-09-03）：把引用旧模型 ID 的 `preferred_model`
+    /// 全部改成新 ID，避免「目录里已改名、会话仍指向旧 ID」导致下一轮解析失败。
+    /// 按模型 ID 全库匹配——模型 ID 在配置里全局唯一，跨服务商同名属极端情况且语义一致。
+    /// 返回受影响行数；`updated_at` 同样维持秒。
+    pub fn rename_session_preferred_model(
+        &self,
+        old_model_id: &str,
+        new_model_id: &str,
+    ) -> Result<usize, String> {
+        let old_model_id = old_model_id.trim();
+        let new_model_id = new_model_id.trim();
+        if old_model_id.is_empty() || new_model_id.is_empty() || old_model_id == new_model_id {
+            return Ok(0);
+        }
+        let _guard = self.write_guard()?;
+        let conn = self.open()?;
+        let changed = conn
+            .execute(
+                "UPDATE session
+                 SET preferred_model = ?1, updated_at = ?2
+                 WHERE preferred_model = ?3",
+                params![new_model_id, now_seconds(), old_model_id],
+            )
+            .map_err(db_err)?;
+        Ok(changed)
     }
 
     /// 会话记录的服务商 id（P3-5 起标题时定位计费方用）
@@ -5905,7 +6390,8 @@ impl SessionHistoryStore {
         .map_err(db_err)
     }
 
-    /// 是否需要自动起标题（P3-5）：摘要还没生成，且已有至少一轮完整对话
+    /// 是否需要自动起标题（P3-5）：摘要还没生成、标题未被手动改名（title_manual 标记，
+    /// 变更-12 承诺：手动改名后不再被自动标题覆盖），且已有至少一轮完整对话。
     pub fn session_needs_auto_title(&self, session_id: &str) -> Result<bool, String> {
         let conn = self.open()?;
         let local_id = self.resolve_local_id(&conn, session_id)?;
@@ -5917,6 +6403,16 @@ impl SessionHistoryStore {
             )
             .map_err(db_err)?;
         if has_summary {
+            return Ok(false);
+        }
+        let title_is_manual: bool = conn
+            .query_row(
+                "SELECT title_manual = 1 FROM session WHERE id = ?1",
+                params![local_id],
+                |row| row.get(0),
+            )
+            .map_err(db_err)?;
+        if title_is_manual {
             return Ok(false);
         }
         let assistant_count: i64 = conn
@@ -5947,28 +6443,46 @@ impl SessionHistoryStore {
         Ok(())
     }
 
+    /// S4 冻结的日粒度聚合：每天返回真实的花费、调用次数、输入/输出 token 与缓存分子/分母字段。
+    /// 只返回有记录的日期（无记录的日期由视图层按"无用量"处理）；某日全部是 legacy 行
+    /// （只有金额、没有 token 证据）时 token 字段为 null，禁止用费用反推。
     pub fn get_daily_usage(&self, days: u32) -> Result<Vec<DailyUsage>, String> {
         let conn = self.open()?;
-        let now = now_seconds();
-        let cutoff_ts = now - (days as i64 * 86400);
+        let (cutoff_ts, now) = self.usage_window(days)?;
 
         let mut stmt = conn
             .prepare(
                 "SELECT
-                    DATE(ts, 'unixepoch') as date,
-                    SUM(cost_usd) as cost
+                    DATE(ts, 'unixepoch') AS date,
+                    SUM(cost_usd) AS cost_usd,
+                    COUNT(*) AS request_count,
+                    CASE WHEN SUM(CASE WHEN cost_kind != 'legacy' THEN 1 ELSE 0 END) > 0
+                         THEN COALESCE(SUM(input_tokens), 0) END AS input_tokens,
+                    CASE WHEN SUM(CASE WHEN cost_kind != 'legacy' THEN 1 ELSE 0 END) > 0
+                         THEN COALESCE(SUM(output_tokens), 0) END AS output_tokens,
+                    CASE WHEN SUM(CASE WHEN cost_kind != 'legacy' THEN 1 ELSE 0 END) > 0
+                         THEN COALESCE(SUM(cached_input_tokens), 0) END AS cached_input_tokens,
+                    CASE WHEN SUM(CASE WHEN cost_kind != 'legacy' THEN 1 ELSE 0 END) > 0
+                         THEN COALESCE(SUM(cache_write_input_tokens), 0) END AS cache_write_input_tokens
                  FROM usage
-                 WHERE ts >= ?1
+                 WHERE ts >= ?1 AND ts <= ?2
                  GROUP BY date
                  ORDER BY date",
             )
             .map_err(db_err)?;
 
         let rows = stmt
-            .query_map(params![cutoff_ts], |row| {
+            .query_map(params![cutoff_ts, now], |row| {
                 Ok(DailyUsage {
                     date: row.get(0)?,
                     cost_usd: row.get(1)?,
+                    request_count: row.get::<_, i64>(2)? as u64,
+                    input_tokens: row.get::<_, Option<i64>>(3)?.map(|v| v.max(0) as u64),
+                    output_tokens: row.get::<_, Option<i64>>(4)?.map(|v| v.max(0) as u64),
+                    cached_input_tokens: row.get::<_, Option<i64>>(5)?.map(|v| v.max(0) as u64),
+                    cache_write_input_tokens: row
+                        .get::<_, Option<i64>>(6)?
+                        .map(|v| v.max(0) as u64),
                 })
             })
             .map_err(db_err)?;
@@ -5978,8 +6492,7 @@ impl SessionHistoryStore {
 
     pub fn get_top_sessions(&self, days: u32, limit: usize) -> Result<Vec<TopSession>, String> {
         let conn = self.open()?;
-        let now = now_seconds();
-        let cutoff_ts = now - (days as i64 * 86400);
+        let (cutoff_ts, now) = self.usage_window(days)?;
 
         let mut stmt = conn
             .prepare(
@@ -5991,16 +6504,16 @@ impl SessionHistoryStore {
                     COALESCE(SUM(u.cost_usd), 0.0) as cost,
                     COALESCE(SUM(u.input_tokens + u.output_tokens), 0) as tokens
                  FROM session s
-                 LEFT JOIN usage u ON s.id = u.session_id AND u.ts >= ?1
+                 LEFT JOIN usage u ON s.id = u.session_id AND u.ts >= ?1 AND u.ts <= ?2
                  GROUP BY s.id
                  HAVING cost > 0
                  ORDER BY cost DESC
-                 LIMIT ?2",
+                 LIMIT ?3",
             )
             .map_err(db_err)?;
 
         let rows = stmt
-            .query_map(params![cutoff_ts, limit], |row| {
+            .query_map(params![cutoff_ts, now, limit], |row| {
                 Ok(TopSession {
                     id: row.get(0)?,
                     title: row.get(1)?,
@@ -6134,6 +6647,29 @@ impl SessionHistoryStore {
         let Some(snapshot_json) = snapshot_json else {
             return Ok(None);
         };
+        // 十一次反馈：CapabilitySet 结构演进（新增 native_branch）后，磁盘上仍存着
+        // 无该字段的旧格式快照。能力缓存只是探测优化：旧格式视为未命中——清除该行，
+        // 让调用方重新探测并覆盖；真正损坏的新格式数据仍显式报错。
+        let legacy_format = serde_json::from_str::<serde_json::Value>(&snapshot_json)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("capabilities")
+                    .map(|capabilities| capabilities.get("nativeBranch").is_none())
+            })
+            .unwrap_or(false);
+        if legacy_format {
+            {
+                let _guard = self.write_guard()?;
+                let conn = self.open()?;
+                conn.execute(
+                    "DELETE FROM capability_snapshot WHERE cache_key = ?1",
+                    params![cache_key],
+                )
+                .map_err(db_err)?;
+            }
+            return Ok(None);
+        }
         let snapshot: crate::capability_registry::EngineCapabilitySnapshot =
             serde_json::from_str(&snapshot_json)
                 .map_err(|error| format!("CapabilitySnapshot 缓存损坏：{error}"))?;
@@ -6990,9 +7526,10 @@ fn context_path_key(path: &str) -> String {
 
 /// 当前数据库 schema 版本。任何加列/改表都必须：把版本 +1，并在
 /// `apply_migrations` 中补一段从旧版本到新版本的迁移 SQL。
-const SCHEMA_VERSION: i64 = 30;
+/// `pub` 供集成测试断言「迁移后 user_version == 当前版本」，避免每升版改一片写死数字。
+pub const SCHEMA_VERSION: i64 = 34;
 // 新增迁移必须先使用这个连续版本号，再同步提升 SCHEMA_VERSION。
-const NEXT_MIGRATION_VERSION: i64 = 31;
+const NEXT_MIGRATION_VERSION: i64 = 35;
 const _: () = assert!(NEXT_MIGRATION_VERSION == SCHEMA_VERSION + 1);
 
 fn init_schema(conn: &mut Connection) -> Result<(), String> {
@@ -7022,7 +7559,9 @@ fn init_schema(conn: &mut Connection) -> Result<(), String> {
           last_context_tokens INTEGER,
           last_context_window INTEGER,
           preferred_model TEXT,
-          preferred_reasoning_effort TEXT
+          preferred_reasoning_effort TEXT,
+          archived INTEGER NOT NULL DEFAULT 0,
+          title_manual INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS session_folder (
           id TEXT PRIMARY KEY,
@@ -7167,6 +7706,7 @@ fn init_schema(conn: &mut Connection) -> Result<(), String> {
            ended_at INTEGER,
            terminal_reason TEXT,
            identity_source TEXT NOT NULL DEFAULT 'legacy',
+           native_turn_id TEXT,
            PRIMARY KEY (history_session_id, turn_id)
          );
          CREATE TABLE IF NOT EXISTS turn_execution_spec (
@@ -8780,6 +9320,57 @@ fn apply_migrations(tx: &Transaction<'_>) -> Result<(), String> {
         )
         .map_err(db_err)?;
     }
+    if current < 31 && !column_exists(tx, "session", "archived")? {
+        // v31（变更-34/35 · 切片7 · F1 会话归档）：可逆归档标记，区别于删除。
+        // 新库的 CREATE TABLE 已含该列，这里只补老库。
+        tx.execute_batch("ALTER TABLE session ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;")
+            .map_err(db_err)?;
+    }
+    if current < 32 && !column_exists(tx, "session", "title_manual")? {
+        // v32（变更-12 承诺补全）：手动改名标记，自动起标题不再覆盖用户手动标题。
+        // 新库的 CREATE TABLE 已含该列，这里只补老库。
+        tx.execute_batch("ALTER TABLE session ADD COLUMN title_manual INTEGER NOT NULL DEFAULT 0;")
+            .map_err(db_err)?;
+    }
+    if current < 33 {
+        // v33（十次反馈 · 同引擎无损分支）：新分支会话在首轮发送前记录源会话与源
+        // CLI 会话 id；首轮以 `--resume <源> --fork-session` 复制完整历史，成功后
+        // 由运行时改写自身 cli_session_id，本行保留作审计（来源可追溯）。
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_native_branch (
+               session_id TEXT PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE,
+               source_session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+               source_cli_session_id TEXT NOT NULL,
+               created_at INTEGER NOT NULL,
+               boundary_native_turn_id TEXT,
+               boundary_helm_turn_id TEXT
+             );",
+        )
+        .map_err(db_err)?;
+    }
+    if current < 34 {
+        // v34（切点分叉）：从对话内某条回答分叉时，只带该轮及之前的历史。
+        // ① turn 记 native_turn_id：Codex turn/start 返回的原生轮次 id 落库，
+        //    供 thread/fork 的 lastTurnId 精确截断源线程到某一轮。
+        // ② session_native_branch 记边界：分叉时把被点回答所属轮的 native/helm turn id
+        //    冻结进来源行，resume 首轮据此决定 lastTurnId；无边界（左栏整段分叉）保持 NULL。
+        if !column_exists(tx, "turn", "native_turn_id")? {
+            tx.execute_batch("ALTER TABLE turn ADD COLUMN native_turn_id TEXT;")
+                .map_err(db_err)?;
+        }
+        if !column_exists(tx, "session_native_branch", "boundary_native_turn_id")? {
+            tx.execute_batch(
+                "ALTER TABLE session_native_branch ADD COLUMN boundary_native_turn_id TEXT;",
+            )
+            .map_err(db_err)?;
+        }
+        if !column_exists(tx, "session_native_branch", "boundary_helm_turn_id")? {
+            tx.execute_batch(
+                "ALTER TABLE session_native_branch ADD COLUMN boundary_helm_turn_id TEXT;",
+            )
+            .map_err(db_err)?;
+        }
+    }
     // Keep the mandatory Folder invariant intact even after manual DB edits or older write paths.
     tx.execute(
         "UPDATE session
@@ -8790,6 +9381,20 @@ fn apply_migrations(tx: &Transaction<'_>) -> Result<(), String> {
                 SELECT 1 FROM session_folder
                 WHERE session_folder.id = session.folder_id
             )",
+        [],
+    )
+    .map_err(db_err)?;
+    // 分叉会话时间戳单位订正（幂等，2026-09-02）：start_session_branch 曾用
+    // now_millis() 写入秒约定的 created_at/updated_at，毫秒值（约 1.78e12）比合法
+    // 秒值（约 1.78e9）大 1000 倍 → 分叉会话在侧栏永远置顶且相对时间显示「刚刚」。
+    // 阈值取 1e11：合法秒时间戳远小于它，毫秒值必然命中；订正后再次启动不再命中，
+    // 可长期驻留。新写入已改用 now_seconds()（commands.rs 两处分叉创建）。
+    tx.execute(
+        "UPDATE session
+         SET created_at = created_at / 1000,
+             updated_at = updated_at / 1000
+         WHERE created_at > 100000000000
+            OR updated_at > 100000000000",
         [],
     )
     .map_err(db_err)?;
@@ -8817,6 +9422,11 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, S
 fn configure_connection(conn: &Connection) -> Result<(), String> {
     conn.busy_timeout(Duration::from_secs(10)).map_err(db_err)?;
     conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(db_err)?;
+    // 性能与持久性权衡见 ADR 0020：默认 synchronous=FULL 每次提交都 fsync WAL，
+    // 边界事件（tool_call / tool_result / 审批等）的多次提交是工具密集会话的主要卡顿源。
+    // WAL + NORMAL 下崩溃不损坏库，仅掉电可能丢最后几笔已提交事务（会话历史可重建，可接受）。
+    conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(db_err)?;
     Ok(())
 }
@@ -8853,7 +9463,41 @@ fn summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSummary>
         last_context_window: row.get::<_, Option<i64>>(21)?.map(|value| value as u64),
         preferred_model: row.get(22)?,
         preferred_reasoning_effort: row.get(23)?,
+        archived: row.get::<_, i64>(24)? != 0,
+        current_tool: row.get(25)?,
+        current_target: tool_target_from_input(row.get::<_, Option<String>>(26)?),
+        change_additions: row.get::<_, i64>(27)? as u64,
+        change_deletions: row.get::<_, i64>(28)? as u64,
+        pending_approval: row.get::<_, i64>(29)? != 0,
+        last_turn_failed: row.get::<_, i64>(30)? != 0,
+        // 2026-08-28 修复「分叉自 failed」：SQL 列 31 = 最近 turn_snapshot.status，列 32 = source_title_snapshot；此前两列索引对调，forked_from 误取 turn 终态、last_turn_status 误取分叉源标题，导致侧栏「分叉自」显示 succeeded/failed 等状态串。
+        forked_from: row.get(32)?,
+        last_turn_status: row.get(31)?,
     })
+}
+
+/// 从工具 input JSON 中提取「正在做什么」的目标摘要（切片7 · F2）。
+/// 只取常见目标字段的第一个非空字符串；无结构化目标时返回 None（显示暂无）。
+fn tool_target_from_input(input_json: Option<String>) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(input_json.as_deref()?).ok()?;
+    for key in [
+        "path",
+        "file_path",
+        "file",
+        "target",
+        "glob",
+        "pattern",
+        "command",
+        "query",
+    ] {
+        if let Some(text) = value.get(key).and_then(serde_json::Value::as_str) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn uuid_like_id() -> String {
@@ -9216,9 +9860,11 @@ fn safe_file_write_effect(
         return Ok(PermissionEffect::Ask);
     }
     let session_cwd = conn
-        .query_row("SELECT cwd FROM session WHERE id = ?1", params![action.session_id], |row| {
-            row.get::<_, String>(0)
-        })
+        .query_row(
+            "SELECT cwd FROM session WHERE id = ?1",
+            params![action.session_id],
+            |row| row.get::<_, String>(0),
+        )
         .optional()
         .map_err(db_err)?;
     let Some(session_cwd) = session_cwd.filter(|root| !root.is_empty()) else {
@@ -9447,6 +10093,9 @@ pub struct UsageStats {
     pub total_tokens: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// S4：缓存命中分子（分母为本窗口 input_tokens）；缓存列晚于最早记录（v13 回填 0）。
+    pub cached_input_tokens: u64,
+    pub cache_write_input_tokens: u64,
     pub request_count: u32,
     pub session_count: u32,
     pub actual_cost: f64,
@@ -9462,28 +10111,55 @@ pub struct UsageStats {
     pub previous_session_count: u32,
 }
 
+/// S4 冻结：用量分组维度。model 按（模型, 引擎）成组；engine/provider 按单键成组。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UsageBreakdownDimension {
+    Model,
+    Engine,
+    Provider,
+}
+
+/// 成本类型计数，口径与 UsageStats 的 cost_kind 一致（actual/estimated/subscription/unknown/legacy）。
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct ModelUsage {
-    pub model: String,
-    pub engine: String,
-    pub request_count: u32,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cost_usd: f64,
-    pub share: f64,
+pub struct UsageCostKindCounts {
+    pub actual: u32,
+    pub estimated: u32,
+    pub subscription: u32,
+    pub unknown: u32,
+    pub legacy: u32,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct ProviderUsage {
-    pub provider: String,
+pub struct UsageBreakdownRow {
+    /// model 维度 = 模型 ID；engine 维度 = engine id；provider 维度 = provider_id（空串 = 未标注旧会话）。
+    pub key: String,
+    /// 该组运行引擎；model 维度按（模型, 引擎）成组因此总有值，engine 维度等于 key。
+    pub engine: String,
+    pub request_count: u32,
+    /// 组内无 token 证据（全部 cost_kind = legacy）时为 null，禁止用费用反推。
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    /// 缓存命中率分子；分母为同组 input_tokens。
+    pub cached_input_tokens: Option<u64>,
+    pub cache_write_input_tokens: Option<u64>,
     pub cost_usd: f64,
     pub share: f64,
+    pub cost_kinds: UsageCostKindCounts,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DailyUsage {
     pub date: String,
     pub cost_usd: f64,
+    /// 当日真实调用次数（含只有金额、没有 token 证据的 legacy 行）。
+    pub request_count: u64,
+    /// 无 token 证据（当日全部 legacy 行）时为 null，禁止估算。
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    /// 缓存命中率分子；分母为同日 input_tokens。
+    pub cached_input_tokens: Option<u64>,
+    pub cache_write_input_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -9619,5 +10295,795 @@ mod path_prefix_tests {
             r"\\server\share\dir"
         );
     }
+
+    #[test]
+    fn json_diff_change_aggregation_matches_protocol_shape() {
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
+        let diff = r#"{"path":"auth.ts","hunks":[{"oldStart":1,"newStart":1,"lines":[{"kind":"add","text":"+x"},{"kind":"del","text":"-y"},{"kind":"ctx","text":" z"}]},{"oldStart":9,"newStart":9,"lines":[{"kind":"add","text":"+w"}]}]}"#;
+        let additions: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(CASE WHEN json_extract(j.value, '$.kind') = 'add' THEN 1 ELSE 0 END), 0)
+                 FROM json_each(?1, '$.hunks') h, json_each(h.value, '$.lines') j",
+                [diff],
+                |row| row.get(0),
+            )
+            .expect("aggregate additions");
+        let deletions: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(CASE WHEN json_extract(j.value, '$.kind') = 'del' THEN 1 ELSE 0 END), 0)
+                 FROM json_each(?1, '$.hunks') h, json_each(h.value, '$.lines') j",
+                [diff],
+                |row| row.get(0),
+            )
+            .expect("aggregate deletions");
+        assert_eq!((additions, deletions), (2, 1));
+    }
 }
 
+#[cfg(test)]
+mod usage_contract_tests {
+    use super::{now_seconds, SessionHistoryStore, UsageBreakdownDimension};
+    use crate::protocol::EngineId;
+    use rusqlite::params;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn fixture_store(label: &str) -> SessionHistoryStore {
+        let unique = format!(
+            "{}-{}-{}",
+            label,
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let root = std::env::temp_dir().join(format!("helm-usage-contract-{unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+        SessionHistoryStore::new(root.join("sessions.sqlite"))
+    }
+
+    fn create_session(store: &SessionHistoryStore, id: &str, engine: EngineId) {
+        store
+            .create_session(crate::sessions::NewSessionRecord {
+                id: id.to_string(),
+                engine,
+                model: "claude-sonnet-4.6".to_string(),
+                cwd: r"D:\work\demo".to_string(),
+                created_at: 1_717_171_700,
+            })
+            .unwrap();
+    }
+
+    /// 以受控 ts 直接写入 usage 行（与真实 TokenUsage/操作收口落库形状一致）。
+    fn insert_usage(
+        store: &SessionHistoryStore,
+        session_id: Option<&str>,
+        model: &str,
+        provider_id: &str,
+        input: i64,
+        cached: i64,
+        cache_write: i64,
+        output: i64,
+        cost: f64,
+        cost_kind: &str,
+        ts: i64,
+    ) {
+        let conn = store.open().unwrap();
+        conn.execute(
+            "INSERT INTO usage
+             (session_id, operation_id, model, provider_id, input_tokens, cached_input_tokens,
+              cache_write_input_tokens, output_tokens, cost_usd, cost_kind, ts)
+             VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                session_id,
+                model,
+                provider_id,
+                input,
+                cached,
+                cache_write,
+                output,
+                cost,
+                cost_kind,
+                ts
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn daily_usage_returns_real_call_token_and_cache_fields() {
+        let store = fixture_store("daily-real");
+        create_session(&store, "s1", EngineId::ClaudeCode);
+        let now = now_seconds();
+        insert_usage(
+            &store,
+            Some("s1"),
+            "claude-sonnet-4.6",
+            "p1",
+            1000,
+            400,
+            100,
+            200,
+            0.5,
+            "actual",
+            now,
+        );
+        insert_usage(
+            &store,
+            Some("s1"),
+            "claude-sonnet-4.6",
+            "p1",
+            300,
+            0,
+            0,
+            50,
+            0.25,
+            "actual",
+            now - 86_400,
+        );
+
+        let rows = store.get_daily_usage(7).unwrap();
+        assert_eq!(rows.len(), 2, "两个有记录的日期各返回一行：{rows:?}");
+        let today = rows.last().unwrap();
+        assert_eq!(today.request_count, 1);
+        assert_eq!(today.input_tokens, Some(1000));
+        assert_eq!(today.cached_input_tokens, Some(400));
+        assert_eq!(today.cache_write_input_tokens, Some(100));
+        assert_eq!(today.output_tokens, Some(200));
+        assert!((today.cost_usd - 0.5).abs() < 1e-9);
+        let yesterday = &rows[0];
+        assert_eq!(yesterday.input_tokens, Some(300));
+        assert_eq!(yesterday.output_tokens, Some(50));
+
+        // 分子/分母同源可追溯：缓存命中率必须能从同一聚合里算出，而不是前端反推。
+        let stats = store.get_usage_stats(7).unwrap();
+        assert_eq!(stats.input_tokens, 1300);
+        assert_eq!(stats.cached_input_tokens, 400);
+        assert_eq!(stats.cache_write_input_tokens, 100);
+        let _ =
+            std::fs::remove_dir_all(std::env::temp_dir().join("helm-usage-contract-daily-real"));
+    }
+
+    /// 模型改名级联（2026-09-03）：rename_session_preferred_model 只改引用旧 ID 的行，
+    /// 其余行不动；改完后会话列表读回的 preferred_model 必须是新 ID。
+    #[test]
+    fn rename_session_preferred_model_updates_only_matching_rows() {
+        let store = fixture_store("rename-pref");
+        create_session(&store, "s1", EngineId::ClaudeCode);
+        create_session(&store, "s2", EngineId::Codex);
+        create_session(&store, "s3", EngineId::ClaudeCode);
+        store
+            .set_session_turn_preference("s1", "DeepSeek-V4-Flash-0731", None)
+            .unwrap();
+        store
+            .set_session_turn_preference("s2", "DeepSeek-V4-Flash-0731", None)
+            .unwrap();
+        store
+            .set_session_turn_preference("s3", "other-model", None)
+            .unwrap();
+
+        let changed = store
+            .rename_session_preferred_model("DeepSeek-V4-Flash-0731", "DeepSeek-V4-Flash-0731-1M")
+            .unwrap();
+        assert_eq!(changed, 2, "只有引用旧 ID 的两个会话被更新");
+
+        let sessions = store.list_sessions().unwrap();
+        let preferred = |id: &str| {
+            sessions
+                .iter()
+                .find(|session| session.id == id)
+                .and_then(|session| session.preferred_model.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(preferred("s1"), "DeepSeek-V4-Flash-0731-1M");
+        assert_eq!(preferred("s2"), "DeepSeek-V4-Flash-0731-1M");
+        assert_eq!(preferred("s3"), "other-model", "无关会话不受影响");
+
+        // 同 ID / 空 ID 是无操作，不应报错也不应改变任何行
+        let noop = store
+            .rename_session_preferred_model("DeepSeek-V4-Flash-0731-1M", "DeepSeek-V4-Flash-0731-1M")
+            .unwrap();
+        assert_eq!(noop, 0);
+        let _ =
+            std::fs::remove_dir_all(std::env::temp_dir().join("helm-usage-contract-rename-pref"));    }
+
+    #[test]
+    fn daily_usage_legacy_only_day_returns_null_token_fields_without_estimates() {
+        // v12 以前的旧数据只有金额：调用次数与花费真实返回，token 字段为 null（暂无），不估算。
+        let store = fixture_store("daily-legacy");
+        create_session(&store, "s-old", EngineId::ClaudeCode);
+        let now = now_seconds();
+        insert_usage(
+            &store,
+            Some("s-old"),
+            "claude-legacy",
+            "",
+            0,
+            0,
+            0,
+            0,
+            2.0,
+            "legacy",
+            now,
+        );
+
+        let rows = store.get_daily_usage(7).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].request_count, 1);
+        assert!((rows[0].cost_usd - 2.0).abs() < 1e-9);
+        assert_eq!(rows[0].input_tokens, None);
+        assert_eq!(rows[0].output_tokens, None);
+        assert_eq!(rows[0].cached_input_tokens, None);
+        assert_eq!(rows[0].cache_write_input_tokens, None);
+        let _ =
+            std::fs::remove_dir_all(std::env::temp_dir().join("helm-usage-contract-daily-legacy"));
+    }
+
+    #[test]
+    fn daily_usage_mixed_legacy_and_evidence_sums_known_tokens_only() {
+        // 混合日期：有 token 证据时返回已知数据的真实求和；legacy 行只贡献次数和花费。
+        let store = fixture_store("daily-mixed");
+        create_session(&store, "s-mix", EngineId::ClaudeCode);
+        let now = now_seconds();
+        insert_usage(
+            &store,
+            Some("s-mix"),
+            "m",
+            "p",
+            800,
+            200,
+            40,
+            100,
+            0.4,
+            "actual",
+            now,
+        );
+        insert_usage(
+            &store,
+            Some("s-mix"),
+            "m",
+            "p",
+            0,
+            0,
+            0,
+            0,
+            3.0,
+            "legacy",
+            now,
+        );
+
+        let rows = store.get_daily_usage(7).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].request_count, 2);
+        assert!((rows[0].cost_usd - 3.4).abs() < 1e-9);
+        assert_eq!(rows[0].input_tokens, Some(800));
+        assert_eq!(rows[0].cached_input_tokens, Some(200));
+        assert_eq!(rows[0].output_tokens, Some(100));
+        let _ =
+            std::fs::remove_dir_all(std::env::temp_dir().join("helm-usage-contract-daily-mixed"));
+    }
+
+    #[test]
+    fn usage_windows_are_consistent_across_all_queries() {
+        // 7/30/90/365 的窗口谓词在 daily/stats/breakdown/top 上一致：
+        // 同一批行在 7 天与 30 天口径下得到一致的包含关系，未来时间戳一律排除。
+        let store = fixture_store("window-consistency");
+        create_session(&store, "s-w", EngineId::ClaudeCode);
+        let now = now_seconds();
+        insert_usage(
+            &store,
+            Some("s-w"),
+            "m",
+            "p",
+            100,
+            10,
+            0,
+            10,
+            1.0,
+            "actual",
+            now - 6 * 86_400,
+        );
+        insert_usage(
+            &store,
+            Some("s-w"),
+            "m",
+            "p",
+            200,
+            0,
+            0,
+            20,
+            2.0,
+            "actual",
+            now - 9 * 86_400,
+        );
+        insert_usage(
+            &store,
+            Some("s-w"),
+            "m",
+            "p",
+            999,
+            0,
+            0,
+            0,
+            9.0,
+            "actual",
+            now + 3_600,
+        );
+
+        assert_eq!(store.get_daily_usage(7).unwrap().len(), 1);
+        assert_eq!(store.get_daily_usage(30).unwrap().len(), 2);
+        assert_eq!(store.get_usage_stats(7).unwrap().request_count, 1);
+        assert_eq!(store.get_usage_stats(30).unwrap().request_count, 2);
+        let seven = store
+            .get_usage_breakdown(7, UsageBreakdownDimension::Engine)
+            .unwrap();
+        assert_eq!(seven.len(), 1);
+        assert_eq!(seven[0].request_count, 1);
+        let thirty = store
+            .get_usage_breakdown(30, UsageBreakdownDimension::Engine)
+            .unwrap();
+        assert_eq!(thirty.len(), 1, "同一引擎聚合成一行：{thirty:?}");
+        assert_eq!(thirty[0].request_count, 2, "未来行不计入");
+
+        let top_seven = store.get_top_sessions(7, 5).unwrap();
+        assert_eq!(top_seven.len(), 1);
+        assert!((top_seven[0].cost_usd - 1.0).abs() < 1e-9, "{top_seven:?}");
+        let top_thirty = store.get_top_sessions(30, 5).unwrap();
+        assert!(
+            (top_thirty[0].cost_usd - 3.0).abs() < 1e-9,
+            "{top_thirty:?}"
+        );
+        let _ = std::fs::remove_dir_all(
+            std::env::temp_dir().join("helm-usage-contract-window-consistency"),
+        );
+    }
+
+    #[test]
+    fn background_operation_retry_resets_only_terminal_failures() {
+        // 十次反馈回归：终态失败（failed/cancelled/delivery_unknown）的 ForkJob 必须可
+        // 被重试语义重置——状态回 committed、旧错误清空；非终态一律拒绝，防止进行中/
+        // 已完成的操作被并发重跑。此前幂等命中会把终态失败原样永久缓存。
+        let store = fixture_store("background-op-retry-reset");
+        let now = now_seconds();
+        {
+            let conn = store.open().unwrap();
+            for (id, status) in [
+                ("op-failed", "failed"),
+                ("op-cancelled", "cancelled"),
+                ("op-delivery-unknown", "delivery_unknown"),
+                ("op-active", "committed"),
+            ] {
+                conn.execute(
+                    "INSERT INTO background_operation
+                     (id, kind, input_digest, idempotency_key, status, error_code, created_at)
+                     VALUES (?1, 'fork_job', 'digest', ?2, ?3,
+                             '[operation_spawn_failed] stale', ?4)",
+                    params![id, format!("idem-{id}"), status, now],
+                )
+                .unwrap();
+            }
+        }
+        for id in ["op-failed", "op-cancelled", "op-delivery-unknown"] {
+            store
+                .prepare_background_operation_retry(id)
+                .unwrap_or_else(|error| panic!("{id} 应可重试：{error}"));
+        }
+        let conn = store.open().unwrap();
+        for id in ["op-failed", "op-cancelled", "op-delivery-unknown"] {
+            let (status, error_code): (String, Option<String>) = conn
+                .query_row(
+                    "SELECT status, error_code FROM background_operation WHERE id = ?1",
+                    params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(status, "committed", "{id} 重试后应回到 committed");
+            assert_eq!(error_code, None, "{id} 重试后旧错误必须清空");
+        }
+        drop(conn);
+        assert!(
+            store
+                .prepare_background_operation_retry("op-active")
+                .is_err(),
+            "非终态操作不允许重试"
+        );
+        let _ =
+            std::fs::remove_dir_all(std::env::temp_dir().join("helm-background-op-retry-reset"));
+    }
+
+    #[test]
+    fn session_native_branch_roundtrip_and_isolation() {
+        // 十次反馈：分支链接登记后可回读；不同会话互不可见；源会话删除不孤儿化（FK 级联）。
+        let store = fixture_store("session-native-branch-roundtrip");
+        let now = now_seconds();
+        {
+            let conn = store.open().unwrap();
+            for id in ["sess-src", "sess-branch", "sess-other"] {
+                conn.execute(
+                    "INSERT INTO session (id, title, engine, model, cwd, status, created_at, updated_at, folder_id)
+                     VALUES (?1, 't', 'claude-code', 'm', 'C:\\w', 'active', ?2, ?2, 'folder-default')",
+                    params![id, now],
+                )
+                .unwrap();
+            }
+        }
+        store
+            .record_session_native_branch("sess-branch", "sess-src", "cli-src-123", None, None)
+            .unwrap();
+        let loaded = store.load_session_native_branch("sess-branch").unwrap();
+        assert_eq!(
+            loaded,
+            Some((
+                "sess-src".to_string(),
+                "cli-src-123".to_string(),
+                None,
+                None
+            )),
+            "{loaded:?}"
+        );
+        assert_eq!(
+            store.load_session_native_branch("sess-other").unwrap(),
+            None
+        );
+        // 重复登记覆盖（幂等），不产生第二行。切点边界随登记更新。
+        store
+            .record_session_native_branch(
+                "sess-branch",
+                "sess-src",
+                "cli-src-456",
+                Some("turn-native-9"),
+                Some("turn-helm-9"),
+            )
+            .unwrap();
+        assert_eq!(
+            store.load_session_native_branch("sess-branch").unwrap(),
+            Some((
+                "sess-src".to_string(),
+                "cli-src-456".to_string(),
+                Some("turn-native-9".to_string()),
+                Some("turn-helm-9".to_string())
+            ))
+        );
+        {
+            let conn = store.open().unwrap();
+            conn.execute("DELETE FROM session WHERE id = 'sess-src'", [])
+                .unwrap();
+        }
+        // 源被删：ON DELETE CASCADE 清掉分支链接，open 流程不再拿到悬挂的源引用。
+        assert_eq!(
+            store.load_session_native_branch("sess-branch").unwrap(),
+            None
+        );
+        let _ = std::fs::remove_dir_all(
+            std::env::temp_dir().join("helm-session-native-branch-roundtrip"),
+        );
+    }
+
+    #[test]
+    fn clone_messages_into_session_copies_visible_history_only() {
+        // 2026-09-02 分叉二轮：分支会话必须能看到分叉前的对话。只复制未回溯消息
+        // （reverted=0）；复制的消息 turn_id 置空（分支 turns 表无对应轮次，不留悬空
+        // 引用）；附件一并复制且指向新消息行；目标会话原有消息不受影响。
+        let store = fixture_store("session-clone-messages");
+        let now = now_seconds();
+        {
+            let conn = store.open().unwrap();
+            for id in ["sess-src", "sess-branch"] {
+                conn.execute(
+                    "INSERT INTO session (id, title, engine, model, cwd, status, created_at, updated_at, folder_id)
+                     VALUES (?1, 't', 'codex', 'm', 'C:\\w', 'active', ?2, ?2, 'folder-default')",
+                    params![id, now],
+                )
+                .unwrap();
+            }
+            // 分支会话预置一条自己的消息，验证复制不覆盖既有内容。
+            conn.execute(
+                "INSERT INTO message (session_id, role, text, ts, reverted) VALUES ('sess-branch', 'user', '分支自己的消息', ?1, 0)",
+                params![now],
+            )
+            .unwrap();
+            for (text, reverted) in [("第一条", 0i64), ("已被回溯", 1), ("第二条", 0)] {
+                conn.execute(
+                    "INSERT INTO message (session_id, role, text, ts, reverted, turn_id)
+                     VALUES ('sess-src', 'user', ?1, ?2, ?3, 'turn-src-1')",
+                    params![text, now, reverted],
+                )
+                .unwrap();
+            }
+            let source_message_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM message WHERE session_id = 'sess-src' AND text = '第一条'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO message_attachment
+                 (id, message_id, session_id, turn_id, ordinal, source_path, path_digest)
+                 VALUES ('att-src-1', ?1, 'sess-src', 'turn-src-1', 0, 'C:\\w\\a.txt', 'sha256:aa')",
+                params![source_message_id],
+            )
+            .unwrap();
+        }
+        let copied = store
+            .clone_messages_into_session("sess-src", "sess-branch")
+            .unwrap();
+        assert_eq!(copied, 2, "已回溯消息不得复制");
+        {
+            let conn = store.open().unwrap();
+            let branch_messages: Vec<(String, Option<String>)> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT text, turn_id FROM message WHERE session_id = 'sess-branch' ORDER BY id ASC",
+                    )
+                    .unwrap();
+                stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            };
+            assert_eq!(
+                branch_messages
+                    .iter()
+                    .map(|(text, _)| text.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["分支自己的消息", "第一条", "第二条"],
+                "复制应保持原顺序且不覆盖既有消息，实际 {branch_messages:?}"
+            );
+            assert!(
+                branch_messages[1..]
+                    .iter()
+                    .all(|(_, turn_id)| turn_id.is_none()),
+                "复制的消息 turn_id 必须置空，实际 {branch_messages:?}"
+            );
+            // 附件复制：指向新消息行，内容原样保留。
+            let attachment_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM message_attachment WHERE session_id = 'sess-branch'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(attachment_count, 1, "附件应随消息复制");
+            let (new_message_id, source_path): (i64, String) = conn
+                .query_row(
+                    "SELECT message_id, source_path FROM message_attachment WHERE session_id = 'sess-branch'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(source_path, "C:\\w\\a.txt");
+            let copied_text: String = conn
+                .query_row(
+                    "SELECT text FROM message WHERE id = ?1",
+                    params![new_message_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(copied_text, "第一条", "附件必须挂到复制后的新消息上");
+        }
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("helm-session-clone-messages"));
+    }
+
+    #[test]
+    fn clone_messages_into_session_upto_truncates_at_boundary_turn() {
+        // 切点分叉：只复制「切点轮及其之前」的消息。源会话有三条消息分属 turn-1/turn-2，
+        // 以 turn-1 为切点时，turn-2 的消息不得复制；无切点（upto=None）时全量复制。
+        let store = fixture_store("session-clone-upto");
+        let now = now_seconds();
+        {
+            let conn = store.open().unwrap();
+            for id in ["sess-src", "sess-branch"] {
+                conn.execute(
+                    "INSERT INTO session (id, title, engine, model, cwd, status, created_at, updated_at, folder_id)
+                     VALUES (?1, 't', 'codex', 'm', 'C:\\w', 'active', ?2, ?2, 'folder-default')",
+                    params![id, now],
+                )
+                .unwrap();
+            }
+            // turn-1：一问一答（同一 turn_id，两条）；turn-2：切点之后的轮，不应被带入。
+            for (text, turn) in [
+                ("问题一", "turn-1"),
+                ("回答一", "turn-1"),
+                ("问题二", "turn-2"),
+                ("回答二", "turn-2"),
+            ] {
+                conn.execute(
+                    "INSERT INTO message (session_id, role, text, ts, reverted, turn_id)
+                     VALUES ('sess-src', 'user', ?1, ?2, 0, ?3)",
+                    params![text, now, turn],
+                )
+                .unwrap();
+            }
+        }
+        let copied = store
+            .clone_messages_into_session_upto("sess-src", "sess-branch", Some("turn-1"))
+            .unwrap();
+        assert_eq!(copied, 2, "切点 turn-1 应只复制该轮的一问一答");
+        {
+            let conn = store.open().unwrap();
+            let texts: Vec<String> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT text FROM message WHERE session_id = 'sess-branch' ORDER BY id ASC",
+                    )
+                    .unwrap();
+                stmt.query_map([], |row| row.get(0))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            };
+            assert_eq!(
+                texts,
+                vec!["问题一", "回答一"],
+                "切点之后的轮次不得复制：{texts:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("helm-session-clone-upto"));
+    }
+
+    #[test]
+    fn capability_snapshot_legacy_format_is_invalidated_not_fatal() {
+        // 十一次反馈回归：CapabilitySet 新增 native_branch 前写入的旧快照缺该字段，
+        // 加载必须视为未命中（清行返回 None 触发重探），不得硬报错阻断分叉/打开会话。
+        let store = fixture_store("capability-legacy-cache");
+        use crate::capability_registry::{
+            CapabilityIdentity, CapabilitySet, EngineCapabilitySnapshot,
+        };
+        let identity = CapabilityIdentity {
+            engine_id: "claude-code".into(),
+            adapter_version: "test".into(),
+            binary_identity: "claude:sha256:legacy".into(),
+            engine_profile_digest: "sha256:engine".into(),
+            provider_launch_profile_ref: "provider:a:api".into(),
+            provider_launch_profile_digest: "sha256:p".into(),
+            launch_profile_identity: "sha256:l".into(),
+            model_capability_key: "m".into(),
+        };
+        let cache_key = identity.cache_key().unwrap();
+        let snapshot = EngineCapabilitySnapshot {
+            id: "snap-legacy".into(),
+            identity: identity.clone(),
+            capabilities: CapabilitySet::unknown("legacy"),
+            probe_kind: "help".into(),
+            probed_at: 1,
+        };
+        store
+            .save_capability_snapshot(&cache_key, &snapshot)
+            .unwrap();
+        // 把刚存的快照降级成旧格式：删掉 capabilities.nativeBranch。
+        {
+            let conn = store.open().unwrap();
+            let json: String = conn
+                .query_row(
+                    "SELECT snapshot_json FROM capability_snapshot WHERE cache_key = ?1",
+                    params![cache_key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            value["capabilities"]
+                .as_object_mut()
+                .unwrap()
+                .remove("nativeBranch");
+            conn.execute(
+                "UPDATE capability_snapshot SET snapshot_json = ?1 WHERE cache_key = ?2",
+                params![serde_json::to_string(&value).unwrap(), cache_key],
+            )
+            .unwrap();
+        }
+        // 旧格式 → Ok(None)（未命中），且行已被清除。
+        assert!(
+            matches!(store.load_capability_snapshot(&cache_key), Ok(None)),
+            "旧格式缓存必须视为未命中而非报错"
+        );
+        {
+            let conn = store.open().unwrap();
+            let remaining: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM capability_snapshot WHERE cache_key = ?1",
+                    params![cache_key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(remaining, 0, "旧行必须被清除以便重探覆盖");
+        }
+        // 新格式仍然正常加载。
+        store
+            .save_capability_snapshot(&cache_key, &snapshot)
+            .unwrap();
+        assert!(store
+            .load_capability_snapshot(&cache_key)
+            .unwrap()
+            .is_some());
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("helm-capability-legacy-cache"));
+    }
+
+    #[test]
+    fn breakdown_resolves_engine_for_background_operations() {
+        // 会话行取 session.engine；后台操作行（session_id 为 NULL）取 operation_execution_spec.engine_id。
+        let store = fixture_store("breakdown-operation-engine");
+        create_session(&store, "s-e", EngineId::ClaudeCode);
+        let now = now_seconds();
+        insert_usage(
+            &store,
+            Some("s-e"),
+            "m-a",
+            "p",
+            1000,
+            100,
+            10,
+            100,
+            1.0,
+            "actual",
+            now,
+        );
+
+        let conn = store.open().unwrap();
+        conn.execute(
+            "INSERT INTO background_operation
+             (id, kind, input_digest, idempotency_key, status, created_at)
+             VALUES ('op-eng', 'model_only', 'digest', 'idem-eng', 'succeeded', ?1)",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO operation_execution_spec
+             (operation_id, engine_id, provider_id, provider_kind, provider_display_name,
+              route_label_snapshot, requested_model_id, routed_model_id, model_label_snapshot,
+              requested_reasoning_effort, routed_reasoning_effort, binding_id, binding_revision,
+              engine_profile_digest, provider_launch_profile_ref, provider_launch_profile_digest,
+              launch_config_digest, routing_capability_snapshot_id, pricing_basis_snapshot_json,
+              purpose, created_at)
+             VALUES ('op-eng', 'codex', 'provider-x', 'api', 'Provider X', 'route', 'gpt-x',
+                     'gpt-x', 'gpt-x', 'standard', 'standard', 'binding-1', 1, 'sha256:e',
+                     'ref', 'sha256:p', 'sha256:l', 'cap-1', '{}', 'test', ?1)",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage
+             (operation_id, model, provider_id, input_tokens, cached_input_tokens,
+              cache_write_input_tokens, output_tokens, cost_usd, cost_kind, ts)
+             VALUES ('op-eng', 'm-a', 'provider-x', 500, 250, 50, 60, 0.25, 'estimated', ?1)",
+            params![now],
+        )
+        .unwrap();
+
+        let rows = store
+            .get_usage_breakdown(7, UsageBreakdownDimension::Engine)
+            .unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let codex = rows.iter().find(|row| row.key == "codex").unwrap();
+        assert_eq!(codex.engine, "codex");
+        assert_eq!(codex.request_count, 1);
+        assert_eq!(codex.input_tokens, Some(500));
+        assert_eq!(codex.cached_input_tokens, Some(250));
+        assert_eq!(codex.cache_write_input_tokens, Some(50));
+        assert_eq!(codex.output_tokens, Some(60));
+        assert_eq!(codex.cost_kinds.estimated, 1);
+        let claude = rows.iter().find(|row| row.key == "claude-code").unwrap();
+        assert_eq!(claude.cost_kinds.actual, 1);
+
+        // 模型维度按（模型, 引擎）成组：同名模型在不同引擎上是两行，占比合计为 1。
+        let by_model = store
+            .get_usage_breakdown(7, UsageBreakdownDimension::Model)
+            .unwrap();
+        assert_eq!(by_model.len(), 2, "{by_model:?}");
+        for row in &by_model {
+            assert_eq!(row.key, "m-a");
+        }
+        let engines: Vec<&str> = by_model.iter().map(|row| row.engine.as_str()).collect();
+        assert!(
+            engines.contains(&"claude-code") && engines.contains(&"codex"),
+            "{engines:?}"
+        );
+        let total_share: f64 = by_model.iter().map(|row| row.share).sum();
+        assert!(
+            (total_share - 1.0).abs() < 1e-9,
+            "share 合计应为 1：{total_share}"
+        );
+        let _ = std::fs::remove_dir_all(
+            std::env::temp_dir().join("helm-usage-contract-breakdown-operation-engine"),
+        );
+    }
+}

@@ -31,6 +31,7 @@ function state(overrides: Partial<SessionState> = {}): SessionState {
     startedAt: null,
     turnActivity: null,
     turnStartedAt: null,
+    turnCostUsd: 0,
     disabledMcp: [],
     ...overrides,
   };

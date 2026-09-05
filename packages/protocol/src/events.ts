@@ -155,6 +155,24 @@ export type AgentEvent =
       contextTokens: number;
       contextWindow?: number;
     }
+  | {
+      /**
+       * Codex 原生上下文压缩生命周期（P0-04）。
+       * 由 app-server `contextCompaction` item 的 started/completed 上报。
+       * 状态机：submitted（RPC 已提交，等 app-server 确认）→ running → succeeded/failed。
+       * summary 为压缩完成后 app-server 返回的真实摘要，缺省不补写虚构内容。
+       */
+      type: 'context_compaction';
+      sessionId: string;
+      /** 压缩记录稳定身份（Codex item id；无 item id 时由后端合成）。 */
+      id: string;
+      status: 'submitted' | 'running' | 'succeeded' | 'failed';
+      ts: number;
+      /** succeeded 时的真实摘要正文；app-server 未提供则缺省。 */
+      summary?: string;
+      /** failed 时的真实错误原因。 */
+      error?: string;
+    }
   | { type: 'turn_complete'; sessionId: string; stopReason: 'end' | 'interrupted' | 'error' }
   | {
       type: 'error';

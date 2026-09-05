@@ -10,9 +10,12 @@ import type {
   Provider,
   ProviderKind,
   ProviderTest,
+  ProviderAccessType,
   ModelPriceOverride,
   PricingCatalogStatus,
+  PricingCatalogEntry,
   ProviderPricingPreference,
+  ProviderRoleKey,
 } from '@helm/protocol';
 
 export type EngineStatus = 'ready' | 'missing' | 'error';
@@ -25,7 +28,14 @@ export type BindingConfig = Binding;
 export type ProviderProtocol = Protocol;
 export type ProviderAuthMethod = AuthMethod;
 export type { AppConfig, FailureCategory, ProviderTest };
-export type { ModelPriceOverride, PricingCatalogStatus, ProviderPricingPreference };
+export type {
+  ModelPriceOverride,
+  PricingCatalogStatus,
+  PricingCatalogEntry,
+  ProviderAccessType,
+  ProviderPricingPreference,
+  ProviderRoleKey,
+};
 
 export interface ConnectionResult {
   ok: boolean;
@@ -94,6 +104,31 @@ export function saveProviderModelSelection(
   return invoke<AppConfig>('save_provider_model_selection', { providerId, enabledModelIds });
 }
 
+/** 模型改名（2026-09-03）：在用模型也允许改；后端原地改名/合并并级联 binding 与会话偏好。 */
+export function renameProviderModel(
+  providerId: string,
+  oldModelId: string,
+  newModelId: string,
+): Promise<AppConfig> {
+  return invoke<AppConfig>('rename_provider_model', { providerId, oldModelId, newModelId });
+}
+
+export function deleteProviderModel(providerId: string, modelId: string): Promise<AppConfig> {
+  return invoke<AppConfig>('delete_provider_model', { providerId, modelId });
+}
+
+/** 用系统默认浏览器打开外链（仅 https；Tauri webview 不放行 target=_blank）。 */
+export function openExternalUrl(url: string): Promise<void> {
+  return invoke<void>('open_external_url', { url });
+}
+
+export function saveProviderModelsConfig(
+  providerId: string,
+  models: ModelConfig[],
+): Promise<AppConfig> {
+  return invoke<AppConfig>('save_provider_models_config', { providerId, models });
+}
+
 export function syncProviderModels(providerId: string): Promise<AppConfig> {
   return invoke<AppConfig>('sync_provider_models_config', { providerId });
 }
@@ -121,12 +156,43 @@ export function testProviderConfig(providerId: string): Promise<ConnectionResult
   return invoke<ConnectionResult>('test_provider_config', { providerId });
 }
 
+/** 添加流程「测试连接」：对未保存草稿（URL + 密钥 + 协议）做真实 HTTP 探活。 */
+export function testProviderDraft(
+  baseUrl: string,
+  apiKey: string,
+  protocol: string,
+): Promise<ConnectionResult> {
+  return invoke<ConnectionResult>('test_provider_draft_config', { baseUrl, apiKey, protocol });
+}
+
+/** 「同步模型」候选拉取结果：远端模型 ID + 最新配置；候选不写入模型行。 */
+export interface ProviderModelListing {
+  modelIds: string[];
+  config: AppConfig;
+}
+
+export function listProviderModels(
+  providerId: string,
+  draft?: { baseUrl?: string; apiKey?: string },
+): Promise<ProviderModelListing> {
+  return invoke<ProviderModelListing>('list_provider_models_config', {
+    providerId,
+    baseUrl: draft?.baseUrl?.trim() ? draft.baseUrl.trim() : null,
+    apiKey: draft?.apiKey?.trim() ? draft.apiKey.trim() : null,
+  });
+}
+
 export function testEngineConfig(bin: string): Promise<ConnectionResult> {
   return invoke<ConnectionResult>('test_engine_config', { bin });
 }
 
 export function getPricingCatalogStatus(): Promise<PricingCatalogStatus> {
   return invoke<PricingCatalogStatus>('get_pricing_catalog_status');
+}
+
+/** 定价目录标准价格表（只读参考费率，来自已验签缓存或内置目录） */
+export function getPricingCatalogEntries(): Promise<PricingCatalogEntry[]> {
+  return invoke<PricingCatalogEntry[]>('get_pricing_catalog_entries');
 }
 
 export function refreshPricingCatalog(): Promise<PricingCatalogStatus> {

@@ -13,7 +13,7 @@ use crate::commands::{
 use crate::operations::{
     BackgroundOperation, ModelOnlyOperationPolicy, NewBackgroundOperation, OperationExecutionSpec,
 };
-use crate::providers::{BindingConfig, KeyringSecretStore, ProviderStore};
+use crate::providers::{BindingConfig, KeyringSecretStore, ModelConfig, ProviderStore};
 use crate::reasoning::ReasoningEffort;
 use crate::runtime_registry::RuntimeRegistry;
 use crate::sessions::{SessionDetail, SessionHistoryStore, TurnLedgerRecord};
@@ -27,6 +27,33 @@ pub const HANDOFF_CONTRACT_VERSION: u32 = 1;
 const MAX_LEDGER_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_HANDOFF_PROMPT_BYTES: usize = 512 * 1024;
 const MAX_RECURSIVE_SUMMARY_DEPTH: usize = 8;
+
+/// 分叉摘要模型目录预检（九次反馈）：路由模型必须是该绑定服务商当前启用目录中的
+/// 精确 ID；否则在 spawn 前给出带 tag 的可操作错误，而不是等引擎链路以含糊的
+/// unrecognized_model 非零退出。服务商目录为空（旧配置未同步过目录）时不判定，
+/// 放行走引擎侧兜底映射，避免误拦合法旧配置。
+fn ensure_fork_model_in_catalog(
+    models: &[ModelConfig],
+    provider_id: &str,
+    model_id: &str,
+) -> Result<(), String> {
+    let provider_models: Vec<&ModelConfig> = models
+        .iter()
+        .filter(|model| model.provider_id == provider_id)
+        .collect();
+    if provider_models.is_empty() {
+        return Ok(());
+    }
+    let known = provider_models
+        .iter()
+        .any(|model| model.id == model_id && model.enabled);
+    if known {
+        return Ok(());
+    }
+    Err(format!(
+        "[operation_model_unavailable] 分叉摘要路由的模型 {model_id} 不在服务商当前启用的模型目录中（目录可能已漂移，或来自旧配置迁移）；请到「AI 配置」为对应引擎绑定更换快速模型或主模型后重试分叉"
+    ))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -93,15 +120,13 @@ pub fn freeze_fork_input(
     detail: &SessionDetail,
     ledger: &[TurnLedgerRecord],
     target_engine: &str,
+    boundary_turn_id: Option<&str>,
 ) -> Result<FrozenForkInput, String> {
     let target_engine = normalize_engine(target_engine)?;
     let source_engine = match detail.summary.engine {
         crate::protocol::EngineId::ClaudeCode => "claude-code",
         crate::protocol::EngineId::Codex => "codex",
     };
-    if source_engine == target_engine {
-        return Err("[fork_same_engine] 目标 Engine 必须与源 Session 不同".to_string());
-    }
     if detail.turns.iter().any(|turn| {
         matches!(
             turn.status.as_str(),
@@ -110,11 +135,23 @@ pub fn freeze_fork_input(
     }) {
         return Err("[fork_source_busy] 当前轮次尚未完成，不能冻结派生边界".to_string());
     }
-    let boundary = ledger
-        .iter()
-        .filter(|record| record.turn.status == "succeeded")
-        .max_by_key(|record| record.turn.epoch)
-        .ok_or_else(|| "[fork_no_completed_turn] 源 Session 没有可冻结的成功 Turn".to_string())?;
+    // 切点分叉：调用方给出被点回答所属的 Helm turn id 时，冻结边界取该轮（须已完成），
+    // 摘要只带「这段回答及之前」；无切点（左栏整段分叉）沿用最近一个成功轮。
+    let boundary = match boundary_turn_id {
+        Some(turn_id) => ledger
+            .iter()
+            .find(|record| record.turn.id == turn_id && record.turn.status == "succeeded")
+            .ok_or_else(|| {
+                "[fork_boundary_unavailable] 切点 Turn 不存在或尚未完成，无法按切点派生".to_string()
+            })?,
+        None => ledger
+            .iter()
+            .filter(|record| record.turn.status == "succeeded")
+            .max_by_key(|record| record.turn.epoch)
+            .ok_or_else(|| {
+                "[fork_no_completed_turn] 源 Session 没有可冻结的成功 Turn".to_string()
+            })?,
+    };
     let visible = ledger
         .iter()
         .filter(|record| record.turn.epoch <= boundary.turn.epoch)
@@ -207,7 +244,7 @@ fn bounded_utf8(value: &str, max_bytes: usize) -> String {
 
 pub fn handoff_prompt(input: &FrozenForkInput) -> String {
     format!(
-        "你正在为另一个 CLI Agent Engine 生成交接摘要。只输出一个 JSON 对象，不要 Markdown 代码围栏或额外文字。\nJSON 必须包含：contractVersion=1、goal 字符串、completed 字符串数组、currentState 字符串、decisionsAndFiles 字符串数组、remaining 字符串数组、constraints 字符串数组。\n摘要必须基于给定事实，明确未知，不得虚构；不要输出密钥、token 或认证内容。\n源 Engine：{}\n目标 Engine：{}\n源标题：{}\n冻结 Turn：{} (epoch {})\n\nTurnLedger JSON：\n{}",
+        "你正在为一个 CLI Agent Engine 生成交接摘要（目标可能与源同引擎，用于从摘要派生新会话）。只输出一个 JSON 对象，不要 Markdown 代码围栏或额外文字。\nJSON 必须包含：contractVersion=1、goal 字符串、completed 字符串数组、currentState 字符串、decisionsAndFiles 字符串数组、remaining 字符串数组、constraints 字符串数组。\n摘要必须基于给定事实，明确未知，不得虚构；不要输出密钥、token 或认证内容。\n源 Engine：{}\n目标 Engine：{}\n源标题：{}\n冻结 Turn：{} (epoch {})\n\nTurnLedger JSON：\n{}",
         input.source_engine,
         input.target_engine,
         input.source_title,
@@ -235,13 +272,14 @@ pub async fn start_session_fork(
     app: &AppHandle,
     source_session_id: &str,
     target_engine: &str,
+    boundary_turn_id: Option<&str>,
 ) -> Result<BackgroundOperation, String> {
     let history = app
         .try_state::<SessionHistoryStore>()
         .ok_or("历史存储未初始化")?;
     let detail = history.get_session(source_session_id)?;
     let ledger = history.get_turn_ledger(source_session_id)?;
-    let frozen = freeze_fork_input(&detail, &ledger, target_engine)?;
+    let frozen = freeze_fork_input(&detail, &ledger, target_engine, boundary_turn_id)?;
     let frozen_value = serde_json::to_value(&frozen).map_err(|error| error.to_string())?;
     let provider_store = app
         .try_state::<ProviderStore<KeyringSecretStore>>()
@@ -269,6 +307,11 @@ pub async fn start_session_fork(
             .filter(|model| !model.trim().is_empty())
             .unwrap_or(&binding.primary_model)
             .to_string();
+        // 模型目录预检（九次反馈）：分叉摘要路由取 绑定快速模型→主模型；目录漂移或旧
+        // 配置迁移可能留下引擎链路已不认识的 ID，spawn 只会得到引擎侧含糊的
+        // unrecognized_model。先在 Helm 侧给出可定位、可操作的错误（保存时已有同源
+        // 校验，这里是运行时兜底）。
+        ensure_fork_model_in_catalog(&candidate.config.models, &binding.provider_id, &model)?;
         let launch_binding = BindingConfig {
             primary_model: model.clone(),
             assistant_model_id: None,
@@ -359,7 +402,33 @@ pub async fn start_session_fork(
         match provider_store.commit_route_if_unchanged(&candidate.config_digest, |_| {
             history.create_background_operation(&new_operation)
         })? {
-            Some((existing, false)) => return Ok(existing),
+            Some((existing, false)) => {
+                // 幂等命中（十次反馈修复）：此前不分状态原样返回旧记录——终态失败的
+                // 分叉会被永久缓存，用户每次点分叉看到的都是同一句旧 os error 206，
+                // 真实 spawn 从未再次发生，任何二进制修复都「看起来无效」。终态失败
+                // 改为与手工重试同源语义：复核冻结 spec → 重置状态 → 真实重跑；
+                // 非终态（进行中/已完成）维持幂等返回。
+                if !matches!(
+                    existing.status.as_str(),
+                    "failed" | "cancelled" | "delivery_unknown"
+                ) {
+                    return Ok(existing);
+                }
+                let (execution, retry_bin, retry_env) =
+                    prepare_fork_job_retry(app, &existing.id).await?;
+                let rerun_id = existing.id.clone();
+                let rerun_app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) =
+                        run_fork_job(&rerun_app, execution, &retry_bin, &retry_env).await
+                    {
+                        eprintln!("[handoff] ForkJob 自动重跑失败：{error}");
+                    }
+                });
+                return history
+                    .load_background_operation(&rerun_id)?
+                    .ok_or_else(|| format!("ForkJob 自动重跑后状态丢失：{rerun_id}"));
+            }
             Some((operation, true)) => {
                 committed = Some((new_operation, operation, capability, bin, env));
                 break;
@@ -596,7 +665,15 @@ fn chunk_turn_facts(
     Ok(chunks)
 }
 
-pub async fn retry_fork_job(app: &AppHandle, operation_id: &str) -> Result<(), String> {
+/// 重试准备（十次反馈拆分）：校验 ForkJob 处于可重试终态（failed/cancelled/
+/// delivery_unknown）、冻结输入摘要一致、当前配置仍能逐字段复现冻结 spec，然后把
+/// 操作状态重置回 `committed` 并清空旧错误；返回真实重跑所需的 execution/bin/env。
+/// 拆成独立步骤供两条入口复用：设置任务 Tab 的手工重试（`retry_fork_job`），以及
+/// 侧栏再次分叉时对终态失败旧记录的自动重跑（`start_session_fork` 幂等命中分支）。
+async fn prepare_fork_job_retry(
+    app: &AppHandle,
+    operation_id: &str,
+) -> Result<(NewBackgroundOperation, String, Vec<(String, String)>), String> {
     let history = app
         .try_state::<SessionHistoryStore>()
         .ok_or("历史存储未初始化")?;
@@ -700,12 +777,69 @@ pub async fn retry_fork_job(app: &AppHandle, operation_id: &str) -> Result<(), S
     if transitioned.is_none() {
         return Err("Provider 配置在 ForkJob 重试复核期间发生变化，请重新重试".to_string());
     }
+    Ok((execution, bin, env))
+}
+
+/// 手工重试入口（设置任务 Tab）：语义不变，准备与重跑拆分后仅组合两步。
+pub async fn retry_fork_job(app: &AppHandle, operation_id: &str) -> Result<(), String> {
+    let (execution, bin, env) = prepare_fork_job_retry(app, operation_id).await?;
     run_fork_job(app, execution, &bin, &env).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::EngineId;
+
+    fn catalog_model(id: &str, provider_id: &str, enabled: bool) -> ModelConfig {
+        ModelConfig {
+            id: id.to_string(),
+            provider_id: provider_id.to_string(),
+            display_name: id.to_string(),
+            input_price_per_mtok: 0.0,
+            output_price_per_mtok: 0.0,
+            cached_input_price_per_mtok: None,
+            price_source: None,
+            enabled,
+            context_window: None,
+            capabilities: None,
+        }
+    }
+
+    #[test]
+    fn fork_model_must_be_in_provider_enabled_catalog() {
+        let models = vec![
+            catalog_model("deepseek-chat", "p-ds", true),
+            catalog_model("stale-id", "p-ds", false),
+        ];
+        assert!(
+            super::ensure_fork_model_in_catalog(&models, "p-ds", "deepseek-chat").is_ok(),
+            "启用目录内的模型应放行"
+        );
+        for bad in ["stale-id", "never-existed"] {
+            let error = super::ensure_fork_model_in_catalog(&models, "p-ds", bad)
+                .expect_err("目录外模型必须在 spawn 前拦截");
+            assert!(
+                error.starts_with("[operation_model_unavailable]"),
+                "错误必须带 tag：{error}"
+            );
+            assert!(error.contains(bad), "错误必须指认模型：{error}");
+        }
+        // 其他服务商的条目不能顶替本服务商的缺失（本服务商有目录但没有该模型）。
+        let cross = vec![
+            catalog_model("deepseek-chat", "p-ds", true),
+            catalog_model("shared-id", "p-other", true),
+        ];
+        assert!(
+            super::ensure_fork_model_in_catalog(&cross, "p-ds", "shared-id").is_err(),
+            "跨服务商目录不得视为已知"
+        );
+        // 空目录（旧配置未同步过模型目录）不判定，放行交由引擎侧兜底。
+        assert!(
+            super::ensure_fork_model_in_catalog(&[], "p-ds", "anything").is_ok(),
+            "空目录不应误拦旧配置"
+        );
+    }
 
     #[test]
     fn parses_structured_handoff_and_builds_lossy_context() {
@@ -755,5 +889,147 @@ mod tests {
         })];
         let error = chunk_turn_facts(&facts, 100).unwrap_err();
         assert!(error.contains("fork_turn_too_large"));
+    }
+
+    #[test]
+    fn freeze_allows_same_engine_fork() {
+        let detail = session_detail_with_turn(EngineId::Codex, "s-source", "succeeded", 7);
+        let ledger = ledger_with_turn("turn-7", "succeeded", 7);
+        let frozen =
+            freeze_fork_input(&detail, &ledger, "codex", None).expect("同引擎派生应被允许");
+        assert_eq!(frozen.source_engine, "codex");
+        assert_eq!(frozen.target_engine, "codex");
+        assert_eq!(frozen.boundary_turn_id, "turn-7");
+        assert_eq!(frozen.source_session_id, "s-source");
+    }
+
+    #[test]
+    fn freeze_allows_cross_engine_fork() {
+        let detail = session_detail_with_turn(EngineId::ClaudeCode, "s-source", "succeeded", 7);
+        let ledger = ledger_with_turn("turn-7", "succeeded", 7);
+        let frozen =
+            freeze_fork_input(&detail, &ledger, "codex", None).expect("跨引擎派生应被允许");
+        assert_eq!(frozen.source_engine, "claude-code");
+        assert_eq!(frozen.target_engine, "codex");
+    }
+
+    #[test]
+    fn freeze_rejects_busy_source_turn() {
+        let detail = session_detail_with_turn(EngineId::ClaudeCode, "s-source", "running", 7);
+        let ledger = ledger_with_turn("turn-7", "succeeded", 7);
+        let error = freeze_fork_input(&detail, &ledger, "codex", None).unwrap_err();
+        assert!(error.contains("fork_source_busy"));
+    }
+
+    fn session_detail_with_turn(
+        engine: EngineId,
+        session_id: &str,
+        turn_status: &str,
+        epoch: u64,
+    ) -> crate::sessions::SessionDetail {
+        use crate::sessions::{SessionStatus, SessionSummary};
+        crate::sessions::SessionDetail {
+            summary: SessionSummary {
+                id: session_id.to_string(),
+                cli_session_id: None,
+                title: "测试会话".to_string(),
+                engine,
+                model: "model-test".to_string(),
+                cwd: "D:/work".to_string(),
+                status: SessionStatus::Idle,
+                message_count: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_usd: 0.0,
+                created_at: 0,
+                updated_at: 0,
+                summary: None,
+                pinned: false,
+                runtime_capabilities: None,
+                safe_permission_profile: "standard".to_string(),
+                folder_id: "folder-default".to_string(),
+                cached_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                last_context_tokens: None,
+                last_context_window: None,
+                preferred_model: None,
+                preferred_reasoning_effort: None,
+                archived: false,
+                current_tool: None,
+                current_target: None,
+                change_additions: 0,
+                change_deletions: 0,
+                pending_approval: false,
+                last_turn_failed: false,
+                forked_from: None,
+                last_turn_status: None,
+            },
+            messages: Vec::new(),
+            tool_calls: Vec::new(),
+            checkpoints: Vec::new(),
+            approvals: Vec::new(),
+            turns: vec![crate::sessions::SessionTurn {
+                id: format!("turn-{epoch}"),
+                epoch,
+                mode: "default".to_string(),
+                permission_profile: "standard".to_string(),
+                status: turn_status.to_string(),
+                started_at: 1,
+                ended_at: Some(2),
+                terminal_reason: None,
+                provider_display_name: None,
+                requested_model_id: None,
+                routed_model_id: None,
+                requested_reasoning_effort: None,
+                routed_reasoning_effort: None,
+                resolution_source: None,
+            }],
+            session_context: Vec::new(),
+            fork: None,
+        }
+    }
+
+    fn ledger_with_turn(
+        turn_id: &str,
+        status: &str,
+        epoch: u64,
+    ) -> Vec<crate::sessions::TurnLedgerRecord> {
+        use crate::sessions::{SessionMessage, SessionToolCall, SessionTurn, TurnLedgerRecord};
+        vec![TurnLedgerRecord {
+            turn: SessionTurn {
+                id: turn_id.to_string(),
+                epoch,
+                mode: "default".to_string(),
+                permission_profile: "standard".to_string(),
+                status: status.to_string(),
+                started_at: 1,
+                ended_at: Some(2),
+                terminal_reason: None,
+                provider_display_name: None,
+                requested_model_id: None,
+                routed_model_id: None,
+                requested_reasoning_effort: None,
+                routed_reasoning_effort: None,
+                resolution_source: None,
+            },
+            route: crate::sessions::TurnLedgerRoute {
+                engine_id: "codex".to_string(),
+                provider_id: "provider-test".to_string(),
+                requested_model_id: "model-test".to_string(),
+                routed_model_id: "model-test".to_string(),
+                requested_reasoning_effort: "auto".to_string(),
+                routed_reasoning_effort: "auto".to_string(),
+                resolution_source: "compatible".to_string(),
+                launch_config_digest: "d".to_string(),
+                pricing_basis_snapshot: serde_json::Value::Null,
+            },
+            messages: Vec::<SessionMessage>::new(),
+            tool_calls: Vec::<SessionToolCall>::new(),
+            approvals: Vec::new(),
+            checkpoints: Vec::new(),
+            usage: Vec::new(),
+            attachments: Vec::new(),
+            session_context: Vec::new(),
+        }]
     }
 }
