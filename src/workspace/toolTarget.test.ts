@@ -104,13 +104,13 @@ describe('collectTurnDeliverables（轮次交付物计数）', () => {
     const result = collectTurnDeliverables([
       {
         name: 'Write',
-        input: { file_path: 'D:/6_其他/gmini/fund/基金套利方案.md', content: '# 方案' },
+        input: { file_path: 'D:/work/notes/套利方案.md', content: '# 方案' },
         status: 'success',
       },
     ]);
     expect(result.changeCount).toBe(1);
     expect(result.fileCount).toBe(1);
-    expect(result.documents).toEqual(['D:/6_其他/gmini/fund/基金套利方案.md']);
+    expect(result.documents).toEqual(['D:/work/notes/套利方案.md']);
   });
 
   it('无 name 的旧数据保持原口径：只有 diff 才算变更', () => {
