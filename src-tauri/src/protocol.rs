@@ -8,6 +8,17 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnStreamFailure {
+    pub history_id: String,
+    pub turn_id: String,
+    pub turn_epoch: u64,
+    pub attempt_no: u64,
+    pub runtime_generation_id: String,
+    pub message: String,
+}
+
 /// 引擎标识，对应 TS `EngineId`（kebab-case：`claude-code` / `codex`）。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -123,6 +134,38 @@ pub enum PlanStatus {
 pub struct PlanStep {
     pub text: String,
     pub status: PlanStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnPresentation {
+    pub turn_id: String,
+    pub event_seq: u64,
+    pub ts: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<i64>,
+    #[serde(default)]
+    pub reverted: bool,
+    #[serde(flatten)]
+    pub content: TurnPresentationContent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TurnPresentationContent {
+    Message {
+        role: Role,
+        text: String,
+        complete: bool,
+    },
+    Thinking {
+        text: String,
+        complete: bool,
+    },
+    Plan {
+        steps: Vec<PlanStep>,
+        truncated: bool,
+    },
 }
 
 /// 差异行类型。
@@ -283,17 +326,6 @@ pub enum AgentEvent {
     PlanUpdate {
         session_id: String,
         steps: Vec<PlanStep>,
-    },
-    #[serde(rename_all = "camelCase")]
-    Checkpoint {
-        session_id: String,
-        id: String,
-        label: String,
-        ts: i64,
-        restorable: bool,
-        file_count: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
     },
     #[serde(rename_all = "camelCase")]
     TokenUsage {

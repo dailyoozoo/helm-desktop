@@ -16,7 +16,8 @@ import {
   type PlatformInfo,
 } from './api';
 import { openPathInSystem } from '../engine/transport';
-import { UpdateActions } from './updateActions';
+import { openExternalUrl } from '../providers/api';
+import { UpdateActions, type UpdateFeedback } from './updateActions';
 import { SetupWizardModal, type PageIdLike } from './SetupWizardModal';
 import type { AppSettings } from './types';
 
@@ -40,6 +41,7 @@ export function AboutTab({
   const [logDir, setLogDir] = useState<LogDirInfo | null>(null);
   const [importOpen, setImportOpen] = useState(false);
   const [wizardOpen, setWizardOpen] = useState(false);
+  const [updateFeedback, setUpdateFeedback] = useState<UpdateFeedback | null>(null);
   const [feedConfigured, setFeedConfigured] = useState(
     () =>
       settings.general.updateFeedUrl.trim().length > 0 ||
@@ -178,17 +180,47 @@ export function AboutTab({
           </div>
         </div>
         <div className="row gap-sm">
-          <a
+          {/* Tauri WebView 内 <a target="_blank"> 不会打开系统浏览器，必须走 open_external_url */}
+          <button
             className="cm-action cm-action--quiet"
-            href={RELEASES_URL}
-            target="_blank"
-            rel="noopener noreferrer"
+            type="button"
+            onClick={() =>
+              void openExternalUrl(RELEASES_URL).catch((error: unknown) =>
+                showResultToast(
+                  '打开发布页失败：' + (error instanceof Error ? error.message : String(error)),
+                ),
+              )
+            }
           >
             <Icon name="gitbranch" /> 查看发布
-          </a>
-          <UpdateActions feedConfigured={feedConfigured} />
+          </button>
+          <UpdateActions feedConfigured={feedConfigured} onFeedback={setUpdateFeedback} />
         </div>
       </div>
+
+      {/* 检查更新状态条：对齐原型，紧跟 hero 之下，结果不靠底部 toast */}
+      {updateFeedback ? (
+        <div
+          className={'cm-about-status-bar is-' + updateFeedback.kind}
+          role="status"
+          aria-live="polite"
+        >
+          <span className="cm-about-status-bar__icon">
+            <Icon
+              name={
+                updateFeedback.kind === 'checking'
+                  ? 'refresh'
+                  : updateFeedback.kind === 'latest'
+                    ? 'checkc'
+                    : updateFeedback.kind === 'available'
+                      ? 'down'
+                      : 'alert'
+              }
+            />
+          </span>
+          <span>{updateFeedback.message}</span>
+        </div>
+      ) : null}
 
       <div className="cm-section">
         <div className="cm-section__head">
@@ -345,6 +377,9 @@ function ImportHistoryModal({
     let active = true;
     setLoading(true);
     setError(null);
+    // 切换引擎时必须清掉上一次的扫描结果：Codex 扫描要读几百个 JSONL 耗时数秒，
+    // 否则这段时间会显示上一个引擎的旧列表（看起来像"串台"）
+    setScan(null);
     listImportableHistories(engine)
       .then((next) => {
         if (active) setScan(next);
@@ -404,72 +439,82 @@ function ImportHistoryModal({
       </p>
 
       {step === 'select-agent' ? (
-        <div className="cm-import-agent-list">
-          <button
-            className="cm-import-agent"
-            type="button"
-            onClick={() => {
-              setEngine('claude-code');
-              setSelected([]);
-              setResults([]);
-              setStep('select-conv');
-            }}
-          >
-            <span className="cm-import-agent__icon">
-              <EngineBrand engine="claude-code" size={16} />
-            </span>
-            <span className="cm-import-agent__body">
-              <b>Claude Code</b>
-              <small>扫描本机 Claude Code 项目记录（JSONL）</small>
-            </span>
-            <span className="cm-import-agent__arrow">
-              <Icon name="right" />
-            </span>
-          </button>
-          <button
-            className="cm-import-agent"
-            type="button"
-            onClick={() => {
-              setEngine('codex');
-              setSelected([]);
-              setResults([]);
-              setStep('select-conv');
-            }}
-          >
-            <span className="cm-import-agent__icon">
-              <EngineBrand engine="codex" size={16} />
-            </span>
-            <span className="cm-import-agent__body">
-              <b>Codex</b>
-              <small>扫描本机 Codex 会话 rollout（JSONL）</small>
-            </span>
-            <span className="cm-import-agent__arrow">
-              <Icon name="right" />
-            </span>
-          </button>
-          <button className="cm-import-agent" type="button" onClick={onPickFile}>
-            <span className="cm-import-agent__icon">
-              <Icon name="file" />
-            </span>
-            <span className="cm-import-agent__body">
-              <b>从文件导入</b>
-              <small>
-                {busyPath
-                  ? '正在导入：' + busyPath
-                  : '支持 Claude Code / Codex 形状的 JSONL 对话记录'}
-              </small>
-            </span>
-            <span className="cm-import-agent__arrow">
-              <Icon name="right" />
-            </span>
-          </button>
+        <div className="cm-import-step is-active">
+          <div className="cm-import-breadcrumb">
+            <Icon name="right" />
+            <span>选择 Agent</span>
+            <Icon name="right" />
+            <span>选择对话</span>
+          </div>
+          <div className="cm-import-agent-list">
+            <button
+              className="cm-import-agent"
+              type="button"
+              onClick={() => {
+                setEngine('claude-code');
+                setSelected([]);
+                setResults([]);
+                setStep('select-conv');
+              }}
+            >
+              <span className="cm-import-agent__icon">
+                <EngineBrand engine="claude-code" size={16} />
+              </span>
+              <span className="cm-import-agent__main">
+                <b>Claude Code</b>
+                <small>扫描本机 Claude Code 项目记录（JSONL）</small>
+              </span>
+              <span className="cm-import-agent__arrow">
+                <Icon name="right" />
+              </span>
+            </button>
+            <button
+              className="cm-import-agent"
+              type="button"
+              onClick={() => {
+                setEngine('codex');
+                setSelected([]);
+                setResults([]);
+                setStep('select-conv');
+              }}
+            >
+              <span className="cm-import-agent__icon">
+                <EngineBrand engine="codex" size={16} />
+              </span>
+              <span className="cm-import-agent__main">
+                <b>Codex</b>
+                <small>扫描本机 Codex 会话 rollout（JSONL）</small>
+              </span>
+              <span className="cm-import-agent__arrow">
+                <Icon name="right" />
+              </span>
+            </button>
+            <button className="cm-import-agent" type="button" onClick={onPickFile}>
+              <span className="cm-import-agent__icon">
+                <Icon name="file" />
+              </span>
+              <span className="cm-import-agent__main">
+                <b>从文件导入</b>
+                <small>
+                  {busyPath
+                    ? '正在导入：' + busyPath
+                    : '支持 Claude Code / Codex 形状的 JSONL 对话记录'}
+                </small>
+              </span>
+              <span className="cm-import-agent__arrow">
+                <Icon name="right" />
+              </span>
+            </button>
+          </div>
         </div>
       ) : (
         <div className="cm-import-step is-active">
           <div className="cm-import-breadcrumb">
             <button type="button" onClick={() => setStep('select-agent')}>
-              <Icon name="left" /> {engine === 'codex' ? 'Codex' : 'Claude Code'}
+              <Icon name="left" /> 返回
             </button>
+            <Icon name="right" />
+            <span>{engine === 'codex' ? 'Codex' : 'Claude Code'}</span>
             <Icon name="right" />
             <span>选择对话</span>
           </div>
@@ -500,10 +545,12 @@ function ImportHistoryModal({
             </div>
           ) : null}
 
-          {scan && (scan.skippedTooLarge > 0 || scan.skippedUnparsable > 0) ? (
+          {scan &&
+          (scan.skippedTooLarge > 0 || scan.skippedUnparsable > 0 || scan.skippedTrivial > 0) ? (
             <p className="faint" style={{ marginTop: 8 }}>
-              已跳过 {scan.skippedTooLarge} 个超大文件、{scan.skippedUnparsable} 个无法解析的文件；
-              共发现 {scan.totalFound} 个记录文件。
+              已跳过 {scan.skippedTooLarge} 个超大文件、{scan.skippedUnparsable} 个无法解析的文件、
+              {scan.skippedTrivial} 个无实质内容或内部派生的记录；共发现 {scan.totalFound}{' '}
+              个记录文件。
             </p>
           ) : null}
 

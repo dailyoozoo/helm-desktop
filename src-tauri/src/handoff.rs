@@ -13,12 +13,15 @@ use crate::commands::{
 use crate::operations::{
     BackgroundOperation, ModelOnlyOperationPolicy, NewBackgroundOperation, OperationExecutionSpec,
 };
-use crate::providers::{BindingConfig, KeyringSecretStore, ModelConfig, ProviderStore};
+#[cfg(test)]
+use crate::providers::ModelConfig;
+use crate::providers::{BindingConfig, KeyringSecretStore, ProviderStore};
 use crate::reasoning::ReasoningEffort;
 use crate::runtime_registry::RuntimeRegistry;
 use crate::sessions::{SessionDetail, SessionHistoryStore, TurnLedgerRecord};
 use crate::settings::load_app_settings_from_store;
 use crate::subscription_profiles::SubscriptionProfileStore;
+use crate::titler::{frozen_operation_binding, frozen_operation_launch};
 use crate::turn_start::{build_runtime_route, digest_json};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
@@ -28,31 +31,14 @@ const MAX_LEDGER_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_HANDOFF_PROMPT_BYTES: usize = 512 * 1024;
 const MAX_RECURSIVE_SUMMARY_DEPTH: usize = 8;
 
-/// 分叉摘要模型目录预检（九次反馈）：路由模型必须是该绑定服务商当前启用目录中的
-/// 精确 ID；否则在 spawn 前给出带 tag 的可操作错误，而不是等引擎链路以含糊的
-/// unrecognized_model 非零退出。服务商目录为空（旧配置未同步过目录）时不判定，
-/// 放行走引擎侧兜底映射，避免误拦合法旧配置。
 fn ensure_fork_model_in_catalog(
-    models: &[ModelConfig],
+    config: &crate::providers::AppConfig,
     provider_id: &str,
     model_id: &str,
-) -> Result<(), String> {
-    let provider_models: Vec<&ModelConfig> = models
-        .iter()
-        .filter(|model| model.provider_id == provider_id)
-        .collect();
-    if provider_models.is_empty() {
-        return Ok(());
-    }
-    let known = provider_models
-        .iter()
-        .any(|model| model.id == model_id && model.enabled);
-    if known {
-        return Ok(());
-    }
-    Err(format!(
-        "[operation_model_unavailable] 分叉摘要路由的模型 {model_id} 不在服务商当前启用的模型目录中（目录可能已漂移，或来自旧配置迁移）；请到「AI 配置」为对应引擎绑定更换快速模型或主模型后重试分叉"
-    ))
+) -> Result<String, String> {
+    crate::providers::resolve_model_reference(config, provider_id, model_id).map_err(|error| {
+        format!("[operation_model_unavailable] {error}；请到「AI 配置」检查快速模型或主模型")
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -307,11 +293,7 @@ pub async fn start_session_fork(
             .filter(|model| !model.trim().is_empty())
             .unwrap_or(&binding.primary_model)
             .to_string();
-        // 模型目录预检（九次反馈）：分叉摘要路由取 绑定快速模型→主模型；目录漂移或旧
-        // 配置迁移可能留下引擎链路已不认识的 ID，spawn 只会得到引擎侧含糊的
-        // unrecognized_model。先在 Helm 侧给出可定位、可操作的错误（保存时已有同源
-        // 校验，这里是运行时兜底）。
-        ensure_fork_model_in_catalog(&candidate.config.models, &binding.provider_id, &model)?;
+        let model = ensure_fork_model_in_catalog(&candidate.config, &binding.provider_id, &model)?;
         let launch_binding = BindingConfig {
             primary_model: model.clone(),
             assistant_model_id: None,
@@ -335,14 +317,11 @@ pub async fn start_session_fork(
                 "claude"
             })
             .to_string();
-        let pricing_profile = candidate
-            .config
-            .models
-            .iter()
-            .find(|item| item.provider_id == binding.provider_id && item.id == model)
-            .map(|item| provider_store.model_pricing_profile(&candidate.config, item))
-            .transpose()?
-            .flatten();
+        let pricing_profile = provider_store.pricing_profile_for_model_id(
+            &candidate.config,
+            &binding.provider_id,
+            &model,
+        )?;
         let requested_effort = binding.reasoning_effort.unwrap_or(ReasoningEffort::Auto);
         let route = build_runtime_route(
             &candidate.config,
@@ -422,7 +401,7 @@ pub async fn start_session_fork(
                     if let Err(error) =
                         run_fork_job(&rerun_app, execution, &retry_bin, &retry_env).await
                     {
-                        eprintln!("[handoff] ForkJob 自动重跑失败：{error}");
+                        log::warn!("[handoff] ForkJob 自动重跑失败：{error}");
                     }
                 });
                 return history
@@ -449,7 +428,7 @@ pub async fn start_session_fork(
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         if let Err(error) = run_fork_job(&app, execution, &bin, &env).await {
-            eprintln!("[handoff] ForkJob 失败：{error}");
+            log::warn!("[handoff] ForkJob 失败：{error}");
         }
     });
     Ok(operation)
@@ -708,61 +687,21 @@ async fn prepare_fork_job_retry(
         .ok_or("订阅 Profile 存储未初始化")?;
     let settings = load_app_settings_from_store(&history)?;
     let candidate = provider_store.route_candidate()?;
-    let current_binding = candidate
-        .config
-        .bindings
-        .iter()
-        .find(|binding| binding.engine_id == execution.spec.engine_id)
-        .cloned()
-        .ok_or_else(|| format!("引擎还没有配置生效绑定：{}", execution.spec.engine_id))?;
-    let launch_binding = BindingConfig {
-        provider_id: execution.spec.provider_id.clone(),
-        primary_model: execution.spec.routed_model_id.clone(),
-        fast_model: Some(execution.spec.routed_model_id.clone()),
-        assistant_model_id: None,
-        reasoning_effort: Some(execution.spec.routed_reasoning_effort),
-        revision: execution.spec.binding_revision,
-        ..current_binding
-    };
-    ensure_binding_runtime_ready(&profiles, &candidate.config, &launch_binding).await?;
-    let mut env = provider_store.launch_env_for_config(&candidate.config, &launch_binding)?;
+    let launch_binding = frozen_operation_binding(&execution.spec);
     let subscription_home =
         subscription_profile_for_binding(&profiles, &candidate.config, &launch_binding)?;
+    let mut extra_env = Vec::new();
     if subscription_home.is_some() {
-        profiles.append_launch_env(&mut env, &execution.spec.engine_id)?;
+        profiles.append_launch_env(&mut extra_env, &execution.spec.engine_id)?;
     }
-    env.extend(agent_environment_from_settings(&settings));
-    let bin = candidate
-        .config
-        .engine_bin(&execution.spec.engine_id)
-        .filter(|bin| !bin.is_empty())
-        .unwrap_or(if execution.spec.engine_id == "codex" {
-            "codex"
-        } else {
-            "claude"
-        })
-        .to_string();
-    let route = build_runtime_route(
+    extra_env.extend(agent_environment_from_settings(&settings));
+    let (bin, env, route) = frozen_operation_launch(
+        &*provider_store,
         &candidate.config,
-        &launch_binding,
-        &execution.spec.routed_model_id,
-        &bin,
-        &env,
-        execution.spec.routed_reasoning_effort,
-        execution.spec.pricing_basis_snapshot.profile.clone(),
+        &execution.spec,
+        &extra_env,
     )?;
-    if route.engine_id != execution.spec.engine_id
-        || route.provider_id != execution.spec.provider_id
-        || route.model_id != execution.spec.routed_model_id
-        || route.engine_profile_digest != execution.spec.engine_profile_digest
-        || route.provider_launch_profile_ref != execution.spec.provider_launch_profile_ref
-        || route.provider_launch_profile_digest != execution.spec.provider_launch_profile_digest
-        || route.launch_config_digest != execution.spec.launch_config_digest
-    {
-        return Err(
-            "[operation_frozen_launch_unavailable] 当前配置无法复现冻结的 ForkJob spec".to_string(),
-        );
-    }
+    ensure_binding_runtime_ready(&profiles, &candidate.config, &launch_binding).await?;
     let capabilities = app
         .try_state::<EngineCapabilityRegistry>()
         .ok_or("Engine Capability Registry 未初始化")?;
@@ -808,17 +747,29 @@ mod tests {
 
     #[test]
     fn fork_model_must_be_in_provider_enabled_catalog() {
+        let catalog_config = |models: Vec<ModelConfig>| -> crate::providers::AppConfig {
+            serde_json::from_value(serde_json::json!({
+                "providers": [{"id":"p-ds","name":"Provider","kind":"api","protocol":"anthropic","authMethod":"apikey","baseUrl":"https://example.test","keyRef":null,"ready":true,"lastTest":null}],
+                "models": models, "engines": [], "bindings": [], "defaultEngine":"claude-code", "defaultModel":""
+            })).unwrap()
+        };
         let models = vec![
             catalog_model("deepseek-chat", "p-ds", true),
             catalog_model("stale-id", "p-ds", false),
         ];
         assert!(
-            super::ensure_fork_model_in_catalog(&models, "p-ds", "deepseek-chat").is_ok(),
+            super::ensure_fork_model_in_catalog(
+                &catalog_config(models.clone()),
+                "p-ds",
+                "deepseek-chat"
+            )
+            .is_ok(),
             "启用目录内的模型应放行"
         );
         for bad in ["stale-id", "never-existed"] {
-            let error = super::ensure_fork_model_in_catalog(&models, "p-ds", bad)
-                .expect_err("目录外模型必须在 spawn 前拦截");
+            let error =
+                super::ensure_fork_model_in_catalog(&catalog_config(models.clone()), "p-ds", bad)
+                    .expect_err("目录外模型必须在 spawn 前拦截");
             assert!(
                 error.starts_with("[operation_model_unavailable]"),
                 "错误必须带 tag：{error}"
@@ -831,13 +782,14 @@ mod tests {
             catalog_model("shared-id", "p-other", true),
         ];
         assert!(
-            super::ensure_fork_model_in_catalog(&cross, "p-ds", "shared-id").is_err(),
+            super::ensure_fork_model_in_catalog(&catalog_config(cross), "p-ds", "shared-id")
+                .is_err(),
             "跨服务商目录不得视为已知"
         );
-        // 空目录（旧配置未同步过模型目录）不判定，放行交由引擎侧兜底。
         assert!(
-            super::ensure_fork_model_in_catalog(&[], "p-ds", "anything").is_ok(),
-            "空目录不应误拦旧配置"
+            super::ensure_fork_model_in_catalog(&catalog_config(vec![]), "p-ds", "anything")
+                .is_err(),
+            "未配置目录或角色时不能猜测模型有效"
         );
     }
 
@@ -966,8 +918,8 @@ mod tests {
             },
             messages: Vec::new(),
             tool_calls: Vec::new(),
-            checkpoints: Vec::new(),
             approvals: Vec::new(),
+            presentations: vec![],
             turns: vec![crate::sessions::SessionTurn {
                 id: format!("turn-{epoch}"),
                 epoch,
@@ -1026,7 +978,6 @@ mod tests {
             messages: Vec::<SessionMessage>::new(),
             tool_calls: Vec::<SessionToolCall>::new(),
             approvals: Vec::new(),
-            checkpoints: Vec::new(),
             usage: Vec::new(),
             attachments: Vec::new(),
             session_context: Vec::new(),

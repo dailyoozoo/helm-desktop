@@ -116,7 +116,6 @@ const activeSession = {
       turnId: 'turn-2',
     },
   ],
-  checkpoints: [],
   approvals: [],
   turns: [
     {
@@ -1304,40 +1303,7 @@ const wsApprovalsDetail = vaWsDetail({
       turnId: 'turn-1',
     },
   ],
-  checkpoints: [],
   turns: [wsTurnRow({ status: 'running', endedAt: null })],
-});
-const wsCheckpointsDetail = vaWsDetail({
-  messages: [
-    wsMsg('user', '重构 token 刷新逻辑并保留可回退点。', now - 40_000, 'turn-1'),
-    wsMsg('assistant', '已完成重构；两个检查点已记录，可随时回溯。', now - 9_000, 'turn-1'),
-  ],
-  toolCalls: [
-    wsTool({
-      id: 'ws-write-1',
-      name: 'Write',
-      input: { path: 'src/auth/token.ts' },
-      output: 'written',
-    }),
-  ],
-  checkpoints: [
-    {
-      id: 'cp-ok',
-      label: '写入 auth.ts 前',
-      ts: now - 13_000,
-      restorable: true,
-      fileCount: 2,
-      turnId: 'turn-1',
-    },
-    {
-      id: 'cp-ro',
-      label: '工作区外目标，仅记录',
-      ts: now - 12_500,
-      restorable: false,
-      reason: '路径越界',
-      turnId: 'turn-1',
-    },
-  ],
 });
 const wsSubagentsDetail = vaWsDetail({
   messages: [
@@ -1431,7 +1397,6 @@ const wsWindowedDetail = vaWsDetail({
   messages: wsWindowedMessages,
   toolCalls: [],
   approvals: [],
-  checkpoints: [],
   turns: wsWindowedTurns,
 });
 const wsNoDiffDetail = vaWsDetail({
@@ -1443,6 +1408,19 @@ const wsNoDiffDetail = vaWsDetail({
       input: { pattern: 'refreshToken' },
       output: '3 matches',
       ts: now - 11_500,
+    }),
+  ],
+});
+// 文件动态 tab 探针（2026-09-10）：写入轮提供交付物行入口；
+// read_file_preview / read_file_preview_bytes 由探针运行时经 __setFixture 注入。
+const wsFilePreviewDetail = vaWsDetail({
+  toolCalls: [
+    wsTool({
+      id: 'ws-write-prd',
+      name: 'Write',
+      input: { file_path: 'docs/PRD.md', content: '# 套利方案' },
+      output: 'File created successfully',
+      ts: now - 9_000,
     }),
   ],
 });
@@ -1582,7 +1560,6 @@ const wsSwchDetail = vaWsDetail({
   messages: wsSwchMessages,
   toolCalls: [],
   approvals: [],
-  checkpoints: [],
   turns: wsSwchTurns,
 });
 const wsFixtureVariants: Record<string, Record<string, unknown>> = {
@@ -1626,10 +1603,6 @@ const wsFixtureVariants: Record<string, Record<string, unknown>> = {
     get_active_session: wsApprovalsDetail,
     get_session_history: wsApprovalsDetail,
   },
-  'ws-checkpoints': {
-    get_active_session: wsCheckpointsDetail,
-    get_session_history: wsCheckpointsDetail,
-  },
   'ws-subagents': {
     get_active_session: wsSubagentsDetail,
     get_session_history: wsSubagentsDetail,
@@ -1666,6 +1639,12 @@ const wsFixtureVariants: Record<string, Record<string, unknown>> = {
   },
   'ws-files-empty': { search_workspace_files: () => [] },
   'ws-files-error': { search_workspace_files: '__reject' },
+  // 文件动态 tab 探针（2026-09-10）：清单含 md/xlsx/txt，验证 tab 开关与渲染分型
+  'ws-file-preview': {
+    search_workspace_files: () => ['docs/PRD.md', 'sample.xlsx', 'notes.txt', 'docs/'],
+    get_active_session: wsFilePreviewDetail,
+    get_session_history: wsFilePreviewDetail,
+  },
   'ws-mcp-error': { list_mcp_servers: '__reject' },
   'ws-skills-error': { list_skills: '__reject' },
   // J 组发送阻断

@@ -1840,6 +1840,14 @@ body.is-rail-dragging .rail-task__more {
 .muted {
   color: var(--fg-3);
 }
+/* 轮次终态原因（零输出中断/失败时由后端落库）：告诉用户这轮到底发生了什么。 */
+.turn-note {
+  margin: 2px 0 0;
+  color: var(--fg-3);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
 .faint {
   color: var(--fg-4);
 }
@@ -2413,7 +2421,7 @@ body.is-rail-dragging .rail-task__more {
 .toast {
   position: fixed;
   left: 50%;
-  bottom: 26px;
+  top: 22px;
   z-index: 300;
   display: flex;
   align-items: center;
@@ -2428,7 +2436,7 @@ body.is-rail-dragging .rail-task__more {
   font-size: 13px;
   opacity: 0;
   pointer-events: none;
-  transform: translate(-50%, 14px);
+  transform: translate(-50%, -14px);
   transition: 0.2s;
 }
 .toast.show {
@@ -2441,11 +2449,11 @@ body.is-rail-dragging .rail-task__more {
   color: var(--success);
   flex: none;
 }
-/* 全局通知层（P2-2）：可堆叠、分级别的 toast */
+/* 全局通知层（P2-2）：可堆叠、分级别的 toast（顶部居中，对齐同业习惯） */
 .toast-layer {
   position: fixed;
   left: 50%;
-  bottom: 26px;
+  top: 22px;
   z-index: 300;
   display: flex;
   flex-direction: column;
@@ -5207,6 +5215,7 @@ body.is-rail-dragging .rail-task__more {
   margin-bottom: 4px;
   font-size: 12px;
   color: var(--fg-4);
+  white-space: nowrap;
 }
 .cm-import-breadcrumb button {
   border: 0;
@@ -5216,6 +5225,11 @@ body.is-rail-dragging .rail-task__more {
   font-size: 12px;
   cursor: pointer;
   padding: 2px 0;
+  flex: none;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 .cm-import-breadcrumb button:hover {
   text-decoration: underline;

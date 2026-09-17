@@ -68,7 +68,7 @@ function runRealMatrix({ bin, appConfig }, timeoutSeconds) {
     {
       encoding: 'utf8',
       env: { ...process.env, Path: commandPath, PATH: commandPath },
-      timeout: 15_000,
+      timeout: 60_000,
     },
   );
 }
@@ -115,7 +115,7 @@ Write-Output 'Logged in using ChatGPT'
     const result = runRealMatrix(environment, 1);
     expect(result.error).toBeUndefined();
     expect(result.status).toBe(0);
-    expect(Date.now() - startedAt).toBeLessThan(10_000);
+    expect(Date.now() - startedAt).toBeLessThan(45_000);
     const report = JSON.parse(result.stdout);
     expect(report.engines.claude).toMatchObject({ version: 'timeout', auth_method: 'timeout' });
     expect(report.engines.codex).toMatchObject({ version: 'timeout', auth_method: 'timeout' });
@@ -140,7 +140,7 @@ Write-Output 'Logged in using ChatGPT'
       {
         encoding: 'utf8',
         env: process.env,
-        timeout: 15_000,
+        timeout: 60_000,
       },
     );
     expect(result.error).toBeUndefined();

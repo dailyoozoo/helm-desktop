@@ -1,5 +1,7 @@
 import type { ThreadRenderEntry } from './threadGroups';
 import type { SessionTurn } from '../sessions/api';
+import type { ThreadItem } from '../engine/useSession';
+import { diffStats } from './diffStats';
 
 export interface TurnSummaryMeta {
   /** 第几轮（用户消息序号） */
@@ -34,12 +36,9 @@ export function turnDiffStats(entries: ThreadRenderEntry[]): {
     for (const item of items) {
       toolCount += 1;
       if (!item.diff) continue;
-      for (const hunk of item.diff.hunks) {
-        for (const line of hunk.lines) {
-          if (line.kind === 'add') added += 1;
-          else if (line.kind === 'del') removed += 1;
-        }
-      }
+      const stats = diffStats(item.diff);
+      added += stats.added;
+      removed += stats.removed;
     }
   }
   return { added, removed, toolCount };
@@ -51,11 +50,29 @@ export function turnDiffStats(entries: ThreadRenderEntry[]): {
  * - 耗时仅在该轮所有事件都已结束（Turn.endedAt 或条目的 endedAt 齐全）时给出，
  *   进行中的轮次不估算、不显示，避免伪进度。
  */
+const completedSummaries = new WeakMap<
+  ThreadItem,
+  { items: ThreadItem[]; turn?: SessionTurn | null; ordinal: number; summary: TurnSummaryMeta }
+>();
+
 export function summarizeTurn(
   entries: ThreadRenderEntry[],
   turnNumber: number,
   turn?: SessionTurn | null,
 ): TurnSummaryMeta {
+  const items = entries.flatMap((entry) => (entry.kind === 'item' ? [entry.item] : entry.items));
+  const last = items.at(-1);
+  const completed =
+    turn?.endedAt != null || (items.length > 0 && items.every((item) => item.turnStatus));
+  const cached = last && completed ? completedSummaries.get(last) : undefined;
+  if (
+    cached &&
+    cached.turn === turn &&
+    cached.ordinal === turnNumber &&
+    cached.items.length === items.length &&
+    cached.items.every((item, index) => item === items[index])
+  )
+    return cached.summary;
   const { added, removed, toolCount } = turnDiffStats(entries);
 
   let durationSec: number | undefined;
@@ -99,6 +116,8 @@ export function summarizeTurn(
   if (thinkingSec > 0) summary.thinkingSec = thinkingSec;
   if (added > 0) summary.added = added;
   if (removed > 0) summary.removed = removed;
+  if (last && completed)
+    completedSummaries.set(last, { items, turn, ordinal: turnNumber, summary });
   return summary;
 }
 

@@ -84,22 +84,25 @@ describe('基础对话场景 DLG-01 至 DLG-12', () => {
     expect(next.items[0]).toMatchObject({ kind: 'assistant', text: '你好，Helm' });
   });
 
-  it('DLG-03 Runtime error 进入唯一错误终态，不伪造成功回复', () => {
-    let next = reduceSessionAction(state(), { type: 'send', id: 'u-1', text: '运行检查' });
-    next = reduceSessionEvent(
-      next,
-      event({
-        type: 'error',
-        sessionId: 'cli-1',
-        message: '模型不可用',
-        recoverable: true,
-        kind: 'model_unavailable',
-      }),
-    );
-    expect(next.status).toBe('idle');
-    expect(next.items.filter((item) => item.kind === 'error')).toHaveLength(1);
-    expect(next.items.some((item) => item.kind === 'assistant')).toBe(false);
-  });
+  it.each([false, true])(
+    'DLG-03 recoverable=%s 的错误按事实归约，不伪造成功回复',
+    (recoverable) => {
+      let next = reduceSessionAction(state(), { type: 'send', id: 'u-1', text: '运行检查' });
+      next = reduceSessionEvent(
+        next,
+        event({
+          type: 'error',
+          sessionId: 'cli-1',
+          message: '模型不可用',
+          recoverable,
+          kind: 'model_unavailable',
+        }),
+      );
+      expect(next.status).toBe(recoverable ? 'working' : 'idle');
+      expect(next.items.filter((item) => item.kind === 'error')).toHaveLength(1);
+      expect(next.items.some((item) => item.kind === 'assistant')).toBe(false);
+    },
+  );
 
   it('DLG-04 working 时 Enter 进入队列动作而不替代 Stop', () => {
     expect(
@@ -196,7 +199,6 @@ describe('基础对话场景 DLG-01 至 DLG-12', () => {
         { role: 'assistant' as const, text: '回答', ts: 2 },
       ],
       toolCalls: [],
-      checkpoints: [],
       approvals: [],
     };
     const items = itemsFromHistory(detail);

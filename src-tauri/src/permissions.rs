@@ -1198,7 +1198,7 @@ mod tests {
         }
         let read_p95 = p95(read_samples);
         let network_p95 = p95(network_samples);
-        eprintln!(
+        log::info!(
             "permission-fast-path-p95 safe_read_us={} safe_network_read_us={}",
             read_p95.as_micros(),
             network_p95.as_micros()

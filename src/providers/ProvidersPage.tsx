@@ -7,48 +7,7 @@ import { EngineBrand } from '../shell/EngineBrand';
 import { ProviderBrand } from './ProviderBrand';
 import { getReadinessReport } from '../settings/api';
 import { loadSettings, saveSettings } from '../settings/api';
-import { engineEffortTiers } from '../home/newTaskViewModel';
-
-/** 定价目录模糊匹配（用户裁决）：忽略大小写；逐级去厂商前缀（a/b/c → b/c → c）；
- *  再展开常见协议后缀（m2/glm-5.2-openai → glm-5.2）；任一候选与目录 ID 相等即命中。 */
-function fuzzyPriceMatch(
-  entries: PricingCatalogEntry[],
-  modelId: string,
-): PricingCatalogEntry | null {
-  const target = modelId.toLowerCase();
-  const forms = new Set<string>([target]);
-  const parts = target.split('/');
-  for (let index = 1; index < parts.length; index += 1) {
-    forms.add(parts.slice(index).join('/'));
-  }
-  for (const form of [...forms]) {
-    for (const suffix of ['-openai', '-responses', '-chat', '-completions']) {
-      if (form.endsWith(suffix)) forms.add(form.slice(0, -suffix.length));
-    }
-  }
-  for (const entry of entries) {
-    if (forms.has(entry.modelId.toLowerCase())) return entry;
-  }
-  return null;
-}
-
-/** 手动添加模型：按模糊匹配预填目录价（未命中则未计价），返回新模型条目。 */
-function buildManualModel(
-  providerId: string,
-  id: string,
-  match: PricingCatalogEntry | null,
-): ModelConfig {
-  return {
-    id,
-    providerId,
-    displayName: id,
-    inputPricePerMtok: match?.input ?? 0,
-    cachedInputPricePerMtok: match?.cachedInput ?? undefined,
-    outputPricePerMtok: match?.output ?? 0,
-    priceSource: match ? 'builtin' : 'manual',
-    enabled: true,
-  };
-}
+import { useReasoningEffortCapability } from '../engine/useReasoningEffortCapability';
 
 /** 目录价签文案：$输入/$缓存/$输出（对齐原型 priceText 三段格式）。 */
 function catalogPriceText(entry: PricingCatalogEntry): string {
@@ -57,7 +16,7 @@ function catalogPriceText(entry: PricingCatalogEntry): string {
 
 /** 模型 ID 组合框（原型 roleCombo）：自由填写 + 下拉候选（输入即筛选、候选行附价签）。
  *  候选只来自「同步模型」拉取的远端列表（同步前为空、纯手输）；
- *  失焦/回车确认：确认后由父级做模糊匹配带出目录价；空值保留该行。
+ *  失焦/回车确认：确认后由父级做精确模型或显式别名匹配带出目录价；空值保留该行。
  *
  *  三条硬约束（改动前必读，都是踩过的坑）：
  *  1. 菜单必须 portal 到最近的 [role=dialog]，不能 portal 到 body。Radix Dialog 打开时给
@@ -313,13 +272,10 @@ import {
   logoutCliAccount,
   readEngineConfigFile,
   revealProviderSecret,
-  renameProviderModel,
   saveBindingConfig,
   saveEngineConfig,
   saveModelConfig,
   openExternalUrl,
-  saveProviderModelSelection,
-  saveProviderModelsConfig,
   saveModelPriceOverride,
   getPricingCatalogEntries,
   getPricingCatalogStatus,
@@ -352,6 +308,8 @@ import {
   canBindProvider,
   compatibleProvidersForEngine,
   createProviderDraft,
+  buildManualModel,
+  catalogPriceMatch,
   envPairsToText,
   isRelayProvider,
   lastSyncTimeText,
@@ -362,6 +320,7 @@ import {
   modelAccessGroups,
   bindingModelOptions,
   modelCatalogForProvider,
+  mergeSyncedModelSelection,
   modelGroupPriceSummary,
   normalizeBindingDraft,
   providerAccessGroup,
@@ -583,7 +542,7 @@ const ADD_FLOW_GROUPS: ProviderTemplate['accessGroup'][] = [
   'relay',
 ];
 
-function AddProviderModal({
+export function AddProviderModal({
   providers,
   onConfig,
   onNotice,
@@ -607,7 +566,7 @@ function AddProviderModal({
   const [created, setCreated] = useState<ProviderConfig | null>(null);
   const [modelDrafts, setModelDrafts] = useState<ModelConfig[]>([]);
   const [roleDrafts, setRoleDrafts] = useState<Partial<Record<ProviderRoleKey, string>>>({});
-  // 定价目录候选：模型组合框下拉与模糊匹配价签共用（读取失败按空目录处理，仍可手填）
+  // 定价目录候选：模型组合框下拉与精确模型或显式别名匹配价签共用（读取失败按空目录处理，仍可手填）
   const [catalog, setCatalog] = useState<PricingCatalogEntry[]>([]);
   useEffect(() => {
     let active = true;
@@ -644,6 +603,7 @@ function AddProviderModal({
   // 同步候选缓存（原型 card.models）：只喂组合框下拉，不生成模型行
   const [syncOptions, setSyncOptions] = useState<{ id: string; priceText: string }[]>([]);
   const template = PROVIDER_TEMPLATES.find((item) => item.id === selected) ?? PROVIDER_TEMPLATES[0];
+  const isSub = template.kind === 'subscription';
   const needsApiKey = template.authMethod === 'apikey';
   const testable = Boolean(baseUrl.trim()) && (!needsApiKey || Boolean(apiKey.trim()));
   const existingSubscription =
@@ -708,7 +668,9 @@ function AddProviderModal({
     setCreating(true);
     return saveProviderConfig(
       payload,
-      templateId === selected ? apiKey.trim() || undefined : undefined,
+      tpl.kind !== 'subscription' && templateId === selected
+        ? apiKey.trim() || undefined
+        : undefined,
     ).then((next) => {
       onConfig(next);
       const saved = next.providers.find((item) => item.id === payload.id);
@@ -718,18 +680,31 @@ function AddProviderModal({
   };
   /** 订阅卡点击即登录：显式传入模板，避免 setState 尚未生效时创建出别的服务商 */
   const startLoginFor = (item: (typeof PROVIDER_TEMPLATES)[number]) => {
+    if (creating) return;
     setCreating(true);
     loginCliAccount(item.protocol === 'anthropic' ? 'claude-code' : 'codex')
-      .then(() => createProvider(item.id))
-      .then(({ saved }) => {
-        onNotice('登录完成，正在打开服务商详情');
+      .then((state) => {
+        if (state.state !== 'ok' || state.authMethod !== 'subscription') {
+          throw new Error(state.detail || '订阅登录未完成，请重新登录');
+        }
+        return createProvider(item.id);
+      })
+      .then(async ({ saved }) => {
+        try {
+          const next = await syncProviderModels(saved.id);
+          onConfig(next);
+          onNotice('登录完成，订阅模型目录已同步');
+        } catch (error) {
+          onNotice(`登录已完成，但模型同步失败：${errorMessage(error, '请在详情中重试')}`);
+        }
         onOpenExisting(saved.id);
       })
       .catch((err: unknown) => onNotice(errorMessage(err, '登录未完成')))
       .finally(() => setCreating(false));
   };
   const finish = () => {
-    if (!created) return;
+    if (!created || creating || syncBusy) return;
+    setCreating(true);
     const rows = modelDrafts.filter((model) => model.id.trim() !== '');
     const payload: ProviderConfig = {
       ...created,
@@ -737,35 +712,29 @@ function AddProviderModal({
       baseUrl: template.kind === 'subscription' ? '' : baseUrl.trim(),
       ...(mode === 'roles-anthropic' ? { roleModels: roleDrafts } : {}),
     };
-    void saveProviderConfig(payload, apiKey.trim() || undefined)
-      .then((next) => {
-        if (mode !== 'list-openai') return next;
-        // 目录与启用集分两条命令落库：save_models_for_provider 会沿用旧 enabled，
-        // 勾选必须再经 save_provider_model_selection 才生效（与服务商详情抽屉同口径）。
-        return saveProviderModelsConfig(created.id, rows).then((afterModels) =>
-          saveProviderModelSelection(
-            created.id,
-            rows.filter((model) => model.enabled).map((model) => model.id),
-          ).then(() => afterModels),
-        );
-      })
+    void saveProviderConfig(
+      payload,
+      isSub ? undefined : apiKey.trim() || undefined,
+      mode === 'list-openai' ? rows : undefined,
+    )
       .then((next) => {
         onConfig(next);
         onNotice('服务商配置已保存');
         onClose();
       })
-      .catch((err: unknown) => onNotice(errorMessage(err, '保存服务商失败')));
+      .catch((err: unknown) => onNotice(errorMessage(err, '保存服务商失败')))
+      .finally(() => setCreating(false));
   };
   // 角色下拉候选：同步缓存优先（新添加流程 modelDrafts 为空）
   const modelById = new Map(modelDrafts.map((model) => [model.id, model]));
   const priceTextOf = (id: string) => {
     const saved = modelById.get(id);
     if (saved) return priceChipFor(saved).text;
-    const match = fuzzyPriceMatch(catalog, id);
+    const match = catalogPriceMatch(catalog, id, template.protocol);
     return match ? catalogPriceText(match) : '未计价';
   };
   const roleRows = PROVIDER_ROLE_ROWS.anthropic;
-  // 组合框确认（选中/失焦/回车）：空值保留该行；重复 ID 提示但不删行；其余模糊匹配带出目录价
+  // 组合框确认（选中/失焦/回车）：空值保留该行；重复 ID 提示但不删行；其余精确模型或显式别名匹配带出目录价
   const commitModelRow = (providerId: string, index: number, id: string) => {
     const decision = commitProviderModelRow(
       modelDrafts.map((item) => item.id),
@@ -777,7 +746,7 @@ function AddProviderModal({
       onNotice('该模型已在目录中');
       return;
     }
-    const match = fuzzyPriceMatch(catalog, decision.id);
+    const match = catalogPriceMatch(catalog, decision.id, template.protocol);
     setModelDrafts((prev) =>
       prev.map((item, at) =>
         at === index
@@ -802,14 +771,28 @@ function AddProviderModal({
   // 模型步骤「同步模型」：拉取远端 /models 只作组合框候选（不铺到模型行）；
   // 已手动添加的行原样保留，后续「添加模型」从候选中挑选或继续手输。
   const runSync = () => {
-    if (!created) return;
+    if (!created || syncBusy || creating) return;
     setSyncBusy(true);
+    if (isSub) {
+      void syncProviderModels(created.id)
+        .then((next) => {
+          const models = modelCatalogForProvider(next, created.id);
+          onConfig(next);
+          setModelDrafts((previous) => mergeSyncedModelSelection(models, previous));
+          setSyncedAt(Date.now());
+          setSyncedCount(models.length);
+          onNotice('订阅模型目录已同步');
+        })
+        .catch((err: unknown) => onNotice(errorMessage(err, '同步模型失败')))
+        .finally(() => setSyncBusy(false));
+      return;
+    }
     void listProviderModels(created.id, { baseUrl, apiKey })
       .then((listing) => {
         onConfig(listing.config);
         setSyncOptions(
           listing.modelIds.map((id) => {
-            const match = fuzzyPriceMatch(catalog, id);
+            const match = catalogPriceMatch(catalog, id, template.protocol);
             return { id, priceText: match ? catalogPriceText(match) : '未计价' };
           }),
         );
@@ -956,7 +939,7 @@ function AddProviderModal({
                 disabled={creating}
                 onClick={() => startLoginFor(template)}
               >
-                <Icon name="key" /> {creating ? '等待浏览器授权…' : '前往登录'}
+                <Icon name="key" /> {creating ? '正在登录并同步…' : '前往登录'}
               </button>
             </div>
             <small className="pv-login__note">
@@ -1049,9 +1032,11 @@ function AddProviderModal({
                   <div>
                     <h3>模型配置</h3>
                     <small>
-                      {syncedAt
-                        ? `已同步 ${syncedCount} 个候选 · 刚刚 · ${compatLabel}`
-                        : '尚未同步 · 可直接手动填写，或点右上角「同步模型」获取候选'}
+                      {isSub
+                        ? '模型仅来自订阅官方目录；勾选后点击保存生效。'
+                        : syncedAt
+                          ? `已同步 ${syncedCount} 个候选 · 刚刚 · ${compatLabel}`
+                          : '尚未同步 · 可直接手动填写，或点右上角「同步模型」获取候选'}
                     </small>
                   </div>
                   <span className="pv-headright">
@@ -1061,7 +1046,7 @@ function AddProviderModal({
                     <button
                       className="cm-action"
                       type="button"
-                      disabled={syncBusy}
+                      disabled={syncBusy || creating}
                       onClick={runSync}
                     >
                       <Icon name="refresh" className={syncBusy ? 'spin' : undefined} /> 同步模型
@@ -1070,9 +1055,11 @@ function AddProviderModal({
                 </div>
                 {modelDrafts.length === 0 ? (
                   <div className="pv-empty">
-                    {syncedAt
-                      ? '还没有添加模型 · 点下方「添加模型」从候选中选择'
-                      : '还没有添加模型 · 建议先「同步模型」获取候选，也可直接手动填写'}
+                    {isSub
+                      ? '暂无订阅模型，请先登录并同步官方目录。'
+                      : syncedAt
+                        ? '还没有添加模型 · 点下方「添加模型」从候选中选择'
+                        : '还没有添加模型 · 建议先「同步模型」获取候选，也可直接手动填写'}
                   </div>
                 ) : (
                   <div className="pv-openai-list">
@@ -1084,6 +1071,8 @@ function AddProviderModal({
                             <input
                               type="checkbox"
                               checked={model.enabled}
+                              aria-label={`启用 ${model.id}`}
+                              disabled={syncBusy || creating}
                               onChange={() =>
                                 setModelDrafts(
                                   modelDrafts.map((item, at) =>
@@ -1094,13 +1083,17 @@ function AddProviderModal({
                             />
                             <i />
                           </label>
-                          <ModelIdCombo
-                            value={model.id}
-                            options={syncOptions}
-                            taken={modelDrafts.map((item) => item.id.trim()).filter(Boolean)}
-                            autoOpen={!model.id.trim() && syncOptions.length > 0}
-                            onCommit={(id) => commitModelRow(created.id, index, id)}
-                          />
+                          {isSub ? (
+                            <span className="mono">{model.id}</span>
+                          ) : (
+                            <ModelIdCombo
+                              value={model.id}
+                              options={syncOptions}
+                              taken={modelDrafts.map((item) => item.id.trim()).filter(Boolean)}
+                              autoOpen={!model.id.trim() && syncOptions.length > 0}
+                              onCommit={(id) => commitModelRow(created.id, index, id)}
+                            />
+                          )}
                           <span className="pv-synclist__end">
                             <span
                               className={'pv-pricechip' + (chip.priced ? '' : ' is-none')}
@@ -1120,33 +1113,37 @@ function AddProviderModal({
                                 改价
                               </button>
                             ) : null}
-                            <button
-                              className="btn-icon"
-                              type="button"
-                              aria-label="移除模型"
-                              onClick={() =>
-                                setModelDrafts(modelDrafts.filter((_, at) => at !== index))
-                              }
-                            >
-                              <Icon name="trash" />
-                            </button>
+                            {!isSub ? (
+                              <button
+                                className="btn-icon"
+                                type="button"
+                                aria-label="移除模型"
+                                onClick={() =>
+                                  setModelDrafts(modelDrafts.filter((_, at) => at !== index))
+                                }
+                              >
+                                <Icon name="trash" />
+                              </button>
+                            ) : null}
                           </span>
                         </div>
                       );
                     })}
                   </div>
                 )}
-                <div className="pv-synclist__add pv-synclist__add--solo">
-                  <button
-                    className="cm-action"
-                    type="button"
-                    onClick={() =>
-                      setModelDrafts([...modelDrafts, buildManualModel(created.id, '', null)])
-                    }
-                  >
-                    <Icon name="plus" /> 添加模型
-                  </button>
-                </div>
+                {!isSub ? (
+                  <div className="pv-synclist__add pv-synclist__add--solo">
+                    <button
+                      className="cm-action"
+                      type="button"
+                      onClick={() =>
+                        setModelDrafts([...modelDrafts, buildManualModel(created.id, '', null)])
+                      }
+                    >
+                      <Icon name="plus" /> 添加模型
+                    </button>
+                  </div>
+                ) : null}
               </section>
             ) : (
               <section className="cm-detail-card">
@@ -1209,7 +1206,7 @@ function AddProviderModal({
                                     buildManualModel(
                                       created.id,
                                       currentId,
-                                      fuzzyPriceMatch(catalog, currentId),
+                                      catalogPriceMatch(catalog, currentId, template.protocol),
                                     ),
                                 )
                               }
@@ -1266,7 +1263,12 @@ function AddProviderModal({
             </button>
           ) : null}
           {step === 'models' ? (
-            <button className="cm-action cm-action--primary" onClick={finish} type="button">
+            <button
+              className="cm-action cm-action--primary"
+              onClick={finish}
+              type="button"
+              disabled={creating || syncBusy}
+            >
               保存
             </button>
           ) : null}
@@ -1466,7 +1468,7 @@ const ENGINE_DESCRIPTIONS: Record<string, string> = {
   codex: 'OpenAI 的本地编码 Agent，支持原生线程续接、沙箱和结构化工具调用。',
 };
 
-function EngineDetailPanel({
+export function EngineDetailPanel({
   config,
   engine,
   onConfig,
@@ -1491,18 +1493,31 @@ function EngineDetailPanel({
   const [fileDraft, setFileDraft] = useState('');
   const [editingFile, setEditingFile] = useState(false);
   const [fileBusy, setFileBusy] = useState(false);
-  type EnvRow = { name: string; value: string };
+  type EnvRow = { name: string; value: string; keyRef?: string | null };
   const [envRows, setEnvRows] = useState<EnvRow[]>([]);
+  const [savingEnv, setSavingEnv] = useState(false);
   const providerId = binding?.providerId ?? '';
   const models = providerId ? bindingModelOptions(config, providerId) : [];
   const [fastModel, setFastModel] = useState<string>(binding?.fastModel ?? '');
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>(
     binding?.reasoningEffort ?? 'auto',
   );
-  const [thinkingEnabled, setThinkingEnabled] = useState<boolean>(
-    binding?.thinkingEnabled ?? false,
+  const {
+    capability: effortCapability,
+    loading: effortLoading,
+    error: effortError,
+  } = useReasoningEffortCapability(
+    engine.id as 'claude-code' | 'codex',
+    binding?.primaryModel ?? '',
+    providerId,
   );
-  const [context1m, setContext1m] = useState<boolean>(binding?.context1m ?? false);
+  const effortOptions = [
+    ...new Set<ReasoningEffort>([
+      'auto',
+      ...(effortCapability?.support === 'supported' ? effortCapability.options : []),
+    ]),
+  ];
+  const effortUnavailable = !effortOptions.includes(reasoningEffort);
 
   useEffect(() => {
     let live = true;
@@ -1518,7 +1533,7 @@ function EngineDetailPanel({
     return () => {
       live = false;
     };
-  }, [engine.id]);
+  }, [engine.id, engine.bin]);
 
   useEffect(() => {
     let live = true;
@@ -1546,11 +1561,11 @@ function EngineDetailPanel({
         setConfigFile(file);
         setFileDraft(file.content);
       })
-      .catch(() => undefined);
+      .catch((error: unknown) => onNotice(errorMessage(error, '读取 Helm 引擎配置失败')));
     return () => {
       live = false;
     };
-  }, [engine.id]);
+  }, [engine.id, engine.bin, engine.envVars, onNotice]);
 
   // 环境变量：引擎级覆盖，独立于 Helm 配置文件存储（EngineConfig.envVars）
   useEffect(() => {
@@ -1558,37 +1573,39 @@ function EngineDetailPanel({
       (engine.envVars ?? []).map((item) => ({
         name: item.name,
         value: item.value ?? '',
+        keyRef: item.keyRef,
       })),
     );
   }, [engine.id, engine.envVars]);
 
   const persistEnv = (rows: EnvRow[]) => {
+    if (savingEnv) return;
+    setSavingEnv(true);
     const clean = rows.filter((row) => row.name.trim());
     void saveEngineConfig({
       ...engine,
-      envVars: clean.map((row) => ({ name: row.name.trim(), value: row.value })),
+      envVars: clean.map((row) => ({
+        name: row.name.trim(),
+        value: row.value,
+        secret: true,
+        keyRef: row.keyRef,
+      })),
     })
       .then((next) => {
         onConfig(next);
         onNotice('环境变量已保存到当前执行引擎');
       })
-      .catch((err: unknown) => onNotice(errorMessage(err, '保存环境变量失败')));
+      .catch((err: unknown) => onNotice(errorMessage(err, '保存环境变量失败')))
+      .finally(() => setSavingEnv(false));
   };
 
   useEffect(() => {
     if (!binding) return;
     setFastModel(binding.fastModel ?? '');
     setReasoningEffort(binding.reasoningEffort ?? 'auto');
-    setThinkingEnabled(binding.thinkingEnabled ?? false);
-    setContext1m(binding.context1m ?? false);
   }, [binding]);
 
-  const persistPref = (patch: {
-    fastModel?: string;
-    reasoningEffort?: ReasoningEffort;
-    thinkingEnabled?: boolean;
-    context1m?: boolean;
-  }) => {
+  const persistPref = (patch: { fastModel?: string; reasoningEffort?: ReasoningEffort }) => {
     if (!binding) {
       onNotice('请先绑定服务商后再设置引擎偏好');
       return;
@@ -1602,8 +1619,8 @@ function EngineDetailPanel({
     });
     const next: BindingConfig = {
       ...draft,
-      thinkingEnabled: patch.thinkingEnabled ?? thinkingEnabled,
-      context1m: patch.context1m ?? context1m,
+      thinkingEnabled: false,
+      context1m: false,
     };
     void saveBindingConfig(next)
       .then((saved) => {
@@ -1723,14 +1740,22 @@ function EngineDetailPanel({
               <div className="cm-option-row__main">
                 <b>默认推理强度</b>
                 <small>
-                  {isClaude
-                    ? '新任务默认带出，工作台仍可在 Turn 之间调整。'
-                    : '按 Codex 真实支持范围提供：低、中、高、超高与自动。'}
+                  {effortLoading
+                    ? '正在检测当前模型的推理档位…'
+                    : effortError
+                      ? `推理能力检测失败：${effortError}。`
+                      : effortCapability?.support === 'supported'
+                        ? '档位来自当前服务商、模型和 CLI 的真实能力检测。'
+                        : '当前未确认可用的推理档位；自动表示使用模型默认设置。'}
+                  {effortUnavailable && !effortLoading
+                    ? ` 已保存的“${reasoningEffortLabel(reasoningEffort)}”不在当前可用列表中，请重新选择；不会自动改写偏好。`
+                    : null}
                 </small>
               </div>
               <select
                 className="cm-select w-130"
-                disabled={prefsDisabled}
+                aria-label="默认推理强度"
+                disabled={prefsDisabled || effortLoading}
                 value={reasoningEffort}
                 onChange={(event) => {
                   const next = event.target.value as ReasoningEffort;
@@ -1738,7 +1763,15 @@ function EngineDetailPanel({
                   persistPref({ reasoningEffort: next });
                 }}
               >
-                {engineEffortTiers(engine.id).map((effort) => (
+                {effortUnavailable ? (
+                  <option value={reasoningEffort} disabled>
+                    {reasoningEffortLabel(reasoningEffort)}
+                    {effortLoading || !effortCapability || effortCapability.support === 'unknown'
+                      ? '（待确认）'
+                      : '（当前不可用）'}
+                  </option>
+                ) : null}
+                {effortOptions.map((effort) => (
                   <option key={effort} value={effort}>
                     {reasoningEffortLabel(effort)}
                   </option>
@@ -1749,19 +1782,10 @@ function EngineDetailPanel({
               <div className="cm-option-row">
                 <div className="cm-option-row__main">
                   <b>默认开启思考</b>
-                  <small>独立于推理强度，使用 Claude Code 的原生能力。</small>
+                  <small>暂无可靠的独立开关执行合同；思考行为由引擎与推理强度控制。</small>
                 </div>
                 <label className="cm-switch">
-                  <input
-                    type="checkbox"
-                    checked={thinkingEnabled}
-                    disabled={prefsDisabled}
-                    onChange={(event) => {
-                      const next = event.target.checked;
-                      setThinkingEnabled(next);
-                      persistPref({ thinkingEnabled: next });
-                    }}
-                  />
+                  <input type="checkbox" checked={false} disabled readOnly />
                   <i />
                 </label>
               </div>
@@ -1770,19 +1794,10 @@ function EngineDetailPanel({
               <div className="cm-option-row">
                 <div className="cm-option-row__main">
                   <b>1M 上下文</b>
-                  <small>开启时先校验当前服务商与模型能力。</small>
+                  <small>窗口大小按模型真实能力显示，暂不提供强制扩容开关。</small>
                 </div>
                 <label className="cm-switch">
-                  <input
-                    type="checkbox"
-                    checked={context1m}
-                    disabled={prefsDisabled}
-                    onChange={(event) => {
-                      const next = event.target.checked;
-                      setContext1m(next);
-                      persistPref({ context1m: next });
-                    }}
-                  />
+                  <input type="checkbox" checked={false} disabled readOnly />
                   <i />
                 </label>
               </div>
@@ -1841,15 +1856,24 @@ function EngineDetailPanel({
               <div className="pv-advsec__head">
                 <h3>环境变量</h3>
                 <button
+                  className="btn btn--primary btn--sm"
+                  type="button"
+                  disabled={savingEnv}
+                  onClick={() => persistEnv(envRows)}
+                >
+                  {savingEnv ? '正在保存…' : '保存变量'}
+                </button>
+                <button
                   className="btn btn--subtle btn--sm"
                   type="button"
                   onClick={() => setEnvRows([...envRows, { name: '', value: '' }])}
+                  disabled={savingEnv}
                 >
                   <Icon name="plus" /> 添加变量
                 </button>
               </div>
               <p className="pv-advsec__note">
-                秘密值存入系统钥匙串，预览、SQLite 与日志不回显明文。
+                变量值统一存入系统钥匙串，预览不回显明文；已保存的值留空表示保留，修改后点击保存变量。
               </p>
               {envRows.length ? (
                 <div className="pv-env">
@@ -1859,18 +1883,20 @@ function EngineDetailPanel({
                         className="input mono"
                         placeholder="变量名"
                         aria-label="变量名"
+                        disabled={savingEnv}
                         value={row.name}
                         onChange={(event) => {
                           const next = [...envRows];
                           next[index] = { ...row, name: event.target.value };
                           setEnvRows(next);
                         }}
-                        onBlur={() => persistEnv(envRows)}
                       />
                       <div className="pv-env__value">
                         <input
                           className="input mono"
-                          placeholder="变量值"
+                          type="password"
+                          placeholder={row.keyRef ? '已保存，输入新值替换' : '变量值'}
+                          disabled={savingEnv}
                           aria-label="变量值"
                           value={row.value}
                           onChange={(event) => {
@@ -1878,7 +1904,6 @@ function EngineDetailPanel({
                             next[index] = { ...row, value: event.target.value };
                             setEnvRows(next);
                           }}
-                          onBlur={() => persistEnv(envRows)}
                         />
                       </div>
                       <button
@@ -1886,10 +1911,10 @@ function EngineDetailPanel({
                         type="button"
                         title="移除变量"
                         aria-label="移除变量"
+                        disabled={savingEnv}
                         onClick={() => {
                           const next = envRows.filter((_, k) => k !== index);
                           setEnvRows(next);
-                          persistEnv(next);
                         }}
                       >
                         <Icon name="trash" />
@@ -1904,11 +1929,12 @@ function EngineDetailPanel({
             <div className="pv-advsec">
               <div className="pv-advsec__head">
                 <h3>
-                  Helm 配置 <span className="cm-source-label">{isClaude ? 'JSON' : 'TOML'}</span>
+                  Helm 配置片段 <span className="cm-source-label">JSON</span>
                 </h3>
               </div>
               <p className="pv-advsec__note">
-                受控 Profile，不修改全局配置；与上方「引擎偏好」联动，保存时自动汇总。
+                与上方环境变量共用 Helm 配置，仅编辑 CLI 路径和环境变量；不读写用户全局 CLI
+                配置。模型与推理偏好请使用上方控件。
               </p>
               <div className="engine-file">
                 <div className="engine-file__actions">
@@ -1927,11 +1953,12 @@ function EngineDetailPanel({
                       onClick={() => {
                         setFileBusy(true);
                         void writeEngineConfigFile(engine.id, fileDraft)
-                          .then((file) => {
+                          .then(async (file) => {
                             setConfigFile(file);
                             setFileDraft(file.content);
                             setEditingFile(false);
-                            onNotice('已写入真实配置文件');
+                            onConfig(await getProviderConfig());
+                            onNotice('引擎配置已保存到 Helm');
                           })
                           .catch((err: unknown) => onNotice(errorMessage(err, '保存配置文件失败')))
                           .finally(() => setFileBusy(false));
@@ -1949,7 +1976,7 @@ function EngineDetailPanel({
                   />
                 ) : (
                   <pre className="engine-file__preview mono">
-                    {configFile?.content || '真实配置文件为空或尚未创建'}
+                    {configFile?.content || '正在读取 Helm 引擎配置…'}
                   </pre>
                 )}
               </div>
@@ -2321,7 +2348,7 @@ function ProvidersGrid({
 }
 
 /** S6：服务商详情抽屉。承载既有 CRUD/探活/同步全部能力；关闭只丢弃未保存草稿。 */
-function ProviderDrawer({
+export function ProviderDrawer({
   config,
   activeProvider,
   onConfig,
@@ -2349,6 +2376,7 @@ function ProviderDrawer({
   const [apiKey, setApiKey] = useState('');
   const [showKey, setShowKey] = useState(false);
   const [editingKey, setEditingKey] = useState(false);
+  const [savingProvider, setSavingProvider] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [modelDrafts, setModelDrafts] = useState(() =>
     modelCatalogForProvider(config, activeProvider.id),
@@ -2360,9 +2388,11 @@ function ProviderDrawer({
     modelCatalogForProvider(config, activeProvider.id).map((model) => model.id),
   );
   /** 目录快照重置：切换服务商 / 同步 / 保存成功后，行与落库 ID 一并回填。 */
-  const resetRowsFromCatalog = (next: AppConfig, providerId: string) => {
+  const resetRowsFromCatalog = (next: AppConfig, providerId: string, preserveSelection = false) => {
     const catalog = modelCatalogForProvider(next, providerId);
-    setModelDrafts(catalog);
+    setModelDrafts((previous) =>
+      preserveSelection ? mergeSyncedModelSelection(catalog, previous) : catalog,
+    );
     setRowOrigins(catalog.map((model) => model.id));
   };
   const [login, setLogin] = useState<CliLoginState | null>(null);
@@ -2371,7 +2401,7 @@ function ProviderDrawer({
   const [syncedAt, setSyncedAt] = useState<number | null>(null);
   // 同步候选缓存：只喂组合框/角色下拉，不生成模型行（订阅除外——官方目录是持久来源）
   const [syncOptions, setSyncOptions] = useState<{ id: string; priceText: string }[]>([]);
-  // 定价目录候选：模型组合框下拉与模糊匹配价签共用（读取失败按空目录处理，仍可手填）
+  // 定价目录候选：模型组合框下拉与精确模型或显式别名匹配价签共用（读取失败按空目录处理，仍可手填）
   const [catalog, setCatalog] = useState<PricingCatalogEntry[]>([]);
   useEffect(() => {
     let active = true;
@@ -2428,12 +2458,13 @@ function ProviderDrawer({
   // 「同步模型」：拉取远端 /models 只作组合框/角色下拉候选，不铺到模型行；
   // 已添加的模型行原样保留。订阅服务商走落库同步（官方目录是角色行的持久来源）。
   const runSync = () => {
+    if (syncBusy || savingProvider || loginBusy !== null) return;
     if (isSub) {
       setSyncBusy(true);
       void syncProviderModels(draft.id)
         .then((next) => {
           onConfig(next);
-          resetRowsFromCatalog(next, draft.id);
+          resetRowsFromCatalog(next, draft.id, true);
           setSyncedAt(Date.now());
           onNotice('订阅模型目录已同步');
         })
@@ -2452,7 +2483,7 @@ function ProviderDrawer({
         if (saved) setDraft((prev) => ({ ...prev, lastSyncAt: saved.lastSyncAt }));
         setSyncOptions(
           listing.modelIds.map((id) => {
-            const match = fuzzyPriceMatch(catalog, id);
+            const match = catalogPriceMatch(catalog, id, draft.protocol);
             return { id, priceText: match ? catalogPriceText(match) : '未计价' };
           }),
         );
@@ -2468,7 +2499,7 @@ function ProviderDrawer({
     setShowKey(true);
     setEditingKey(true);
   };
-  // 组合框确认（选中/失焦/回车）：空值保留该行；重复 ID 提示但不删行；其余模糊匹配带出目录价
+  // 组合框确认（选中/失焦/回车）：空值保留该行；重复 ID 提示但不删行；其余精确模型或显式别名匹配带出目录价
   const commitDraftModelRow = (index: number, id: string) => {
     const decision = commitProviderModelRow(
       modelDrafts.map((item) => item.id),
@@ -2480,7 +2511,7 @@ function ProviderDrawer({
       onNotice('该模型已在目录中');
       return;
     }
-    const match = fuzzyPriceMatch(catalog, decision.id);
+    const match = catalogPriceMatch(catalog, decision.id, draft.protocol);
     setModelDrafts((prev) =>
       prev.map((item, at) =>
         at === index
@@ -2497,6 +2528,7 @@ function ProviderDrawer({
     return true;
   };
   const runLoginAction = (action: 'refresh' | 'logout' | 'login') => {
+    if (loginBusy !== null || savingProvider || syncBusy) return;
     setLoginBusy(action);
     const work =
       action === 'refresh'
@@ -2508,21 +2540,27 @@ function ProviderDrawer({
       .then((state) => {
         setLogin(state);
         if (action === 'logout') onNotice('已退出 Helm 隔离登录');
-        else if (action === 'login') onNotice('登录完成，正在同步订阅模型目录');
+        else if (state.state !== 'ok' || state.authMethod !== 'subscription') {
+          onNotice(state.detail || '订阅登录未完成，请重新登录');
+        } else if (action === 'login') onNotice('登录完成，正在同步订阅模型目录');
         else onNotice('登录状态已刷新');
+        if (state.state !== 'ok' || state.authMethod !== 'subscription') return;
         return syncProviderModels(draft.id)
           .then((next) => {
             onConfig(next);
-            resetRowsFromCatalog(next, draft.id);
+            resetRowsFromCatalog(next, draft.id, action === 'refresh');
             if (action === 'refresh') onNotice('登录状态已刷新，订阅模型目录已同步');
           })
-          .catch(() => undefined);
+          .catch((err: unknown) =>
+            onNotice(errorMessage(err, '登录状态已更新，但订阅模型同步失败')),
+          );
       })
       .catch((err: unknown) => onNotice(errorMessage(err, '登录操作失败')))
       .finally(() => setLoginBusy(null));
   };
   const saveProvider = () => {
-    if (requireApiKeyWhenEditing()) return;
+    if (savingProvider || syncBusy || loginBusy !== null || requireApiKeyWhenEditing()) return;
+    setSavingProvider(true);
     // 改名检测：行的落库来源 ID 与当前 ID 不同 → 该行是「改名」而非「删旧建新」。
     // 在用（被绑定引用）的模型也允许改名，但必须先走后端 rename_provider_model：
     // 它会级联同服务商 binding 的 primary/fast/assistant 与全库会话 preferred_model，
@@ -2531,51 +2569,31 @@ function ProviderDrawer({
     const renamedRows: { oldId: string; index: number }[] = [];
     const seenOrigins = new Set<string>();
     modelDrafts.forEach((model, index) => {
+      if (isSub) return;
       const origin = rowOrigins[index] ?? null;
       const currentId = model.id.trim();
       if (!origin || !currentId || origin === currentId || seenOrigins.has(origin)) return;
       seenOrigins.add(origin);
       renamedRows.push({ oldId: origin, index });
     });
-    const runModelSaves = (): Promise<AppConfig> => {
-      if (mode !== 'list-openai') return Promise.reject(new Error('该模式下无模型目录操作'));
-      // 1) 先逐个改名（顺序执行，避免后端目录并发写竞争）
-      const runRenames = async (): Promise<void> => {
-        for (const renamed of renamedRows) {
-          const target = modelDrafts[renamed.index];
-          await renameProviderModel(draft.id, renamed.oldId, target.id.trim());
-        }
-      };
-      // 2) 再落完整目录与勾选集（两条命令，与服务商添加流程同口径）
-      return runRenames().then(() => {
-        const savedDrafts = modelDrafts.filter((model) => model.id.trim() !== '');
-        // 注意：renameProviderModel 返回的 config 已含改名结果，但这里统一以
-        // save_provider_models_config 传入的草稿为准（含新行/删除行/价格编辑）。
-        return saveProviderModelsConfig(draft.id, savedDrafts).then((afterModels) =>
-          saveProviderModelSelection(
-            draft.id,
-            savedDrafts.filter((model) => model.enabled).map((model) => model.id),
-          ).then(() => afterModels),
-        );
-      });
-    };
-    void saveProviderConfig(draft, apiKey)
-      .then((next) => {
-        onConfig(next);
-        if (mode === 'list-openai') {
-          // 模型目录与启用集分两条命令持久化：save_models_for_provider 会保留旧 enabled，
-          // 勾选状态必须经 save_provider_model_selection 落库（否则开关永远不生效）。
-          return runModelSaves();
-        }
-        return next;
-      })
+    const savedDrafts = modelDrafts.filter((model) => model.id.trim() !== '');
+    void saveProviderConfig(
+      draft,
+      isSub ? undefined : apiKey,
+      mode === 'list-openai' ? savedDrafts : undefined,
+      mode === 'list-openai' && !isSub
+        ? renamedRows.map((row): [string, string] => [row.oldId, modelDrafts[row.index].id.trim()])
+        : [],
+    )
       .then((next) => {
         onConfig(next);
         resetRowsFromCatalog(next, draft.id);
+        const savedProvider = next.providers.find((provider) => provider.id === draft.id);
+        if (savedProvider) setDraft(savedProvider);
         onNotice(
           renamedRows.length > 0
             ? '服务商配置已保存；模型已改名，相关绑定与会话偏好已同步'
-            : '服务商配置已保存；当前引擎绑定未改变',
+            : '服务商与模型配置已保存；相关引用已按启用模型更新',
         );
         setApiKey('');
         setShowKey(false);
@@ -2583,7 +2601,13 @@ function ProviderDrawer({
       })
       .catch((err: unknown) => {
         onNotice(errorMessage(err, '保存服务商失败'));
-      });
+        if (errorMessage(err, '').startsWith('配置已保存')) {
+          void getProviderConfig()
+            .then(onConfig)
+            .catch(() => undefined);
+        }
+      })
+      .finally(() => setSavingProvider(false));
   };
   const providerModelCount = config.models.filter((model) => model.providerId === draft.id).length;
   const providerBindingCount = config.bindings.filter(
@@ -2605,7 +2629,7 @@ function ProviderDrawer({
   const syncPriceText = (id: string) => {
     const hit = syncOptions.find((option) => option.id === id);
     if (hit) return hit.priceText;
-    const match = fuzzyPriceMatch(catalog, id);
+    const match = catalogPriceMatch(catalog, id, draft.protocol);
     return match ? catalogPriceText(match) : '未计价';
   };
 
@@ -2697,7 +2721,7 @@ function ProviderDrawer({
                     <button
                       className="cm-action"
                       type="button"
-                      disabled={loginBusy !== null}
+                      disabled={loginBusy !== null || savingProvider || syncBusy}
                       onClick={() => runLoginAction('refresh')}
                     >
                       <Icon name="refresh" /> 刷新登录状态
@@ -2706,7 +2730,7 @@ function ProviderDrawer({
                       <button
                         className="cm-action"
                         type="button"
-                        disabled={loginBusy !== null}
+                        disabled={loginBusy !== null || savingProvider || syncBusy}
                         onClick={() => runLoginAction('logout')}
                       >
                         {loginBusy === 'logout' ? '正在退出…' : '退出登录'}
@@ -2715,7 +2739,7 @@ function ProviderDrawer({
                       <button
                         className="cm-action cm-action--primary"
                         type="button"
-                        disabled={loginBusy !== null}
+                        disabled={loginBusy !== null || savingProvider || syncBusy}
                         onClick={() => runLoginAction('login')}
                       >
                         {loginBusy === 'login' ? '等待浏览器授权…' : '前往登录'}
@@ -2762,7 +2786,7 @@ function ProviderDrawer({
                 <h3>模型配置</h3>
                 <small>
                   {isSub
-                    ? `来自 ${engineId === 'claude-code' ? 'Claude Code' : 'Codex'} 订阅官方目录，按订阅折算计费`
+                    ? `来自 ${engineId === 'claude-code' ? 'Claude Code' : 'Codex'} 订阅官方目录；只能勾选，点击保存生效。`
                     : `${lastSyncTimeText(draft, modelDrafts.length > 0)} · ${modelCalibrationLabel(draft)}`}
                 </small>
               </div>
@@ -2772,20 +2796,25 @@ function ProviderDrawer({
                 >
                   {modelDrafts.length > 0 ? `${modelDrafts.length} 个模型` : '未同步'}
                 </span>
-                {!isSub ? (
-                  <button className="cm-action" type="button" disabled={syncBusy} onClick={runSync}>
-                    <Icon name="refresh" className={syncBusy ? 'spin' : undefined} /> 同步模型
-                  </button>
-                ) : null}
+                <button
+                  className="cm-action"
+                  type="button"
+                  disabled={syncBusy || savingProvider || loginBusy !== null}
+                  onClick={runSync}
+                >
+                  <Icon name="refresh" className={syncBusy ? 'spin' : undefined} /> 同步模型
+                </button>
               </span>
             </div>
             {mode === 'list-openai' ? (
               <>
                 {modelDrafts.length === 0 ? (
                   <div className="pv-empty">
-                    {syncedAt
-                      ? '还没有添加模型 · 点下方「添加模型」从候选中选择'
-                      : '还没有添加模型 · 建议先「同步模型」获取候选，也可直接手动填写'}
+                    {isSub
+                      ? '暂无订阅模型，请先登录并同步官方目录。'
+                      : syncedAt
+                        ? '还没有添加模型 · 点下方「添加模型」从候选中选择'
+                        : '还没有添加模型 · 建议先「同步模型」获取候选，也可直接手动填写'}
                   </div>
                 ) : (
                   <div>
@@ -2795,6 +2824,8 @@ function ProviderDrawer({
                           <input
                             type="checkbox"
                             checked={model.enabled}
+                            aria-label={`启用 ${model.id}`}
+                            disabled={syncBusy || savingProvider || loginBusy !== null}
                             onChange={() =>
                               setModelDrafts(
                                 modelDrafts.map((item, at) =>
@@ -2805,13 +2836,17 @@ function ProviderDrawer({
                           />
                           <i />
                         </label>
-                        <ModelIdCombo
-                          value={model.id}
-                          options={syncOptions}
-                          taken={modelDrafts.map((item) => item.id.trim()).filter(Boolean)}
-                          autoOpen={!model.id.trim() && syncOptions.length > 0}
-                          onCommit={(id) => commitDraftModelRow(index, id)}
-                        />
+                        {isSub ? (
+                          <span className="mono">{model.id}</span>
+                        ) : (
+                          <ModelIdCombo
+                            value={model.id}
+                            options={syncOptions}
+                            taken={modelDrafts.map((item) => item.id.trim()).filter(Boolean)}
+                            autoOpen={!model.id.trim() && syncOptions.length > 0}
+                            onCommit={(id) => commitDraftModelRow(index, id)}
+                          />
+                        )}
                         <span className="pv-mline__end">
                           <span
                             className={
@@ -2835,35 +2870,39 @@ function ProviderDrawer({
                               改价
                             </button>
                           ) : null}
-                          <button
-                            className="btn-icon"
-                            type="button"
-                            aria-label="移除模型"
-                            title="移除模型"
-                            onClick={() => {
-                              setModelDrafts(modelDrafts.filter((_, at) => at !== index));
-                              setRowOrigins(rowOrigins.filter((_, at) => at !== index));
-                            }}
-                          >
-                            <Icon name="trash" />
-                          </button>
+                          {!isSub ? (
+                            <button
+                              className="btn-icon"
+                              type="button"
+                              aria-label="移除模型"
+                              title="移除模型"
+                              onClick={() => {
+                                setModelDrafts(modelDrafts.filter((_, at) => at !== index));
+                                setRowOrigins(rowOrigins.filter((_, at) => at !== index));
+                              }}
+                            >
+                              <Icon name="trash" />
+                            </button>
+                          ) : null}
                         </span>
                       </div>
                     ))}
                   </div>
                 )}
-                <div className="pv-synclist__add pv-synclist__add--solo">
-                  <button
-                    className="cm-action"
-                    type="button"
-                    onClick={() => {
-                      setModelDrafts([...modelDrafts, buildManualModel(draft.id, '', null)]);
-                      setRowOrigins([...rowOrigins, '']);
-                    }}
-                  >
-                    <Icon name="plus" /> 添加模型
-                  </button>
-                </div>
+                {!isSub ? (
+                  <div className="pv-synclist__add pv-synclist__add--solo">
+                    <button
+                      className="cm-action"
+                      type="button"
+                      onClick={() => {
+                        setModelDrafts([...modelDrafts, buildManualModel(draft.id, '', null)]);
+                        setRowOrigins([...rowOrigins, '']);
+                      }}
+                    >
+                      <Icon name="plus" /> 添加模型
+                    </button>
+                  </div>
+                ) : null}
               </>
             ) : (
               <>
@@ -2957,7 +2996,12 @@ function ProviderDrawer({
               >
                 去绑定
               </button>
-              <button className="cm-action cm-action--primary" type="button" onClick={saveProvider}>
+              <button
+                className="cm-action cm-action--primary"
+                type="button"
+                onClick={saveProvider}
+                disabled={savingProvider || syncBusy || loginBusy !== null}
+              >
                 保存修改
               </button>
             </span>
@@ -3538,7 +3582,10 @@ function ModelAccessRow({
     <div className="pv-path">
       <span className="pv-path__main">
         <b>{provider.name}</b>
-        <small>{model.id}</small>
+        <small>
+          {model.id}
+          {path.roles?.length ? ` · 角色：${path.roles.join(' / ')}` : ''}
+        </small>
       </span>
       <span className="pv-path__billing">{path.billing}</span>
       <span className={'pv-path__price' + (tokenPriced ? '' : ' pv-plan')}>
@@ -3557,10 +3604,18 @@ function ModelAccessRow({
           `输入 ${priceText(model.inputPricePerMtok)} · 输出 ${priceText(model.outputPricePerMtok)}`
         )}
       </span>
-      <label className="cm-switch pv-path__switch" title="启用 / 停用该接入路径">
+      <label
+        className="cm-switch pv-path__switch"
+        title={
+          path.roles?.length
+            ? '角色模型在服务商详情的角色行中配置，不单独启用/停用'
+            : '启用 / 停用该接入路径'
+        }
+      >
         <input
           type="checkbox"
           checked={model.enabled}
+          disabled={Boolean(path.roles?.length)}
           onChange={() => {
             void saveModelConfig({ ...model, enabled: !model.enabled })
               .then(onConfig)

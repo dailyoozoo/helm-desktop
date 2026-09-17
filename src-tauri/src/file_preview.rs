@@ -140,6 +140,39 @@ pub fn read_file_preview(path: String) -> Result<FilePreview, String> {
     })
 }
 
+/// Office 内嵌预览（xlsx/docx 由前端 JS 库解析）允许的最大字节数。
+const MAX_OFFICE_PREVIEW_BYTES: u64 = 20 * 1024 * 1024;
+
+/// 二进制文件的 base64 字节结果（供前端 SheetJS/mammoth 渲染）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FileBytesPreview {
+    pub content: String,
+    pub size: u64,
+}
+
+/// 读取二进制文件的 base64 内容（只读；敏感路径与大小上限保护同 `read_file_preview`）。
+#[tauri::command]
+pub fn read_file_preview_bytes(path: String) -> Result<FileBytesPreview, String> {
+    let resolved = PathBuf::from(&path);
+    if sensitive_path(&resolved) {
+        return Err("该路径属于系统敏感目录，Helm 拒绝预览".to_string());
+    }
+    if !resolved.is_file() {
+        return Err(format!("文件不存在或不是普通文件：{path}"));
+    }
+    let (bytes, size, truncated) = read_sized(&resolved, MAX_OFFICE_PREVIEW_BYTES)?;
+    if truncated {
+        return Err(format!(
+            "文件过大（{size} 字节），超过内嵌预览上限（{MAX_OFFICE_PREVIEW_BYTES} 字节）"
+        ));
+    }
+    Ok(FileBytesPreview {
+        content: base64::engine::general_purpose::STANDARD.encode(bytes),
+        size,
+    })
+}
+
 /// 用系统默认程序打开文件/目录（供二进制或需要在外部查看的文件使用）。
 #[tauri::command]
 pub fn open_path_in_system(path: String) -> Result<(), String> {
@@ -229,6 +262,32 @@ mod tests {
     #[test]
     fn missing_file_is_rejected() {
         let err = read_file_preview("C:/definitely/not/exist.txt".to_string()).unwrap_err();
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn bytes_preview_returns_base64() {
+        use base64::Engine;
+        let payload = b"PK\x03\x04 helm-bytes-test".to_vec();
+        let path = temp_file("sheet.xlsx", &payload);
+        let result = super::read_file_preview_bytes(path.to_string_lossy().to_string()).unwrap();
+        assert_eq!(result.size, payload.len() as u64);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&result.content)
+                .unwrap(),
+            payload
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn bytes_preview_rejects_sensitive_and_missing() {
+        let err = super::read_file_preview_bytes("C:/Users/test/.ssh/id_rsa".to_string())
+            .unwrap_err();
+        assert!(err.contains("敏感"));
+        let err = super::read_file_preview_bytes("C:/definitely/not/exist.docx".to_string())
+            .unwrap_err();
         assert!(!err.is_empty());
     }
 }

@@ -7,10 +7,7 @@ export interface ActivityLogGroup {
 }
 
 const isActivityItem = (item: ThreadItem) =>
-  item.kind === 'tool' ||
-  item.kind === 'checkpoint' ||
-  item.kind === 'approval' ||
-  item.kind === 'plan';
+  item.kind === 'tool' || item.kind === 'approval' || item.kind === 'plan';
 
 export function activityLogGroups(items: ThreadItem[]): ActivityLogGroup[] {
   const groups: ActivityLogGroup[] = [];

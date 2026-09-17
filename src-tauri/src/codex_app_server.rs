@@ -543,15 +543,15 @@ fn trace_outbound(value: &serde_json::Value) {
         {
             detail.push_str(&format!(" command_len={}", command.chars().count()));
         }
-        eprintln!("[codex-trace] outbound request id={id} method={method}{detail}");
+        log::debug!("[codex-trace] outbound request id={id} method={method}{detail}");
     } else if value.get("result").is_some() {
         let decision = value
             .pointer("/result/decision")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("none");
-        eprintln!("[codex-trace] outbound response id={id} result=present decision={decision}");
+        log::debug!("[codex-trace] outbound response id={id} result=present decision={decision}");
     } else if value.get("error").is_some() {
-        eprintln!("[codex-trace] outbound response id={id} result=error");
+        log::debug!("[codex-trace] outbound response id={id} result=error");
     }
 }
 
@@ -571,7 +571,7 @@ fn trace_inbound(value: &serde_json::Value) {
                 .pointer("/params/command")
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|command| command.contains("codex-command-approval-check"));
-            eprintln!(
+            log::debug!(
                 "[codex-trace] inbound server_request id={id} method={method} command_len={command_len} targets_probe_file={command_targets_probe_file}"
             );
         } else {
@@ -615,14 +615,14 @@ fn trace_inbound(value: &serde_json::Value) {
                     }
                 }
             }
-            eprintln!(
+            log::debug!(
                 "[codex-trace] inbound notification method={method} item={item_type} status={status}{detail}"
             );
         }
     } else if value.get("result").is_some() {
-        eprintln!("[codex-trace] inbound response id={id} result=present");
+        log::debug!("[codex-trace] inbound response id={id} result=present");
     } else if value.get("error").is_some() {
-        eprintln!("[codex-trace] inbound response id={id} result=error");
+        log::debug!("[codex-trace] inbound response id={id} result=error");
     }
 }
 

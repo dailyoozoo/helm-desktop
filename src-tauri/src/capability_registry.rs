@@ -1,3 +1,4 @@
+use crate::probe_cache::{AsyncProbeCache, PROBE_INVALIDATED};
 use crate::protocol::{RuntimeCapabilityAvailability, RuntimeCapabilitySnapshot};
 use crate::reasoning::{ReasoningEffort, ReasoningEffortCapability, ReasoningEffortSupport};
 use crate::sessions::SessionHistoryStore;
@@ -5,12 +6,16 @@ use crate::turn_start::{digest_json, RuntimeRoute};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 pub const CAPABILITY_PROBE_DEADLINE: Duration = Duration::from_secs(15);
 pub const CAPABILITY_PROBE_OUTPUT_LIMIT: usize = 256 * 1024;
+const CAPABILITY_CACHE_TTL: Duration = Duration::from_secs(300);
+const BINARY_IDENTITY_CACHE_TTL: Duration = Duration::from_secs(30);
+const PROBE_CACHE_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -195,14 +200,16 @@ fn availability(support: CapabilitySupport) -> RuntimeCapabilityAvailability {
 #[derive(Clone)]
 pub struct EngineCapabilityRegistry {
     history: SessionHistoryStore,
-    memory: Arc<Mutex<HashMap<String, EngineCapabilitySnapshot>>>,
+    probes: AsyncProbeCache<EngineCapabilitySnapshot>,
+    invalidated_at: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 impl EngineCapabilityRegistry {
     pub fn new(history: SessionHistoryStore) -> Self {
         Self {
             history,
-            memory: Arc::new(Mutex::new(HashMap::new())),
+            probes: AsyncProbeCache::new(CAPABILITY_CACHE_TTL, PROBE_CACHE_CAPACITY),
+            invalidated_at: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -216,45 +223,126 @@ impl EngineCapabilityRegistry {
         Fut: std::future::Future<Output = Result<(CapabilitySet, String), String>>,
     {
         let cache_key = identity.cache_key()?;
-        if let Some(snapshot) = self
-            .memory
-            .lock()
-            .map_err(|_| "Capability Registry 内存缓存锁中毒".to_string())?
-            .get(&cache_key)
-            .cloned()
-        {
-            return Ok(snapshot);
-        }
-        if let Some(snapshot) = self.history.load_capability_snapshot(&cache_key)? {
-            self.memory
-                .lock()
-                .map_err(|_| "Capability Registry 内存缓存锁中毒".to_string())?
-                .insert(cache_key, snapshot.clone());
-            return Ok(snapshot);
-        }
-        let (capabilities, probe_kind) = tokio::time::timeout(CAPABILITY_PROBE_DEADLINE, probe())
+        let memory_key = format!("{}:{cache_key}", identity.engine_id);
+        self.probes
+            .get_or_probe_if(
+                memory_key,
+                |token| async move {
+                    let cached = {
+                        let invalidated = self
+                            .invalidated_at
+                            .lock()
+                            .map_err(|_| "Capability Registry 发布锁中毒".to_string())?;
+                        self.history
+                            .load_capability_snapshot(&cache_key)?
+                            .filter(|snapshot| {
+                                capability_snapshot_is_fresh(
+                                    snapshot,
+                                    invalidated.get(&identity.engine_id).copied(),
+                                )
+                            })
+                    };
+                    if let Some(snapshot) = cached {
+                        return Ok(snapshot);
+                    }
+                    let (mut capabilities, probe_kind) =
+                        tokio::time::timeout(CAPABILITY_PROBE_DEADLINE, probe())
+                            .await
+                            .map_err(|_| {
+                                "[capability_probe_timeout] Engine 能力握手超时".to_string()
+                            })??;
+                    let invalidated = self
+                        .invalidated_at
+                        .lock()
+                        .map_err(|_| "Capability Registry 发布锁中毒".to_string())?;
+                    if !token.is_current() {
+                        return Err(PROBE_INVALIDATED.to_string());
+                    }
+                    let previous = self.history.load_capability_snapshot(&cache_key)?;
+                    if let Some(previous) = &previous {
+                        preserve_runtime_evidence(&mut capabilities, &previous.capabilities);
+                    }
+                    let probed_at = crate::util::now_millis().max(
+                        invalidated
+                            .get(&identity.engine_id)
+                            .copied()
+                            .unwrap_or_default()
+                            .saturating_add(1),
+                    );
+                    let id = match &previous {
+                        Some(previous) => previous.id.clone(),
+                        None => digest_json(&(&identity, &capabilities, &probe_kind, probed_at))?,
+                    };
+                    let snapshot = EngineCapabilitySnapshot {
+                        id,
+                        identity,
+                        capabilities,
+                        probe_kind,
+                        probed_at,
+                    };
+                    if previous.is_some() {
+                        self.history
+                            .update_capability_snapshot(&cache_key, &snapshot)?;
+                    } else {
+                        self.history
+                            .save_capability_snapshot(&cache_key, &snapshot)?;
+                    }
+                    Ok(snapshot)
+                },
+                |snapshot| capability_snapshot_is_fresh(snapshot, None),
+            )
             .await
-            .map_err(|_| "[capability_probe_timeout] Engine 能力握手超时".to_string())??;
-        let probed_at = crate::util::now_millis();
-        let id = digest_json(&(&identity, &capabilities, &probe_kind, probed_at))?;
-        let snapshot = EngineCapabilitySnapshot {
-            id,
-            identity,
-            capabilities,
-            probe_kind,
-            probed_at,
-        };
-        self.history
-            .save_capability_snapshot(&cache_key, &snapshot)?;
-        let snapshot = self
+    }
+
+    pub fn invalidate_engine(&self, engine: &str) -> Result<(), String> {
+        if !matches!(engine, "claude-code" | "codex") {
+            return Err(format!("未知引擎：{engine}"));
+        }
+        let mut invalidated = self
+            .invalidated_at
+            .lock()
+            .map_err(|_| "Capability Registry 发布锁中毒".to_string())?;
+        let invalidated_at = crate::util::now_millis().max(
+            invalidated
+                .get(engine)
+                .copied()
+                .unwrap_or_default()
+                .saturating_add(1),
+        );
+        invalidated.insert(engine.to_string(), invalidated_at);
+        let prefix = format!("{engine}:");
+        self.probes.invalidate_where(|key| key.starts_with(&prefix))
+    }
+
+    fn record_runtime_observation(
+        &self,
+        snapshot: &EngineCapabilitySnapshot,
+        update: impl FnOnce(&mut CapabilitySet),
+    ) -> Result<EngineCapabilitySnapshot, String> {
+        let cache_key = snapshot.identity.cache_key()?;
+        let invalidated = self
+            .invalidated_at
+            .lock()
+            .map_err(|_| "Capability Registry 发布锁中毒".to_string())?;
+        let mut updated = self
             .history
             .load_capability_snapshot(&cache_key)?
-            .ok_or_else(|| "CapabilitySnapshot 持久化后不可见".to_string())?;
-        self.memory
-            .lock()
-            .map_err(|_| "Capability Registry 内存缓存锁中毒".to_string())?
-            .insert(cache_key, snapshot.clone());
-        Ok(snapshot)
+            .ok_or_else(|| "CapabilitySnapshot 更新目标不存在".to_string())?;
+        update(&mut updated.capabilities);
+        updated.probed_at = crate::util::now_millis().max(
+            invalidated
+                .get(&updated.identity.engine_id)
+                .copied()
+                .unwrap_or_default()
+                .saturating_add(1),
+        );
+        self.history
+            .update_capability_snapshot(&cache_key, &updated)?;
+        self.probes.put(
+            format!("{}:{cache_key}", updated.identity.engine_id),
+            updated.clone(),
+        )?;
+        Ok(updated)
     }
 
     pub fn record_auto_review_degraded(
@@ -268,63 +356,39 @@ impl EngineCapabilityRegistry {
         ) {
             return Err("拒绝用非兼容性拒绝污染 Auto capability".to_string());
         }
-        let cache_key = snapshot.identity.cache_key()?;
-        let mut updated = snapshot.clone();
-        updated.capabilities.auto_approval = CapabilityEvidence::new(
-            CapabilitySupport::Degraded,
-            "claude_runtime_denial",
-            evidence_code,
-        );
-        updated.probed_at = crate::util::now_millis();
-        self.history
-            .update_capability_snapshot(&cache_key, &updated)?;
-        self.memory
-            .lock()
-            .map_err(|_| "Capability Registry 内存缓存锁中毒".to_string())?
-            .insert(cache_key, updated.clone());
-        Ok(updated)
+        self.record_runtime_observation(snapshot, |capabilities| {
+            capabilities.auto_approval = CapabilityEvidence::new(
+                CapabilitySupport::Degraded,
+                "claude_runtime_denial",
+                evidence_code,
+            );
+        })
     }
 
     pub fn record_auto_review_native(
         &self,
         snapshot: &EngineCapabilitySnapshot,
     ) -> Result<EngineCapabilitySnapshot, String> {
-        let cache_key = snapshot.identity.cache_key()?;
-        let mut updated = snapshot.clone();
-        updated.capabilities.auto_approval = CapabilityEvidence::new(
-            CapabilitySupport::Supported,
-            "claude_runtime_success",
-            "claude_native_auto_turn_completed",
-        );
-        updated.probed_at = crate::util::now_millis();
-        self.history
-            .update_capability_snapshot(&cache_key, &updated)?;
-        self.memory
-            .lock()
-            .map_err(|_| "Capability Registry 内存缓存锁中毒".to_string())?
-            .insert(cache_key, updated.clone());
-        Ok(updated)
+        self.record_runtime_observation(snapshot, |capabilities| {
+            capabilities.auto_approval = CapabilityEvidence::new(
+                CapabilitySupport::Supported,
+                "claude_runtime_success",
+                "claude_native_auto_turn_completed",
+            );
+        })
     }
 
     pub fn record_web_search_native(
         &self,
         snapshot: &EngineCapabilitySnapshot,
     ) -> Result<EngineCapabilitySnapshot, String> {
-        let cache_key = snapshot.identity.cache_key()?;
-        let mut updated = snapshot.clone();
-        updated.capabilities.search = CapabilityEvidence::new(
-            CapabilitySupport::Supported,
-            "codex_runtime_observation",
-            "codex_native_web_search_item_observed",
-        );
-        updated.probed_at = crate::util::now_millis();
-        self.history
-            .update_capability_snapshot(&cache_key, &updated)?;
-        self.memory
-            .lock()
-            .map_err(|_| "Capability Registry 内存缓存锁中毒".to_string())?
-            .insert(cache_key, updated.clone());
-        Ok(updated)
+        self.record_runtime_observation(snapshot, |capabilities| {
+            capabilities.search = CapabilityEvidence::new(
+                CapabilitySupport::Supported,
+                "codex_runtime_observation",
+                "codex_native_web_search_item_observed",
+            );
+        })
     }
 
     pub fn record_web_search_unavailable(
@@ -332,50 +396,114 @@ impl EngineCapabilityRegistry {
         snapshot: &EngineCapabilitySnapshot,
         diagnostic: &str,
     ) -> Result<EngineCapabilitySnapshot, String> {
-        let cache_key = snapshot.identity.cache_key()?;
-        let mut updated = snapshot.clone();
-        updated.capabilities.search = CapabilityEvidence::new(
-            CapabilitySupport::Unsupported,
-            "codex_runtime_observation",
-            diagnostic,
-        );
-        updated.probed_at = crate::util::now_millis();
-        self.history
-            .update_capability_snapshot(&cache_key, &updated)?;
-        self.memory
-            .lock()
-            .map_err(|_| "Capability Registry 内存缓存锁中毒".to_string())?
-            .insert(cache_key, updated.clone());
-        Ok(updated)
+        self.record_runtime_observation(snapshot, |capabilities| {
+            capabilities.search = CapabilityEvidence::new(
+                CapabilitySupport::Unsupported,
+                "codex_runtime_observation",
+                diagnostic,
+            );
+        })
     }
 }
 
+fn capability_snapshot_is_fresh(
+    snapshot: &EngineCapabilitySnapshot,
+    invalidated_at: Option<i64>,
+) -> bool {
+    let now = crate::util::now_millis();
+    snapshot.probed_at <= now.saturating_add(1000)
+        && now.saturating_sub(snapshot.probed_at) < CAPABILITY_CACHE_TTL.as_millis() as i64
+        && invalidated_at.is_none_or(|invalidated| snapshot.probed_at > invalidated)
+}
+
+fn preserve_runtime_evidence(capabilities: &mut CapabilitySet, previous: &CapabilitySet) {
+    if matches!(
+        previous.auto_approval.source.as_str(),
+        "claude_runtime_denial" | "claude_runtime_success"
+    ) {
+        capabilities.auto_approval = previous.auto_approval.clone();
+    }
+    if previous.search.source == "codex_runtime_observation" {
+        capabilities.search = previous.search.clone();
+    }
+}
+
+type BinaryIdentityKey = (PathBuf, u64, SystemTime);
+
+fn binary_identity_cache() -> &'static Mutex<HashMap<BinaryIdentityKey, (String, Instant)>> {
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<BinaryIdentityKey, (String, Instant)>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 pub fn binary_identity(configured_bin: &str) -> Result<String, String> {
-    let path = resolve_binary_path(configured_bin)?;
+    let path = resolve_binary_path(configured_bin)?
+        .canonicalize()
+        .map_err(|error| format!("解析 Engine 二进制路径失败：{error}"))?;
     let metadata = std::fs::metadata(&path)
         .map_err(|error| format!("读取 Engine 二进制元数据失败：{error}"))?;
     if metadata.len() > 128 * 1024 * 1024 {
         return Err("Engine 二进制超过 capability identity 读取上限".to_string());
     }
-    let bytes = std::fs::read(&path).map_err(|error| format!("读取 Engine 二进制失败：{error}"))?;
-    let canonical = path
-        .canonicalize()
-        .unwrap_or(path)
-        .to_string_lossy()
-        .to_string();
     let modified = metadata
         .modified()
-        .ok()
-        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|value| value.as_nanos())
-        .unwrap_or_default();
-    Ok(format!(
+        .map_err(|error| format!("读取 Engine 二进制时间失败：{error}"))?;
+    let key = (path.clone(), metadata.len(), modified);
+    let mut cache = binary_identity_cache()
+        .lock()
+        .map_err(|_| "Engine 二进制身份缓存锁中毒".to_string())?;
+    cache.retain(|_, (_, checked_at)| checked_at.elapsed() < BINARY_IDENTITY_CACHE_TTL);
+    if let Some((identity, _)) = cache.get(&key) {
+        return Ok(identity.clone());
+    }
+    let mut file =
+        std::fs::File::open(&path).map_err(|error| format!("读取 Engine 二进制失败：{error}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut read_bytes = 0_u64;
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| format!("读取 Engine 二进制失败：{error}"))?;
+        if count == 0 {
+            break;
+        }
+        read_bytes = read_bytes.saturating_add(count as u64);
+        if read_bytes > 128 * 1024 * 1024 {
+            return Err("Engine 二进制超过 capability identity 读取上限".to_string());
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let latest = file
+        .metadata()
+        .map_err(|error| format!("读取 Engine 二进制元数据失败：{error}"))?;
+    if read_bytes != metadata.len()
+        || latest.len() != metadata.len()
+        || latest.modified().ok() != Some(modified)
+    {
+        return Err("Engine 二进制在探测期间发生变化，请重试".to_string());
+    }
+    let identity = format!(
         "{}:{}:{}:sha256:{:x}",
-        canonical,
+        path.to_string_lossy(),
         metadata.len(),
-        modified,
-        Sha256::digest(bytes)
-    ))
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        hasher.finalize(),
+    );
+    if cache.len() >= PROBE_CACHE_CAPACITY {
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, (_, checked_at))| *checked_at)
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(key, (identity.clone(), Instant::now()));
+    Ok(identity)
 }
 
 pub fn launch_profile_identity(
@@ -415,33 +543,37 @@ pub fn launch_profile_identity(
     ))
 }
 
-fn resolve_binary_path(configured_bin: &str) -> Result<PathBuf, String> {
+pub(crate) fn resolve_binary_path(configured_bin: &str) -> Result<PathBuf, String> {
     let candidate = Path::new(configured_bin);
     if candidate.is_file() {
         return Ok(candidate.to_path_buf());
     }
-    let output = if cfg!(windows) {
-        let mut probe = std::process::Command::new("where.exe");
-        probe.arg(configured_bin);
-        use std::os::windows::process::CommandExt as _;
-        probe.creation_flags(0x0800_0000);
-        probe.output()
-    } else {
-        std::process::Command::new("which")
-            .arg(configured_bin)
-            .output()
-    }
-    .map_err(|error| format!("定位 Engine 二进制失败：{error}"))?;
-    if !output.status.success() {
+    if configured_bin.trim().is_empty() || candidate.components().count() != 1 {
         return Err(format!("找不到 Engine 二进制：{configured_bin}"));
     }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(PathBuf::from)
-        .find(|path| path.is_file())
-        .ok_or_else(|| format!("找不到 Engine 二进制：{configured_bin}"))
+    let extensions = if cfg!(windows) && candidate.extension().is_none() {
+        let mut extensions = std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+            .split(';')
+            .filter(|extension| extension.starts_with('.'))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        extensions.push(String::new());
+        extensions
+    } else {
+        vec![String::new()]
+    };
+    if let Some(search_path) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&search_path) {
+            for extension in &extensions {
+                let path = directory.join(format!("{configured_bin}{extension}"));
+                if path.is_file() {
+                    return Ok(path);
+                }
+            }
+        }
+    }
+    Err(format!("找不到 Engine 二进制：{configured_bin}"))
 }
 
 pub fn bounded_probe_output(stdout: &[u8], stderr: &[u8]) -> Result<String, String> {
@@ -722,6 +854,366 @@ pub fn resume_strategy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn probe_registry() -> (EngineCapabilityRegistry, CapabilityIdentity, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "helm-probe-cache-{}-{}.sqlite",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let registry = EngineCapabilityRegistry::new(SessionHistoryStore::new(path.clone()));
+        let identity = CapabilityIdentity {
+            engine_id: "codex".into(),
+            adapter_version: "test".into(),
+            binary_identity: "configured:sha256:test".into(),
+            engine_profile_digest: "engine:test".into(),
+            provider_launch_profile_ref: "provider:test".into(),
+            provider_launch_profile_digest: "provider:digest".into(),
+            launch_profile_identity: "launch:test".into(),
+            model_capability_key: "test-model".into(),
+        };
+        (registry, identity, path)
+    }
+
+    #[tokio::test]
+    async fn capability_probes_merge_concurrent_requests() {
+        let (registry, identity, path) = probe_registry();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let probe = || async {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            Ok((CapabilitySet::unknown("shared"), "test".into()))
+        };
+        let (first, second) = tokio::join!(
+            registry.resolve(identity.clone(), probe),
+            registry.resolve(identity, probe)
+        );
+        assert_eq!(first.unwrap(), second.unwrap());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn isolated_auth_updates_do_not_reuse_another_account_capabilities() {
+        let (registry, _, database_path) = probe_registry();
+        let config_dir = database_path.with_extension("profiles");
+        let profiles =
+            crate::subscription_profiles::SubscriptionProfileStore::new(config_dir.clone());
+        let unrelated_profile = config_dir.join("unrelated-profile");
+        std::fs::create_dir_all(&unrelated_profile).unwrap();
+
+        for (engine, auth_file) in [("codex", "auth.json"), ("claude-code", ".credentials.json")] {
+            let profile_home = profiles.profile_dir(engine).unwrap();
+            let auth_path = profile_home.join(auth_file);
+            let route = RuntimeRoute {
+                engine_id: engine.into(),
+                provider_id: "subscription".into(),
+                provider_kind: "subscription".into(),
+                provider_display_name: "Subscription".into(),
+                route_label_snapshot: "Subscription / test-model".into(),
+                model_id: "test-model".into(),
+                model_label_snapshot: "Test Model".into(),
+                default_reasoning_effort: ReasoningEffort::Auto,
+                engine_profile_digest: "sha256:engine".into(),
+                provider_launch_profile_ref: "provider:subscription:subscription".into(),
+                provider_launch_profile_digest: "sha256:provider".into(),
+                launch_config_digest: "sha256:launch".into(),
+                pricing_basis_snapshot: crate::turn_start::PricingBasisSnapshot { profile: None },
+            };
+            let current_identity = || {
+                CapabilityIdentity::from_route(
+                    &route,
+                    "configured:sha256:test".into(),
+                    launch_profile_identity(&route, Some(&profile_home)).unwrap(),
+                )
+            };
+            let unsigned_identity = current_identity();
+            std::fs::write(&auth_path, "synthetic-first-account").unwrap();
+            let first_identity = current_identity();
+            assert_ne!(
+                unsigned_identity.cache_key().unwrap(),
+                first_identity.cache_key().unwrap()
+            );
+            let first = registry
+                .resolve(first_identity.clone(), || async {
+                    Ok((CapabilitySet::unknown("first-account"), "test".into()))
+                })
+                .await
+                .unwrap();
+
+            std::fs::write(unrelated_profile.join(auth_file), "unrelated-sentinel").unwrap();
+            assert_eq!(first_identity, current_identity());
+            let cached = registry
+                .resolve(current_identity(), || async {
+                    Err("unchanged account should use cached capabilities".into())
+                })
+                .await
+                .unwrap();
+            assert_eq!(first, cached);
+
+            std::fs::write(&auth_path, "synthetic-second-account-with-a-new-length").unwrap();
+            let changed_identity = current_identity();
+            assert_ne!(
+                first_identity.cache_key().unwrap(),
+                changed_identity.cache_key().unwrap()
+            );
+            let refreshed = registry
+                .resolve(changed_identity.clone(), || async {
+                    Ok((CapabilitySet::unknown("second-account"), "test".into()))
+                })
+                .await
+                .unwrap();
+            assert_ne!(first.id, refreshed.id);
+            assert_eq!(refreshed.capabilities.search.source, "second-account");
+
+            let reopened = EngineCapabilityRegistry::new(registry.history.clone());
+            let persisted = reopened
+                .resolve(changed_identity, || async {
+                    Err("updated account should use its own persisted capabilities".into())
+                })
+                .await
+                .unwrap();
+            assert_eq!(refreshed, persisted);
+
+            std::fs::remove_file(auth_path).unwrap();
+            assert_eq!(unsigned_identity, current_identity());
+        }
+
+        std::fs::remove_dir_all(config_dir).unwrap();
+        let _ = std::fs::remove_file(database_path);
+    }
+
+    #[tokio::test]
+    async fn failed_capability_probe_is_not_cached_or_persisted() {
+        let (registry, identity, path) = probe_registry();
+        assert!(registry
+            .resolve(identity.clone(), || async { Err("unavailable".into()) })
+            .await
+            .is_err());
+        assert!(registry
+            .history
+            .load_capability_snapshot(&identity.cache_key().unwrap())
+            .unwrap()
+            .is_none());
+        let resolved = registry
+            .resolve(identity, || async {
+                Ok((CapabilitySet::unknown("retry"), "test".into()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(resolved.capabilities.search.source, "retry");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn expired_persisted_snapshot_is_refreshed_without_changing_its_reference() {
+        let (registry, identity, path) = probe_registry();
+        let mut previous = registry
+            .resolve(identity.clone(), || async {
+                Ok((CapabilitySet::unknown("old"), "test".into()))
+            })
+            .await
+            .unwrap();
+        previous.probed_at =
+            crate::util::now_millis() - CAPABILITY_CACHE_TTL.as_millis() as i64 - 1;
+        registry
+            .history
+            .update_capability_snapshot(&identity.cache_key().unwrap(), &previous)
+            .unwrap();
+        let reopened = EngineCapabilityRegistry::new(registry.history.clone());
+        let next = reopened
+            .resolve(identity, || async {
+                Ok((CapabilitySet::unknown("fresh"), "test".into()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(next.id, previous.id);
+        assert_eq!(next.capabilities.search.source, "fresh");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn explicit_refresh_does_not_reuse_a_fresh_persisted_snapshot() {
+        let (registry, identity, path) = probe_registry();
+        let previous = registry
+            .resolve(identity.clone(), || async {
+                Ok((CapabilitySet::unknown("old"), "test".into()))
+            })
+            .await
+            .unwrap();
+        registry.invalidate_engine("codex").unwrap();
+        let next = registry
+            .resolve(identity, || async {
+                Ok((CapabilitySet::unknown("fresh"), "test".into()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(next.id, previous.id);
+        assert_eq!(next.capabilities.search.source, "fresh");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn explicit_invalidations_advance_even_within_one_clock_tick() {
+        let (registry, _, path) = probe_registry();
+        let previous = crate::util::now_millis() + 1000;
+        registry
+            .invalidated_at
+            .lock()
+            .unwrap()
+            .insert("codex".into(), previous);
+        registry.invalidate_engine("codex").unwrap();
+        assert!(registry.invalidated_at.lock().unwrap()["codex"] > previous);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn runtime_observation_wins_when_an_older_probe_finishes_late() {
+        let (registry, identity, path) = probe_registry();
+        let original = registry
+            .resolve(identity.clone(), || async {
+                Ok((CapabilitySet::unknown("initial"), "test".into()))
+            })
+            .await
+            .unwrap();
+        registry.invalidate_engine("codex").unwrap();
+        let started = tokio::sync::Notify::new();
+        let release = tokio::sync::Notify::new();
+        let (resolved, observed) = tokio::join!(
+            registry.resolve(identity.clone(), || async {
+                started.notify_one();
+                release.notified().await;
+                Ok((CapabilitySet::unknown("late"), "test".into()))
+            }),
+            async {
+                started.notified().await;
+                let observed = registry.record_web_search_native(&original).unwrap();
+                release.notify_one();
+                observed
+            }
+        );
+        assert_eq!(resolved.unwrap(), observed);
+        let persisted = registry
+            .history
+            .load_capability_snapshot(&identity.cache_key().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted.capabilities.search.support,
+            CapabilitySupport::Supported
+        );
+        assert_eq!(
+            persisted.capabilities.search.source,
+            "codex_runtime_observation"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn stale_observation_input_does_not_erase_other_runtime_evidence() {
+        let (registry, identity, path) = probe_registry();
+        let original = registry
+            .resolve(identity, || async {
+                Ok((CapabilitySet::unknown("initial"), "test".into()))
+            })
+            .await
+            .unwrap();
+        registry
+            .record_auto_review_degraded(&original, "automode-unavailable")
+            .unwrap();
+        let observed = registry.record_web_search_native(&original).unwrap();
+        assert_eq!(
+            observed.capabilities.auto_approval.support,
+            CapabilitySupport::Degraded
+        );
+        assert_eq!(
+            observed.capabilities.search.support,
+            CapabilitySupport::Supported
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn invalidated_probe_does_not_publish_to_the_persistent_cache() {
+        let (registry, identity, path) = probe_registry();
+        let started = tokio::sync::Notify::new();
+        let release = tokio::sync::Notify::new();
+        let (result, ()) = tokio::join!(
+            registry.resolve(identity.clone(), || async {
+                started.notify_one();
+                release.notified().await;
+                Ok((CapabilitySet::unknown("late"), "test".into()))
+            }),
+            async {
+                started.notified().await;
+                registry.invalidate_engine("codex").unwrap();
+                release.notify_one();
+            }
+        );
+        assert_eq!(result.unwrap_err(), PROBE_INVALIDATED);
+        assert!(registry
+            .history
+            .load_capability_snapshot(&identity.cache_key().unwrap())
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn binary_identity_reuses_hash_until_metadata_or_ttl_changes() {
+        let path = std::env::temp_dir().join(format!(
+            "helm-binary-identity-{}-{}.bin",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::write(&path, "first").unwrap();
+        let first = binary_identity(path.to_str().unwrap()).unwrap();
+        let canonical = path.canonicalize().unwrap();
+        let checked_at = binary_identity_cache()
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(key, _)| key.0 == canonical)
+            .unwrap()
+            .1
+             .1;
+        assert_eq!(first, binary_identity(path.to_str().unwrap()).unwrap());
+        assert_eq!(
+            binary_identity_cache()
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(key, _)| key.0 == canonical)
+                .unwrap()
+                .1
+                 .1,
+            checked_at
+        );
+        std::fs::write(&path, "second-longer").unwrap();
+        let second = binary_identity(path.to_str().unwrap()).unwrap();
+        assert_ne!(first, second);
+        {
+            let mut cache = binary_identity_cache().lock().unwrap();
+            for (key, (_, checked_at)) in cache.iter_mut().filter(|(key, _)| key.0 == canonical) {
+                assert_eq!(key.0, canonical);
+                *checked_at = Instant::now() - BINARY_IDENTITY_CACHE_TTL - Duration::from_secs(1);
+            }
+        }
+        assert_eq!(second, binary_identity(path.to_str().unwrap()).unwrap());
+        assert!(
+            binary_identity_cache()
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(key, _)| key.0 == canonical)
+                .unwrap()
+                .1
+                 .1
+                .elapsed()
+                < BINARY_IDENTITY_CACHE_TTL
+        );
+        std::fs::remove_file(path).unwrap();
+    }
     use crate::reasoning::{ReasoningEffortSource, ReasoningEffortSupport};
 
     fn reasoning() -> ReasoningEffortCapability {

@@ -122,6 +122,8 @@ pub struct PricingCatalogStatus {
 pub struct PricingCatalogEntry {
     pub vendor: String,
     pub model_id: String,
+    pub aliases: Vec<String>,
+    pub protocols: Vec<Protocol>,
     pub currency: String,
     pub input: f64,
     pub cached_input: Option<f64>,
@@ -313,6 +315,21 @@ impl PricingCatalogStore {
                 Some(PricingCatalogEntry {
                     vendor: card.vendor.clone(),
                     model_id: card.model_id.clone(),
+                    aliases: card.aliases.clone(),
+                    protocols: [
+                        Protocol::Anthropic,
+                        Protocol::OpenAiResponses,
+                        Protocol::OpenAiChat,
+                    ]
+                    .into_iter()
+                    .filter(|protocol| {
+                        vendor_matches(
+                            &card.vendor,
+                            vendor_for_protocol(protocol),
+                            &normalize_model_id(&card.model_id),
+                        )
+                    })
+                    .collect(),
                     currency: card.currency.clone(),
                     input: band.input,
                     cached_input: band.cached_input,

@@ -10,7 +10,7 @@ use crate::permissions::{
 use crate::pricing::{PricingBand, PricingTier, ResolvedPricingProfile, ServiceTier};
 use crate::protocol::{
     AgentEvent, CallStatus, Diff, EngineId, Role, RuntimeCapabilitySnapshot, StopReason,
-    ToolDenialSource, ToolOutcomeKind, ToolStatus,
+    ToolDenialSource, ToolOutcomeKind, ToolStatus, TurnPresentation, TurnPresentationContent,
 };
 use crate::turn_start::{FrozenSessionContext, TurnExecutionSpec, TurnStartCommand};
 use crate::util::{now_millis, now_seconds};
@@ -18,6 +18,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -219,22 +220,6 @@ pub struct SessionApproval {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct SessionCheckpoint {
-    pub id: String,
-    pub label: String,
-    pub ts: i64,
-    #[serde(default)]
-    pub turn_id: Option<String>,
-    #[serde(default)]
-    pub restorable: bool,
-    #[serde(default)]
-    pub file_count: u64,
-    #[serde(default)]
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct PermissionAuditSummary {
     pub record_count: u64,
     pub oldest_at: Option<i64>,
@@ -277,10 +262,11 @@ pub struct SessionDetail {
     pub summary: SessionSummary,
     pub messages: Vec<SessionMessage>,
     pub tool_calls: Vec<SessionToolCall>,
-    pub checkpoints: Vec<SessionCheckpoint>,
     /// 审批请求（变更-07）：含 pending 的悬空审批，前端恢复时重建审批卡
     #[serde(default)]
     pub approvals: Vec<SessionApproval>,
+    #[serde(default)]
+    pub presentations: Vec<TurnPresentation>,
     /// 每轮实际生效的模式与权限档位，用于历史徽标和审计。
     #[serde(default)]
     pub turns: Vec<SessionTurn>,
@@ -381,7 +367,6 @@ pub struct TurnLedgerRecord {
     pub messages: Vec<SessionMessage>,
     pub tool_calls: Vec<SessionToolCall>,
     pub approvals: Vec<SessionApproval>,
-    pub checkpoints: Vec<SessionCheckpoint>,
     pub usage: Vec<TurnLedgerUsage>,
     pub attachments: Vec<TurnLedgerAttachment>,
     pub session_context: Vec<TurnLedgerContextEvidence>,
@@ -469,9 +454,47 @@ pub struct SessionHistoryStore {
     path: PathBuf,
     write_lock: Arc<Mutex<()>>,
     initialized: Arc<Mutex<bool>>,
+    connections: Arc<Mutex<Vec<Connection>>>,
     model_prices: Arc<Mutex<HashMap<String, ResolvedPricingProfile>>>,
     runtime_grants: Arc<Mutex<RuntimeGrantCache>>,
     session_providers: Arc<Mutex<HashMap<String, String>>>,
+}
+
+struct ConnectionLease {
+    connection: Option<Connection>,
+    pool: Arc<Mutex<Vec<Connection>>>,
+}
+
+impl Deref for ConnectionLease {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        self.connection
+            .as_ref()
+            .expect("connection lease is active")
+    }
+}
+
+impl DerefMut for ConnectionLease {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.connection
+            .as_mut()
+            .expect("connection lease is active")
+    }
+}
+
+impl Drop for ConnectionLease {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            if connection.is_autocommit() {
+                if let Ok(mut pool) = self.pool.lock() {
+                    if pool.len() < 4 {
+                        pool.push(connection);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -521,6 +544,7 @@ impl SessionHistoryStore {
             path,
             write_lock: Arc::new(Mutex::new(())),
             initialized: Arc::new(Mutex::new(false)),
+            connections: Arc::new(Mutex::new(Vec::new())),
             model_prices: Arc::new(Mutex::new(HashMap::new())),
             runtime_grants: Arc::new(Mutex::new(RuntimeGrantCache::default())),
             session_providers: Arc::new(Mutex::new(HashMap::new())),
@@ -824,6 +848,17 @@ impl SessionHistoryStore {
         Ok(rows)
     }
 
+    pub(crate) fn engine_for_session(&self, id: &str) -> Result<String, String> {
+        let connection = self.open()?;
+        connection
+            .query_row(
+                "SELECT engine FROM session WHERE id = ?1 OR cli_session_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .map_err(db_err)
+    }
+
     pub fn get_session(&self, id: &str) -> Result<SessionDetail, String> {
         self.refresh_session_contexts(id)?;
         let conn = self.open()?;
@@ -877,8 +912,8 @@ impl SessionHistoryStore {
         Ok(SessionDetail {
             messages: self.messages_for_conn(&conn, &summary.id)?,
             tool_calls: self.tools_for_conn(&conn, &summary.id)?,
-            checkpoints: self.checkpoints_for_conn(&conn, &summary.id)?,
             approvals: self.approvals_for_conn(&conn, &summary.id)?,
+            presentations: self.presentations_for_conn(&conn, &summary.id)?,
             turns: self.turns_for_conn(&conn, &summary.id)?,
             session_context: self.session_context_for_conn(&conn, &summary.id)?,
             fork: self.session_fork_for_conn(&conn, &summary.id)?,
@@ -963,10 +998,22 @@ impl SessionHistoryStore {
     pub fn get_turn_ledger(&self, session_id: &str) -> Result<Vec<TurnLedgerRecord>, String> {
         let conn = self.open()?;
         let local_id = self.resolve_local_id(&conn, session_id)?;
-        let messages = self.messages_for_conn(&conn, &local_id)?;
+        let mut messages = self.messages_for_conn(&conn, &local_id)?;
+        for record in self.presentations_for_conn(&conn, &local_id)? {
+            if let TurnPresentationContent::Message { role, text, .. } = record.content {
+                messages.push(SessionMessage {
+                    role,
+                    text,
+                    ts: record.ts,
+                    reverted: record.reverted,
+                    turn_id: Some(record.turn_id),
+                    attachments: Vec::new(),
+                });
+            }
+        }
+        messages.sort_by_key(|message| message.ts);
         let tools = self.tools_for_conn(&conn, &local_id)?;
         let approvals = self.approvals_for_conn(&conn, &local_id)?;
-        let checkpoints = self.checkpoints_for_conn(&conn, &local_id)?;
         let turns = self.turns_for_conn(&conn, &local_id)?;
         let mut ledger = Vec::new();
         for turn in turns {
@@ -1087,11 +1134,6 @@ impl SessionHistoryStore {
                 approvals: approvals
                     .iter()
                     .filter(|approval| approval.turn_id.as_deref() == Some(turn.id.as_str()))
-                    .cloned()
-                    .collect(),
-                checkpoints: checkpoints
-                    .iter()
-                    .filter(|checkpoint| checkpoint.turn_id.as_deref() == Some(turn.id.as_str()))
                     .cloned()
                     .collect(),
                 turn,
@@ -2907,32 +2949,6 @@ impl SessionHistoryStore {
                     )
                 })
             }
-            AgentEvent::Checkpoint {
-                id,
-                label,
-                ts,
-                session_id,
-                restorable,
-                file_count,
-                reason,
-            } => self.with_session(session_id, |conn, local_id| {
-                conn.execute(
-                    "INSERT OR IGNORE INTO checkpoint
-                     (id, session_id, turn_idx, label, snapshot_ref, ts, turn_id,
-                      restorable, file_count, restorable_reason)
-                     VALUES (?1, ?2, 0, ?3, '', ?4, NULL, ?5, ?6, ?7)",
-                    params![
-                        id,
-                        local_id,
-                        label,
-                        ts,
-                        i64::from(*restorable),
-                        *file_count as i64,
-                        reason,
-                    ],
-                )?;
-                Ok(())
-            }),
         }
     }
 
@@ -2977,14 +2993,32 @@ impl SessionHistoryStore {
         legacy_compat: bool,
         event: &AgentEvent,
     ) -> Result<(), String> {
+        self.record_event_on_connection(history_session_id, turn_id, legacy_compat, event, None)
+    }
+
+    fn record_event_on_connection(
+        &self,
+        history_session_id: &str,
+        turn_id: Option<&str>,
+        legacy_compat: bool,
+        event: &AgentEvent,
+        connection: Option<&Connection>,
+    ) -> Result<(), String> {
         // 性能：不落库的事件在脱敏与开连接之前短路，语义与尾部 match 完全一致。
         if Self::is_unpersisted_event(event) {
             return Ok(());
         }
         let event = crate::redaction::sanitize_agent_event(event);
         if let Some(turn_id) = turn_id {
-            let conn = self.open()?;
-            let local_id = self.resolve_local_id(&conn, history_session_id)?;
+            let owned_connection;
+            let conn = match connection {
+                Some(conn) => conn,
+                None => {
+                    owned_connection = self.open()?;
+                    &owned_connection
+                }
+            };
+            let local_id = self.resolve_local_id(conn, history_session_id)?;
             let status = conn
                 .query_row(
                     "SELECT status FROM turn WHERE history_session_id = ?1 AND turn_id = ?2",
@@ -3036,7 +3070,7 @@ impl SessionHistoryStore {
                 // session.updated_at 维持秒
                 let ts = now_millis();
                 let updated_at = ts / 1000;
-                self.with_local_session(history_session_id, |conn, local_id| {
+                self.with_event_session(connection, history_session_id, |conn, local_id| {
                     conn.execute(
                         "INSERT INTO message (session_id, role, text, ts, turn_id)
                          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -3061,7 +3095,7 @@ impl SessionHistoryStore {
                 }
                 let ts = now_millis();
                 let updated_at = ts / 1000;
-                self.with_local_session(history_session_id, |conn, local_id| {
+                self.with_event_session(connection, history_session_id, |conn, local_id| {
                     if let Some(turn_id) = turn_id {
                         reconcile_tool_call(conn, local_id, turn_id, id, name, input, *status, ts)?;
                     } else {
@@ -3097,7 +3131,7 @@ impl SessionHistoryStore {
                     .map(serde_json::to_string)
                     .transpose()
                     .map_err(|e| e.to_string())?;
-                self.with_local_session(history_session_id, |conn, local_id| {
+                self.with_event_session(connection, history_session_id, |conn, local_id| {
                     if let Some(turn_id) = turn_id {
                         reconcile_tool_result(
                             conn,
@@ -3163,7 +3197,7 @@ impl SessionHistoryStore {
                     return Err("新 Usage 缺少 turn_id".to_string());
                 }
                 let ts = now_seconds();
-                self.with_local_session(history_session_id, |conn, local_id| {
+                self.with_event_session(connection, history_session_id, |conn, local_id| {
                     let frozen_route = turn_id
                         .map(|turn_id| {
                             conn.query_row(
@@ -3300,7 +3334,7 @@ impl SessionHistoryStore {
                     return Err("新 ContextUsage 缺少 turn_id".to_string());
                 }
                 let ts = now_seconds();
-                self.with_local_session(history_session_id, |conn, local_id| {
+                self.with_event_session(connection, history_session_id, |conn, local_id| {
                     conn.execute(
                         "UPDATE session SET last_context_tokens = ?1, last_context_window = COALESCE(?2, last_context_window), updated_at = ?3 WHERE id = ?4",
                         params![context_tokens, context_window, ts, local_id],
@@ -3323,7 +3357,7 @@ impl SessionHistoryStore {
                 };
                 let ts = now_seconds();
                 let artifact_reason = terminal_artifact_reason(*stop_reason);
-                self.with_local_session(history_session_id, |conn, local_id| {
+                self.with_event_session(connection, history_session_id, |conn, local_id| {
                     finalize_terminal_artifacts(conn, local_id, status, artifact_reason, ts)
                 })
             }
@@ -3341,7 +3375,7 @@ impl SessionHistoryStore {
                     return Ok(());
                 }
                 let ts = now_seconds();
-                self.with_local_session(history_session_id, |conn, local_id| {
+                self.with_event_session(connection, history_session_id, |conn, local_id| {
                     finalize_terminal_artifacts(
                         conn,
                         local_id,
@@ -3372,7 +3406,7 @@ impl SessionHistoryStore {
                     return Err("新审批缺少 turn_id".to_string());
                 }
                 let ts = now_millis();
-                self.with_local_session(history_session_id, |conn, local_id| {
+                self.with_event_session(connection, history_session_id, |conn, local_id| {
                     upsert_approval_request(
                         conn,
                         local_id,
@@ -3384,38 +3418,6 @@ impl SessionHistoryStore {
                         turn_id,
                         ts,
                     )
-                })
-            }
-            AgentEvent::Checkpoint {
-                id,
-                label,
-                ts,
-                restorable,
-                file_count,
-                reason,
-                ..
-            } => {
-                if turn_id.is_none() && !legacy_compat {
-                    return Err("新检查点缺少 turn_id".to_string());
-                }
-                self.with_local_session(history_session_id, |conn, local_id| {
-                    conn.execute(
-                        "INSERT OR IGNORE INTO checkpoint
-                     (id, session_id, turn_idx, label, snapshot_ref, ts, turn_id,
-                      restorable, file_count, restorable_reason)
-                     VALUES (?1, ?2, 0, ?3, '', ?4, ?5, ?6, ?7, ?8)",
-                        params![
-                            id,
-                            local_id,
-                            label,
-                            ts,
-                            turn_id,
-                            i64::from(*restorable),
-                            *file_count as i64,
-                            reason,
-                        ],
-                    )?;
-                    Ok(())
                 })
             }
         }
@@ -3735,27 +3737,69 @@ impl SessionHistoryStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn record_stream_boundary(
+    pub fn record_supervised_boundary(
         &self,
-        history_session_id: &str,
-        turn_id: &str,
+        snapshot: &crate::turn_supervisor::TurnSnapshot,
         attempt_no: u64,
         runtime_generation_id: &str,
-        event_seq: u64,
         event_kind: &str,
-        disposition: &str,
         event_digest: &str,
-        observed_at: i64,
+        event: &AgentEvent,
+        presentations: &[TurnPresentation],
     ) -> Result<(), String> {
+        if snapshot.status.is_terminal()
+            || matches!(
+                event,
+                AgentEvent::TurnComplete { .. }
+                    | AgentEvent::Error {
+                        recoverable: false,
+                        ..
+                    }
+            )
+        {
+            return Err("终态事件必须通过 Turn Finalizer 提交".to_string());
+        }
+        let history_session_id = snapshot.history_session_id.as_str();
+        let turn_id = snapshot.turn_id.as_str();
+        let event_seq = snapshot.event_seq;
+        let observed_at = snapshot.updated_at;
+        let presentation_json = encode_presentations(turn_id, event_seq, presentations)?;
+        let session_started = matches!(event, AgentEvent::SessionStarted { .. });
+        if session_started {
+            self.record_event_for_session_in_turn(history_session_id, Some(turn_id), event)?;
+        }
         retry_locked(|| {
             let _guard = self.write_guard()?;
             let mut conn = self.open()?;
-            let tx = conn.transaction().map_err(db_err)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(db_err)?;
+            let existing: Option<String> = tx.query_row(
+                "SELECT event_digest FROM stream_boundary_event WHERE turn_id = ?1 AND attempt_no = ?2 AND event_seq = ?3",
+                params![turn_id, i64::try_from(attempt_no).unwrap_or(i64::MAX), i64::try_from(event_seq).unwrap_or(i64::MAX)],
+                |row| row.get(0),
+            ).optional().map_err(db_err)?;
+            if let Some(existing) = existing {
+                return if existing == event_digest {
+                    Ok(())
+                } else {
+                    Err("同一事件序号的内容发生冲突".to_string())
+                };
+            }
+            if !session_started {
+                self.record_event_on_connection(
+                    history_session_id,
+                    Some(turn_id),
+                    false,
+                    event,
+                    Some(&tx),
+                )?;
+            }
             tx.execute(
-                "INSERT OR IGNORE INTO stream_boundary_event
+                "INSERT INTO stream_boundary_event
                  (turn_id, attempt_no, event_seq, history_session_id, runtime_generation_id,
-                  event_kind, disposition, event_digest, observed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                  event_kind, disposition, event_digest, observed_at, presentation_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'accepted', ?7, ?8, ?9)",
                 params![
                     turn_id,
                     i64::try_from(attempt_no).unwrap_or(i64::MAX),
@@ -3763,21 +3807,43 @@ impl SessionHistoryStore {
                     history_session_id,
                     runtime_generation_id,
                     event_kind,
-                    disposition,
                     event_digest,
                     observed_at,
+                    presentation_json,
                 ],
             )
             .map_err(db_err)?;
-            tx.execute(
+            let updated = tx.execute(
                 "UPDATE turn_snapshot
-                 SET attempt_no = ?1, runtime_generation_id = ?2, recovery_state = 'none'
-                 WHERE history_session_id = ?3 AND turn_id = ?4",
+                 SET attempt_no = ?1, runtime_generation_id = ?2, recovery_state = 'none',
+                     status = ?5, terminal_reason = ?6, recoverable = ?7, event_seq = ?8, updated_at = ?9
+                 WHERE history_session_id = ?3 AND turn_id = ?4
+                   AND status NOT IN ('succeeded', 'failed', 'interrupted')",
                 params![
                     i64::try_from(attempt_no).unwrap_or(i64::MAX),
                     runtime_generation_id,
                     history_session_id,
                     turn_id,
+                    turn_status_to_str(snapshot.status),
+                    snapshot.terminal_reason,
+                    i64::from(snapshot.recoverable),
+                    i64::try_from(event_seq).unwrap_or(i64::MAX),
+                    observed_at,
+                ],
+            )
+            .map_err(db_err)?;
+            if updated != 1 {
+                return Err("事件提交时 Turn 快照已变化".to_string());
+            }
+            tx.execute(
+                "UPDATE turn SET status = ?1, terminal_reason = ?2
+                 WHERE history_session_id = ?3 AND turn_id = ?4
+                   AND status NOT IN ('succeeded', 'failed', 'interrupted')",
+                params![
+                    turn_status_to_str(snapshot.status),
+                    snapshot.terminal_reason,
+                    history_session_id,
+                    turn_id
                 ],
             )
             .map_err(db_err)?;
@@ -3831,9 +3897,33 @@ impl SessionHistoryStore {
         event_kind: &str,
         event_digest: &str,
     ) -> Result<(), String> {
+        self.finalize_supervised_turn_with_presentations(
+            snapshot,
+            attempt_no,
+            runtime_generation_id,
+            event_kind,
+            event_digest,
+            &[],
+            &[],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn finalize_supervised_turn_with_presentations(
+        &self,
+        snapshot: &crate::turn_supervisor::TurnSnapshot,
+        attempt_no: u64,
+        runtime_generation_id: &str,
+        event_kind: &str,
+        event_digest: &str,
+        presentations: &[TurnPresentation],
+        tool_outputs: &[(String, String)],
+    ) -> Result<(), String> {
         if !snapshot.status.is_terminal() {
             return Err("Finalizer 只能提交 Turn 终态".to_string());
         }
+        let presentation_json =
+            encode_presentations(&snapshot.turn_id, snapshot.event_seq, presentations)?;
         retry_locked(|| {
             let _guard = self.write_guard()?;
             let mut conn = self.open()?;
@@ -3934,6 +4024,21 @@ impl SessionHistoryStore {
             if changed != 1 {
                 return Err("Turn 唯一终态 CAS 失败".to_string());
             }
+            for (tool_id, output) in tool_outputs {
+                let output = bounded_ledger_text(&crate::redaction::redact_text(output));
+                tx.execute(
+                    "UPDATE tool_call SET output = ?1, has_output = ?2
+                     WHERE session_id = ?3 AND turn_id = ?4 AND id = ?5 AND status = 'pending'",
+                    params![
+                        output,
+                        i64::from(!output.is_empty()),
+                        snapshot.history_session_id,
+                        snapshot.turn_id,
+                        ledger_tool_id(&snapshot.turn_id, tool_id)
+                    ],
+                )
+                .map_err(db_err)?;
+            }
             finalize_turn_artifacts(
                 &tx,
                 &snapshot.history_session_id,
@@ -3945,8 +4050,8 @@ impl SessionHistoryStore {
             tx.execute(
                 "INSERT INTO stream_boundary_event
                  (turn_id, attempt_no, event_seq, history_session_id, runtime_generation_id,
-                  event_kind, disposition, event_digest, observed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'accepted', ?7, ?8)",
+                  event_kind, disposition, event_digest, observed_at, presentation_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'accepted', ?7, ?8, ?9)",
                 params![
                     snapshot.turn_id,
                     i64::try_from(attempt_no).unwrap_or(i64::MAX),
@@ -3956,6 +4061,7 @@ impl SessionHistoryStore {
                     event_kind,
                     event_digest,
                     snapshot.updated_at,
+                    presentation_json,
                 ],
             )
             .map_err(db_err)?;
@@ -4060,6 +4166,23 @@ impl SessionHistoryStore {
         })
     }
 
+    fn with_event_session<F>(
+        &self,
+        connection: Option<&Connection>,
+        history_session_id: &str,
+        update: F,
+    ) -> Result<(), String>
+    where
+        F: Fn(&Connection, &str) -> rusqlite::Result<()>,
+    {
+        if let Some(connection) = connection {
+            let local_id = self.resolve_local_id(connection, history_session_id)?;
+            update(connection, &local_id).map_err(db_err)
+        } else {
+            self.with_local_session(history_session_id, update)
+        }
+    }
+
     fn cost_with_fallback(
         &self,
         provider_id: &str,
@@ -4144,14 +4267,28 @@ impl SessionHistoryStore {
         }
     }
 
-    fn open(&self) -> Result<Connection, String> {
+    fn open(&self) -> Result<ConnectionLease, String> {
+        if let Some(connection) = self
+            .connections
+            .lock()
+            .map_err(|_| "会话数据库连接池锁中毒".to_string())?
+            .pop()
+        {
+            return Ok(ConnectionLease {
+                connection: Some(connection),
+                pool: self.connections.clone(),
+            });
+        }
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("创建会话数据库目录失败：{e}"))?;
         }
         let mut conn = Connection::open(&self.path).map_err(db_err)?;
         configure_connection(&conn)?;
         self.ensure_initialized(&mut conn)?;
-        Ok(conn)
+        Ok(ConnectionLease {
+            connection: Some(conn),
+            pool: self.connections.clone(),
+        })
     }
 
     fn write_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>, String> {
@@ -4180,6 +4317,34 @@ impl SessionHistoryStore {
             |row| row.get(0),
         )
         .map_err(db_err)
+    }
+
+    fn presentations_for_conn(
+        &self,
+        conn: &Connection,
+        session_id: &str,
+    ) -> Result<Vec<TurnPresentation>, String> {
+        let mut statement = conn.prepare(
+            "SELECT presentation_json, presentation_reverted FROM stream_boundary_event
+             WHERE history_session_id = ?1 AND disposition = 'accepted' AND presentation_json IS NOT NULL
+             ORDER BY observed_at, event_seq",
+        ).map_err(db_err)?;
+        let rows = statement
+            .query_map(params![session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+            })
+            .map_err(db_err)?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (json, reverted) = row.map_err(db_err)?;
+            let mut stored: Vec<TurnPresentation> = serde_json::from_str(&json)
+                .map_err(|error| format!("读取历史展示摘要失败：{error}"))?;
+            for record in &mut stored {
+                record.reverted = reverted;
+            }
+            records.extend(stored);
+        }
+        Ok(records)
     }
 
     fn messages_for_conn(
@@ -4298,35 +4463,6 @@ impl SessionHistoryStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(db_err)?;
         Ok(tool_calls)
-    }
-
-    fn checkpoints_for_conn(
-        &self,
-        conn: &Connection,
-        session_id: &str,
-    ) -> Result<Vec<SessionCheckpoint>, String> {
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, label, ts, turn_id, restorable, file_count, restorable_reason
-                 FROM checkpoint WHERE session_id = ?1 ORDER BY ts ASC",
-            )
-            .map_err(db_err)?;
-        let checkpoints = stmt
-            .query_map(params![session_id], |row| {
-                Ok(SessionCheckpoint {
-                    id: row.get(0)?,
-                    label: row.get(1)?,
-                    ts: row.get(2)?,
-                    turn_id: row.get(3)?,
-                    restorable: row.get::<_, i64>(4)? != 0,
-                    file_count: row.get::<_, i64>(5)?.max(0) as u64,
-                    reason: row.get(6)?,
-                })
-            })
-            .map_err(db_err)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(db_err)?;
-        Ok(checkpoints)
     }
 
     fn approvals_for_conn(
@@ -5623,107 +5759,6 @@ impl SessionHistoryStore {
             .transpose()
     }
 
-    pub fn save_checkpoint(
-        &self,
-        checkpoint_id: &str,
-        session_id: &str,
-        turn_idx: i64,
-        label: &str,
-        snapshot_ref: &str,
-        ts: i64,
-        turn_id: &str,
-        restorable: bool,
-        file_count: u64,
-        reason: Option<&str>,
-    ) -> Result<(), String> {
-        let _guard = self.write_guard()?;
-        let conn = self.open()?;
-        let local_id = self.resolve_local_id(&conn, session_id)?;
-        let turn_idx = conn
-            .query_row(
-                "SELECT turn_epoch FROM turn WHERE history_session_id = ?1 AND turn_id = ?2",
-                params![local_id, turn_id],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(db_err)?
-            .unwrap_or(turn_idx);
-        conn.execute(
-            "INSERT INTO checkpoint
-             (id, session_id, turn_idx, label, snapshot_ref, ts, turn_id, restorable, file_count, restorable_reason)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                checkpoint_id,
-                local_id,
-                turn_idx,
-                label,
-                snapshot_ref,
-                ts,
-                turn_id,
-                i64::from(restorable),
-                file_count as i64,
-                reason,
-            ],
-        )
-        .map_err(db_err)?;
-        Ok(())
-    }
-
-    pub fn get_checkpoint(&self, checkpoint_id: &str) -> Result<Option<CheckpointRecord>, String> {
-        let conn = self.open()?;
-        let result: Option<CheckpointRecord> = conn
-            .query_row(
-                "SELECT id, session_id, turn_idx, label, snapshot_ref, ts, turn_id,
-                        restorable, file_count, restorable_reason
-                 FROM checkpoint WHERE id = ?1",
-                params![checkpoint_id],
-                |row| {
-                    Ok(CheckpointRecord {
-                        id: row.get(0)?,
-                        session_id: row.get(1)?,
-                        turn_idx: row.get(2)?,
-                        label: row.get(3)?,
-                        snapshot_ref: row.get(4)?,
-                        ts: row.get(5)?,
-                        turn_id: row.get(6)?,
-                        restorable: row.get::<_, i64>(7)? != 0,
-                        file_count: row.get::<_, i64>(8)?.max(0) as u64,
-                        reason: row.get(9)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(db_err)?;
-        Ok(result)
-    }
-
-    /// 回溯语义（P2-5 / 变更-07）：把检查点之后的消息打上 reverted 标记，
-    /// 重建上下文/续聊序列化会剔除它们，让 Agent 记忆与文件状态一致。
-    /// `ts_millis` 与 message.ts 同为毫秒（v4 迁移统一单位后比较才有效）。
-    pub fn revert_messages_after(&self, session_id: &str, ts_millis: i64) -> Result<(), String> {
-        let _guard = self.write_guard()?;
-        let conn = self.open()?;
-        let local_id = self.resolve_local_id(&conn, session_id)?;
-        conn.execute(
-            "UPDATE message SET reverted = 1 WHERE session_id = ?1 AND ts > ?2",
-            params![local_id, ts_millis],
-        )
-        .map_err(db_err)?;
-        Ok(())
-    }
-
-    pub fn unrevert_messages(&self, session_id: &str) -> Result<(), String> {
-        let _guard = self.write_guard()?;
-        let conn = self.open()?;
-        let local_id = self.resolve_local_id(&conn, session_id)?;
-        conn.execute(
-            "UPDATE message SET reverted = 0 WHERE session_id = ?1",
-            params![local_id],
-        )
-        .map_err(db_err)?;
-        Ok(())
-    }
-
     /// 回填 Codex `turn/start` 返回的原生轮次 id（切点分叉依赖）。仅在首轮 fork 前
     /// 每轮记录；找不到对应 turn 行时静默忽略（不阻断轮次）。
     pub fn set_turn_native_id(
@@ -5856,7 +5891,8 @@ impl SessionHistoryStore {
         upto_helm_turn_id: Option<&str>,
     ) -> Result<usize, String> {
         let _guard = self.write_guard()?;
-        let conn = self.open()?;
+        let mut connection = self.open()?;
+        let conn = connection.transaction().map_err(db_err)?;
         let source_id = self.resolve_local_id(&conn, source_session_id)?;
         let target_id = self.resolve_local_id(&conn, target_session_id)?;
         // 切点截断：以「截止线 rowid」为准按 id 顺序复制。一个轮次的用户提问与该轮
@@ -5899,7 +5935,7 @@ impl SessionHistoryStore {
             }
             None => i64::MAX,
         };
-        let rows = {
+        let mut rows = {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, role, text, ts, turn_id FROM message
@@ -5909,7 +5945,7 @@ impl SessionHistoryStore {
             let mapped = stmt
                 .query_map(params![source_id, cutoff_id], |row| {
                     Ok((
-                        row.get::<_, i64>(0)?,
+                        Some(row.get::<_, i64>(0)?),
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, i64>(3)?,
@@ -5921,6 +5957,45 @@ impl SessionHistoryStore {
                 .map_err(db_err)?;
             mapped
         };
+        let presentations = self.presentations_for_conn(&conn, &source_id)?;
+        let epochs: HashMap<_, _> = self
+            .turns_for_conn(&conn, &source_id)?
+            .into_iter()
+            .map(|turn| (turn.id, turn.epoch))
+            .collect();
+        let cutoff_epoch = upto_helm_turn_id
+            .and_then(|turn_id| epochs.get(turn_id))
+            .copied();
+        let cutoff_ts = rows.iter().map(|row| row.3).max().unwrap_or_default();
+        let original_count = rows.len();
+        for record in presentations {
+            if record.reverted {
+                continue;
+            }
+            let within_boundary = upto_helm_turn_id.is_none()
+                || upto_helm_turn_id == Some(record.turn_id.as_str())
+                || match cutoff_epoch {
+                    Some(cutoff) => epochs
+                        .get(&record.turn_id)
+                        .is_some_and(|epoch| *epoch <= cutoff),
+                    None => record.ts <= cutoff_ts,
+                };
+            if !within_boundary {
+                continue;
+            }
+            if let TurnPresentationContent::Message { role, text, .. } = record.content {
+                rows.push((
+                    None,
+                    role_to_str(role).to_string(),
+                    text,
+                    record.ts,
+                    Some(record.turn_id),
+                ));
+            }
+        }
+        if rows.len() != original_count {
+            rows.sort_by_key(|row| row.3);
+        }
         for (message_id, role, text, ts, _source_turn_id) in &rows {
             conn.execute(
                 "INSERT INTO message (session_id, role, text, ts, reverted, turn_id)
@@ -5968,20 +6043,8 @@ impl SessionHistoryStore {
                 .map_err(db_err)?;
             }
         }
+        conn.commit().map_err(db_err)?;
         Ok(rows.len())
-    }
-
-    /// 回溯后作废旧的 CLI 会话 id：下次恢复不再 `--resume`，改用截断历史重建上下文（P2-5）
-    pub fn clear_cli_session(&self, session_id: &str) -> Result<(), String> {
-        let _guard = self.write_guard()?;
-        let conn = self.open()?;
-        let local_id = self.resolve_local_id(&conn, session_id)?;
-        conn.execute(
-            "UPDATE session SET cli_session_id = NULL WHERE id = ?1",
-            params![local_id],
-        )
-        .map_err(db_err)?;
-        Ok(())
     }
 
     /// Codex `thread.started` 返回的原生 continuation id。它会替换进程启动时的临时 id，
@@ -6327,26 +6390,43 @@ impl SessionHistoryStore {
 
     /// 模型改名后批量纠正会话偏好（2026-09-03）：把引用旧模型 ID 的 `preferred_model`
     /// 全部改成新 ID，避免「目录里已改名、会话仍指向旧 ID」导致下一轮解析失败。
-    /// 按模型 ID 全库匹配——模型 ID 在配置里全局唯一，跨服务商同名属极端情况且语义一致。
-    /// 返回受影响行数；`updated_at` 同样维持秒。
     pub fn rename_session_preferred_model(
         &self,
+        engine_id: &str,
         old_model_id: &str,
         new_model_id: &str,
     ) -> Result<usize, String> {
-        let old_model_id = old_model_id.trim();
-        let new_model_id = new_model_id.trim();
-        if old_model_id.is_empty() || new_model_id.is_empty() || old_model_id == new_model_id {
+        self.rename_session_preferred_models(
+            engine_id,
+            &[(old_model_id.to_string(), new_model_id.to_string())],
+        )
+    }
+
+    pub fn rename_session_preferred_models(
+        &self,
+        engine_id: &str,
+        renames: &[(String, String)],
+    ) -> Result<usize, String> {
+        let mapping = renames
+            .iter()
+            .filter_map(|(old, new)| {
+                let old = old.trim();
+                let new = new.trim();
+                (!old.is_empty() && !new.is_empty() && old != new).then_some((old, new))
+            })
+            .collect::<HashMap<_, _>>();
+        if mapping.is_empty() {
             return Ok(0);
         }
+        let mapping = serde_json::to_string(&mapping).map_err(|error| error.to_string())?;
         let _guard = self.write_guard()?;
         let conn = self.open()?;
         let changed = conn
             .execute(
                 "UPDATE session
-                 SET preferred_model = ?1, updated_at = ?2
-                 WHERE preferred_model = ?3",
-                params![new_model_id, now_seconds(), old_model_id],
+                 SET preferred_model = (SELECT value FROM json_each(?1) WHERE key = session.preferred_model), updated_at = ?2
+                 WHERE engine = ?3 AND preferred_model IN (SELECT key FROM json_each(?1))",
+                params![mapping, now_seconds(), engine_id],
             )
             .map_err(db_err)?;
         Ok(changed)
@@ -7432,20 +7512,6 @@ fn observed_model_matches(engine: EngineId, routed: &str, observed: &str) -> boo
         && matches!(routed, "default" | "best" | "sonnet" | "opus" | "haiku")
 }
 
-#[derive(Debug, Clone)]
-pub struct CheckpointRecord {
-    pub id: String,
-    pub session_id: String,
-    pub turn_idx: i64,
-    pub label: String,
-    pub snapshot_ref: String,
-    pub ts: i64,
-    pub turn_id: Option<String>,
-    pub restorable: bool,
-    pub file_count: u64,
-    pub reason: Option<String>,
-}
-
 fn ensure_context_mutation_allowed(conn: &Connection, session_id: &str) -> Result<(), String> {
     let active: i64 = conn
         .query_row(
@@ -7527,9 +7593,9 @@ fn context_path_key(path: &str) -> String {
 /// 当前数据库 schema 版本。任何加列/改表都必须：把版本 +1，并在
 /// `apply_migrations` 中补一段从旧版本到新版本的迁移 SQL。
 /// `pub` 供集成测试断言「迁移后 user_version == 当前版本」，避免每升版改一片写死数字。
-pub const SCHEMA_VERSION: i64 = 34;
+pub const SCHEMA_VERSION: i64 = 35;
 // 新增迁移必须先使用这个连续版本号，再同步提升 SCHEMA_VERSION。
-const NEXT_MIGRATION_VERSION: i64 = 35;
+const NEXT_MIGRATION_VERSION: i64 = 36;
 const _: () = assert!(NEXT_MIGRATION_VERSION == SCHEMA_VERSION + 1);
 
 fn init_schema(conn: &mut Connection) -> Result<(), String> {
@@ -7956,6 +8022,8 @@ fn init_schema(conn: &mut Connection) -> Result<(), String> {
           disposition TEXT NOT NULL,
           event_digest TEXT NOT NULL,
           observed_at INTEGER NOT NULL,
+          presentation_json TEXT,
+          presentation_reverted INTEGER NOT NULL DEFAULT 0,
           PRIMARY KEY (turn_id, attempt_no, event_seq)
         );
         CREATE INDEX IF NOT EXISTS idx_stream_boundary_session
@@ -8255,18 +8323,47 @@ fn ledger_tool_id(turn_id: &str, native_id: &str) -> String {
 }
 
 fn bounded_ledger_text(value: &str) -> String {
-    const MAX_BYTES: usize = 65_536;
-    const SUFFIX: &str = "\n[ledger_output_truncated]";
-    if value.len() <= MAX_BYTES {
-        return value.to_string();
+    crate::output_limits::bounded_text(value, crate::output_limits::MAX_TOOL_OUTPUT_BYTES)
+}
+
+fn encode_presentations(
+    turn_id: &str,
+    event_seq: u64,
+    records: &[TurnPresentation],
+) -> Result<Option<String>, String> {
+    if records.is_empty() {
+        return Ok(None);
     }
-    let mut boundary = MAX_BYTES.saturating_sub(SUFFIX.len());
-    while !value.is_char_boundary(boundary) {
-        boundary = boundary.saturating_sub(1);
+    if records.len() > 4
+        || records
+            .iter()
+            .any(|record| record.turn_id != turn_id || record.event_seq > event_seq)
+    {
+        return Err("历史展示摘要的 Turn 或事件身份不匹配".to_string());
     }
-    let mut bounded = value[..boundary].to_string();
-    bounded.push_str(SUFFIX);
-    bounded
+    if crate::output_limits::bounded_json_size(&records, 512 * 1024).is_none() {
+        return Err("历史展示摘要超出保存预算".to_string());
+    }
+    let mut records = records.to_vec();
+    for record in &mut records {
+        match &mut record.content {
+            TurnPresentationContent::Message { text, .. }
+            | TurnPresentationContent::Thinking { text, .. } => {
+                *text = bounded_ledger_text(&crate::redaction::redact_text(text));
+            }
+            TurnPresentationContent::Plan { steps, .. } => {
+                for step in steps {
+                    step.text = bounded_ledger_text(&crate::redaction::redact_text(&step.text));
+                }
+            }
+        }
+    }
+    if crate::output_limits::bounded_json_size(&records, 512 * 1024).is_none() {
+        return Err("脱敏后的历史展示摘要超出保存预算".to_string());
+    }
+    serde_json::to_string(&records)
+        .map(Some)
+        .map_err(|error| format!("序列化历史展示摘要失败：{error}"))
 }
 
 fn turn_is_terminal(conn: &Connection, session_id: &str, turn_id: &str) -> rusqlite::Result<bool> {
@@ -9371,6 +9468,17 @@ fn apply_migrations(tx: &Transaction<'_>) -> Result<(), String> {
             .map_err(db_err)?;
         }
     }
+    if current < 35 {
+        if !column_exists(tx, "stream_boundary_event", "presentation_json")? {
+            tx.execute_batch(
+                "ALTER TABLE stream_boundary_event ADD COLUMN presentation_json TEXT;",
+            )
+            .map_err(db_err)?;
+        }
+        if !column_exists(tx, "stream_boundary_event", "presentation_reverted")? {
+            tx.execute_batch("ALTER TABLE stream_boundary_event ADD COLUMN presentation_reverted INTEGER NOT NULL DEFAULT 0;").map_err(db_err)?;
+        }
+    }
     // Keep the mandatory Folder invariant intact even after manual DB edits or older write paths.
     tx.execute(
         "UPDATE session
@@ -10321,6 +10429,87 @@ mod path_prefix_tests {
 }
 
 #[cfg(test)]
+mod connection_and_presentation_tests {
+    use super::*;
+
+    fn test_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "helm-presentation-{name}-{}-{}.sqlite",
+            std::process::id(),
+            rand::random::<u64>()
+        ))
+    }
+
+    #[test]
+    fn idle_connections_are_reused_and_the_pool_is_bounded() {
+        let path = test_path("pool");
+        let store = SessionHistoryStore::new(path.clone());
+        {
+            let connection = store.open().unwrap();
+            connection.execute_batch("CREATE TEMP TABLE connection_marker (value INTEGER); INSERT INTO connection_marker VALUES (7);").unwrap();
+        }
+        {
+            let connection = store.open().unwrap();
+            let value: i64 = connection
+                .query_row("SELECT value FROM connection_marker", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(value, 7);
+        }
+        let leases: Vec<_> = (0..8).map(|_| store.open().unwrap()).collect();
+        drop(leases);
+        assert_eq!(store.connections.lock().unwrap().len(), 4);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn v34_migration_adds_optional_presentation_without_losing_history() {
+        let path = test_path("migration");
+        {
+            let store = SessionHistoryStore::new(path.clone());
+            store
+                .create_session(NewSessionRecord {
+                    id: "history".into(),
+                    engine: EngineId::ClaudeCode,
+                    model: "model".into(),
+                    cwd: "D:/repo".into(),
+                    created_at: 100,
+                })
+                .unwrap();
+            let connection = store.open().unwrap();
+            connection
+                .execute_batch(
+                    "ALTER TABLE stream_boundary_event DROP COLUMN presentation_json;
+                 ALTER TABLE stream_boundary_event DROP COLUMN presentation_reverted;
+                 PRAGMA user_version = 34;",
+                )
+                .unwrap();
+        }
+        let restored = SessionHistoryStore::new(path.clone());
+        let detail = restored.get_session("history").unwrap();
+        assert!(detail.presentations.is_empty());
+        assert_eq!(detail.summary.id, "history");
+        let connection = restored.open().unwrap();
+        assert!(column_exists(&connection, "stream_boundary_event", "presentation_json").unwrap());
+        assert!(column_exists(
+            &connection,
+            "stream_boundary_event",
+            "presentation_reverted"
+        )
+        .unwrap());
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        drop(connection);
+        drop(restored);
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
 mod usage_contract_tests {
     use super::{now_seconds, SessionHistoryStore, UsageBreakdownDimension};
     use crate::protocol::EngineId;
@@ -10462,9 +10651,13 @@ mod usage_contract_tests {
             .unwrap();
 
         let changed = store
-            .rename_session_preferred_model("DeepSeek-V4-Flash-0731", "DeepSeek-V4-Flash-0731-1M")
+            .rename_session_preferred_model(
+                "claude-code",
+                "DeepSeek-V4-Flash-0731",
+                "DeepSeek-V4-Flash-0731-1M",
+            )
             .unwrap();
-        assert_eq!(changed, 2, "只有引用旧 ID 的两个会话被更新");
+        assert_eq!(changed, 1, "只更新当前引擎内引用旧 ID 的任务");
 
         let sessions = store.list_sessions().unwrap();
         let preferred = |id: &str| {
@@ -10475,16 +10668,60 @@ mod usage_contract_tests {
                 .unwrap_or_default()
         };
         assert_eq!(preferred("s1"), "DeepSeek-V4-Flash-0731-1M");
-        assert_eq!(preferred("s2"), "DeepSeek-V4-Flash-0731-1M");
+        assert_eq!(preferred("s2"), "DeepSeek-V4-Flash-0731");
         assert_eq!(preferred("s3"), "other-model", "无关会话不受影响");
 
         // 同 ID / 空 ID 是无操作，不应报错也不应改变任何行
         let noop = store
-            .rename_session_preferred_model("DeepSeek-V4-Flash-0731-1M", "DeepSeek-V4-Flash-0731-1M")
+            .rename_session_preferred_model(
+                "claude-code",
+                "DeepSeek-V4-Flash-0731-1M",
+                "DeepSeek-V4-Flash-0731-1M",
+            )
             .unwrap();
         assert_eq!(noop, 0);
         let _ =
-            std::fs::remove_dir_all(std::env::temp_dir().join("helm-usage-contract-rename-pref"));    }
+            std::fs::remove_dir_all(std::env::temp_dir().join("helm-usage-contract-rename-pref"));
+    }
+
+    #[test]
+    fn rename_session_preferred_models_applies_mapping_without_chaining() {
+        let store = fixture_store("rename-pref-batch");
+        create_session(&store, "first", EngineId::ClaudeCode);
+        create_session(&store, "second", EngineId::ClaudeCode);
+        create_session(&store, "other-engine", EngineId::Codex);
+        store
+            .set_session_turn_preference("first", "model-a", None)
+            .unwrap();
+        store
+            .set_session_turn_preference("second", "model-b", None)
+            .unwrap();
+        store
+            .set_session_turn_preference("other-engine", "model-a", None)
+            .unwrap();
+        assert_eq!(
+            store
+                .rename_session_preferred_models(
+                    "claude-code",
+                    &[
+                        ("model-a".into(), "model-b".into()),
+                        ("model-b".into(), "model-c".into()),
+                    ]
+                )
+                .unwrap(),
+            2
+        );
+        let sessions = store.list_sessions().unwrap();
+        let preferred = |id: &str| {
+            sessions
+                .iter()
+                .find(|session| session.id == id)
+                .and_then(|session| session.preferred_model.as_deref())
+        };
+        assert_eq!(preferred("first"), Some("model-b"));
+        assert_eq!(preferred("second"), Some("model-c"));
+        assert_eq!(preferred("other-engine"), Some("model-a"));
+    }
 
     #[test]
     fn daily_usage_legacy_only_day_returns_null_token_fields_without_estimates() {

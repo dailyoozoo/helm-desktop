@@ -1,5 +1,6 @@
 use crate::adapter::{AgentSession, ApprovalDecision, PermissionProfile};
 use crate::budget::{BudgetDimension, TurnBudgetSnapshot};
+use crate::capability_registry::CapabilitySupport;
 use crate::operations::{
     ModelOnlyOperationOutput, ModelOnlyOperationPolicy, OperationExecutionSpec,
 };
@@ -201,6 +202,49 @@ async fn read_bounded_operation_output(
 struct RuntimeProcessConfig {
     permission_profile: PermissionProfile,
     disabled_mcp: Vec<String>,
+}
+
+pub(crate) struct PendingRuntimeSession {
+    session: Option<AgentSession>,
+}
+
+impl PendingRuntimeSession {
+    pub(crate) fn new(session: AgentSession) -> Self {
+        Self {
+            session: Some(session),
+        }
+    }
+
+    fn session(&self) -> &AgentSession {
+        self.session
+            .as_ref()
+            .expect("pending Runtime was already transferred")
+    }
+
+    pub(crate) fn into_session(mut self) -> AgentSession {
+        self.session
+            .take()
+            .expect("pending Runtime was already transferred")
+    }
+
+    pub(crate) async fn shutdown(mut self) {
+        if let Some(session) = self.session.as_ref() {
+            session.release_turn_reservation();
+            session.shutdown().await;
+        }
+        self.session.take();
+    }
+}
+
+impl Drop for PendingRuntimeSession {
+    fn drop(&mut self) {
+        if let Some(session) = self.session.take() {
+            session.release_turn_reservation();
+            tauri::async_runtime::spawn(async move {
+                session.shutdown().await;
+            });
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -708,6 +752,8 @@ impl RuntimeRegistry {
         capability_snapshot: &crate::capability_registry::EngineCapabilitySnapshot,
         cwd: &str,
     ) -> Result<RuntimeGeneration, String> {
+        let pending = PendingRuntimeSession::new(session);
+        let session = pending.session();
         let RuntimeOwnerRef::Session(session_id) = &owner else {
             return Err("Session Runtime 不能注册到 Operation owner".to_string());
         };
@@ -723,7 +769,11 @@ impl RuntimeRegistry {
             return Err("CapabilitySnapshot 与 Session 路由身份不匹配".to_string());
         }
         let canonical_cwd = canonical_runtime_cwd(cwd)?;
-        let base_compatibility_key = base_runtime_compatibility_key(route, &canonical_cwd)?;
+        let base_compatibility_key = base_runtime_compatibility_key_with_override(
+            route,
+            &canonical_cwd,
+            capability_snapshot.capabilities.model_override.support,
+        )?;
         let process_config = RuntimeProcessConfig {
             permission_profile: session.permission_profile().await?,
             disabled_mcp: Vec::new(),
@@ -757,7 +807,7 @@ impl RuntimeRegistry {
             owner.key(),
             RuntimeEntry {
                 generation: generation.clone(),
-                session,
+                session: pending.into_session(),
                 base_compatibility_key,
                 process_config,
             },
@@ -788,10 +838,15 @@ impl RuntimeRegistry {
         owner: &RuntimeOwnerRef,
         route: &RuntimeRoute,
         cwd: &str,
+        capability_snapshot: &crate::capability_registry::EngineCapabilitySnapshot,
     ) -> Result<bool, String> {
         let entry = self.entry(owner).await?;
         let canonical_cwd = canonical_runtime_cwd(cwd)?;
-        let candidate = base_runtime_compatibility_key(route, &canonical_cwd)?;
+        let candidate = base_runtime_compatibility_key_with_override(
+            route,
+            &canonical_cwd,
+            capability_snapshot.capabilities.model_override.support,
+        )?;
         Ok(candidate != entry.base_compatibility_key)
     }
 
@@ -819,6 +874,8 @@ impl RuntimeRegistry {
         capability_snapshot: &crate::capability_registry::EngineCapabilitySnapshot,
         cwd: &str,
     ) -> Result<RuntimeGeneration, String> {
+        let pending = PendingRuntimeSession::new(session);
+        let session = pending.session();
         let current = self.entry(owner).await?;
         if session.history_session_id() != owner.id() {
             return Err("替换 Runtime 与 Session owner 身份不匹配".to_string());
@@ -832,7 +889,11 @@ impl RuntimeRegistry {
             return Err("CapabilitySnapshot 与替换 Runtime 路由身份不匹配".to_string());
         }
         let canonical_cwd = canonical_runtime_cwd(cwd)?;
-        let base_compatibility_key = base_runtime_compatibility_key(route, &canonical_cwd)?;
+        let base_compatibility_key = base_runtime_compatibility_key_with_override(
+            route,
+            &canonical_cwd,
+            capability_snapshot.capabilities.model_override.support,
+        )?;
         if base_compatibility_key == current.base_compatibility_key {
             return Err("兼容 Runtime 不应创建新 generation".to_string());
         }
@@ -868,21 +929,19 @@ impl RuntimeRegistry {
                 .get_mut(&owner.key())
                 .ok_or_else(|| format!("找不到 Runtime owner：{}", owner.id()))?;
             if live.generation.id != current.generation.id {
-                session.release_turn_reservation();
                 return Err("RuntimeGeneration 在路由切换期间发生并发变化".to_string());
             }
             if let Err(error) = self
                 .history
                 .rotate_runtime_generation(&current.generation.id, &generation)
             {
-                session.release_turn_reservation();
                 return Err(error);
             }
             std::mem::replace(
                 live,
                 RuntimeEntry {
                     generation: generation.clone(),
-                    session,
+                    session: pending.into_session(),
                     base_compatibility_key,
                     process_config: current.process_config.clone(),
                 },
@@ -944,21 +1003,33 @@ impl RuntimeRegistry {
         match entry.session.send_reserved(text, attachments, spec).await {
             Ok(()) => Ok(()),
             Err(error) => {
-                let supervised = self.supervisor.as_ref().is_some_and(|supervisor| {
-                    supervisor.submit_event(
-                        owner.id(),
-                        Some(&attempt.turn_id),
-                        None,
-                        AgentEvent::Error {
-                            session_id: None,
-                            message: error.clone(),
-                            recoverable: false,
-                            kind: Some("dispatch_rejected".to_string()),
-                            stalled_kind: None,
-                        },
-                    )
-                });
-                if !supervised {
+                if let Some(supervisor) = self.supervisor.as_ref() {
+                    if let Err(submission_error) = supervisor
+                        .submit_event(
+                            owner.id(),
+                            Some(&attempt.turn_id),
+                            None,
+                            AgentEvent::Error {
+                                session_id: None,
+                                message: error.clone(),
+                                recoverable: false,
+                                kind: Some("dispatch_rejected".to_string()),
+                                stalled_kind: None,
+                            },
+                        )
+                        .await
+                    {
+                        let submission_error = crate::redaction::redact_text(&submission_error);
+                        crate::adapter::log_runtime_line(
+                            "stream-submit-failed",
+                            &format!("owner={} error=<{submission_error}>", owner.id()),
+                        );
+                        return Err(format!(
+                            "{submission_error}; 发送失败：{}",
+                            crate::redaction::redact_text(&error)
+                        ));
+                    }
+                } else {
                     let _ = self.history.finish_turn_attempt(
                         &attempt.turn_id,
                         attempt.attempt_no,
@@ -1207,10 +1278,18 @@ fn base_runtime_compatibility_key(
     route: &RuntimeRoute,
     canonical_cwd: &str,
 ) -> Result<String, String> {
+    base_runtime_compatibility_key_with_override(route, canonical_cwd, CapabilitySupport::Unknown)
+}
+
+fn base_runtime_compatibility_key_with_override(
+    route: &RuntimeRoute,
+    canonical_cwd: &str,
+    model_override: CapabilitySupport,
+) -> Result<String, String> {
     digest_json(&serde_json::json!({
         "adapterProtocolGeneration": adapter_protocol_generation(&route.engine_id),
         "engineId": route.engine_id,
-        "modelId": route.model_id,
+        "modelId": if model_override == CapabilitySupport::Supported { None } else { Some(&route.model_id) },
         "engineProfileDigest": route.engine_profile_digest,
         "providerLaunchProfileRef": route.provider_launch_profile_ref,
         "providerLaunchProfileDigest": route.provider_launch_profile_digest,
@@ -1387,7 +1466,7 @@ mod tests {
     }
 
     #[test]
-    fn model_change_requires_new_compatibility_key() {
+    fn model_change_requires_new_compatibility_key_without_override_contract() {
         let first = base_runtime_compatibility_key(
             &route("gpt-primary", ReasoningEffort::Auto),
             "c:\\repo",
@@ -1397,6 +1476,87 @@ mod tests {
             base_runtime_compatibility_key(&route("gpt-fast", ReasoningEffort::Auto), "c:\\repo")
                 .unwrap();
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn proven_per_turn_override_reuses_runtime_across_models() {
+        let first = base_runtime_compatibility_key_with_override(
+            &route("gpt-primary", ReasoningEffort::Auto),
+            "c:\\repo",
+            CapabilitySupport::Supported,
+        )
+        .unwrap();
+        let next = base_runtime_compatibility_key_with_override(
+            &route("gpt-fast", ReasoningEffort::Auto),
+            "c:\\repo",
+            CapabilitySupport::Supported,
+        )
+        .unwrap();
+        assert_eq!(first, next);
+        for support in [
+            CapabilitySupport::Unknown,
+            CapabilitySupport::Unsupported,
+            CapabilitySupport::Degraded,
+        ] {
+            let primary = base_runtime_compatibility_key_with_override(
+                &route("gpt-primary", ReasoningEffort::Auto),
+                "c:\\repo",
+                support,
+            )
+            .unwrap();
+            let fast = base_runtime_compatibility_key_with_override(
+                &route("gpt-fast", ReasoningEffort::Auto),
+                "c:\\repo",
+                support,
+            )
+            .unwrap();
+            assert_ne!(primary, fast);
+            assert_ne!(next, fast);
+        }
+    }
+
+    #[test]
+    fn model_override_never_reuses_a_changed_process_identity() {
+        let original = route("gpt-primary", ReasoningEffort::Auto);
+        let first = base_runtime_compatibility_key_with_override(
+            &original,
+            "c:\\repo",
+            CapabilitySupport::Supported,
+        )
+        .unwrap();
+        let mut changed_routes = Vec::new();
+        let mut changed = original.clone();
+        changed.provider_launch_profile_digest = "sha256:rotated-credential".into();
+        changed_routes.push(changed);
+        let mut changed = original.clone();
+        changed.provider_launch_profile_ref = "provider:other:api".into();
+        changed_routes.push(changed);
+        let mut changed = original.clone();
+        changed.engine_profile_digest = "sha256:changed-skills".into();
+        changed_routes.push(changed);
+        let mut changed = original.clone();
+        changed.engine_id = "claude-code".into();
+        changed_routes.push(changed);
+        for changed in changed_routes {
+            assert_ne!(
+                first,
+                base_runtime_compatibility_key_with_override(
+                    &changed,
+                    "c:\\repo",
+                    CapabilitySupport::Supported
+                )
+                .unwrap()
+            );
+        }
+        assert_ne!(
+            first,
+            base_runtime_compatibility_key_with_override(
+                &original,
+                "c:\\other",
+                CapabilitySupport::Supported
+            )
+            .unwrap()
+        );
     }
 
     #[test]

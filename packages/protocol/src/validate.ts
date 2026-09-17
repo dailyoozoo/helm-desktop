@@ -123,8 +123,6 @@ export function isAgentEvent(x: unknown): x is AgentEvent {
       );
     case 'plan_update':
       return strNonEmpty('sessionId') && Array.isArray(x.steps) && x.steps.every(isPlanStep);
-    case 'checkpoint':
-      return strNonEmpty('sessionId') && strNonEmpty('id') && str('label') && num('ts');
     case 'token_usage':
       return (
         strNonEmpty('sessionId') &&

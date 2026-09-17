@@ -92,6 +92,12 @@ pub async fn review_changes(
             .filter(|model| !model.trim().is_empty())
             .unwrap_or(&binding.primary_model)
             .to_string();
+        let model = crate::providers::resolve_model_reference(
+            &candidate.config,
+            &binding.provider_id,
+            &model,
+        )
+        .map_err(|error| format!("[operation_model_unavailable] {error}"))?;
         let launch_binding = BindingConfig {
             primary_model: model.clone(),
             assistant_model_id: None,
@@ -115,14 +121,11 @@ pub async fn review_changes(
                 "claude"
             })
             .to_string();
-        let pricing_profile = candidate
-            .config
-            .models
-            .iter()
-            .find(|item| item.provider_id == binding.provider_id && item.id == model)
-            .map(|item| provider_store.model_pricing_profile(&candidate.config, item))
-            .transpose()?
-            .flatten();
+        let pricing_profile = provider_store.pricing_profile_for_model_id(
+            &candidate.config,
+            &binding.provider_id,
+            &model,
+        )?;
         let requested_effort = binding.reasoning_effort.unwrap_or(ReasoningEffort::Auto);
         let route = build_runtime_route(
             &candidate.config,

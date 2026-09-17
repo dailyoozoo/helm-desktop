@@ -17,6 +17,8 @@
 import type { AgentEvent, Diff, DiffLine, EngineId } from '@helm/protocol';
 
 const ENGINE: EngineId = 'claude-code';
+const DIFF_LCS_CELL_LIMIT = 262_144;
+const DIFF_LOOKAHEAD_LINES = 64;
 
 function isRecord(x: unknown): x is Record<string, unknown> {
   return typeof x === 'object' && x !== null;
@@ -48,55 +50,85 @@ function splitLines(text: string): string[] {
   return lines;
 }
 
-function lcsMatrix(a: string[], b: string[]): number[][] {
-  const matrix = Array.from({ length: a.length + 1 }, () => Array<number>(b.length + 1).fill(0));
-  for (let i = 1; i <= a.length; i += 1) {
-    for (let j = 1; j <= b.length; j += 1) {
-      matrix[i][j] =
-        a[i - 1] === b[j - 1]
-          ? matrix[i - 1][j - 1] + 1
-          : Math.max(matrix[i - 1][j], matrix[i][j - 1]);
-    }
+function nextMatchingLine(lines: string[], start: number, text: string): number {
+  const end = Math.min(lines.length, start + DIFF_LOOKAHEAD_LINES + 1);
+  for (let index = start + 1; index < end; index += 1) {
+    if (lines[index] === text) return index - start;
   }
-  return matrix;
+  return -1;
 }
 
-function computeDiffLines(oldLines: string[], newLines: string[]): DiffLine[] {
-  let pre = 0;
-  while (pre < oldLines.length && pre < newLines.length && oldLines[pre] === newLines[pre])
-    pre += 1;
-
-  let suff = 0;
+function computeDiffLines(oldLines: string[], newLines: string[]) {
+  let prefix = 0;
   while (
-    suff < oldLines.length - pre &&
-    suff < newLines.length - pre &&
-    oldLines[oldLines.length - 1 - suff] === newLines[newLines.length - 1 - suff]
+    prefix < oldLines.length &&
+    prefix < newLines.length &&
+    oldLines[prefix] === newLines[prefix]
   ) {
-    suff += 1;
+    prefix += 1;
   }
-
-  const midOld = oldLines.slice(pre, oldLines.length - suff);
-  const midNew = newLines.slice(pre, newLines.length - suff);
-  const lcs = lcsMatrix(midOld, midNew);
-  const lines: DiffLine[] = [];
-  let oi = 0;
-  let ni = 0;
-
-  while (oi < midOld.length || ni < midNew.length) {
-    if (oi < midOld.length && ni < midNew.length && midOld[oi] === midNew[ni]) {
-      lines.push({ kind: 'ctx', text: midOld[oi] });
-      oi += 1;
-      ni += 1;
-    } else if (ni >= midNew.length || (oi < midOld.length && lcs[oi + 1][ni] >= lcs[oi][ni + 1])) {
-      lines.push({ kind: 'del', text: midOld[oi] });
-      oi += 1;
-    } else {
-      lines.push({ kind: 'add', text: midNew[ni] });
-      ni += 1;
+  let suffix = 0;
+  while (
+    suffix < oldLines.length - prefix &&
+    suffix < newLines.length - prefix &&
+    oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
+  ) {
+    suffix += 1;
+  }
+  const old = oldLines.slice(prefix, oldLines.length - suffix);
+  const next = newLines.slice(prefix, newLines.length - suffix);
+  const width = next.length + 1;
+  const cells = (old.length + 1) * width;
+  const matrix = cells <= DIFF_LCS_CELL_LIMIT ? new Uint32Array(cells) : null;
+  if (matrix) {
+    for (let oldIndex = old.length - 1; oldIndex >= 0; oldIndex -= 1) {
+      for (let newIndex = next.length - 1; newIndex >= 0; newIndex -= 1) {
+        matrix[oldIndex * width + newIndex] =
+          old[oldIndex] === next[newIndex]
+            ? matrix[(oldIndex + 1) * width + newIndex + 1] + 1
+            : Math.max(
+                matrix[(oldIndex + 1) * width + newIndex],
+                matrix[oldIndex * width + newIndex + 1],
+              );
+      }
     }
   }
-
-  return lines;
+  const lines: DiffLine[] = [];
+  let oldIndex = 0;
+  let newIndex = 0;
+  while (oldIndex < old.length || newIndex < next.length) {
+    if (oldIndex < old.length && newIndex < next.length && old[oldIndex] === next[newIndex]) {
+      lines.push({ kind: 'ctx', text: old[oldIndex] });
+      oldIndex += 1;
+      newIndex += 1;
+      continue;
+    }
+    let deleteFirst = newIndex === next.length;
+    if (oldIndex < old.length && newIndex < next.length) {
+      if (matrix) {
+        deleteFirst =
+          matrix[(oldIndex + 1) * width + newIndex] >= matrix[oldIndex * width + newIndex + 1];
+      } else {
+        const nextOld = nextMatchingLine(old, oldIndex, next[newIndex]);
+        const nextNew = nextMatchingLine(next, newIndex, old[oldIndex]);
+        if (nextOld < 0 && nextNew < 0) {
+          lines.push({ kind: 'del', text: old[oldIndex] }, { kind: 'add', text: next[newIndex] });
+          oldIndex += 1;
+          newIndex += 1;
+          continue;
+        }
+        deleteFirst = nextOld >= 0 && (nextNew < 0 || nextOld <= nextNew);
+      }
+    }
+    if (deleteFirst) {
+      lines.push({ kind: 'del', text: old[oldIndex] });
+      oldIndex += 1;
+    } else {
+      lines.push({ kind: 'add', text: next[newIndex] });
+      newIndex += 1;
+    }
+  }
+  return { lines, start: prefix + 1 };
 }
 
 function extractDiff(content: unknown): Diff | undefined {
@@ -115,9 +147,9 @@ function extractDiff(content: unknown): Diff | undefined {
   if (oldText.length === 0 && newText.length === 0) return undefined;
   const oldLines = splitLines(oldText);
   const newLines = splitLines(newText);
-  const lines = computeDiffLines(oldLines, newLines);
+  const { lines, start } = computeDiffLines(oldLines, newLines);
   if (lines.length === 0) return undefined;
-  return { path, hunks: [{ oldStart: 1, newStart: 1, lines }] };
+  return { path, hunks: [{ oldStart: start, newStart: start, lines }] };
 }
 
 function parseSystem(obj: Record<string, unknown>, sessionId: string): AgentEvent[] {

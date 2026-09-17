@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import type { AppConfig, ModelConfig } from './api';
+import type { AppConfig, ModelConfig, PricingCatalogEntry } from './api';
 import {
   applicableEngineLabels,
   canBindProvider,
   compatibleProvidersForEngine,
+  buildManualModel,
+  catalogPriceMatch,
   createProviderDraft,
   modelAccessGroups,
   modelGroupPriceSummary,
@@ -25,11 +27,13 @@ import {
   matchingSubscriptionProvider,
   modelCatalog,
   modelCatalogForProvider,
+  mergeSyncedModelSelection,
   modelsForProvider,
   normalizeBindingDraft,
   priceSourceText,
   providerCapabilities,
   providerCanDelete,
+  providerModelMode,
   providerFailureCategory,
   providerSetupCopy,
   providerRuntimeReady,
@@ -38,6 +42,7 @@ import {
   reachabilityStatus,
   readinessText,
   subscriptionLoginWarning,
+  sessionModelOptions,
 } from './providerViewModel';
 
 const config: AppConfig = {
@@ -469,7 +474,12 @@ describe('provider view model', () => {
   });
 
   it('derives card status pills only from real readiness/login/model data', () => {
-    const base = { kind: 'api' as const, ready: true, lastTest: null };
+    const base = {
+      kind: 'api' as const,
+      protocol: 'openai-responses' as const,
+      ready: true,
+      lastTest: null,
+    };
     expect(providerCardStatus(base, null, 0)).toEqual({ label: '待选模型', tone: 'warn' });
     expect(providerCardStatus({ ...base, lastTest: { result: 'fail', at: 1 } }, null, 2)).toEqual({
       label: '探活失败',
@@ -484,7 +494,12 @@ describe('provider view model', () => {
       tone: 'muted',
     });
     // 订阅：登录成功 → 已登录/待选模型；未登录 → 登录态文案
-    const sub = { kind: 'subscription' as const, ready: true, lastTest: null };
+    const sub = {
+      kind: 'subscription' as const,
+      protocol: 'openai-responses' as const,
+      ready: true,
+      lastTest: null,
+    };
     expect(providerCardStatus(sub, { state: 'ok', authMethod: 'subscription' }, 1)).toEqual({
       label: '已登录',
       tone: 'ready',
@@ -494,6 +509,30 @@ describe('provider view model', () => {
       tone: 'warn',
     });
     expect(providerCardStatus(sub, { state: 'missing' }, 1).tone).toBe('warn');
+    // 角色模式（Anthropic 兼容中转）：模型在 roleModels，不在模型目录，按角色配置判定
+    const relay = {
+      kind: 'api' as const,
+      protocol: 'anthropic' as const,
+      ready: true,
+      lastTest: null,
+    };
+    expect(providerCardStatus({ ...relay, roleModels: {} }, null, 0)).toEqual({
+      label: '待选模型',
+      tone: 'warn',
+    });
+    expect(
+      providerCardStatus({ ...relay, roleModels: { default: '  ', opus: '' } }, null, 0),
+    ).toEqual({ label: '待选模型', tone: 'warn' });
+    expect(
+      providerCardStatus({ ...relay, roleModels: { opus: 'claude-sonnet-5' } }, null, 0),
+    ).toEqual({ label: '配置就绪', tone: 'ready' });
+    expect(
+      providerCardStatus(
+        { ...relay, roleModels: { opus: 'claude-sonnet-5' }, lastTest: { result: 'fail', at: 1 } },
+        null,
+        0,
+      ),
+    ).toEqual({ label: '探活失败', tone: 'warn' });
   });
 
   it('normalizes model ids with the same rules as Rust pricing::normalize_model_id', () => {
@@ -556,6 +595,65 @@ describe('provider view model', () => {
     expect(gpt?.paths.map((path) => path.provider.id)).toEqual(['openai', 'kimi-plan']);
     expect(gpt?.paths[0].boundEngines).toContain('Codex');
     expect(gpt?.paths[1].billing).toBe('套餐等效');
+  });
+
+  it('shows role-mode paths from roleModels and hides legacy catalog leftovers', () => {
+    const relayProvider = {
+      id: 'relay-anthropic',
+      name: 'sui-xiang',
+      kind: 'api' as const,
+      baseUrl: 'https://sui-xiang.com',
+      keyRef: null,
+      ready: true,
+      lastTest: null,
+      protocol: 'anthropic' as const,
+      authMethod: 'apikey' as const,
+      // 四个角色共用 claude-sonnet-5 → 合并为一条路径并标注角色；haiku 独立模型 → 单独一条
+      roleModels: {
+        default: 'claude-sonnet-5',
+        opus: 'claude-sonnet-5',
+        sonnet: 'claude-sonnet-5',
+        haiku: 'claude-haiku-4',
+      },
+    };
+    const roleMode: AppConfig = {
+      ...config,
+      providers: [...config.providers, relayProvider],
+      // 目录里的 claude-sonnet-5 / claude-haiku-4 是历史同步残留，角色模式下不应展示
+      models: [
+        ...config.models,
+        {
+          id: 'claude-sonnet-5',
+          providerId: 'relay-anthropic',
+          displayName: 'claude-sonnet-5',
+          inputPricePerMtok: 0,
+          outputPricePerMtok: 0,
+          enabled: true,
+        },
+      ],
+      bindings: [
+        ...config.bindings,
+        {
+          engineId: 'claude-code',
+          providerId: 'relay-anthropic',
+          primaryModel: 'role:opus',
+          fastModel: 'role:opus',
+        },
+      ],
+    };
+    const groups = modelAccessGroups(roleMode);
+    const sonnet = groups.find((group) => group.key === 'claude-sonnet-5');
+    expect(sonnet).toBeDefined();
+    expect(sonnet?.paths).toHaveLength(1);
+    expect(sonnet?.paths[0].provider.id).toBe('relay-anthropic');
+    expect(sonnet?.paths[0].roles).toEqual(['默认模型', 'Sonnet', 'Opus']);
+    expect(sonnet?.paths[0].boundEngines).toContain('Claude Code');
+    const haiku = groups.find((group) => group.key === 'claude-haiku-4');
+    expect(haiku?.paths[0].roles).toEqual(['Haiku']);
+    expect(haiku?.paths[0].boundEngines).toEqual([]);
+    // 非订阅 anthropic 服务商的目录条目一律不进模型列表
+    const anthropicCatalog = groups.find((group) => group.key === 'claude-sonnet-4.6');
+    expect(anthropicCatalog).toBeUndefined();
   });
 
   it('summarizes group price preferring token-priced paths over plan fallbacks', () => {
@@ -669,5 +767,136 @@ describe('multiplierInputToBasisPoints（矩阵 H-4 倍率钳制）', () => {
     expect(multiplierInputToBasisPoints('0.5')).toBe(5000);
     expect(multiplierInputToBasisPoints('1.5')).toBe(15000);
     expect(multiplierInputToBasisPoints('100')).toBe(1000000);
+  });
+});
+
+describe('目录定价只接受规范 ID、显式别名与适用协议', () => {
+  const catalog: PricingCatalogEntry[] = [
+    {
+      vendor: 'openai',
+      modelId: 'gpt-example-2026-01-01',
+      aliases: ['gpt-example'],
+      protocols: ['openai-responses', 'openai-chat'],
+      currency: 'USD',
+      input: 2,
+      cachedInput: 0.2,
+      output: 8,
+      observedAt: '2026-01-01',
+    },
+    {
+      vendor: 'anthropic',
+      modelId: 'claude-example',
+      aliases: ['shared-alias'],
+      protocols: ['anthropic', 'bedrock', 'vertex'],
+      currency: 'USD',
+      input: 3,
+      cachedInput: 0.3,
+      output: 15,
+      observedAt: '2026-01-01',
+    },
+  ];
+
+  it('精确 ID 与显式 alias 使用同一后端规范化口径', () => {
+    expect(catalogPriceMatch(catalog, 'gpt-example-2026-01-01', 'openai-responses')).toBe(
+      catalog[0],
+    );
+    expect(catalogPriceMatch(catalog, ' MODELS/OPENAI/GPT-EXAMPLE ', 'openai-chat')).toBe(
+      catalog[0],
+    );
+    expect(catalogPriceMatch(catalog, 'gateway:shared-alias', 'anthropic')).toBe(catalog[1]);
+    expect(catalogPriceMatch(catalog, 'models/anthropic/claude@example', 'vertex')).toBe(
+      catalog[1],
+    );
+  });
+
+  it.each([
+    'gpt-example-latest',
+    'gpt-example-thinking',
+    'gpt-example-responses',
+    'gpt-example-2026-02-01',
+    'example',
+    '',
+  ])('不对 %s 做相似名称、协议后缀或日期猜价', (modelId) => {
+    expect(catalogPriceMatch(catalog, modelId, 'openai-responses')).toBeNull();
+  });
+
+  it('同名与别名都不能跨协议套用价格；缺少协议证据按未知处理', () => {
+    expect(catalogPriceMatch(catalog, 'gpt-example', 'anthropic')).toBeNull();
+    expect(catalogPriceMatch(catalog, 'shared-alias', 'openai-chat')).toBeNull();
+    expect(
+      catalogPriceMatch([{ ...catalog[0], protocols: undefined }], 'gpt-example', 'openai-chat'),
+    ).toBeNull();
+    expect(
+      catalogPriceMatch([{ ...catalog[0], protocols: [] }], 'gpt-example', 'openai-chat'),
+    ).toBeNull();
+  });
+
+  it('名称相同时按适用协议选择，不把目录中的第一个厂商当权威', () => {
+    const duplicate = { ...catalog[1], modelId: catalog[0].modelId };
+    expect(catalogPriceMatch([duplicate, ...catalog], catalog[0].modelId, 'openai-responses')).toBe(
+      catalog[0],
+    );
+  });
+
+  it('未命中是 unknown，不把默认零价冒充手动或目录价', () => {
+    const model = buildManualModel('relay', 'custom-model', null);
+    expect(model).toMatchObject({
+      id: 'custom-model',
+      providerId: 'relay',
+      priceSource: 'unknown',
+      inputPricePerMtok: 0,
+      outputPricePerMtok: 0,
+      enabled: true,
+    });
+  });
+
+  it('命中仅复制权威价，不改写实际模型 ID', () => {
+    const modelId = 'gpt-example';
+    const match = catalogPriceMatch(catalog, modelId, 'openai-responses');
+    expect(buildManualModel('api', modelId, match)).toMatchObject({
+      id: modelId,
+      displayName: modelId,
+      inputPricePerMtok: 2,
+      cachedInputPricePerMtok: 0.2,
+      outputPricePerMtok: 8,
+      priceSource: 'builtin',
+    });
+    expect(buildManualModel('api', modelId, { ...catalog[0], input: 0, output: 0 })).toMatchObject({
+      priceSource: 'builtin',
+      inputPricePerMtok: 0,
+      outputPricePerMtok: 0,
+    });
+  });
+});
+
+describe('订阅目录与本地勾选', () => {
+  it.each(['claude-subscription', 'codex-subscription'] as const)(
+    '%s 只展示官方目录，不开放手写角色',
+    (template) => {
+      const provider = createProviderDraft(template, 1);
+      const model = { ...config.models[0], providerId: provider.id };
+      const next = { ...config, providers: [provider], models: [model] };
+      expect(providerModelMode(provider)).toBe('list-openai');
+      expect(sessionModelOptions(next, provider.id)).toEqual([model]);
+    },
+  );
+
+  it('API Anthropic 保持角色配置，API OpenAI 保持可编辑列表', () => {
+    expect(providerModelMode(config.providers[0])).toBe('roles-anthropic');
+    expect(providerModelMode(config.providers[1])).toBe('list-openai');
+  });
+
+  it('刷新只保留同服务商同模型的勾选，其余字段和增删以最新官方目录为准', () => {
+    const current = { ...config.models[0], enabled: true, inputPricePerMtok: 9 };
+    const added = { ...current, id: 'new-official-model', enabled: true };
+    const drafts = [
+      { ...current, enabled: false, inputPricePerMtok: 999, displayName: 'edited' },
+      { ...current, id: 'removed-model', enabled: true },
+      { ...added, providerId: 'other-provider', enabled: false },
+    ];
+    const merged = mergeSyncedModelSelection([current, added], drafts);
+    expect(merged).toEqual([{ ...current, enabled: false }, added]);
+    expect(current.enabled).toBe(true);
+    expect(drafts[0].inputPricePerMtok).toBe(999);
   });
 });

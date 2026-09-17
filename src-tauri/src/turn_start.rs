@@ -161,18 +161,9 @@ pub fn build_runtime_route(
         .iter()
         .find(|provider| provider.id == binding.provider_id)
         .ok_or_else(|| format!("找不到绑定服务商：{}", binding.provider_id))?;
-    // 方案 b（用户裁决）：绑定可选角色（role:键），启动时解析为角色对应的模型；
-    // 运行中的 Turn 已冻结解析结果，角色映射变更只影响后续发送。
-    let model_id = match model_id.strip_prefix("role:") {
-        Some(role_key) => provider
-            .role_models
-            .as_ref()
-            .and_then(|role_models| role_models.get(role_key))
-            .map(|model| model.as_str())
-            .filter(|model| !model.trim().is_empty())
-            .ok_or_else(|| format!("角色 {role_key} 未配置对应模型，请在服务商详情中补全"))?,
-        None => model_id,
-    };
+    let resolved_model =
+        crate::providers::resolve_model_reference(config, &binding.provider_id, model_id)?;
+    let model_id = resolved_model.as_str();
     let model_label = config
         .models
         .iter()
@@ -226,6 +217,7 @@ fn provider_launch_profile_digest(
         ProviderKind::Api | ProviderKind::Local => serde_json::json!({
             "baseUrl": provider.base_url,
             "keyRef": provider.key_ref,
+            "credentialRevision": provider.credential_revision,
         }),
     };
     digest_json(&serde_json::json!({
@@ -364,6 +356,7 @@ mod tests {
             access_type: None,
             role_models: None,
             last_sync_at: None,
+            credential_revision: 0,
         };
         let first = provider_launch_profile_digest(&binding, &provider).unwrap();
         let mut changed = provider.clone();
@@ -374,6 +367,12 @@ mod tests {
             provider_launch_profile_digest(&binding, &changed).unwrap()
         );
         changed.base_url = "https://other.example.test".into();
+        assert_ne!(
+            first,
+            provider_launch_profile_digest(&binding, &changed).unwrap()
+        );
+        changed = provider.clone();
+        changed.credential_revision += 1;
         assert_ne!(
             first,
             provider_launch_profile_digest(&binding, &changed).unwrap()
@@ -406,6 +405,7 @@ mod tests {
             access_type: None,
             role_models: None,
             last_sync_at: None,
+            credential_revision: 0,
         };
         let first = provider_launch_profile_digest(&binding, &provider).unwrap();
         let mut changed = provider.clone();

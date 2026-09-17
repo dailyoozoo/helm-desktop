@@ -5,6 +5,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
   AgentEventEnvelope,
+  TurnStreamFailure,
   Decision,
   EngineId,
   ReasoningEffort,
@@ -156,13 +157,10 @@ export function onAgentEvent(cb: (envelope: AgentEventEnvelope) => void): Promis
   return listen<AgentEventEnvelope>('agent-event', (evt) => cb(evt.payload));
 }
 
-// 回溯到某个检查点
-export function restoreCheckpoint(checkpointId: string): Promise<void> {
-  return invoke<void>('restore_checkpoint', { checkpointId });
-}
-// 撤销回溯（按内部会话句柄定位——回溯后 CLI 会话 id 已作废）
-export function undoRevert(handleId: string): Promise<void> {
-  return invoke<void>('undo_revert', { handleId });
+export function onTurnStreamFailure(
+  callback: (failure: TurnStreamFailure) => void,
+): Promise<UnlistenFn> {
+  return listen<TurnStreamFailure>('turn-stream-failed', (event) => callback(event.payload));
 }
 
 // 变更-34 · A3：让 Helm 自评审当前会话变更（真实 fast model 调用，返回行级意见）。
@@ -235,6 +233,19 @@ export interface FilePreview {
 /** 软件内只读预览文件（文本/图片）；二进制返回类型标记。 */
 export function readFilePreview(path: string): Promise<FilePreview> {
   return invoke<FilePreview>('read_file_preview', { path });
+}
+
+/** Office 等二进制预览所需的字节结果（base64 编码的原始文件）。 */
+export interface FileBytesPreview {
+  /** 原始文件 Bytes 的 base64 */
+  content: string;
+  /** 实际文件字节数 */
+  size: number;
+}
+
+/** 读取二进制文件的 base64 内容（供前端 xlsx/docx 解析渲染；同样经过敏感路径与大小上限保护）。 */
+export function readFilePreviewBytes(path: string): Promise<FileBytesPreview> {
+  return invoke<FileBytesPreview>('read_file_preview_bytes', { path });
 }
 
 /** 用系统默认程序打开文件/目录（供二进制或需要在外部查看的文件使用）。 */

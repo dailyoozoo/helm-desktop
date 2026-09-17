@@ -57,6 +57,8 @@ export interface PricingCatalogStatus {
 export interface PricingCatalogEntry {
   vendor: string;
   modelId: string;
+  aliases?: string[];
+  protocols?: Protocol[];
   currency: string;
   input: number;
   cachedInput?: number | null;
@@ -93,6 +95,7 @@ export interface Provider {
   roleModels?: Partial<Record<ProviderRoleKey, string>> | null;
   /** 最近一次成功同步模型目录时间（秒级 epoch，与 lastTest.at 同口径）；缺省=尚未同步 */
   lastSyncAt?: number | null;
+  credentialRevision?: number;
 }
 
 export interface Model {
@@ -116,6 +119,7 @@ export interface EngineEnvVar {
   /** 秘密值不落盘：secret=true 时 value 恒为空，仅本次会话生效 */
   value?: string;
   secret?: boolean;
+  keyRef?: string | null;
 }
 
 export interface Engine {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { SessionState } from '../engine/useSession';
+import type { SessionTurn } from '../sessions/api';
 import { reduceSessionEvent } from '../engine/useSession';
 import { Thread } from './Thread';
 
@@ -31,14 +32,7 @@ function activeState(kind: 'thinking' | 'tool'): SessionState {
 }
 
 function renderThread(state: SessionState): string {
-  return renderToStaticMarkup(
-    <Thread
-      state={state}
-      onApprove={() => {}}
-      onRestoreCheckpoint={() => {}}
-      onUndoRevert={() => {}}
-    />,
-  );
+  return renderToStaticMarkup(<Thread state={state} onApprove={() => {}} />);
 }
 
 function workingRows(markup: string): string[] {
@@ -48,6 +42,54 @@ function workingRows(markup: string): string[] {
 }
 
 describe('Thread activity rendering', () => {
+  it('renders fatal errors without leaving live thinking, tools or approval controls', () => {
+    const initial = activeState('thinking');
+    initial.items = [
+      { kind: 'user', id: 'user', text: 'request', turnId: 'turn' },
+      { kind: 'thinking', id: 'thinking-1', text: 'public thought', done: false, turnId: 'turn' },
+      { kind: 'tool', id: 'tool', name: 'Bash', input: {}, status: 'pending', turnId: 'turn' },
+      {
+        kind: 'approval',
+        id: 'approval',
+        action: 'Bash',
+        detail: 'command',
+        status: 'pending',
+        availableDecisions: ['allow', 'deny'],
+        turnId: 'turn',
+      },
+    ];
+    const failed = reduceSessionEvent(
+      initial,
+      { type: 'error', message: 'runtime failed', recoverable: false },
+      'turn',
+    );
+    const markup = renderThread(failed);
+    expect(markup).not.toContain('think is-live');
+    expect(markup).not.toContain('等待审批…');
+    expect(markup).not.toContain('正在思考…');
+    expect(markup).not.toContain('>允许一次<');
+    expect(markup).toContain('runtime failed');
+  });
+
+  it('shows an explicit truncated-plan notice without inserting artificial steps', () => {
+    const state = activeState('thinking');
+    state.status = 'idle';
+    state.turnActivity = null;
+    state.openThinkingId = null;
+    state.items = [
+      {
+        kind: 'plan',
+        id: 'plan',
+        steps: [{ text: '真实步骤', status: 'active' }],
+        truncated: true,
+        turnStatus: 'failed',
+      },
+    ];
+    const markup = renderThread(state);
+    expect(markup).toContain('计划过长，历史仅保留部分步骤。');
+    expect(markup.match(/<li[ >]/g)).toHaveLength(1);
+  });
+
   it('hides the raw Codex tool-surface code behind the version-incompatible guidance', () => {
     const state = reduceSessionEvent(activeState('thinking'), {
       type: 'error',
@@ -180,17 +222,76 @@ function completedTurn(tools: SessionState['items']): SessionState {
   return state;
 }
 
-function renderCompleted(state: SessionState): string {
+function renderCompleted(state: SessionState, turns?: SessionTurn[]): string {
   return renderToStaticMarkup(
-    <Thread
-      state={state}
-      onApprove={() => {}}
-      onRestoreCheckpoint={() => {}}
-      onUndoRevert={() => {}}
-      onOpenPane={() => {}}
-    />,
+    <Thread state={state} onApprove={() => {}} onOpenPane={() => {}} turns={turns} />,
   );
 }
+
+describe('Thread ledger lookup', () => {
+  it('keeps ledger indexing and rail projection linear instead of searching per visible turn', () => {
+    let ledgerReads = 0;
+    const turns: SessionTurn[] = Array.from({ length: 2_000 }, (_, index) => ({
+      get id() {
+        ledgerReads += 1;
+        return `turn-${index}`;
+      },
+      epoch: index + 1,
+      mode: 'build',
+      permissionProfile: 'standard',
+      status: 'succeeded',
+      startedAt: index * 1_000,
+      endedAt: index * 1_000 + 500,
+      routedModelId: `model-${index % 2}`,
+    }));
+    const state = activeState('tool');
+    state.status = 'idle';
+    state.turnActivity = null;
+    state.items = Array.from({ length: 20 }, (_, visibleIndex) => {
+      const index = 1_980 + visibleIndex;
+      return [
+        { kind: 'user' as const, id: `user-${index}`, text: 'request', turnId: `turn-${index}` },
+        {
+          kind: 'assistant' as const,
+          id: `answer-${index}`,
+          text: 'answer',
+          turnId: `turn-${index}`,
+        },
+      ];
+    }).flat();
+    const markup = renderToStaticMarkup(
+      <Thread state={state} turns={turns} onApprove={() => {}} />,
+    );
+    expect(ledgerReads).toBe(turns.length * 2);
+    expect(markup).toContain('模型切换');
+    expect(markup).toContain('model-0');
+    expect(markup).toContain('model-1');
+  });
+
+  it('compares against the last actually reported model across missing model records', () => {
+    const turns: SessionTurn[] = ['model-a', undefined, 'model-b'].map((model, index) => ({
+      id: `turn-${index}`,
+      epoch: index + 1,
+      mode: 'build',
+      permissionProfile: 'standard',
+      status: 'succeeded',
+      startedAt: 1_000 + index,
+      endedAt: 2_000 + index,
+      routedModelId: model,
+    }));
+    const state = activeState('tool');
+    state.status = 'idle';
+    state.turnActivity = null;
+    state.items = [
+      { kind: 'user', id: 'user', text: 'request', turnId: 'turn-2' },
+      { kind: 'assistant', id: 'answer', text: 'answer', turnId: 'turn-2' },
+    ];
+    const markup = renderToStaticMarkup(
+      <Thread state={state} turns={turns} onApprove={() => {}} />,
+    );
+    expect(markup).toContain('model-a → model-b');
+  });
+});
 
 describe('Thread 交付物行 · 触碰文件口径', () => {
   it('只跑过 shell 命令的轮次不显示交付物入口', () => {
@@ -236,7 +337,25 @@ describe('Thread 交付物行 · 触碰文件口径', () => {
     expect(markup).not.toContain('deliverables');
   });
 
-  it('真正读过文件的轮次仍然显示「查看全部文件」', () => {
+  it('读取失败的工具不产生交付物入口（变更-37）', () => {
+    // 回归：Read 二进制 .xls 报错，路径却进了 touched → 「查看全部文件 1」。
+    const markup = renderCompleted(
+      completedTurn([
+        {
+          kind: 'tool',
+          id: 'tool-1',
+          name: 'Read',
+          input: { file_path: 'D:/work/demo/配置.xls' },
+          status: 'error',
+          turnId: 'turn-1',
+        },
+      ]),
+    );
+    expect(markup).not.toContain('查看全部文件');
+    expect(markup).not.toContain('deliverables');
+  });
+
+  it('只读成功的轮次不再显示交付物入口（变更-37：交付物只认产出）', () => {
     const markup = renderCompleted(
       completedTurn([
         {
@@ -249,7 +368,127 @@ describe('Thread 交付物行 · 触碰文件口径', () => {
         },
       ]),
     );
+    expect(markup).not.toContain('deliverables');
+    expect(markup).not.toContain('查看全部文件');
+  });
+
+  it('真正写入文件的轮次显示交付物入口', () => {
+    const markup = renderCompleted(
+      completedTurn([
+        {
+          kind: 'tool',
+          id: 'tool-1',
+          name: 'Write',
+          input: { file_path: 'D:/work/demo/out.md' },
+          diff: { path: 'D:/work/demo/out.md', hunks: [] },
+          status: 'success',
+          turnId: 'turn-1',
+        },
+      ]),
+    );
     expect(markup).toContain('deliverables');
-    expect(markup).toContain('查看全部文件');
+    expect(markup).toContain('查看修改记录');
+  });
+});
+
+/**
+ * 变更-37/38：失败工具曾从过程区抽到 children 底部（01e1a55），把
+ * 「正文→工具→正文→工具」的真实时序切成「思考全在上、工具全沉底」。
+ * 现在失败卡一律就地留在过程区、按真实时序穿插；轮次成败只影响过程区
+ * 默认展开态（失败/中断默认展开，成功折叠），不再用 data-sticky 常驻。
+ */
+describe('Thread 过程区时序 · 失败工具就地渲染', () => {
+  const interleaved = (lastStatus?: 'succeeded' | 'failed') => {
+    const state = activeState('tool');
+    state.status = 'idle';
+    state.openAssistantId = null;
+    state.openThinkingId = null;
+    state.turnActivity = null;
+    state.items = [
+      { kind: 'user', id: 'user-1', text: '分析表格', mode: 'build', turnId: 'turn-1' },
+      { kind: 'assistant', id: 'a-1', text: '我来读取文件。', turnId: 'turn-1' },
+      {
+        kind: 'tool',
+        id: 'tool-1',
+        name: 'Read',
+        input: { file_path: 'D:/work/demo/配置.xls' },
+        status: 'error',
+        outcome: 'tool_failed',
+        turnId: 'turn-1',
+      },
+      { kind: 'assistant', id: 'a-2', text: '换个方式试试。', turnId: 'turn-1' },
+      {
+        kind: 'tool',
+        id: 'tool-2',
+        name: 'Bash',
+        input: { command: 'python --version' },
+        status: 'error',
+        outcome: 'tool_failed',
+        turnId: 'turn-1',
+      },
+      {
+        kind: 'assistant',
+        id: 'a-3',
+        text: '遇到环境限制。',
+        turnId: 'turn-1',
+        ...(lastStatus ? { turnStatus: lastStatus } : {}),
+      },
+    ];
+    return state;
+  };
+  const ledgerTurn = (status: SessionTurn['status']): SessionTurn[] => [
+    {
+      id: 'turn-1',
+      epoch: 1,
+      mode: 'build',
+      permissionProfile: 'standard',
+      status,
+      startedAt: 1,
+      endedAt: 2,
+    },
+  ];
+
+  it('失败卡按真实时序穿插在正文之间，不整批沉到底部', () => {
+    const markup = renderCompleted(interleaved());
+    const firstText = markup.indexOf('我来读取文件');
+    const firstFail = markup.indexOf('工具失败');
+    const secondText = markup.indexOf('换个方式试试');
+    const lastText = markup.indexOf('遇到环境限制');
+
+    expect(firstText).toBeGreaterThan(-1);
+    expect(firstFail).toBeGreaterThan(firstText);
+    expect(secondText).toBeGreaterThan(firstFail);
+    expect(lastText).toBeGreaterThan(secondText);
+  });
+
+  it('无论轮次成败，失败卡都不打 data-sticky（随过程区折叠/展开）', () => {
+    for (const turns of [
+      undefined,
+      ledgerTurn('succeeded'),
+      ledgerTurn('failed'),
+      ledgerTurn('interrupted'),
+    ]) {
+      const markup = renderCompleted(interleaved('succeeded'), turns);
+      expect(markup.match(/data-sticky="1"/g)).toBeNull();
+    }
+  });
+
+  it('失败卡仍渲染在过程体内（不是轮次 children 尾部）', () => {
+    const markup = renderCompleted(interleaved('failed'), ledgerTurn('failed'));
+    const bodyStart = markup.indexOf('turn-process__body');
+    const firstFail = markup.indexOf('工具失败');
+    expect(bodyStart).toBeGreaterThan(-1);
+    expect(firstFail).toBeGreaterThan(bodyStart);
+  });
+
+  it('失败轮次默认展开过程区，失败交代由「执行失败」胶囊 + 原因行承担', () => {
+    const markup = renderCompleted(interleaved('failed'), ledgerTurn('failed'));
+    expect(markup).toContain('执行失败');
+    expect(markup).not.toContain('is-collapsed');
+  });
+
+  it('成功轮次默认折叠过程区', () => {
+    const markup = renderCompleted(interleaved('succeeded'), ledgerTurn('succeeded'));
+    expect(markup).toContain('is-collapsed');
   });
 });

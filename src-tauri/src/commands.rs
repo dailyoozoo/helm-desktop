@@ -22,13 +22,10 @@ use crate::codex_app_server::spawn_codex_app_server;
 use crate::operations::ModelOnlyOperationPolicy;
 use crate::protocol::EngineId;
 use crate::providers::{
-    classify_failure, list_provider_models,
-    read_engine_config_file as read_engine_config_file_from_disk, sync_provider_models,
-    test_engine_connection, test_provider_connection, test_provider_draft,
-    write_engine_config_file as write_engine_config_file_to_disk, AppConfig, BindingConfig,
-    ConnectionResult, EngineConfig, EngineConfigFile, KeyringSecretStore, ModelConfig, PriceSource,
-    Protocol, ProviderConfig, ProviderKind, ProviderModelListing, ProviderStore, ProviderTest,
-    TestOutcome,
+    classify_failure, list_provider_models, sync_provider_models, test_engine_connection,
+    test_provider_connection, test_provider_draft, AppConfig, BindingConfig, ConnectionResult,
+    EngineConfig, EngineConfigFile, KeyringSecretStore, ModelConfig, PriceSource, Protocol,
+    ProviderConfig, ProviderKind, ProviderModelListing, ProviderStore, ProviderTest, TestOutcome,
 };
 use crate::reasoning::{
     claude_reasoning_capability, codex_reasoning_capability, ReasoningEffort,
@@ -166,13 +163,8 @@ fn ensure_pricing_allows_turn(
     if settings.general.pricing_unknown_policy != "block" || budget.monthly_limit <= 0.0 {
         return Ok(());
     }
-    let model = config
-        .models
-        .iter()
-        .find(|model| model.provider_id == provider_id && model.id == model_id)
-        .ok_or_else(|| format!("当前服务商没有模型目录项：{model_id}"))?;
     if provider_store
-        .model_pricing_profile(config, model)?
+        .pricing_profile_for_model_id(config, provider_id, model_id)?
         .is_none()
     {
         return Err(format!(
@@ -188,13 +180,7 @@ pub(crate) fn resolve_turn_pricing_basis(
     provider_id: &str,
     model_id: &str,
 ) -> Result<PricingBasisSnapshot, String> {
-    let profile = config
-        .models
-        .iter()
-        .find(|model| model.provider_id == provider_id && model.id == model_id)
-        .map(|model| provider_store.model_pricing_profile(config, model))
-        .transpose()?
-        .flatten();
+    let profile = provider_store.pricing_profile_for_model_id(config, provider_id, model_id)?;
     Ok(PricingBasisSnapshot { profile })
 }
 
@@ -202,15 +188,18 @@ fn resolve_binding_model(
     config: &AppConfig,
     binding: &BindingConfig,
     requested_model: &str,
-) -> String {
-    config
-        .models
-        .iter()
-        .any(|entry| {
-            entry.provider_id == binding.provider_id && entry.id == requested_model && entry.enabled
-        })
-        .then(|| requested_model.to_string())
-        .unwrap_or_else(|| binding.primary_model.clone())
+) -> Result<String, String> {
+    let requested =
+        crate::providers::resolve_model_reference(config, &binding.provider_id, requested_model);
+    if requested.is_ok() || requested_model.starts_with("role:") {
+        requested
+    } else {
+        crate::providers::resolve_model_reference(
+            config,
+            &binding.provider_id,
+            &binding.primary_model,
+        )
+    }
 }
 
 fn requested_model_for_binding(
@@ -247,24 +236,11 @@ pub(crate) async fn ensure_binding_runtime_ready(
         .find(|provider| provider.id == binding.provider_id)
         .ok_or_else(|| format!("找不到服务商：{}", binding.provider_id))?;
     if matches!(provider.kind, ProviderKind::Subscription) {
-        crate::settings::ensure_subscription_login(profiles, &binding.engine_id).await?;
-        // 订阅会话启动前镜像用户自定义技能到隔离目录（变更-36，只操作 skills 子树、
-        // 不触碰 auth.json）；失败降级为仅日志，不阻断会话启动。
-        match profiles.sync_user_skills(&binding.engine_id) {
-            Ok(result) if result.copied > 0 || result.updated > 0 || result.deleted > 0 => {
-                eprintln!(
-                    "订阅技能同步完成：复制 {}、更新 {}、删除 {}",
-                    result.copied, result.updated, result.deleted
-                );
-            }
-            Ok(_) => {}
-            Err(error) => eprintln!("订阅技能同步失败（忽略，不阻断会话）：{error}"),
-        }
+        let bin = crate::settings::configured_engine_bin(config, &binding.engine_id)?;
+        crate::settings::ensure_subscription_login(profiles, &binding.engine_id, bin).await?;
         if binding.engine_id == "codex" {
-            let codex_home = profiles.profile_dir("codex")?;
             let models =
-                discover_codex_subscription_models(config, &binding.provider_id, &codex_home)
-                    .await?;
+                discover_codex_subscription_models(profiles, config, &binding.provider_id).await?;
             ensure_discovered_binding_model(&models, &binding.primary_model, "主模型")?;
             if let Some(fast_model) = binding
                 .fast_model
@@ -779,67 +755,72 @@ fn codex_subscription_models_from_response(
 }
 
 async fn discover_codex_subscription_models(
+    profiles: &SubscriptionProfileStore,
     config: &AppConfig,
     provider_id: &str,
-    codex_home: &std::path::Path,
 ) -> Result<Vec<ModelConfig>, String> {
-    let bin = config
-        .engine_bin("codex")
-        .filter(|bin| !bin.trim().is_empty())
-        .unwrap_or("codex");
-    let mut command = build_codex_command(bin);
-    apply_inherited_agent_environment(&mut command);
-    command.env("CODEX_HOME", codex_home);
-    for value in codex_provider_config_args(&[]) {
-        command.arg("-c").arg(value);
-    }
-    command.current_dir(std::env::temp_dir()).kill_on_drop(true);
-    let process = tokio::time::timeout(Duration::from_secs(15), spawn_codex_app_server(command))
-        .await
-        .map_err(|_| "读取 Codex 账号模型超时".to_string())??;
-    let result = async {
-        let mut cursor: Option<String> = None;
-        let mut discovered = Vec::new();
-        let mut seen = HashSet::new();
-        for _ in 0..10 {
-            let response = tokio::time::timeout(
-                Duration::from_secs(10),
-                process.rpc.visible_model_list(cursor.as_deref()),
-            )
-            .await
-            .map_err(|_| "读取 Codex 账号模型超时".to_string())??;
-            for (is_default, model) in
-                codex_subscription_models_from_response(provider_id, &response)?
-            {
-                if seen.insert(model.id.clone()) {
-                    discovered.push((is_default, model));
+    let bin = crate::settings::configured_engine_bin(config, "codex")?;
+    let codex_home = profiles.profile_dir("codex")?;
+    let key = format!("{}:models:{provider_id}", profiles.probe_key("codex", bin)?);
+    profiles
+        .model_probes
+        .get_or_probe(key, |_| async {
+            let mut command = build_codex_command(bin);
+            apply_inherited_agent_environment(&mut command);
+            command.env("CODEX_HOME", codex_home);
+            for value in codex_provider_config_args(&[]) {
+                command.arg("-c").arg(value);
+            }
+            command.current_dir(std::env::temp_dir()).kill_on_drop(true);
+            let process =
+                tokio::time::timeout(Duration::from_secs(15), spawn_codex_app_server(command))
+                    .await
+                    .map_err(|_| "读取 Codex 账号模型超时".to_string())??;
+            let result = async {
+                let mut cursor: Option<String> = None;
+                let mut discovered = Vec::new();
+                let mut seen = HashSet::new();
+                for _ in 0..10 {
+                    let response = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        process.rpc.visible_model_list(cursor.as_deref()),
+                    )
+                    .await
+                    .map_err(|_| "读取 Codex 账号模型超时".to_string())??;
+                    for (is_default, model) in
+                        codex_subscription_models_from_response(provider_id, &response)?
+                    {
+                        if seen.insert(model.id.clone()) {
+                            discovered.push((is_default, model));
+                        }
+                    }
+                    cursor = response
+                        .get("nextCursor")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .filter(|value| !value.is_empty());
+                    if cursor.is_none() {
+                        break;
+                    }
                 }
+                if cursor.is_some() {
+                    return Err("Codex 账号模型分页超过安全上限".to_string());
+                }
+                discovered.sort_by_key(|(is_default, _)| !*is_default);
+                let models = discovered
+                    .into_iter()
+                    .map(|(_, model)| model)
+                    .collect::<Vec<_>>();
+                if models.is_empty() {
+                    return Err("Codex 当前登录账号没有返回可用模型，请重新登录后重试".to_string());
+                }
+                Ok(models)
             }
-            cursor = response
-                .get("nextCursor")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-                .filter(|value| !value.is_empty());
-            if cursor.is_none() {
-                break;
-            }
-        }
-        if cursor.is_some() {
-            return Err("Codex 账号模型分页超过安全上限".to_string());
-        }
-        discovered.sort_by_key(|(is_default, _)| !*is_default);
-        let models = discovered
-            .into_iter()
-            .map(|(_, model)| model)
-            .collect::<Vec<_>>();
-        if models.is_empty() {
-            return Err("Codex 当前登录账号没有返回可用模型，请重新登录后重试".to_string());
-        }
-        Ok(models)
-    }
-    .await;
-    process.shutdown().await;
-    result
+            .await;
+            process.shutdown().await;
+            result
+        })
+        .await
 }
 
 impl SessionStore {
@@ -943,6 +924,7 @@ pub async fn create_session(
     } else {
         model
     };
+    let model = resolve_binding_model(&config, &binding, &model)?;
     let reasoning_effort = ReasoningEffort::parse(reasoning_effort.as_deref())?
         .or(binding.reasoning_effort)
         .unwrap_or_default();
@@ -976,13 +958,8 @@ pub async fn create_session(
         .unwrap_or(if engine == "codex" { "codex" } else { "claude" })
         .to_string();
     prepare_codex_search_launch(&engine, &bin, &model, &mut env).await?;
-    let pricing_profile = config
-        .models
-        .iter()
-        .find(|candidate| candidate.provider_id == provider_id && candidate.id == model)
-        .map(|candidate| config_store.model_pricing_profile(&config, candidate))
-        .transpose()?
-        .flatten();
+    let pricing_profile =
+        config_store.pricing_profile_for_model_id(&config, &provider_id, &model)?;
     let runtime_route = build_runtime_route(
         &config,
         &launch_binding,
@@ -1258,7 +1235,11 @@ pub fn remove_session_context(
 /// `rename_all_fields`——此前 session_id 以 snake_case 下发、前端读 sessionId
 /// 得 undefined，「分叉成功但自动跳转静默失效」（2026-09-04 埋点实证）。
 #[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "mode")]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "mode"
+)]
 pub enum BranchForkOutcome {
     Lossless {
         session_id: String,
@@ -1356,7 +1337,7 @@ pub async fn start_session_branch(
         let copied = history_store
             .clone_messages_into_session_upto(&source_session_id, &branch_id, clone_target)
             .unwrap_or(0);
-        eprintln!(
+        log::info!(
             "[helm] [native_branch_history] Codex 分支 {} 已复制来源 {} 的 {} 条历史消息",
             branch_id, source_session_id, copied
         );
@@ -1388,7 +1369,7 @@ pub async fn start_session_branch(
         .find(|binding| binding.engine_id == engine)
         .cloned()
         .ok_or_else(|| format!("引擎还没有配置生效绑定：{engine}"))?;
-    let model = resolve_binding_model(&config, &binding, &binding.primary_model);
+    let model = resolve_binding_model(&config, &binding, &binding.primary_model)?;
     let launch_binding = BindingConfig {
         primary_model: model.clone(),
         ..binding.clone()
@@ -1407,13 +1388,8 @@ pub async fn start_session_branch(
         .filter(|bin| !bin.is_empty())
         .unwrap_or("claude")
         .to_string();
-    let pricing_profile = config
-        .models
-        .iter()
-        .find(|candidate| candidate.provider_id == binding.provider_id && candidate.id == model)
-        .map(|candidate| config_store.model_pricing_profile(&config, candidate))
-        .transpose()?
-        .flatten();
+    let pricing_profile =
+        config_store.pricing_profile_for_model_id(&config, &binding.provider_id, &model)?;
     let route = build_runtime_route(
         &config,
         &launch_binding,
@@ -1468,7 +1444,7 @@ pub async fn start_session_branch(
     let copied = history_store
         .clone_messages_into_session(&source_session_id, &branch_id)
         .unwrap_or(0);
-    eprintln!(
+    log::info!(
         "[helm] [native_branch_history] Claude 分支 {} 已复制来源 {} 的 {} 条历史消息",
         branch_id, source_session_id, copied
     );
@@ -1526,7 +1502,7 @@ pub async fn resume_session(
     let provider_id = binding.provider_id.clone();
     let requested_model =
         requested_model_for_binding(None, detail.summary.preferred_model.as_deref(), &binding);
-    let model = resolve_binding_model(&config, &binding, &requested_model);
+    let model = resolve_binding_model(&config, &binding, &requested_model)?;
     ensure_pricing_allows_turn(
         &history_store.get_budget()?,
         &app_settings,
@@ -1561,13 +1537,8 @@ pub async fn resume_session(
         .unwrap_or(if engine == "codex" { "codex" } else { "claude" })
         .to_string();
     prepare_codex_search_launch(&engine, &bin, &model, &mut env).await?;
-    let pricing_profile = config
-        .models
-        .iter()
-        .find(|candidate| candidate.provider_id == provider_id && candidate.id == model)
-        .map(|candidate| config_store.model_pricing_profile(&config, candidate))
-        .transpose()?
-        .flatten();
+    let pricing_profile =
+        config_store.pricing_profile_for_model_id(&config, &provider_id, &model)?;
     let runtime_route = build_runtime_route(
         &config,
         &launch_binding,
@@ -1594,7 +1565,7 @@ pub async fn resume_session(
     );
     let reasoning_effort = resolve_routed_effort(&capability_snapshot, requested_effort);
     ensure_requested_runtime_capabilities(&capability_snapshot, reasoning_effort)?;
-    let context_messages = ledger_rebuild_messages(&history_store, &session_id)?;
+    let context_messages = ledger_rebuild_messages(&history_store, &session_id, None)?;
     ensure_ledger_fits_context_window(
         &context_messages,
         "",
@@ -1619,7 +1590,7 @@ pub async fn resume_session(
     );
     let native_candidate = match &native_branch_row {
         Some((source_sid, source_cli, _, _)) => {
-            eprintln!(
+            log::info!(
                 "[helm] [native_branch_first_turn] Session {} 将以 --resume {} --fork-session 复制来源 {} 的完整历史",
                 session_id, source_cli, source_sid
             );
@@ -1661,7 +1632,9 @@ pub async fn resume_session(
         "resume",
         &format!(
             "gate session={} pending_native_branch={} native_branch_support={:?} context_ok=true",
-            session_id, pending_native_branch, capability_snapshot.capabilities.native_branch.support
+            session_id,
+            pending_native_branch,
+            capability_snapshot.capabilities.native_branch.support
         ),
     );
     if pending_native_branch
@@ -1712,7 +1685,7 @@ pub async fn resume_session(
         (native_resume_id.clone(), None)
     };
     if detail.summary.cli_session_id.is_some() && native_resume_id.is_none() {
-        eprintln!(
+        log::info!(
             "[helm] [capability_native_resume_fallback_ledger] Session {} 将从完整 TurnLedger 重建",
             detail.summary.id
         );
@@ -1841,10 +1814,37 @@ pub fn reveal_provider_secret(
 #[tauri::command]
 pub fn save_provider_config(
     store: State<'_, ProviderStore<KeyringSecretStore>>,
+    sessions: State<'_, SessionHistoryStore>,
     provider: ProviderConfig,
     api_key: Option<String>,
+    models: Option<Vec<ModelConfig>>,
+    model_renames: Option<Vec<(String, String)>>,
 ) -> Result<AppConfig, String> {
-    store.save_provider(provider, api_key.as_deref())
+    let before = store.load()?;
+    let provider_id = provider.id.clone();
+    let mut renames = model_renames.unwrap_or_default();
+    let config = store.save_provider_bundle(provider, api_key.as_deref(), models, &renames)?;
+    for after in config
+        .bindings
+        .iter()
+        .filter(|binding| binding.provider_id == provider_id)
+    {
+        if let Some(previous) = before
+            .bindings
+            .iter()
+            .find(|binding| binding.engine_id == after.engine_id)
+        {
+            if previous.primary_model != after.primary_model
+                && !renames
+                    .iter()
+                    .any(|(old, _)| old == &previous.primary_model)
+            {
+                renames.push((previous.primary_model.clone(), after.primary_model.clone()));
+            }
+        }
+    }
+    sync_provider_model_preferences(&store, &sessions, &provider_id, &renames)?;
+    Ok(config)
 }
 
 #[tauri::command]
@@ -1863,8 +1863,8 @@ pub fn save_provider_models_config(
     models: Vec<ModelConfig>,
 ) -> Result<AppConfig, String> {
     let before = store.load()?;
-    let config = store.save_models_for_provider(&provider_id, models)?;
-    cascade_preferred_model_after_retarget(&sessions, &before, &config, &provider_id);
+    let config = store.save_provider_model_drafts(&provider_id, models)?;
+    cascade_preferred_model_after_retarget(&store, &sessions, &before, &config, &provider_id)?;
     Ok(config)
 }
 
@@ -1877,7 +1877,7 @@ pub fn delete_provider_model(
 ) -> Result<AppConfig, String> {
     let before = store.load()?;
     let config = store.delete_provider_model(&provider_id, &model_id)?;
-    cascade_preferred_model_after_retarget(&sessions, &before, &config, &provider_id);
+    cascade_preferred_model_after_retarget(&store, &sessions, &before, &config, &provider_id)?;
     Ok(config)
 }
 
@@ -1906,43 +1906,59 @@ pub fn save_provider_model_selection(
 ) -> Result<AppConfig, String> {
     let before = store.load()?;
     let config = store.save_provider_model_selection(&provider_id, &enabled_model_ids)?;
-    cascade_preferred_model_after_retarget(&sessions, &before, &config, &provider_id);
+    cascade_preferred_model_after_retarget(&store, &sessions, &before, &config, &provider_id)?;
     Ok(config)
 }
 
 /// 目录/勾选保存把绑定从旧模型 ID 改到新 ID 后，会话 `preferred_model` 一并跟上。
+fn sync_provider_model_preferences(
+    store: &ProviderStore<KeyringSecretStore>,
+    sessions: &SessionHistoryStore,
+    provider_id: &str,
+    renames: &[(String, String)],
+) -> Result<(), String> {
+    if renames.is_empty() {
+        return Ok(());
+    }
+    store
+        .with_config_gate(|config| {
+            for binding in config
+                .bindings
+                .iter()
+                .filter(|binding| binding.provider_id == provider_id)
+            {
+                sessions.rename_session_preferred_models(&binding.engine_id, renames)?;
+            }
+            Ok(())
+        })
+        .map_err(|error| format!("配置已保存，但模型偏好同步失败：{error}"))
+}
+
 fn cascade_preferred_model_after_retarget(
+    store: &ProviderStore<KeyringSecretStore>,
     sessions: &SessionHistoryStore,
     before: &AppConfig,
     after: &AppConfig,
     provider_id: &str,
-) {
-    for after_binding in after
+) -> Result<(), String> {
+    let renames = after
         .bindings
         .iter()
         .filter(|binding| binding.provider_id == provider_id)
-    {
-        let Some(before_binding) = before
-            .bindings
-            .iter()
-            .find(|binding| binding.engine_id == after_binding.engine_id)
-        else {
-            continue;
-        };
-        if before_binding.primary_model != after_binding.primary_model
-            && !before_binding.primary_model.trim().is_empty()
-        {
-            let _ = sessions.rename_session_preferred_model(
-                &before_binding.primary_model,
-                &after_binding.primary_model,
-            );
-        }
-        let before_fast = before_binding.fast_model.as_deref().unwrap_or("");
-        let after_fast = after_binding.fast_model.as_deref().unwrap_or("");
-        if before_fast != after_fast && !before_fast.is_empty() && !after_fast.is_empty() {
-            let _ = sessions.rename_session_preferred_model(before_fast, after_fast);
-        }
-    }
+        .filter_map(|binding| {
+            let previous = before.bindings.iter().find(|previous| {
+                previous.engine_id == binding.engine_id && previous.provider_id == provider_id
+            })?;
+            (previous.primary_model != binding.primary_model && !previous.primary_model.is_empty())
+                .then(|| {
+                    (
+                        previous.primary_model.clone(),
+                        binding.primary_model.clone(),
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    sync_provider_model_preferences(store, sessions, provider_id, &renames)
 }
 
 #[tauri::command]
@@ -1965,16 +1981,20 @@ pub fn get_equivalent_env(
 }
 
 #[tauri::command]
-pub fn read_engine_config_file(engine_id: String) -> Result<EngineConfigFile, String> {
-    read_engine_config_file_from_disk(&engine_id)
+pub fn read_engine_config_file(
+    store: State<'_, ProviderStore<KeyringSecretStore>>,
+    engine_id: String,
+) -> Result<EngineConfigFile, String> {
+    store.read_engine_config_fragment(&engine_id)
 }
 
 #[tauri::command]
 pub fn write_engine_config_file(
+    store: State<'_, ProviderStore<KeyringSecretStore>>,
     engine_id: String,
     content: String,
 ) -> Result<EngineConfigFile, String> {
-    write_engine_config_file_to_disk(&engine_id, &content)
+    store.write_engine_config_fragment(&engine_id, &content)
 }
 
 #[tauri::command]
@@ -2020,6 +2040,14 @@ pub async fn list_provider_models_config(
     base_url: Option<String>,
     api_key: Option<String>,
 ) -> Result<ProviderModelListing, String> {
+    if store
+        .load()?
+        .providers
+        .iter()
+        .any(|provider| provider.id == provider_id && provider.kind == ProviderKind::Subscription)
+    {
+        return Err("订阅模型请通过真实 CLI 的「同步模型」入口获取".to_string());
+    }
     list_provider_models(
         &store,
         &provider_id,
@@ -2036,7 +2064,7 @@ fn unix_timestamp_seconds() -> Result<i64, String> {
     i64::try_from(duration.as_secs()).map_err(|_| "系统时间超出范围".to_string())
 }
 
-/// message.ts 用毫秒（变更-07：与 checkpoint.ts 同单位，回溯截断依赖比较）
+/// message.ts 用毫秒（变更-07：统一毫秒口径，便于跨表时间比较）
 fn unix_timestamp_millis() -> Result<i64, String> {
     let duration = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2048,6 +2076,7 @@ fn unix_timestamp_millis() -> Result<i64, String> {
 pub async fn sync_provider_models_config(
     store: State<'_, ProviderStore<KeyringSecretStore>>,
     profiles: State<'_, SubscriptionProfileStore>,
+    capability_registry: State<'_, EngineCapabilityRegistry>,
     sessions: State<'_, SessionHistoryStore>,
     provider_id: String,
 ) -> Result<AppConfig, String> {
@@ -2063,26 +2092,40 @@ pub async fn sync_provider_models_config(
             Protocol::OpenAiResponses => "codex",
             _ => return Err("订阅服务商的接口规范不受支持".to_string()),
         };
-        crate::settings::ensure_subscription_login(&profiles, engine).await?;
+        crate::settings::invalidate_engine_probes(&profiles, &capability_registry, engine)?;
+        let bin = crate::settings::configured_engine_bin(&config, engine)?;
+        crate::settings::ensure_subscription_login(&profiles, engine, bin).await?;
         let models = match provider.protocol {
             Protocol::OpenAiResponses => {
-                let codex_home = profiles.profile_dir("codex")?;
-                discover_codex_subscription_models(&config, &provider_id, &codex_home).await?
+                discover_codex_subscription_models(&profiles, &config, &provider_id).await?
             }
             Protocol::Anthropic => crate::providers::subscription_models_for_provider(provider),
             _ => unreachable!("subscription protocol was validated above"),
         };
-        let saved = store.save_models_for_provider(&provider_id, models)?;
-        cascade_preferred_model_after_retarget(&sessions, &config, &saved, &provider_id);
+        let saved = store.save_discovered_subscription_models(&provider_id, engine, bin, models)?;
+        cascade_preferred_model_after_retarget(&store, &sessions, &config, &saved, &provider_id)?;
         return Ok(saved);
     }
     let saved = sync_provider_models(&store, &provider_id).await?;
-    cascade_preferred_model_after_retarget(&sessions, &config, &saved, &provider_id);
+    cascade_preferred_model_after_retarget(&store, &sessions, &config, &saved, &provider_id)?;
     Ok(saved)
 }
 
 #[tauri::command]
-pub async fn test_engine_config(bin: String) -> Result<ConnectionResult, String> {
+pub async fn test_engine_config(
+    store: State<'_, ProviderStore<KeyringSecretStore>>,
+    profiles: State<'_, SubscriptionProfileStore>,
+    capability_registry: State<'_, EngineCapabilityRegistry>,
+    bin: String,
+) -> Result<ConnectionResult, String> {
+    for engine in store
+        .load()?
+        .engines
+        .iter()
+        .filter(|engine| engine.bin.trim() == bin.trim())
+    {
+        crate::settings::invalidate_engine_probes(&profiles, &capability_registry, &engine.id)?;
+    }
     Ok(test_engine_connection(&bin).await)
 }
 
@@ -2114,6 +2157,7 @@ pub async fn get_reasoning_effort_capability(
         binding.provider_id = provider_id;
     }
     let bound_provider_id = binding.provider_id.clone();
+    let model = crate::providers::resolve_model_reference(&config, &bound_provider_id, &model)?;
     let launch_binding = BindingConfig {
         primary_model: model.clone(),
         ..binding
@@ -2202,6 +2246,7 @@ pub async fn send_message(
             .cloned()
             .ok_or_else(|| format!("找不到会话：{handle_id}"))?
     };
+    let dispatch_epoch = session.begin_dispatch();
     let permission_profile = session.permission_profile().await?;
     let detail = history_store.get_session(&history_session_id)?;
     let engine = engine_id_to_string(detail.summary.engine);
@@ -2217,6 +2262,7 @@ pub async fn send_message(
     let created_at = unix_timestamp_millis()?;
     let mut committed = None;
     for _ in 0..3 {
+        session.ensure_dispatch_current(dispatch_epoch)?;
         let candidate = config_store.route_candidate()?;
         let binding = candidate
             .config
@@ -2230,7 +2276,7 @@ pub async fn send_message(
             preferred_model.as_deref(),
             &binding,
         );
-        let routed_model = resolve_binding_model(&candidate.config, &binding, &requested_model);
+        let routed_model = resolve_binding_model(&candidate.config, &binding, &requested_model)?;
         let command = TurnStartCommand {
             history_session_id: history_session_id.clone(),
             display_text: record_text.clone(),
@@ -2312,8 +2358,9 @@ pub async fn send_message(
         )?;
         spec.routed_reasoning_effort = routed_effort;
         spec.session_context = frozen_session_context.clone();
-        session.reserve_turn().await?;
+        session.reserve_turn(dispatch_epoch).await?;
         match config_store.commit_route_if_unchanged(&candidate.config_digest, |_| {
+            session.ensure_dispatch_current(dispatch_epoch)?;
             history_store.start_turn(&command, spec)
         }) {
             Ok(Some(started)) => {
@@ -2328,9 +2375,9 @@ pub async fn send_message(
                 ));
                 break;
             }
-            Ok(None) => session.release_turn_reservation(),
+            Ok(None) => session.release_turn_reservation(dispatch_epoch),
             Err(error) => {
-                session.release_turn_reservation();
+                session.release_turn_reservation(dispatch_epoch);
                 return Err(error);
             }
         }
@@ -2356,11 +2403,18 @@ pub async fn send_message(
     let _ = app.emit("helm-sessions-changed", &history_session_id);
     let owner = RuntimeOwnerRef::session(history_session_id.clone());
     let runtime_result: Result<(), String> = async {
-        if runtime_registry
-            .route_requires_replacement(&owner, &turn_route, &detail.summary.cwd)
+        session.ensure_dispatch_current(dispatch_epoch)?;
+        let replacement = if runtime_registry
+            .route_requires_replacement(
+                &owner,
+                &turn_route,
+                &detail.summary.cwd,
+                &capability_snapshot,
+            )
             .await?
         {
-            let history_messages = ledger_rebuild_messages(&history_store, &history_session_id)?;
+            let history_messages =
+                ledger_rebuild_messages(&history_store, &history_session_id, Some(&spec.turn_id))?;
             ensure_ledger_fits_context_window(
                 &history_messages,
                 &record_text,
@@ -2380,20 +2434,20 @@ pub async fn send_message(
                 capability_snapshot.clone(),
             )
             .await?;
-            runtime_registry
-                .replace_reserved_session(
-                    &owner,
-                    replacement,
-                    &turn_route,
-                    &capability_snapshot,
-                    &detail.summary.cwd,
-                )
-                .await?;
+            Some(replacement)
         } else {
-            runtime_registry
-                .update_reserved_capability_snapshot(&owner, capability_snapshot.clone())
-                .await?;
-        }
+            None
+        };
+        session
+            .configure_reserved_runtime(
+                dispatch_epoch,
+                replacement,
+                turn_route.clone(),
+                capability_snapshot.clone(),
+                detail.summary.cwd.clone(),
+            )
+            .await?;
+        session.ensure_dispatch_current(dispatch_epoch)?;
         history_store.set_session_route_projection(
             &history_session_id,
             &turn_route.provider_id,
@@ -2403,7 +2457,7 @@ pub async fn send_message(
     }
     .await;
     if let Err(runtime_error) = runtime_result {
-        session.release_turn_reservation();
+        session.release_turn_reservation(dispatch_epoch);
         return match history_store.rollback_prepared_user_turn(prepared) {
             Ok(()) => Err(runtime_error),
             Err(rollback_error) => Err(format!(
@@ -2414,9 +2468,11 @@ pub async fn send_message(
     let runtime_text = handoff_context
         .map(|context| format!("{context}\n\n[当前用户请求]\n{text}"))
         .unwrap_or(text);
-    let send_result = session.send_reserved(runtime_text, attachments, spec).await;
+    let send_result = session
+        .send_reserved(dispatch_epoch, runtime_text, attachments, spec)
+        .await;
     if let Err(send_error) = send_result {
-        session.release_turn_reservation();
+        session.release_turn_reservation(dispatch_epoch);
         return match history_store.rollback_prepared_user_turn(prepared) {
             Ok(()) => Err(send_error),
             Err(rollback_error) => Err(format!(
@@ -2478,9 +2534,10 @@ async fn start_route_runtime(
     }
 }
 
-fn ledger_rebuild_messages(
+pub(crate) fn ledger_rebuild_messages(
     history_store: &SessionHistoryStore,
     session_id: &str,
+    excluded_turn_id: Option<&str>,
 ) -> Result<Vec<crate::sessions::SessionMessage>, String> {
     use crate::protocol::Role;
     let detail = history_store.get_session(session_id)?;
@@ -2489,6 +2546,9 @@ fn ledger_rebuild_messages(
     let mut bound_turn_ids = HashSet::new();
     for record in ledger {
         bound_turn_ids.insert(record.turn.id.clone());
+        if excluded_turn_id == Some(record.turn.id.as_str()) {
+            continue;
+        }
         rebuilt.extend(
             record
                 .messages
@@ -2498,7 +2558,6 @@ fn ledger_rebuild_messages(
         );
         if record.tool_calls.is_empty()
             && record.approvals.is_empty()
-            && record.checkpoints.is_empty()
             && record.attachments.is_empty()
         {
             continue;
@@ -2507,7 +2566,6 @@ fn ledger_rebuild_messages(
             "turnId": record.turn.id,
             "tools": record.tool_calls,
             "approvals": record.approvals,
-            "checkpoints": record.checkpoints,
             "attachments": record.attachments,
             "contextEvidence": record.session_context,
         });
@@ -2522,6 +2580,7 @@ fn ledger_rebuild_messages(
     }
     rebuilt.extend(detail.messages.into_iter().filter(|message| {
         !message.reverted
+            && (excluded_turn_id.is_none() || message.turn_id.as_deref() != excluded_turn_id)
             && message
                 .turn_id
                 .as_ref()
@@ -2531,7 +2590,7 @@ fn ledger_rebuild_messages(
     Ok(rebuilt)
 }
 
-fn ensure_ledger_fits_context_window(
+pub(crate) fn ensure_ledger_fits_context_window(
     history: &[crate::sessions::SessionMessage],
     current_prompt: &str,
     context_window: Option<u64>,
@@ -2562,6 +2621,7 @@ pub async fn rename_provider_model(
     new_model_id: String,
 ) -> Result<AppConfig, String> {
     let (old_id, new_id) = (old_model_id.clone(), new_model_id.clone());
+    let target_provider_id = provider_id.clone();
     let config = {
         let store = store.inner().clone();
         tokio::task::spawn_blocking(move || {
@@ -2570,17 +2630,12 @@ pub async fn rename_provider_model(
         .await
         .map_err(|e| format!("模型改名任务失败：{e}"))??
     };
-    let changed = {
-        let sessions = sessions.inner().clone();
-        tokio::task::spawn_blocking(move || {
-            sessions.rename_session_preferred_model(&old_model_id, &new_model_id)
-        })
-        .await
-        .map_err(|e| format!("会话偏好级联失败：{e}"))??
-    };
-    if changed > 0 {
-        eprintln!("模型改名级联：{changed} 个会话的 preferred_model 已同步到新 ID");
-    }
+    sync_provider_model_preferences(
+        &store,
+        &sessions,
+        &target_provider_id,
+        &[(old_model_id, new_model_id)],
+    )?;
     Ok(config)
 }
 
@@ -2599,14 +2654,15 @@ pub async fn set_session_turn_preference(
         .get(&handle_id)
         .cloned()
         .ok_or_else(|| format!("找不到会话：{handle_id}"))?;
-    session.reserve_turn().await?;
+    let dispatch_epoch = session.begin_dispatch();
+    session.reserve_turn(dispatch_epoch).await?;
     let history_session_id = store.history_session_id_for_handle(&handle_id)?;
     let result = history_store.set_session_turn_preference(
         &history_session_id,
         &model,
         reasoning_effort.as_deref(),
     );
-    session.release_turn_reservation();
+    session.release_turn_reservation(dispatch_epoch);
     result
 }
 
@@ -2846,7 +2902,7 @@ where
         },
         Err(error) => {
             if let Err(ledger_error) = history_store.fail(history_session_id, approval_id, &error) {
-                eprintln!("[approval] 记录审批失败状态失败：{ledger_error}");
+                log::warn!("[approval] 记录审批失败状态失败：{ledger_error}");
             }
             Err(error)
         }
@@ -3029,7 +3085,7 @@ pub async fn side_query(
             .cloned()
             .ok_or_else(|| format!("引擎还没有配置生效绑定：{engine}"))?;
         let requested_model = requested_model_for_binding(Some(&admitted_model), None, &binding);
-        let routed_model = resolve_binding_model(&candidate.config, &binding, &requested_model);
+        let routed_model = resolve_binding_model(&candidate.config, &binding, &requested_model)?;
         let launch_binding = BindingConfig {
             primary_model: routed_model.clone(),
             ..binding.clone()
@@ -3418,150 +3474,6 @@ pub fn export_permission_audit(
     Ok(Some(path.to_string_lossy().to_string()))
 }
 
-/// 回溯到某个检查点：还原文件 + 标记回滚 + 重建 Agent 上下文（P2-5 方案 A）
-#[tauri::command]
-pub async fn restore_checkpoint(
-    app: AppHandle,
-    store: State<'_, SessionStore>,
-    history_store: State<'_, SessionHistoryStore>,
-    checkpoint_id: String,
-) -> Result<(), String> {
-    use crate::snapshots::SnapshotStore;
-    use std::path::PathBuf;
-
-    let checkpoint = history_store
-        .get_checkpoint(&checkpoint_id)?
-        .ok_or_else(|| format!("找不到检查点：{checkpoint_id}"))?;
-    if !checkpoint.restorable || checkpoint.file_count == 0 {
-        return Err(format!(
-            "该检查点不可恢复：{}",
-            checkpoint.reason.as_deref().unwrap_or("缺少有效文件快照")
-        ));
-    }
-
-    let snapshots_dir: PathBuf = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("获取应用数据目录失败：{e}"))?
-        .join("snapshots");
-
-    let snapshot_store = SnapshotStore::new(snapshots_dir);
-    let snapshot = snapshot_store.load(&checkpoint.snapshot_ref)?;
-    if snapshot.files.is_empty() || snapshot.files.len() as u64 != checkpoint.file_count {
-        return Err("该检查点不可恢复：文件快照数量与记录不一致".to_string());
-    }
-    let session = history_store.get_session(&checkpoint.session_id)?;
-    let normalize = |value: &str| {
-        value
-            .replace('\\', "/")
-            .trim_start_matches("//?/")
-            .trim_end_matches('/')
-            .to_ascii_lowercase()
-    };
-    let cwd = normalize(&session.summary.cwd);
-    for file in &snapshot.files {
-        let path = normalize(&file.path);
-        let file_name = path
-            .rsplit('/')
-            .next()
-            .unwrap_or_default()
-            .trim_end_matches('.');
-        let device = path == "/dev/null"
-            || path.starts_with("//./")
-            || matches!(
-                file_name,
-                "nul"
-                    | "con"
-                    | "prn"
-                    | "aux"
-                    | "clock$"
-                    | "com1"
-                    | "com2"
-                    | "com3"
-                    | "com4"
-                    | "com5"
-                    | "com6"
-                    | "com7"
-                    | "com8"
-                    | "com9"
-                    | "lpt1"
-                    | "lpt2"
-                    | "lpt3"
-                    | "lpt4"
-                    | "lpt5"
-                    | "lpt6"
-                    | "lpt7"
-                    | "lpt8"
-                    | "lpt9"
-            );
-        if device || (path != cwd && !path.starts_with(&format!("{cwd}/"))) {
-            return Err("该检查点不可恢复：快照包含设备路径或工作区外文件".to_string());
-        }
-    }
-    snapshot_store.restore_files(&snapshot)?;
-
-    history_store.revert_messages_after(&checkpoint.session_id, checkpoint.ts)?;
-    // 回溯语义对齐（P2-5）：检查点之后的消息不再进入 Agent 上下文，
-    // 并作废旧 CLI 会话 id——之后不 `--resume`，改用截断历史重新开场。
-    history_store.clear_cli_session(&checkpoint.session_id)?;
-    reset_live_session_context(&store, &history_store, &checkpoint.session_id).await?;
-
-    Ok(())
-}
-
-/// 撤销回溯：恢复标记；Agent 上下文继续用重建模式（旧 CLI 会话已作废，全量历史重新开场）。
-/// 按内部句柄定位会话——回溯已把 cli_session_id 置空，不能再用它解析。
-#[tauri::command]
-pub async fn undo_revert(
-    store: State<'_, SessionStore>,
-    history_store: State<'_, SessionHistoryStore>,
-    handle_id: String,
-) -> Result<(), String> {
-    let history_session_id = store.history_session_id_for_handle(&handle_id)?;
-    history_store.unrevert_messages(&history_session_id)?;
-    reset_live_session_context(&store, &history_store, &history_session_id).await
-}
-
-/// 把某个历史会话对应的所有运行中句柄的上下文重置为「未回滚消息」的截断历史
-async fn reset_live_session_context(
-    store: &SessionStore,
-    history_store: &SessionHistoryStore,
-    history_session_id: &str,
-) -> Result<(), String> {
-    let detail = history_store.get_session(history_session_id)?;
-    let truncated: Vec<crate::sessions::SessionMessage> = detail
-        .messages
-        .into_iter()
-        .filter(|message| !message.reverted)
-        .collect();
-    let handles: Vec<String> = store
-        .history_session_ids
-        .lock()
-        .map_err(|_| "会话历史映射锁中毒".to_string())?
-        .iter()
-        .filter(|(_, history_id)| {
-            history_id.as_str() == history_session_id
-                || history_id.as_str() == detail.summary.id.as_str()
-        })
-        .map(|(handle, _)| handle.clone())
-        .collect();
-    let actors = {
-        let sessions = store
-            .sessions
-            .lock()
-            .map_err(|_| "会话表锁中毒".to_string())?;
-        handles
-            .into_iter()
-            .filter_map(|handle| sessions.get(&handle).cloned())
-            .collect::<Vec<_>>()
-    };
-    for actor in actors {
-        // 会话可能刚结束，重置失败不阻断回溯本身
-        let _ = actor.reset_context(truncated.clone()).await;
-    }
-    Ok(())
-}
-
 fn engine_id_from_str(engine: &str) -> Result<EngineId, String> {
     match engine {
         "claude-code" => Ok(EngineId::ClaudeCode),
@@ -3853,7 +3765,21 @@ mod tests {
             capabilities: None,
         };
         let config = AppConfig {
-            providers: Vec::new(),
+            providers: vec![ProviderConfig {
+                id: "provider-new".into(),
+                name: "Test provider".into(),
+                kind: ProviderKind::Api,
+                base_url: "https://provider.example/v1".into(),
+                key_ref: None,
+                ready: true,
+                last_test: None,
+                protocol: Protocol::OpenAiResponses,
+                auth_method: AuthMethod::ApiKey,
+                access_type: None,
+                role_models: None,
+                last_sync_at: None,
+                credential_revision: 0,
+            }],
             models: vec![
                 model("gpt-primary", "provider-new", true),
                 model("gpt-valid", "provider-new", true),
@@ -3866,15 +3792,15 @@ mod tests {
             default_model: "gpt-primary".into(),
         };
         assert_eq!(
-            resolve_binding_model(&config, &binding, "gpt-valid"),
+            resolve_binding_model(&config, &binding, "gpt-valid").unwrap(),
             "gpt-valid"
         );
         assert_eq!(
-            resolve_binding_model(&config, &binding, "gpt-disabled"),
+            resolve_binding_model(&config, &binding, "gpt-disabled").unwrap(),
             "gpt-primary"
         );
         assert_eq!(
-            resolve_binding_model(&config, &binding, "gpt-old"),
+            resolve_binding_model(&config, &binding, "gpt-old").unwrap(),
             "gpt-primary"
         );
         assert_eq!(
@@ -3889,6 +3815,13 @@ mod tests {
         assert_eq!(
             requested_model_for_binding(Some("gpt-explicit"), Some("gpt-valid"), &binding),
             "gpt-explicit"
+        );
+        let mut missing_provider = config;
+        missing_provider.providers.clear();
+        assert!(
+            resolve_binding_model(&missing_provider, &binding, "gpt-valid")
+                .unwrap_err()
+                .contains("找不到服务商")
         );
     }
 
@@ -3996,6 +3929,7 @@ mod tests {
             access_type: None,
             role_models: None,
             last_sync_at: None,
+            credential_revision: 0,
         };
         let config = |kind| AppConfig {
             providers: vec![provider(kind)],
@@ -4364,6 +4298,7 @@ mod tests {
             access_type: None,
             role_models: None,
             last_sync_at: None,
+            credential_revision: 0,
         };
         let provider_id = provider.id.clone();
         let model = |id: &str| ModelConfig {
@@ -4477,8 +4412,8 @@ mod tests {
             },
             messages,
             tool_calls: Vec::new(),
-            checkpoints: Vec::new(),
             approvals: Vec::new(),
+            presentations: Vec::new(),
             turns: Vec::new(),
             session_context: Vec::new(),
             fork: None,

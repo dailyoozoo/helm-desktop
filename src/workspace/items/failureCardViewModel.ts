@@ -3,7 +3,7 @@ import type { ThreadItem } from '../../engine/useSession';
 // 变更-34 · C4：失败终态增强 —— 错误分类、已重试次数、能否自愈、下一步动作。
 // 只基于工具的真实 outcome / denialSource / 输出文本归类，不伪造时序或百分比。
 
-export type FailureKind = 'permission' | 'network' | 'auth' | 'timeout' | 'tool' | 'model';
+export type FailureKind = 'permission' | 'network' | 'auth' | 'timeout' | 'tool' | 'env' | 'model';
 
 export const FAILURE_KIND_LABELS: Record<FailureKind, string> = {
   permission: '权限失败',
@@ -11,6 +11,7 @@ export const FAILURE_KIND_LABELS: Record<FailureKind, string> = {
   auth: '凭据失败',
   timeout: '超时失败',
   tool: '工具失败',
+  env: '环境缺命令',
   model: '模型失败',
 };
 
@@ -42,6 +43,11 @@ const ADVICE: Record<FailureKind, FailureAdvice> = {
     selfHeal: true,
     note: '超时可能受负载影响，重试有机会自愈；持续超时可调大时限后重试。',
   },
+  env: {
+    kind: 'env',
+    selfHeal: false,
+    note: '引擎执行环境里找不到这条命令，与 Helm 权限无关——本次调用一次都没到权限系统。重试无效：请把命令所在目录加入 PATH，或改用环境里确实存在的命令（Windows 下常见写法是带 .exe 全名，如 powershell.exe）。',
+  },
   tool: {
     kind: 'tool',
     selfHeal: true,
@@ -60,6 +66,11 @@ const AUTH_RE =
   /unauthorized|invalid .*api.?key|authentication|credential|login required|api.?key.*invalid|401|403/i;
 const TIMEOUT_RE = /timed? ?out|deadline exceeded/i;
 const FS_PERM_RE = /EACCES|permission denied/i;
+// 环境缺命令（变更-37）：Exit code 127 / command not found 这类是「引擎的 shell 里
+// 没有这条命令」，不是 Helm 权限拦截。之前一律归到「工具失败·重试可能自愈」，
+// 会误导用户反复重试，还会被误读成"权限管太严"。
+const ENV_MISSING_RE =
+  /command not found|no such file or directory|is not recognized as an internal or external command|exit code 127|无法将“[^”]+”项识别为/i;
 const MODEL_NAME_RE = /^(llm|model|generate|chat)/i;
 
 export type ToolFailureSource = {
@@ -83,6 +94,7 @@ export function classifyToolFailure(item: ToolFailureSource): FailureKind {
     return 'permission';
   }
   const text = `${item.output ?? ''}\n${JSON.stringify(item.input ?? {})}`;
+  if (ENV_MISSING_RE.test(text)) return 'env';
   if (NETWORK_RE.test(text)) return 'network';
   if (TIMEOUT_RE.test(text)) return 'timeout';
   if (AUTH_RE.test(text)) return 'auth';

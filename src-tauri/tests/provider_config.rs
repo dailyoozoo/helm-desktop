@@ -1,7 +1,7 @@
 use helm_lib::providers::{
     sync_provider_models, test_provider_connection, AppConfig, AuthMethod, BindingConfig,
-    EngineConfig, EngineStatus, MemorySecretStore, ModelConfig, PriceSource, Protocol,
-    ProviderConfig, ProviderKind, ProviderStore, ProviderTest, SecretStore, TestOutcome,
+    EngineConfig, EngineEnvVar, EngineStatus, MemorySecretStore, ModelConfig, PriceSource,
+    Protocol, ProviderConfig, ProviderKind, ProviderStore, ProviderTest, SecretStore, TestOutcome,
 };
 #[cfg(target_os = "windows")]
 use keyring::credential::CredentialPersistence;
@@ -32,6 +32,7 @@ fn anthropic_provider() -> ProviderConfig {
         access_type: None,
         role_models: None,
         last_sync_at: None,
+        credential_revision: 0,
     }
 }
 
@@ -49,7 +50,315 @@ fn openai_provider() -> ProviderConfig {
         access_type: None,
         role_models: None,
         last_sync_at: None,
+        credential_revision: 0,
     }
+}
+
+fn discovered_subscription_store(
+    label: &str,
+) -> (
+    std::path::PathBuf,
+    ProviderStore<MemorySecretStore>,
+    ProviderConfig,
+    Vec<ModelConfig>,
+) {
+    let path = temp_config_path(label);
+    let store = ProviderStore::new(path.clone(), MemorySecretStore::default());
+    let mut provider = openai_provider();
+    provider.kind = ProviderKind::Subscription;
+    provider.auth_method = AuthMethod::OAuth;
+    store.save_provider(provider.clone(), None).unwrap();
+    let mut primary = codex_model();
+    primary.input_price_per_mtok = 0.0;
+    primary.output_price_per_mtok = 0.0;
+    primary.price_source = Some(PriceSource::Subscription);
+    let mut secondary = primary.clone();
+    secondary.id = "account-secondary-model".into();
+    secondary.display_name = "Account secondary".into();
+    let saved = store
+        .save_discovered_subscription_models("openai", "codex", "codex", vec![primary, secondary])
+        .unwrap();
+    let models = saved
+        .models
+        .into_iter()
+        .filter(|model| model.provider_id == "openai")
+        .collect();
+    (path, store, provider, models)
+}
+
+#[test]
+fn subscription_bundle_atomically_saves_final_enablement_provider_and_bindings() {
+    let (path, store, mut provider, mut models) =
+        discovered_subscription_store("subscription-bundle-final");
+    let initial = store
+        .save_binding(BindingConfig {
+            engine_id: "codex".into(),
+            provider_id: provider.id.clone(),
+            primary_model: models[0].id.clone(),
+            fast_model: Some(models[0].id.clone()),
+            assistant_model_id: Some(models[0].id.clone()),
+            thinking_enabled: None,
+            context_1m: None,
+            reasoning_effort: None,
+            revision: 0,
+        })
+        .unwrap();
+    let next_model = models[1].id.clone();
+    assert_eq!(initial.bindings[0].assistant_model_id, None);
+    models[0].enabled = false;
+    models[1].enabled = true;
+    provider.name = "Updated subscription".into();
+    let saved = store
+        .save_provider_bundle(provider, None, Some(models), &[])
+        .unwrap();
+    assert_eq!(saved.providers[0].name, "Updated subscription");
+    assert!(saved.providers[0].last_sync_at.is_some());
+    assert!(!saved.models[0].enabled);
+    assert!(saved.models[1].enabled);
+    assert_eq!(saved.bindings[0].primary_model, next_model);
+    assert_eq!(
+        saved.bindings[0].fast_model.as_deref(),
+        Some(next_model.as_str())
+    );
+    assert_eq!(saved.bindings[0].assistant_model_id, None);
+    assert_eq!(saved.bindings[0].revision, initial.bindings[0].revision + 1);
+    let disk: AppConfig = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&saved).unwrap(),
+        serde_json::to_value(&disk).unwrap()
+    );
+    assert!(saved.providers[0].key_ref.is_none());
+}
+
+#[test]
+fn subscription_bundle_rejects_directory_edits_without_committing_metadata() {
+    let (path, store, mut provider, models) =
+        discovered_subscription_store("subscription-bundle-validation");
+    let before = fs::read_to_string(&path).unwrap();
+    provider.name = "must-not-commit".into();
+    let mut invalid = Vec::new();
+    invalid.push(vec![models[0].clone()]);
+    invalid.push(vec![models[0].clone(), models[0].clone()]);
+    for field in [
+        "id",
+        "provider",
+        "name",
+        "inputPrice",
+        "outputPrice",
+        "cachedPrice",
+        "priceSource",
+        "context",
+        "capabilities",
+    ] {
+        let mut edited = models.clone();
+        match field {
+            "id" => edited[0].id = "unverified-model".into(),
+            "provider" => edited[0].provider_id = "other-provider".into(),
+            "name" => edited[0].display_name = "unverified-name".into(),
+            "inputPrice" => edited[0].input_price_per_mtok = 1.0,
+            "outputPrice" => edited[0].output_price_per_mtok = 1.0,
+            "cachedPrice" => edited[0].cached_input_price_per_mtok = Some(1.0),
+            "priceSource" => edited[0].price_source = Some(PriceSource::Manual),
+            "context" => edited[0].context_window = Some(12345),
+            "capabilities" => edited[0].capabilities = Some(vec!["unverified".into()]),
+            _ => unreachable!(),
+        }
+        invalid.push(edited);
+    }
+    for edited in invalid {
+        assert!(store
+            .save_provider_bundle(provider.clone(), None, Some(edited), &[])
+            .is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+    assert!(store
+        .save_provider_bundle(
+            provider,
+            None,
+            Some(models.clone()),
+            &[(models[0].id.clone(), models[1].id.clone())]
+        )
+        .is_err());
+    assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    assert!(store.save_model(models[0].clone()).is_err());
+    assert!(store
+        .rename_provider_model("openai", &models[0].id, "unverified-model")
+        .is_err());
+    assert!(store
+        .delete_provider_model("openai", &models[0].id)
+        .is_err());
+}
+
+#[test]
+fn subscription_draft_save_preserves_official_order_and_only_changes_enablement() {
+    let (_, store, mut provider, mut models) =
+        discovered_subscription_store("subscription-draft-enable");
+    let first_id = models[0].id.clone();
+    provider.name = "Latest metadata".into();
+    store.save_provider(provider, None).unwrap();
+    models[0].enabled = false;
+    models.reverse();
+    let saved = store
+        .save_provider_model_drafts("openai", models.clone())
+        .unwrap();
+    assert_eq!(saved.providers[0].name, "Latest metadata");
+    assert_eq!(saved.models[0].id, first_id);
+    assert!(!saved.models[0].enabled);
+    models[0].id = "unverified".into();
+    assert!(store.save_provider_model_drafts("openai", models).is_err());
+}
+
+#[test]
+fn subscription_requires_discovered_models_before_saving_a_selection() {
+    let path = temp_config_path("subscription-without-discovery");
+    let store = ProviderStore::new(path, MemorySecretStore::default());
+    let mut provider = openai_provider();
+    provider.kind = ProviderKind::Subscription;
+    provider.auth_method = AuthMethod::OAuth;
+    assert!(store
+        .save_provider_bundle(provider, None, Some(vec![codex_model()]), &[])
+        .is_err());
+    assert!(store.load().unwrap().providers.is_empty());
+}
+
+#[test]
+fn subscription_discovery_does_not_overwrite_a_changed_engine_or_current_selection() {
+    let (_, store, _, models) = discovered_subscription_store("subscription-sync-race");
+    store
+        .save_provider_model_selection("openai", &[models[1].id.clone()])
+        .unwrap();
+    let saved = store
+        .save_discovered_subscription_models("openai", "codex", "codex", models.clone())
+        .unwrap();
+    assert!(!saved.models[0].enabled);
+    assert!(saved.models[1].enabled);
+    let mut engine = saved
+        .engines
+        .iter()
+        .find(|engine| engine.id == "codex")
+        .unwrap()
+        .clone();
+    engine.bin = "custom-codex".into();
+    store.save_engine(engine).unwrap();
+    assert!(store
+        .save_discovered_subscription_models("openai", "codex", "codex", models)
+        .is_err());
+    assert_eq!(
+        store.load().unwrap().engine_bin("codex"),
+        Some("custom-codex")
+    );
+}
+
+#[test]
+fn readiness_merge_keeps_concurrent_provider_and_engine_edits() {
+    let path = temp_config_path("readiness-merge");
+    let store = ProviderStore::new(path, MemorySecretStore::default());
+    let mut provider = openai_provider();
+    store.save_provider(provider.clone(), None).unwrap();
+    let captured = store.load().unwrap();
+    provider.name = "Concurrent provider edit".into();
+    store.save_provider(provider, None).unwrap();
+    let mut engine = captured
+        .engines
+        .iter()
+        .find(|engine| engine.id == "codex")
+        .unwrap()
+        .clone();
+    engine.name = "Concurrent engine edit".into();
+    store.save_engine(engine).unwrap();
+    let saved = store
+        .record_engine_detection(
+            "codex",
+            "codex",
+            EngineStatus::Ready,
+            Some("tested-version".into()),
+        )
+        .unwrap();
+    assert_eq!(saved.providers[0].name, "Concurrent provider edit");
+    let engine = saved
+        .engines
+        .iter()
+        .find(|engine| engine.id == "codex")
+        .unwrap();
+    assert_eq!(engine.name, "Concurrent engine edit");
+    assert_eq!(engine.bin, "codex");
+    assert_eq!(engine.status, EngineStatus::Ready);
+    assert_eq!(engine.version.as_deref(), Some("tested-version"));
+    let mut changed = engine.clone();
+    changed.bin = "custom-codex".into();
+    changed.status = EngineStatus::Error;
+    changed.version = None;
+    store.save_engine(changed).unwrap();
+    let saved = store
+        .record_engine_detection(
+            "codex",
+            "codex",
+            EngineStatus::Ready,
+            Some("stale-version".into()),
+        )
+        .unwrap();
+    let engine = saved
+        .engines
+        .iter()
+        .find(|engine| engine.id == "codex")
+        .unwrap();
+    assert_eq!(engine.bin, "custom-codex");
+    assert_eq!(engine.status, EngineStatus::Error);
+    assert!(engine.version.is_none());
+}
+
+#[tokio::test]
+async fn local_provider_without_key_performs_real_http_without_auth_headers() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for (label, protocol) in [
+        ("local-openai", Protocol::OpenAiChat),
+        ("local-anthropic", Protocol::Anthropic),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0 && request.len() + count <= 8192);
+                request.extend_from_slice(&chunk[..count]);
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"data\":[]}").await.unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let store = ProviderStore::new(temp_config_path(label), MemorySecretStore::default());
+        let mut provider = openai_provider();
+        provider.kind = ProviderKind::Local;
+        provider.auth_method = AuthMethod::Local;
+        provider.protocol = protocol;
+        provider.base_url = format!("http://{address}/v1");
+        store.save_provider(provider, None).unwrap();
+        let result = test_provider_connection(&store, "openai").await.unwrap();
+        let request = server.await.unwrap().to_ascii_lowercase();
+        assert!(result.ok && result.verified);
+        assert!(request.starts_with("get /v1/models "));
+        assert!(!request.contains("\r\nauthorization:"));
+        assert!(!request.contains("\r\nx-api-key:"));
+    }
+}
+
+#[tokio::test]
+async fn api_provider_without_key_is_rejected_before_http() {
+    let store = ProviderStore::new(
+        temp_config_path("api-without-key-probe"),
+        MemorySecretStore::default(),
+    );
+    store.save_provider(openai_provider(), None).unwrap();
+    assert!(test_provider_connection(&store, "openai")
+        .await
+        .unwrap_err()
+        .contains("API 密钥"));
 }
 
 fn change_27c_binding() -> BindingConfig {
@@ -95,6 +404,257 @@ fn change_27c_binding_revision_is_monotonic_persisted_and_invalidates_candidates
     drop(second);
     let reopened = ProviderStore::new(path, MemorySecretStore::default());
     assert_eq!(reopened.load().unwrap().bindings[0].revision, 2);
+}
+
+#[test]
+fn engine_env_is_keyring_only_and_reaches_the_actual_launch_environment() {
+    let (path, store) = change_27c_provider_store("engine-env-secure");
+    store
+        .save_provider(anthropic_provider(), Some("provider-secret"))
+        .unwrap();
+    let mut engine = store.load().unwrap().engines.remove(0);
+    engine.env_vars = Some(vec![EngineEnvVar {
+        name: "CUSTOM_TOKEN".into(),
+        value: Some("custom-secret".into()),
+        secret: Some(false),
+        key_ref: None,
+    }]);
+    let config = store.save_engine(engine.clone()).unwrap();
+    let saved = config
+        .engines
+        .iter()
+        .find(|item| item.id == engine.id)
+        .unwrap();
+    let variable = &saved.env_vars.as_ref().unwrap()[0];
+    assert!(variable.value.is_none());
+    assert_eq!(variable.secret, Some(true));
+    let reference = variable.key_ref.clone().unwrap();
+    assert_eq!(
+        store.secret(&reference).unwrap().as_deref(),
+        Some("custom-secret")
+    );
+    assert!(!fs::read_to_string(&path).unwrap().contains("custom-secret"));
+    assert!(store
+        .launch_env_for_config(&config, &change_27c_binding())
+        .unwrap()
+        .contains(&("CUSTOM_TOKEN".into(), "custom-secret".into())));
+    let config = store.save_engine(saved.clone()).unwrap();
+    let saved = config
+        .engines
+        .iter()
+        .find(|item| item.id == engine.id)
+        .unwrap();
+    assert_eq!(
+        saved.env_vars.as_ref().unwrap()[0].key_ref.as_deref(),
+        Some(reference.as_str())
+    );
+    engine.env_vars = None;
+    store.save_engine(engine).unwrap();
+    assert!(store.secret(&reference).unwrap().is_none());
+}
+
+#[test]
+fn legacy_engine_env_migrates_before_configuration_is_published() {
+    let path = temp_config_path("engine-env-migration");
+    let secrets = MemorySecretStore::default();
+    let mut config = ProviderStore::new(path.clone(), secrets.clone())
+        .load()
+        .unwrap();
+    config.engines[0].env_vars = Some(vec![EngineEnvVar {
+        name: "LEGACY_TOKEN".into(),
+        value: Some("legacy-secret".into()),
+        secret: Some(false),
+        key_ref: None,
+    }]);
+    fs::write(&path, serde_json::to_string(&config).unwrap()).unwrap();
+    let store = ProviderStore::new(path.clone(), secrets);
+    let migrated = store.load().unwrap();
+    assert!(!serde_json::to_string(&migrated)
+        .unwrap()
+        .contains("legacy-secret"));
+    assert!(!fs::read_to_string(&path).unwrap().contains("legacy-secret"));
+    let reference = migrated.engines[0].env_vars.as_ref().unwrap()[0]
+        .key_ref
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        store.secret(reference).unwrap().as_deref(),
+        Some("legacy-secret")
+    );
+}
+
+#[test]
+fn engine_env_rejects_controlled_names_duplicate_names_and_foreign_references() {
+    let path = temp_config_path("engine-env-controls");
+    let store = ProviderStore::new(path, MemorySecretStore::default());
+    let engine = store.load().unwrap().engines.remove(0);
+    for name in [
+        "CODEX_HOME",
+        "ANTHROPIC_API_KEY",
+        "HELM_MODE",
+        "PATH",
+        "NODE_OPTIONS",
+        "CLAUDE_CONFIG_DIR",
+        "x-sandbox",
+    ] {
+        let mut draft = engine.clone();
+        draft.env_vars = Some(vec![EngineEnvVar {
+            name: name.into(),
+            value: Some("value".into()),
+            secret: None,
+            key_ref: None,
+        }]);
+        assert!(store.save_engine(draft).is_err(), "{name}");
+    }
+    let mut draft = engine.clone();
+    draft.env_vars = Some(vec![EngineEnvVar {
+        name: "CUSTOM".into(),
+        value: None,
+        secret: None,
+        key_ref: Some("helm:provider:anthropic:api-key".into()),
+    }]);
+    assert!(store.save_engine(draft).is_err());
+    let mut draft = engine;
+    draft.env_vars = Some(
+        ["TOKEN", "token"]
+            .into_iter()
+            .map(|name| EngineEnvVar {
+                name: name.into(),
+                value: Some("value".into()),
+                secret: None,
+                key_ref: None,
+            })
+            .collect(),
+    );
+    assert!(store.save_engine(draft).is_err());
+}
+
+#[test]
+fn role_model_binding_launch_and_pricing_share_the_resolved_model() {
+    let (path, store) = change_27c_provider_store("role-model-route");
+    let mut provider = anthropic_provider();
+    provider.role_models = Some(std::collections::HashMap::from([(
+        "sonnet".into(),
+        "claude-sonnet-4.6".into(),
+    )]));
+    store
+        .save_provider(provider.clone(), Some("role-secret"))
+        .unwrap();
+    let mut binding = change_27c_binding();
+    binding.primary_model = "role:sonnet".into();
+    let config = store.save_binding(binding.clone()).unwrap();
+    assert!(store
+        .launch_env_for_config(&config, &binding)
+        .unwrap()
+        .contains(&("ANTHROPIC_MODEL".into(), "claude-sonnet-4.6".into())));
+    let role_price = store
+        .pricing_profile_for_model_id(&config, "anthropic", "role:sonnet")
+        .unwrap();
+    let real_price = store
+        .pricing_profile_for_model_id(&config, "anthropic", "claude-sonnet-4.6")
+        .unwrap();
+    assert!(role_price.is_some());
+    assert_eq!(
+        serde_json::to_value(role_price).unwrap(),
+        serde_json::to_value(real_price).unwrap()
+    );
+    binding.primary_model = "role:opus".into();
+    assert!(store.save_binding(binding).is_err());
+    let before = fs::read_to_string(&path).unwrap();
+    provider.role_models = None;
+    assert!(store.save_provider(provider, None).is_err());
+    assert_eq!(fs::read_to_string(path).unwrap(), before);
+}
+
+#[test]
+fn provider_bundle_commits_final_selection_rename_and_binding_together() {
+    let (path, store) = change_27c_provider_store("provider-bundle");
+    store
+        .save_provider(anthropic_provider(), Some("bundle-secret"))
+        .unwrap();
+    store.save_binding(change_27c_binding()).unwrap();
+    let mut renamed = claude_model();
+    let previous_id = renamed.id.clone();
+    renamed.id = "renamed-model".into();
+    renamed.enabled = false;
+    let mut selected = claude_fast_model();
+    selected.enabled = true;
+    let saved = store
+        .save_provider_bundle(
+            anthropic_provider(),
+            None,
+            Some(vec![renamed, selected.clone()]),
+            &[(previous_id, "renamed-model".into())],
+        )
+        .unwrap();
+    assert!(
+        !saved
+            .models
+            .iter()
+            .find(|model| model.id == "renamed-model")
+            .unwrap()
+            .enabled
+    );
+    assert_eq!(saved.bindings[0].primary_model, selected.id);
+    let persisted: AppConfig = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::to_value(saved).unwrap(),
+        serde_json::to_value(persisted).unwrap()
+    );
+}
+
+#[test]
+fn key_rotation_increments_revision_and_restores_credentials_on_disk_failure() {
+    let path = temp_config_path("provider-key-rollback");
+    let store = ProviderStore::new(path.clone(), MemorySecretStore::default());
+    let original = store
+        .save_provider(anthropic_provider(), Some("original-secret"))
+        .unwrap();
+    let rotated = store
+        .save_provider(original.providers[0].clone(), Some("rotated-secret"))
+        .unwrap();
+    assert_eq!(
+        rotated.providers[0].credential_revision,
+        original.providers[0].credential_revision + 1
+    );
+    let before = fs::read_to_string(&path).unwrap();
+    fs::create_dir(path.with_extension("tmp")).unwrap();
+    assert!(store
+        .save_provider(rotated.providers[0].clone(), Some("failed-secret"))
+        .is_err());
+    assert_eq!(
+        store.provider_secret("anthropic").unwrap(),
+        "rotated-secret"
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    assert_eq!(
+        store.load().unwrap().providers[0].credential_revision,
+        rotated.providers[0].credential_revision
+    );
+    fs::remove_dir(path.with_extension("tmp")).unwrap();
+}
+
+#[test]
+fn provider_bundle_validation_happens_before_key_rotation() {
+    let (path, store) = change_27c_provider_store("provider-bundle-invalid");
+    store
+        .save_provider(anthropic_provider(), Some("original-secret"))
+        .unwrap();
+    store.save_binding(change_27c_binding()).unwrap();
+    let before = fs::read_to_string(&path).unwrap();
+    assert!(store
+        .save_provider_bundle(
+            anthropic_provider(),
+            Some("invalid-secret"),
+            Some(vec![codex_model()]),
+            &[]
+        )
+        .is_err());
+    assert_eq!(fs::read_to_string(path).unwrap(), before);
+    assert_eq!(
+        store.provider_secret("anthropic").unwrap(),
+        "original-secret"
+    );
 }
 
 #[test]
@@ -304,6 +864,7 @@ fn provider_api_key_is_stored_as_key_ref_not_plaintext() {
         access_type: None,
         role_models: None,
         last_sync_at: None,
+        credential_revision: 0,
     };
 
     store
@@ -340,6 +901,7 @@ fn saving_provider_without_new_key_preserves_existing_key_ref() {
                 access_type: None,
                 role_models: None,
                 last_sync_at: None,
+                credential_revision: 0,
             },
             Some("sk-ant-secret-value"),
         )
@@ -360,6 +922,7 @@ fn saving_provider_without_new_key_preserves_existing_key_ref() {
                 access_type: None,
                 role_models: None,
                 last_sync_at: None,
+                credential_revision: 0,
             },
             None,
         )
@@ -402,6 +965,7 @@ fn provider_secret_can_be_revealed_from_secret_store_by_provider_id() {
                 access_type: None,
                 role_models: None,
                 last_sync_at: None,
+                credential_revision: 0,
             },
             Some("sk-ant-secret-value"),
         )
@@ -452,6 +1016,7 @@ fn saving_provider_does_not_persist_key_ref_when_secret_cannot_be_read_back() {
             access_type: None,
             role_models: None,
             last_sync_at: None,
+            credential_revision: 0,
         },
         Some("sk-ant-secret-value"),
     );
@@ -829,6 +1394,7 @@ fn provider_last_test_can_be_recorded_after_reachability_test() {
                 access_type: None,
                 role_models: None,
                 last_sync_at: None,
+                credential_revision: 0,
             },
             None,
         )
@@ -960,6 +1526,7 @@ fn deleting_provider_removes_related_models_and_keeps_valid_defaults() {
                 access_type: None,
                 role_models: None,
                 last_sync_at: None,
+                credential_revision: 0,
             },
             None,
         )
@@ -993,6 +1560,7 @@ fn deleting_provider_removes_related_models_and_keeps_valid_defaults() {
                 access_type: None,
                 role_models: None,
                 last_sync_at: None,
+                credential_revision: 0,
             },
             None,
         )
@@ -1377,6 +1945,7 @@ fn codex_launch_env_includes_wire_api_hint_but_equivalent_env_does_not() {
                 protocol: Protocol::OpenAiChat,
                 role_models: None,
                 last_sync_at: None,
+                credential_revision: 0,
                 ..openai_provider()
             },
             Some("sk-openai-runtime-secret"),
@@ -1426,6 +1995,7 @@ fn launch_env_normalizes_custom_openai_base_url_to_v1() {
                 access_type: None,
                 role_models: None,
                 last_sync_at: None,
+                credential_revision: 0,
             },
             Some("sk-openai-runtime-secret"),
         )
@@ -1466,51 +2036,25 @@ fn launch_env_normalizes_custom_openai_base_url_to_v1() {
 }
 
 #[test]
-fn engine_config_file_read_and_write_use_real_files_with_validation() {
-    let mut claude_path = std::env::temp_dir();
-    claude_path.push(format!("helm-claude-settings-{}.json", std::process::id()));
-    let mut codex_path = std::env::temp_dir();
-    codex_path.push(format!("helm-codex-config-{}.toml", std::process::id()));
-    let _ = fs::remove_file(&claude_path);
-    let _ = fs::remove_file(&codex_path);
-
-    helm_lib::providers::write_engine_config_file_at(
-        "claude-code",
-        &claude_path,
-        r#"{"env":{"ANTHROPIC_MODEL":"claude-sonnet-4.6"}}"#,
-    )
-    .unwrap();
-    let claude_file =
-        helm_lib::providers::read_engine_config_file_at("claude-code", &claude_path).unwrap();
-    assert_eq!(claude_file.path, claude_path);
-    assert!(claude_file.content.contains("ANTHROPIC_MODEL"));
-
-    let invalid_json = helm_lib::providers::write_engine_config_file_at(
-        "claude-code",
-        &claude_path,
-        r#"{"env":"missing-close""#,
-    );
-    assert!(invalid_json.is_err());
-    assert!(fs::read_to_string(&claude_path)
-        .unwrap()
-        .contains("ANTHROPIC_MODEL"));
-
-    helm_lib::providers::write_engine_config_file_at(
-        "codex",
-        &codex_path,
-        "model = \"gpt-5-codex\"\n",
-    )
-    .unwrap();
-    let codex_file = helm_lib::providers::read_engine_config_file_at("codex", &codex_path).unwrap();
-    assert_eq!(codex_file.path, codex_path);
-    assert!(codex_file.content.contains("gpt-5-codex"));
-
-    let invalid_toml =
-        helm_lib::providers::write_engine_config_file_at("codex", &codex_path, "model = ");
-    assert!(invalid_toml.is_err());
-    assert!(fs::read_to_string(&codex_path)
-        .unwrap()
-        .contains("gpt-5-codex"));
+fn engine_config_editor_uses_only_helm_fragment_and_validates_before_writing() {
+    let path = temp_config_path("engine-fragment");
+    let store = ProviderStore::new(path.clone(), MemorySecretStore::default());
+    for engine in ["claude-code", "codex"] {
+        let saved = store.write_engine_config_fragment(engine, r#"{"bin":"custom-cli","envVars":[{"name":"CUSTOM_TOKEN","value":"engine-secret"}]}"#).unwrap();
+        assert_eq!(saved.path, path);
+        assert!(!saved.content.contains("engine-secret"));
+        assert!(saved.content.contains("keyRef"));
+        let snapshot = fs::read_to_string(&path).unwrap();
+        for invalid in [
+            r#"{"bin":"other","envVars":[],"model":"override"}"#,
+            r#"{"bin":"","envVars":[]}"#,
+            r#"{"bin":"other","envVars":[{"name":"CODEX_HOME","value":"outside"}]}"#,
+        ] {
+            assert!(store.write_engine_config_fragment(engine, invalid).is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), snapshot);
+        }
+    }
+    assert!(store.read_engine_config_fragment("unknown").is_err());
 }
 
 #[test]
@@ -1524,7 +2068,6 @@ fn subscription_provider_is_ready_without_key_and_uses_cli_login() {
     provider.auth_method = AuthMethod::OAuth;
     provider.key_ref = None;
     store.save_provider(provider, None).unwrap();
-    store.save_model(claude_model()).unwrap();
 
     let config = store.load().unwrap();
     let saved = config
@@ -1541,7 +2084,7 @@ fn subscription_provider_is_ready_without_key_and_uses_cli_login() {
         .launch_env(&BindingConfig {
             engine_id: "claude-code".to_string(),
             provider_id: "anthropic".to_string(),
-            primary_model: "claude-sonnet-4.6".to_string(),
+            primary_model: "sonnet".to_string(),
             fast_model: None,
             assistant_model_id: None,
             thinking_enabled: None,
@@ -1559,10 +2102,7 @@ fn subscription_provider_is_ready_without_key_and_uses_cli_login() {
         "订阅模式不注入 BASE_URL，避免把订阅流量指到中转地址"
     );
     assert!(
-        env.contains(&(
-            "ANTHROPIC_MODEL".to_string(),
-            "claude-sonnet-4.6".to_string()
-        )),
+        env.contains(&("ANTHROPIC_MODEL".to_string(), "sonnet".to_string())),
         "模型选择仍然生效"
     );
 }
@@ -1578,7 +2118,9 @@ fn subscription_codex_provider_leaves_profile_selection_to_the_runtime() {
     provider.auth_method = AuthMethod::OAuth;
     provider.key_ref = None;
     store.save_provider(provider, None).unwrap();
-    store.save_model(codex_model()).unwrap();
+    store
+        .save_discovered_subscription_models("openai", "codex", "codex", vec![codex_model()])
+        .unwrap();
 
     let env = store
         .launch_env(&BindingConfig {
@@ -1920,19 +2462,25 @@ fn model_selection_cannot_disable_models_used_by_binding() {
     assert_eq!(binding.primary_model, fast.id);
     assert_eq!(binding.fast_model.as_deref(), Some(fast.id.as_str()));
 
+    let requested_binding = BindingConfig {
+        engine_id: "codex".to_string(),
+        provider_id: "openai".to_string(),
+        primary_model: primary.id.clone(),
+        fast_model: Some(fast.id.clone()),
+        assistant_model_id: None,
+        thinking_enabled: None,
+        context_1m: None,
+        reasoning_effort: None,
+        revision: 0,
+    };
+    assert!(store
+        .save_binding(requested_binding.clone())
+        .unwrap_err()
+        .contains("模型未启用"));
     store
-        .save_binding(BindingConfig {
-            engine_id: "codex".to_string(),
-            provider_id: "openai".to_string(),
-            primary_model: primary.id.clone(),
-            fast_model: Some(fast.id.clone()),
-            assistant_model_id: None,
-            thinking_enabled: None,
-            context_1m: None,
-            reasoning_effort: None,
-            revision: 0,
-        })
+        .save_provider_model_selection("openai", &[primary.id.clone(), fast.id.clone()])
         .unwrap();
+    store.save_binding(requested_binding).unwrap();
     let retarget_fast = store
         .save_provider_model_selection("openai", &[primary.id.clone()])
         .unwrap();

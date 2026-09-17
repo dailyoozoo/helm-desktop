@@ -5,16 +5,21 @@
 //! history, and is the sole writer of the terminal Turn snapshot.
 
 use crate::budget::{BudgetDimension, BudgetEnforcementMode, TurnBudgetSnapshot};
-use crate::protocol::{AgentEvent, StopReason, TurnStage};
+use crate::protocol::{AgentEvent, StopReason, TurnStage, TurnStreamFailure};
 use crate::runtime_registry::RuntimeOwnerRef;
 use crate::sessions::{SessionHistoryStore, TurnSnapshotRecord};
+use crate::turn_presentation::TurnPresentationBuffer;
 use crate::util::now_millis;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Condvar, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
+use tokio::sync::{mpsc, oneshot};
 
 const EVENT_NAME: &str = "agent-event";
+const STREAM_FAILURE_EVENT_NAME: &str = "turn-stream-failed";
+const STREAM_FAILURE_MESSAGE: &str =
+    "消息流保存/投递失败，已请求停止执行；部分显示内容可能尚未保存，请检查磁盘空间与访问权限";
 const DEFAULT_QUEUE_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +117,7 @@ struct AttemptBinding {
 struct BudgetRuntimeState {
     snapshot: TurnBudgetSnapshot,
     output_bytes: u64,
+    tool_output_bytes: HashMap<String, u64>,
     tool_count: u64,
     repeat_digests: HashMap<String, u64>,
     started_at: i64,
@@ -132,16 +138,23 @@ struct BudgetTrigger {
 struct SupervisedTurn {
     snapshot: TurnSnapshot,
     binding: AttemptBinding,
+    stream_failure_reported: bool,
+    /// 本轮是否已向用户投递过任何可见内容（正文/思考/工具/审批/错误/计划/检查点）。
+    /// 终态时仍为 false = 用户从头到尾什么都没看到，必须补一条可读终态，
+    /// 不能静默收尾（否则 UI 只会显示「已完成」且没有任何结果）。
+    saw_visible_content: bool,
     next_source_seq: u64,
     last_source_seq: u64,
     seen_native_events: HashSet<String>,
     native_session_id: Option<String>,
+    tool_stream_bytes: HashMap<String, u64>,
+    presentation: TurnPresentationBuffer,
     budget: BudgetRuntimeState,
 }
 
-struct QueueState {
-    items: VecDeque<EngineEventCandidate>,
-    draining: bool,
+struct QueuedCandidate {
+    candidate: EngineEventCandidate,
+    reply: oneshot::Sender<CandidateDisposition>,
 }
 
 struct SupervisorInner {
@@ -149,9 +162,9 @@ struct SupervisorInner {
     app: Option<AppHandle>,
     current: Mutex<HashMap<String, SupervisedTurn>>,
     diagnostics: Mutex<StreamDiagnostics>,
-    queue: Mutex<QueueState>,
-    queue_space: Condvar,
-    queue_capacity: usize,
+    processing: Mutex<()>,
+    ingress: tokio::sync::Mutex<()>,
+    queue: mpsc::Sender<QueuedCandidate>,
 }
 
 #[derive(Clone)]
@@ -169,20 +182,31 @@ impl TurnSupervisor {
     }
 
     fn build(store: SessionHistoryStore, app: Option<AppHandle>, queue_capacity: usize) -> Self {
-        Self {
-            inner: Arc::new(SupervisorInner {
-                store,
-                app,
-                current: Mutex::new(HashMap::new()),
-                diagnostics: Mutex::new(StreamDiagnostics::default()),
-                queue: Mutex::new(QueueState {
-                    items: VecDeque::new(),
-                    draining: false,
-                }),
-                queue_space: Condvar::new(),
-                queue_capacity: queue_capacity.max(1),
-            }),
-        }
+        let (queue, mut receiver) = mpsc::channel::<QueuedCandidate>(queue_capacity.max(1));
+        let inner = Arc::new(SupervisorInner {
+            store,
+            app,
+            current: Mutex::new(HashMap::new()),
+            diagnostics: Mutex::new(StreamDiagnostics::default()),
+            processing: Mutex::new(()),
+            ingress: tokio::sync::Mutex::new(()),
+            queue,
+        });
+        let weak = Arc::downgrade(&inner);
+        std::thread::Builder::new()
+            .name("helm-turn-events".to_string())
+            .spawn(move || {
+                while let Some(queued) = receiver.blocking_recv() {
+                    let Some(inner) = weak.upgrade() else {
+                        break;
+                    };
+                    let supervisor = TurnSupervisor { inner };
+                    let disposition = supervisor.process_candidate(queued.candidate);
+                    let _ = queued.reply.send(disposition);
+                }
+            })
+            .expect("无法启动 Turn 事件持久化线程");
+        Self { inner }
     }
 
     pub fn begin_attempt(
@@ -255,13 +279,18 @@ impl TurnSupervisor {
                 SupervisedTurn {
                     snapshot,
                     binding,
+                    stream_failure_reported: false,
+                    saw_visible_content: false,
                     next_source_seq: 0,
                     last_source_seq: 0,
                     seen_native_events: HashSet::new(),
                     native_session_id: None,
+                    tool_stream_bytes: HashMap::new(),
+                    presentation: TurnPresentationBuffer::default(),
                     budget: BudgetRuntimeState {
                         snapshot: budget_snapshot,
                         output_bytes: 0,
+                        tool_output_bytes: HashMap::new(),
                         tool_count: 0,
                         repeat_digests: HashMap::new(),
                         started_at,
@@ -319,6 +348,8 @@ impl TurnSupervisor {
             runtime_generation_id,
         )?;
         turn.binding.attempt_no = attempt_no;
+        turn.stream_failure_reported = false;
+        turn.saw_visible_content = false;
         turn.next_source_seq = 0;
         turn.last_source_seq = 0;
         turn.seen_native_events.clear();
@@ -362,102 +393,160 @@ impl TurnSupervisor {
 
     /// Adapter-facing entry point. Metadata is copied from the binding frozen
     /// by RuntimeRegistry; adapters do not allocate EventSeq or write history.
-    pub fn submit_event(
+    pub async fn submit_event(
         &self,
         history_session_id: &str,
         turn_id: Option<&str>,
         turn_epoch: Option<u64>,
         event: AgentEvent,
-    ) -> bool {
-        let candidate = {
-            let Ok(mut current) = self.inner.current.lock() else {
-                return false;
+    ) -> Result<bool, String> {
+        let (binding, frozen_turn_id, frozen_epoch) = {
+            let current = self
+                .inner
+                .current
+                .lock()
+                .map_err(|_| "Stream Supervisor 状态锁中毒".to_string())?;
+            let Some(turn) = current.get(history_session_id) else {
+                self.bump_diagnostic(|value| value.orphan += 1);
+                return Ok(false);
             };
+            (
+                turn.binding.clone(),
+                turn_id.unwrap_or(&turn.snapshot.turn_id).to_string(),
+                turn_epoch.unwrap_or(turn.snapshot.turn_epoch),
+            )
+        };
+        let ingress = self.inner.ingress.lock().await;
+        let candidate = {
+            let mut current = self
+                .inner
+                .current
+                .lock()
+                .map_err(|_| "Stream Supervisor 状态锁中毒".to_string())?;
             let Some(turn) = current.get_mut(history_session_id) else {
                 self.bump_diagnostic(|value| value.orphan += 1);
-                let _ = self.inner.store.record_stream_diagnostic(
-                    None,
-                    event_kind(&event),
-                    "orphan_session",
-                    None,
-                );
-                return false;
+                return Ok(false);
             };
+            if turn.snapshot.turn_id != frozen_turn_id
+                || turn.snapshot.turn_epoch != frozen_epoch
+                || turn.binding.owner != binding.owner
+                || turn.binding.attempt_no != binding.attempt_no
+                || turn.binding.runtime_generation_id != binding.runtime_generation_id
+            {
+                self.bump_diagnostic(|value| value.stale += 1);
+                return Ok(false);
+            }
+            if turn.stream_failure_reported
+                && !matches!(
+                    &event,
+                    AgentEvent::TurnComplete { .. }
+                        | AgentEvent::Error {
+                            recoverable: false,
+                            ..
+                        }
+                )
+            {
+                self.bump_diagnostic(|value| value.invalid_transition += 1);
+                return Ok(false);
+            }
             turn.next_source_seq = turn.next_source_seq.saturating_add(1);
             EngineEventCandidate {
-                owner: turn.binding.owner.clone(),
+                owner: binding.owner.clone(),
                 history_session_id: history_session_id.to_string(),
-                turn_id: turn_id.unwrap_or(&turn.snapshot.turn_id).to_string(),
-                turn_epoch: turn_epoch.unwrap_or(turn.snapshot.turn_epoch),
-                attempt_no: turn.binding.attempt_no,
-                runtime_generation_id: turn.binding.runtime_generation_id.clone(),
+                turn_id: frozen_turn_id.clone(),
+                turn_epoch: frozen_epoch,
+                attempt_no: binding.attempt_no,
+                runtime_generation_id: binding.runtime_generation_id.clone(),
                 source_seq: turn.next_source_seq,
                 native_event_id: native_event_identity(&event),
                 observed_at: now_millis(),
                 event,
             }
         };
-        self.enqueue(candidate);
-        true
+        let report_failure = || {
+            self.report_stream_failure(history_session_id, &frozen_turn_id, frozen_epoch, &binding)
+        };
+        let reply = self.enqueue(candidate).await;
+        drop(ingress);
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(error) => {
+                report_failure();
+                return Err(error);
+            }
+        };
+        let disposition = reply.await.map_err(|_| {
+            report_failure();
+            format!("[stream_worker_closed] {STREAM_FAILURE_MESSAGE}")
+        })?;
+        match disposition {
+            CandidateDisposition::PersistenceFailed => {
+                report_failure();
+                Err(format!(
+                    "[stream_persistence_failed] {STREAM_FAILURE_MESSAGE}"
+                ))
+            }
+            CandidateDisposition::Accepted => Ok(true),
+            _ => Ok(false),
+        }
     }
 
-    fn enqueue(&self, mut candidate: EngineEventCandidate) {
-        let mut queue = self
-            .inner
-            .queue
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while queue.items.len() >= self.inner.queue_capacity {
-            self.bump_diagnostic(|value| value.backpressure += 1);
-            if is_delta(&candidate.event)
-                && queue
-                    .items
-                    .back_mut()
-                    .is_some_and(|pending| merge_candidate_delta(pending, &mut candidate))
-            {
-                self.bump_diagnostic(|value| value.coalesced_delta += 1);
-                return;
-            }
-            queue = self
-                .inner
-                .queue_space
-                .wait(queue)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
-        queue.items.push_back(candidate);
-        if queue.draining {
-            return;
-        }
-        queue.draining = true;
-        drop(queue);
-
-        loop {
-            let candidate = {
-                let mut queue = self
-                    .inner
+    async fn enqueue(
+        &self,
+        candidate: EngineEventCandidate,
+    ) -> Result<oneshot::Receiver<CandidateDisposition>, String> {
+        let (reply, received) = oneshot::channel();
+        let queued = QueuedCandidate { candidate, reply };
+        match self.inner.queue.try_send(queued) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(queued)) => {
+                self.bump_diagnostic(|value| value.backpressure += 1);
+                self.inner
                     .queue
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let candidate = queue.items.pop_front();
-                self.inner.queue_space.notify_all();
-                if candidate.is_none() {
-                    queue.draining = false;
-                }
-                candidate
-            };
-            let Some(candidate) = candidate else {
-                break;
-            };
-            let _ = self.process_candidate(candidate);
+                    .send(queued)
+                    .await
+                    .map_err(|_| "[stream_worker_closed] 事件持久化队列已关闭".to_string())?;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err("[stream_worker_closed] 事件持久化队列已关闭".to_string());
+            }
         }
+        Ok(received)
     }
 
     pub fn process_candidate(&self, candidate: EngineEventCandidate) -> CandidateDisposition {
-        let event = crate::redaction::sanitize_agent_event(&candidate.event);
-        let (snapshot, event_seq, native_identity, budget_triggers) = {
-            let Ok(mut current) = self.inner.current.lock() else {
-                self.bump_diagnostic(|value| value.persistence_failed += 1);
-                return CandidateDisposition::PersistenceFailed;
+        let _processing = self
+            .inner
+            .processing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut event = crate::redaction::sanitize_agent_event(&candidate.event);
+        let (
+            snapshot,
+            native_identity,
+            mut budget,
+            tool_stream_update,
+            presentations,
+            tool_outputs,
+            terminal_fallback,
+        ) = {
+            let mut current = match self.inner.current.lock() {
+                Ok(current) => current,
+                Err(poisoned) => {
+                    drop(poisoned);
+                    self.bump_diagnostic(|value| value.persistence_failed += 1);
+                    self.report_stream_failure(
+                        &candidate.history_session_id,
+                        &candidate.turn_id,
+                        candidate.turn_epoch,
+                        &AttemptBinding {
+                            owner: candidate.owner.clone(),
+                            attempt_no: candidate.attempt_no,
+                            runtime_generation_id: candidate.runtime_generation_id.clone(),
+                        },
+                    );
+                    return CandidateDisposition::PersistenceFailed;
+                }
             };
             let Some(turn) = current.get_mut(&candidate.history_session_id) else {
                 drop(current);
@@ -503,6 +592,20 @@ impl TurnSupervisor {
                     return CandidateDisposition::Duplicate;
                 }
             }
+            if let AgentEvent::ToolProgress { id, .. } = &event {
+                if turn
+                    .seen_native_events
+                    .contains(&format!("tool_result:{id}"))
+                {
+                    drop(current);
+                    self.reject_candidate(
+                        &candidate,
+                        "progress_after_tool_result",
+                        CandidateDisposition::Stale,
+                    );
+                    return CandidateDisposition::Stale;
+                }
+            }
             let native_identity = match &event {
                 AgentEvent::SessionStarted { session_id, .. } => {
                     if turn
@@ -531,6 +634,24 @@ impl TurnSupervisor {
                 );
                 return CandidateDisposition::Stale;
             }
+            if turn.stream_failure_reported
+                && !matches!(
+                    &event,
+                    AgentEvent::TurnComplete { .. }
+                        | AgentEvent::Error {
+                            recoverable: false,
+                            ..
+                        }
+                )
+            {
+                drop(current);
+                self.reject_candidate(
+                    &candidate,
+                    "stream_failed",
+                    CandidateDisposition::InvalidTransition,
+                );
+                return CandidateDisposition::InvalidTransition;
+            }
             if !valid_transition(turn.snapshot.status, &event) {
                 drop(current);
                 self.reject_candidate(
@@ -544,54 +665,125 @@ impl TurnSupervisor {
             snapshot.event_seq = snapshot.event_seq.saturating_add(1);
             snapshot.updated_at = candidate.observed_at;
             apply_transition(&mut snapshot, &event);
-            turn.budget.last_event_at = candidate.observed_at;
-            let budget_triggers = apply_budget_event(&mut turn.budget, &event);
-            let event_seq = snapshot.event_seq;
-            (snapshot, event_seq, native_identity, budget_triggers)
+            let tool_stream_update = if let AgentEvent::ToolProgress { id, chunk, .. } = &mut event
+            {
+                let previous = turn.tool_stream_bytes.get(id).copied().unwrap_or_default();
+                *chunk = crate::output_limits::bounded_progress(chunk, previous);
+                Some((id.clone(), previous.saturating_add(chunk.len() as u64)))
+            } else {
+                None
+            };
+            if let AgentEvent::ToolResult {
+                id,
+                output,
+                diff,
+                has_output,
+                ..
+            } = &mut event
+            {
+                let fallback = output
+                    .as_deref()
+                    .or_else(|| turn.presentation.tool_output(id));
+                let (bounded_output, bounded_diff) =
+                    crate::output_limits::bounded_tool_result(fallback, diff.as_ref());
+                if has_output.is_none()
+                    && bounded_output
+                        .as_ref()
+                        .is_some_and(|value| !value.is_empty())
+                {
+                    *has_output = Some(true);
+                }
+                *output = bounded_output;
+                *diff = bounded_diff;
+            }
+            let terminal = snapshot.status.is_terminal();
+            // 可见内容记账：只有真正会被用户看到的事件才算「本轮有产出」。
+            // 终态事件本身（TurnComplete）不算，否则每条轮次都会自带一次记账。
+            if !terminal && is_user_visible_event(&event) {
+                turn.saw_visible_content = true;
+            }
+            // 兜底：终态时若用户一个字都没看到，补一条可读终态，避免静默收尾。
+            // 事件序号先给兜底 Error，终态事件顺延一位，保证前端先看到原因再收到收尾。
+            let terminal_fallback = if terminal && !turn.saw_visible_content {
+                no_output_terminal_note(&snapshot).map(|message| {
+                    let fallback_seq = snapshot.event_seq;
+                    snapshot.event_seq = snapshot.event_seq.saturating_add(1);
+                    // 同时写进 terminal_reason：重开会话也能从轮次记录里查到原因。
+                    snapshot.terminal_reason = Some(message.clone());
+                    (
+                        fallback_seq,
+                        AgentEvent::Error {
+                            session_id: turn.native_session_id.clone(),
+                            message,
+                            recoverable: false,
+                            kind: Some("turn_no_output".to_string()),
+                            stalled_kind: None,
+                        },
+                    )
+                })
+            } else {
+                None
+            };
+            let presentations = turn.presentation.records_for_event(
+                &candidate.turn_id,
+                snapshot.event_seq,
+                candidate.observed_at,
+                &event,
+                terminal,
+            );
+            let tool_outputs = if terminal {
+                turn.presentation.pending_tool_outputs()
+            } else {
+                Vec::new()
+            };
+            (
+                snapshot,
+                native_identity,
+                turn.budget.clone(),
+                tool_stream_update,
+                presentations,
+                tool_outputs,
+                terminal_fallback,
+            )
         };
+        let event_seq = snapshot.event_seq;
+        let terminal_status = snapshot.status;
+        budget.last_event_at = candidate.observed_at;
+        let budget_triggers = apply_budget_event(&mut budget, &candidate.event);
 
         let event_kind = event_kind(&event);
         // 性能：digest 只服务于落库（stream_boundary 与终态 finalize），delta 事件不落库，
         // 不必为每条 delta 做一次全量序列化 + SHA-256。合批后约 30 条/秒，省下的量可观。
-        let event_digest = if is_delta(&event) {
+        let event_digest = if !is_boundary(&event) {
             String::new()
         } else {
             crate::turn_start::digest_json(&event)
                 .unwrap_or_else(|_| "sha256:unavailable".to_string())
         };
         let persisted = if snapshot.status.is_terminal() {
-            self.inner.store.finalize_supervised_turn(
+            self.inner
+                .store
+                .finalize_supervised_turn_with_presentations(
+                    &snapshot,
+                    candidate.attempt_no,
+                    &candidate.runtime_generation_id,
+                    event_kind,
+                    &event_digest,
+                    &presentations,
+                    &tool_outputs,
+                )
+        } else if is_boundary(&event) {
+            self.inner.store.record_supervised_boundary(
                 &snapshot,
                 candidate.attempt_no,
                 &candidate.runtime_generation_id,
                 event_kind,
                 &event_digest,
+                &event,
+                &presentations,
             )
         } else {
-            self.inner
-                .store
-                .record_event_for_session_in_turn(
-                    &candidate.history_session_id,
-                    Some(&candidate.turn_id),
-                    &event,
-                )
-                .and_then(|_| {
-                    if is_boundary(&event) {
-                        self.inner.store.upsert_turn_snapshot((&snapshot).into())?;
-                        self.inner.store.record_stream_boundary(
-                            &candidate.history_session_id,
-                            &candidate.turn_id,
-                            candidate.attempt_no,
-                            &candidate.runtime_generation_id,
-                            event_seq,
-                            event_kind,
-                            "accepted",
-                            &event_digest,
-                            candidate.observed_at,
-                        )?;
-                    }
-                    Ok(())
-                })
+            Ok(())
         };
         if let Err(error) = persisted {
             self.bump_diagnostic(|value| value.persistence_failed += 1);
@@ -600,6 +792,23 @@ impl TurnSupervisor {
                 event_kind,
                 "persistence_failed",
                 Some(&error),
+            );
+            if let Some(app) = self.inner.app.as_ref() {
+                crate::adapter::log_runtime_event(
+                    app,
+                    "stream-persistence-failed",
+                    &crate::redaction::redact_text(&error),
+                );
+            }
+            self.report_stream_failure(
+                &candidate.history_session_id,
+                &candidate.turn_id,
+                candidate.turn_epoch,
+                &AttemptBinding {
+                    owner: candidate.owner.clone(),
+                    attempt_no: candidate.attempt_no,
+                    runtime_generation_id: candidate.runtime_generation_id.clone(),
+                },
             );
             return CandidateDisposition::PersistenceFailed;
         }
@@ -619,6 +828,19 @@ impl TurnSupervisor {
                         turn.native_session_id = native_identity;
                     }
                     let new_status = snapshot.status;
+                    turn.budget = budget;
+                    if let Some((tool_id, bytes)) = tool_stream_update {
+                        turn.tool_stream_bytes.insert(tool_id, bytes);
+                    }
+                    turn.presentation.apply(
+                        &event,
+                        event_seq,
+                        candidate.observed_at,
+                        new_status.is_terminal(),
+                    );
+                    if new_status.is_terminal() {
+                        turn.tool_stream_bytes.clear();
+                    }
                     turn.snapshot = snapshot;
                     // 状态徽标实时刷新（#1）：lastTurnStatus 实际变更时广播侧栏刷新事件，
                     // 仅在该边界事件改变状态时才发，避免每个事件都触发 Rail 全量重读。
@@ -633,8 +855,37 @@ impl TurnSupervisor {
         }
 
         self.bump_diagnostic(|value| value.accepted += 1);
+        if matches!(
+            event,
+            AgentEvent::Error {
+                recoverable: false,
+                ..
+            } | AgentEvent::TurnComplete {
+                stop_reason: StopReason::Error,
+                ..
+            }
+        ) {
+            self.invalidate_runtime_probes(&candidate.history_session_id);
+        }
         for trigger in budget_triggers {
             self.record_budget_trigger(&candidate, &trigger);
+        }
+        // 先发兜底原因再发终态事件：前端按顺序收到「为什么结束」+「结束了」，
+        // 不会出现「已完成但一片空白」的静默收尾。
+        if let Some((fallback_seq, fallback_event)) = terminal_fallback.as_ref() {
+            if let AgentEvent::Error { message, .. } = fallback_event {
+                if let Some(app) = self.inner.app.as_ref() {
+                    crate::adapter::log_runtime_event(
+                        app,
+                        "turn-no-output",
+                        &format!(
+                            "history={} turn={} status={:?} note={}",
+                            candidate.history_session_id, candidate.turn_id, terminal_status, message
+                        ),
+                    );
+                }
+            }
+            self.publish(&candidate, *fallback_seq, fallback_event);
         }
         self.publish(&candidate, event_seq, &event);
         CandidateDisposition::Accepted
@@ -744,6 +995,87 @@ impl TurnSupervisor {
         }
     }
 
+    fn report_stream_failure(
+        &self,
+        history_session_id: &str,
+        turn_id: &str,
+        turn_epoch: u64,
+        binding: &AttemptBinding,
+    ) -> bool {
+        let mut current = self
+            .inner
+            .current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(turn) = current.get_mut(history_session_id) else {
+            return false;
+        };
+        if turn.snapshot.turn_id != turn_id
+            || turn.snapshot.turn_epoch != turn_epoch
+            || turn.binding.owner != binding.owner
+            || turn.binding.attempt_no != binding.attempt_no
+            || turn.binding.runtime_generation_id != binding.runtime_generation_id
+            || turn.snapshot.status.is_terminal()
+            || turn.stream_failure_reported
+        {
+            return false;
+        }
+        turn.stream_failure_reported = true;
+        if let Some(app) = self.inner.app.as_ref() {
+            let failure = TurnStreamFailure {
+                history_id: history_session_id.to_string(),
+                turn_id: turn_id.to_string(),
+                turn_epoch,
+                attempt_no: binding.attempt_no,
+                runtime_generation_id: binding.runtime_generation_id.clone(),
+                message: STREAM_FAILURE_MESSAGE.to_string(),
+            };
+            if app.emit(STREAM_FAILURE_EVENT_NAME, &failure).is_err() {
+                crate::adapter::log_runtime_event(
+                    app,
+                    "stream-failure-notification-failed",
+                    "消息流故障通知发送失败",
+                );
+            }
+        }
+        drop(current);
+        self.interrupt_after_delivery_failure(&binding.owner);
+        true
+    }
+
+    fn interrupt_after_delivery_failure(&self, owner: &RuntimeOwnerRef) {
+        let Some(app) = self.inner.app.as_ref() else {
+            return;
+        };
+        let Some(registry) = app.try_state::<crate::runtime_registry::RuntimeRegistry>() else {
+            return;
+        };
+        let registry = registry.inner().clone();
+        let owner = owner.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = registry.interrupt(&owner).await;
+        });
+    }
+
+    fn invalidate_runtime_probes(&self, history_session_id: &str) {
+        let Some(app) = self.inner.app.as_ref() else {
+            return;
+        };
+        let Some(profiles) =
+            app.try_state::<crate::subscription_profiles::SubscriptionProfileStore>()
+        else {
+            return;
+        };
+        let Some(registry) =
+            app.try_state::<crate::capability_registry::EngineCapabilityRegistry>()
+        else {
+            return;
+        };
+        if let Ok(engine) = self.inner.store.engine_for_session(history_session_id) {
+            let _ = crate::settings::invalidate_engine_probes(&profiles, &registry, &engine);
+        }
+    }
+
     fn spawn_budget_watchdog(&self, history_session_id: &str, turn_id: &str, attempt_no: u64) {
         if self.inner.app.is_none() {
             return;
@@ -764,6 +1096,7 @@ impl TurnSupervisor {
                     if turn.snapshot.turn_id != turn_id
                         || turn.binding.attempt_no != attempt_no
                         || turn.snapshot.status.is_terminal()
+                        || turn.stream_failure_reported
                     {
                         return;
                     }
@@ -827,9 +1160,50 @@ impl TurnSupervisor {
     }
 
     fn publish(&self, candidate: &EngineEventCandidate, event_seq: u64, event: &AgentEvent) {
+        if matches!(event, AgentEvent::ToolProgress { chunk, .. } if chunk.is_empty()) {
+            return;
+        }
         let Some(app) = self.inner.app.as_ref() else {
             return;
         };
+        let current = self
+            .inner
+            .current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(turn) = current.get(&candidate.history_session_id) else {
+            return;
+        };
+        if turn.snapshot.turn_id != candidate.turn_id
+            || turn.snapshot.turn_epoch != candidate.turn_epoch
+            || turn.binding.owner != candidate.owner
+            || turn.binding.attempt_no != candidate.attempt_no
+            || turn.binding.runtime_generation_id != candidate.runtime_generation_id
+            || (turn.stream_failure_reported
+                && !matches!(
+                    event,
+                    AgentEvent::TurnComplete { .. }
+                        | AgentEvent::Error {
+                            recoverable: false,
+                            ..
+                        }
+                ))
+        {
+            return;
+        }
+        let _ = app.emit(
+            EVENT_NAME,
+            &AgentEventEnvelope {
+                history_id: &candidate.history_session_id,
+                event_seq,
+                turn_id: &candidate.turn_id,
+                turn_epoch: candidate.turn_epoch,
+                attempt_no: candidate.attempt_no,
+                runtime_generation_id: &candidate.runtime_generation_id,
+                event,
+            },
+        );
+        drop(current);
         if matches!(event, AgentEvent::TokenUsage { .. }) {
             crate::tray::refresh_usage(app);
         }
@@ -845,18 +1219,6 @@ impl TurnSupervisor {
         if matches!(event, AgentEvent::TurnComplete { .. }) {
             crate::titler::maybe_generate_title(app, &candidate.history_session_id);
         }
-        let _ = app.emit(
-            EVENT_NAME,
-            &AgentEventEnvelope {
-                history_id: &candidate.history_session_id,
-                event_seq,
-                turn_id: &candidate.turn_id,
-                turn_epoch: candidate.turn_epoch,
-                attempt_no: candidate.attempt_no,
-                runtime_generation_id: &candidate.runtime_generation_id,
-                event,
-            },
-        );
     }
 }
 
@@ -864,19 +1226,25 @@ fn apply_transition(snapshot: &mut TurnSnapshot, event: &AgentEvent) {
     match event {
         AgentEvent::ApprovalRequest { .. } => snapshot.status = TurnStatus::WaitingApproval,
         AgentEvent::TurnComplete { stop_reason, .. } => {
+            // 先行的 Error 事件已把真实失败原因（脱敏后）写进 terminal_reason 并置 Failed；
+            // 裸 stop reason 不得覆盖丢细节，否则重开会话只剩一行 "error"。
+            let already_failed = snapshot.status == TurnStatus::Failed;
             snapshot.status = match stop_reason {
                 StopReason::End => TurnStatus::Succeeded,
                 StopReason::Interrupted => TurnStatus::Interrupted,
                 StopReason::Error => TurnStatus::Failed,
             };
-            snapshot.terminal_reason = Some(
-                match stop_reason {
-                    StopReason::End => "end",
-                    StopReason::Interrupted => "interrupted",
-                    StopReason::Error => "error",
+            match stop_reason {
+                StopReason::End => snapshot.terminal_reason = Some("end".to_string()),
+                StopReason::Interrupted => {
+                    snapshot.terminal_reason = Some("interrupted".to_string());
                 }
-                .to_string(),
-            );
+                StopReason::Error => {
+                    if !already_failed || snapshot.terminal_reason.is_none() {
+                        snapshot.terminal_reason = Some("error".to_string());
+                    }
+                }
+            }
             snapshot.recoverable = matches!(stop_reason, StopReason::Interrupted);
         }
         AgentEvent::Error {
@@ -900,7 +1268,6 @@ fn apply_transition(snapshot: &mut TurnSnapshot, event: &AgentEvent) {
         | AgentEvent::ToolProgress { .. }
         | AgentEvent::ToolResult { .. }
         | AgentEvent::PlanUpdate { .. }
-        | AgentEvent::Checkpoint { .. }
         | AgentEvent::TokenUsage { .. }
         | AgentEvent::ContextUsage { .. }
         | AgentEvent::ContextCompaction { .. }
@@ -911,12 +1278,26 @@ fn apply_transition(snapshot: &mut TurnSnapshot, event: &AgentEvent) {
 
 fn apply_budget_event(state: &mut BudgetRuntimeState, event: &AgentEvent) -> Vec<BudgetTrigger> {
     match event {
-        AgentEvent::MessageDelta { text, .. }
-        | AgentEvent::ThinkingDelta { text, .. }
-        | AgentEvent::ToolProgress { chunk: text, .. } => {
+        AgentEvent::MessageDelta { text, .. } | AgentEvent::ThinkingDelta { text, .. } => {
             state.output_bytes = state
                 .output_bytes
                 .saturating_add(text.as_bytes().len() as u64);
+        }
+        AgentEvent::ToolProgress { id, chunk, .. } => {
+            let size = chunk.len() as u64;
+            state.output_bytes = state.output_bytes.saturating_add(size);
+            let previous = state.tool_output_bytes.entry(id.clone()).or_default();
+            *previous = previous.saturating_add(size);
+        }
+        AgentEvent::ToolResult {
+            id, output, diff, ..
+        } => {
+            let size = crate::output_limits::tool_result_bytes(output.as_deref(), diff.as_ref());
+            let previous = state.tool_output_bytes.entry(id.clone()).or_default();
+            state.output_bytes = state
+                .output_bytes
+                .saturating_add(size.saturating_sub(*previous));
+            *previous = (*previous).max(size);
         }
         AgentEvent::MessageComplete { text, .. } | AgentEvent::ThinkingComplete { text, .. } => {
             if state.output_bytes == 0 {
@@ -1060,12 +1441,54 @@ fn event_kind(event: &AgentEvent) -> &'static str {
         AgentEvent::ToolResult { .. } => "tool_result",
         AgentEvent::ApprovalRequest { .. } => "approval_request",
         AgentEvent::PlanUpdate { .. } => "plan_update",
-        AgentEvent::Checkpoint { .. } => "checkpoint",
         AgentEvent::TokenUsage { .. } => "token_usage",
         AgentEvent::ContextUsage { .. } => "context_usage",
         AgentEvent::ContextCompaction { .. } => "context_compaction",
         AgentEvent::TurnComplete { .. } => "turn_complete",
         AgentEvent::Error { .. } => "error",
+    }
+}
+
+/// 「用户看得见」的事件类型：正文、思考、工具、审批、计划、错误。
+/// 纯控制面事件（session_started / turn_stage / usage / turn_complete）不算，
+/// 它们只在界面上表现为状态，不构成「本轮有产出」。
+fn is_user_visible_event(event: &AgentEvent) -> bool {
+    matches!(
+        event,
+        AgentEvent::MessageDelta { .. }
+            | AgentEvent::MessageComplete { .. }
+            | AgentEvent::ThinkingDelta { .. }
+            | AgentEvent::ThinkingComplete { .. }
+            | AgentEvent::ToolCall { .. }
+            | AgentEvent::ToolProgress { .. }
+            | AgentEvent::ToolResult { .. }
+            | AgentEvent::ApprovalRequest { .. }
+            | AgentEvent::PlanUpdate { .. }
+            | AgentEvent::Error { .. }
+    )
+}
+
+/// 终态时「用户一个字都没看到」的兜底说明。返回 None 表示无需补发
+/// （已有真实原因，或本就不该打扰用户）。
+fn no_output_terminal_note(snapshot: &TurnSnapshot) -> Option<String> {
+    match snapshot.status {
+        TurnStatus::Interrupted => Some(
+            "本轮已被中断：进程在返回任何内容前就结束了（未收到模型输出）。\
+             可重新发送这条消息。"
+                .to_string(),
+        ),
+        TurnStatus::Failed => {
+            let reason = snapshot.terminal_reason.as_deref().unwrap_or_default().trim();
+            if reason.is_empty() {
+                Some("本轮失败，但引擎没有返回具体原因，且结束前没有任何输出。".to_string())
+            } else {
+                None
+            }
+        }
+        TurnStatus::Succeeded => {
+            Some("本轮已结束，但模型没有返回任何内容（无正文、无工具调用、无错误）。".to_string())
+        }
+        TurnStatus::Running | TurnStatus::WaitingApproval | TurnStatus::Stalled => None,
     }
 }
 
@@ -1078,68 +1501,12 @@ fn is_boundary(event: &AgentEvent) -> bool {
     )
 }
 
-fn is_delta(event: &AgentEvent) -> bool {
-    matches!(
-        event,
-        AgentEvent::MessageDelta { .. } | AgentEvent::ThinkingDelta { .. }
-    )
-}
-
-fn merge_candidate_delta(
-    pending: &mut EngineEventCandidate,
-    incoming: &mut EngineEventCandidate,
-) -> bool {
-    if pending.turn_id != incoming.turn_id
-        || pending.attempt_no != incoming.attempt_no
-        || pending.runtime_generation_id != incoming.runtime_generation_id
-    {
-        return false;
-    }
-    let merged = match (&mut pending.event, &incoming.event) {
-        (
-            AgentEvent::MessageDelta {
-                session_id: left_session,
-                role: left_role,
-                text: left,
-            },
-            AgentEvent::MessageDelta {
-                session_id: right_session,
-                role: right_role,
-                text: right,
-            },
-        ) if left_session == right_session && left_role == right_role => {
-            left.push_str(right);
-            true
-        }
-        (
-            AgentEvent::ThinkingDelta {
-                session_id: left_session,
-                text: left,
-            },
-            AgentEvent::ThinkingDelta {
-                session_id: right_session,
-                text: right,
-            },
-        ) if left_session == right_session => {
-            left.push_str(right);
-            true
-        }
-        _ => false,
-    };
-    if merged {
-        pending.source_seq = incoming.source_seq;
-        pending.observed_at = incoming.observed_at;
-    }
-    merged
-}
-
 fn native_event_identity(event: &AgentEvent) -> Option<String> {
     match event {
         AgentEvent::SessionStarted { session_id, .. } => Some(format!("session:{session_id}")),
         AgentEvent::ToolCall { id, .. } => Some(format!("tool_call:{id}")),
         AgentEvent::ToolResult { id, .. } => Some(format!("tool_result:{id}")),
         AgentEvent::ApprovalRequest { id, .. } => Some(format!("approval:{id}")),
-        AgentEvent::Checkpoint { id, .. } => Some(format!("checkpoint:{id}")),
         AgentEvent::TurnComplete { .. } => Some("turn_complete".to_string()),
         _ => None,
     }
@@ -1189,7 +1556,11 @@ fn normalize_profile(profile: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capability_registry::{CapabilityIdentity, CapabilitySet, EngineCapabilitySnapshot};
     use crate::protocol::{EngineId, Role};
+    use crate::reasoning::ReasoningEffort;
+    use crate::runtime_registry::RuntimeGeneration;
+    use crate::turn_start::{PricingBasisSnapshot, TurnExecutionSpec, TurnStartCommand};
 
     fn store(name: &str) -> SessionHistoryStore {
         SessionHistoryStore::new(std::env::temp_dir().join(format!(
@@ -1212,6 +1583,109 @@ mod tests {
         let supervisor = TurnSupervisor::new(history.clone());
         supervisor.begin("history", "turn-1", 1, "build", "auto");
         (history, supervisor)
+    }
+
+    fn prepared_supervisor(
+        history: &SessionHistoryStore,
+    ) -> (TurnSupervisor, TurnExecutionSpec, RuntimeGeneration) {
+        let created_at = now_millis();
+        history
+            .create_session(crate::sessions::NewSessionRecord {
+                id: "history".into(),
+                engine: EngineId::Codex,
+                model: "model".into(),
+                cwd: "D:/repo".into(),
+                created_at,
+            })
+            .unwrap();
+        let capability = EngineCapabilitySnapshot {
+            id: "capability-fixture".into(),
+            identity: CapabilityIdentity {
+                engine_id: "codex".into(),
+                adapter_version: "test".into(),
+                binary_identity: "test-binary".into(),
+                engine_profile_digest: "sha256:engine".into(),
+                provider_launch_profile_ref: "provider:fixture:api".into(),
+                provider_launch_profile_digest: "sha256:provider".into(),
+                launch_profile_identity: "sha256:launch".into(),
+                model_capability_key: "model".into(),
+            },
+            capabilities: CapabilitySet::unknown("test_fixture"),
+            probe_kind: "test_fixture".into(),
+            probed_at: created_at,
+        };
+        history
+            .save_capability_snapshot(&capability.identity.cache_key().unwrap(), &capability)
+            .unwrap();
+        let command = TurnStartCommand {
+            history_session_id: "history".into(),
+            display_text: "question".into(),
+            turn_mode: "build".into(),
+            permission_profile: "standard".into(),
+            requested_reasoning_effort: None,
+            requested_model_id: Some("model".into()),
+            attachments: Vec::new(),
+            created_at,
+        };
+        let spec = TurnExecutionSpec {
+            turn_id: "turn-1".into(),
+            history_session_id: "history".into(),
+            turn_epoch: 0,
+            engine_id: "codex".into(),
+            provider_id: "fixture".into(),
+            provider_kind: "api".into(),
+            provider_display_name: "Fixture".into(),
+            route_label_snapshot: "Fixture / model".into(),
+            requested_model_id: "model".into(),
+            routed_model_id: "model".into(),
+            model_label_snapshot: "Model".into(),
+            requested_reasoning_effort: ReasoningEffort::Auto,
+            routed_reasoning_effort: ReasoningEffort::Auto,
+            turn_mode: command.turn_mode.clone(),
+            permission_profile: command.permission_profile.clone(),
+            binding_id: Some("codex".into()),
+            binding_revision: Some(1),
+            engine_profile_digest: capability.identity.engine_profile_digest.clone(),
+            provider_launch_profile_ref: capability.identity.provider_launch_profile_ref.clone(),
+            launch_config_digest: capability.identity.launch_profile_identity.clone(),
+            routing_capability_snapshot_id: Some(capability.id.clone()),
+            resolution_source: "binding_live".into(),
+            legacy_route_snapshot_digest: None,
+            pricing_basis_snapshot: PricingBasisSnapshot { profile: None },
+            session_context: Vec::new(),
+            created_at,
+        };
+        let (_, spec) = history.start_turn(&command, spec).unwrap();
+        let generation = RuntimeGeneration {
+            id: "runtime-fixture".into(),
+            owner: RuntimeOwnerRef::Session("history".into()),
+            engine_id: spec.engine_id.clone(),
+            compatibility_key: "sha256:compatibility".into(),
+            engine_profile_digest: spec.engine_profile_digest.clone(),
+            provider_launch_profile_ref: spec.provider_launch_profile_ref.clone(),
+            provider_launch_profile_digest: capability.identity.provider_launch_profile_digest,
+            capability_snapshot_id: capability.id,
+            canonical_cwd: "d:\\repo".into(),
+            created_at,
+        };
+        history.create_runtime_generation(&generation).unwrap();
+        let attempt = history
+            .create_turn_attempt(&spec, &generation, None)
+            .unwrap();
+        let supervisor = TurnSupervisor::new(history.clone());
+        supervisor
+            .begin_attempt(
+                &spec.history_session_id,
+                &spec.turn_id,
+                spec.turn_epoch,
+                &spec.turn_mode,
+                &spec.permission_profile,
+                generation.owner.clone(),
+                attempt.attempt_no,
+                &generation.id,
+            )
+            .unwrap();
+        (supervisor, spec, generation)
     }
 
     #[test]
@@ -1279,8 +1753,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bounded_queue_coalesces_delta_and_never_drops_boundary_events() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn bounded_queue_waits_asynchronously_and_never_drops_boundary_events() {
         let history = store("backpressure");
         history
             .create_session(crate::sessions::NewSessionRecord {
@@ -1313,73 +1787,565 @@ mod tests {
             observed_at: now_millis(),
             event,
         };
-        {
-            let mut queue = supervisor.inner.queue.lock().unwrap();
-            queue.draining = true;
-            queue.items.push_back(candidate(
+        let processing = supervisor.inner.processing.lock().unwrap();
+        let first = supervisor
+            .enqueue(candidate(
                 1,
                 AgentEvent::MessageDelta {
                     session_id: "cli".into(),
                     role: Role::Assistant,
                     text: "a".into(),
                 },
-            ));
-        }
-        supervisor.enqueue(candidate(
-            2,
-            AgentEvent::MessageDelta {
-                session_id: "cli".into(),
-                role: Role::Assistant,
-                text: "b".into(),
-            },
-        ));
-        {
-            let queue = supervisor.inner.queue.lock().unwrap();
-            assert_eq!(queue.items.len(), 1);
-            assert!(matches!(
-                &queue.items[0].event,
-                AgentEvent::MessageDelta { text, .. } if text == "ab"
-            ));
-        }
-        assert_eq!(supervisor.diagnostics().backpressure, 1);
-        assert_eq!(supervisor.diagnostics().coalesced_delta, 1);
-
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while supervisor.inner.queue.capacity() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let second = supervisor
+            .enqueue(candidate(
+                2,
+                AgentEvent::MessageDelta {
+                    session_id: "cli".into(),
+                    role: Role::Assistant,
+                    text: "b".into(),
+                },
+            ))
+            .await
+            .unwrap();
         let worker = supervisor.clone();
         let boundary = candidate(
             3,
-            AgentEvent::TurnStage {
+            AgentEvent::MessageComplete {
                 session_id: "cli".into(),
-                stage: TurnStage::UsingTool,
-                ts: now_millis(),
-                engine_reported_ttft_ms: None,
-                retry_attempt: None,
+                role: Role::Assistant,
+                text: "ab".into(),
             },
         );
-        let join = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            worker.enqueue(boundary);
-            done_tx.send(()).unwrap();
-        });
-        started_rx.recv().unwrap();
-        assert!(done_rx
-            .recv_timeout(std::time::Duration::from_millis(30))
-            .is_err());
-        {
-            let mut queue = supervisor.inner.queue.lock().unwrap();
-            queue.items.pop_front();
-        }
-        supervisor.inner.queue_space.notify_all();
-        done_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
+        let mut queued = tokio::spawn(async move { worker.enqueue(boundary).await.unwrap() });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut queued)
+                .await
+                .is_err()
+        );
+        assert_eq!(supervisor.diagnostics().backpressure, 1);
+        drop(processing);
+        let third = queued.await.unwrap();
+        assert_eq!(first.await.unwrap(), CandidateDisposition::Accepted);
+        assert_eq!(second.await.unwrap(), CandidateDisposition::Accepted);
+        assert_eq!(third.await.unwrap(), CandidateDisposition::Accepted);
+        let detail = supervisor.inner.store.get_session("history").unwrap();
+        assert_eq!(detail.messages.len(), 1);
+        assert_eq!(detail.messages[0].text, "ab");
+    }
+
+    #[tokio::test]
+    async fn persistence_failure_is_reported_without_committing_budget_or_event_sequence() {
+        let path = std::env::temp_dir().join(format!(
+            "helm-event-failure-{}-{}.sqlite",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let history = SessionHistoryStore::new(path.clone());
+        let (supervisor, spec, generation) = prepared_supervisor(&history);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch("CREATE TRIGGER reject_tool_boundary BEFORE INSERT ON stream_boundary_event WHEN NEW.event_kind = 'tool_call' BEGIN SELECT RAISE(FAIL, 'test boundary failure'); END;").unwrap();
+        let event = AgentEvent::ToolCall {
+            session_id: "cli".into(),
+            id: "tool".into(),
+            name: "Read".into(),
+            input: serde_json::json!({"path":"file.txt"}),
+            status: crate::protocol::CallStatus::Pending,
+        };
+        let result = supervisor
+            .submit_event("history", Some("turn-1"), Some(1), event.clone())
+            .await;
+        assert!(result.unwrap_err().contains("stream_persistence_failed"));
+        assert!(history
+            .get_session("history")
+            .unwrap()
+            .tool_calls
+            .is_empty());
+        let binding = {
+            let current = supervisor.inner.current.lock().unwrap();
+            let turn = current.get("history").unwrap();
+            assert_eq!(turn.budget.tool_count, 0);
+            assert_eq!(turn.budget.output_bytes, 0);
+            assert_eq!(turn.snapshot.event_seq, 0);
+            assert_eq!(turn.snapshot.status, TurnStatus::Running);
+            assert_eq!(turn.last_source_seq, 0);
+            assert!(turn.stream_failure_reported);
+            turn.binding.clone()
+        };
+        let stored = history.load_turn_snapshot("history").unwrap().unwrap();
+        assert_eq!(stored.event_seq, 0);
+        assert_eq!(stored.status, TurnStatus::Running);
+        assert!(!supervisor.report_stream_failure("history", "turn-1", 1, &binding));
+        connection
+            .execute_batch("DROP TRIGGER reject_tool_boundary;")
             .unwrap();
-        join.join().unwrap();
-        let mut queue = supervisor.inner.queue.lock().unwrap();
-        assert_eq!(queue.items.len(), 1, "非 delta 边界事件不得在队列满时丢失");
-        assert!(matches!(queue.items[0].event, AgentEvent::TurnStage { .. }));
-        queue.items.clear();
-        queue.draining = false;
+        assert!(!supervisor
+            .submit_event("history", Some("turn-1"), Some(1), event.clone())
+            .await
+            .unwrap());
+        assert_eq!(
+            supervisor.snapshot("history").unwrap().unwrap().event_seq,
+            0
+        );
+        let retry = history
+            .create_turn_attempt(&spec, &generation, None)
+            .unwrap();
+        assert_eq!(retry.attempt_no, binding.attempt_no + 1);
+        supervisor
+            .retry_attempt(
+                "history",
+                "turn-1",
+                retry.attempt_no,
+                &binding.runtime_generation_id,
+                "test pre-execution retry",
+            )
+            .unwrap();
+        assert!(
+            !supervisor
+                .inner
+                .current
+                .lock()
+                .unwrap()
+                .get("history")
+                .unwrap()
+                .stream_failure_reported
+        );
+        assert!(supervisor
+            .submit_event("history", Some("turn-1"), Some(1), event)
+            .await
+            .unwrap());
+        assert_eq!(
+            supervisor
+                .inner
+                .current
+                .lock()
+                .unwrap()
+                .get("history")
+                .unwrap()
+                .budget
+                .tool_count,
+            1
+        );
+        assert_eq!(
+            supervisor.snapshot("history").unwrap().unwrap().event_seq,
+            1
+        );
+        connection.execute_batch("CREATE TRIGGER reject_message_boundary BEFORE INSERT ON stream_boundary_event WHEN NEW.event_kind = 'message_complete' BEGIN SELECT RAISE(FAIL, 'test message failure'); END;").unwrap();
+        assert!(supervisor
+            .submit_event(
+                "history",
+                Some("turn-1"),
+                Some(1),
+                AgentEvent::MessageDelta {
+                    session_id: "cli".into(),
+                    role: Role::Assistant,
+                    text: "partial reply".into(),
+                }
+            )
+            .await
+            .unwrap());
+        assert!(supervisor
+            .submit_event(
+                "history",
+                Some("turn-1"),
+                Some(1),
+                AgentEvent::MessageComplete {
+                    session_id: "cli".into(),
+                    role: Role::Assistant,
+                    text: "partial reply".into(),
+                }
+            )
+            .await
+            .is_err());
+        let messages = history.get_session("history").unwrap().messages;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(messages[0].text, "question");
+        for event in [
+            AgentEvent::MessageDelta {
+                session_id: "cli".into(),
+                role: Role::Assistant,
+                text: "late reply".into(),
+            },
+            AgentEvent::ToolProgress {
+                session_id: "cli".into(),
+                id: "tool".into(),
+                chunk: "late output".into(),
+            },
+            AgentEvent::Error {
+                session_id: Some("cli".into()),
+                message: "recoverable runtime warning".into(),
+                recoverable: true,
+                kind: None,
+                stalled_kind: None,
+            },
+        ] {
+            assert!(!supervisor
+                .submit_event("history", Some("turn-1"), Some(1), event)
+                .await
+                .unwrap());
+        }
+        let snapshot = supervisor.snapshot("history").unwrap().unwrap();
+        assert_eq!(snapshot.event_seq, 2);
+        assert_eq!(snapshot.status, TurnStatus::Running);
+        connection
+            .execute_batch("DROP TRIGGER reject_message_boundary;")
+            .unwrap();
+        assert!(supervisor
+            .submit_event(
+                "history",
+                Some("turn-1"),
+                Some(1),
+                AgentEvent::TurnComplete {
+                    session_id: "cli".into(),
+                    stop_reason: StopReason::Interrupted,
+                }
+            )
+            .await
+            .unwrap());
+        let detail = history.get_session("history").unwrap();
+        assert_eq!(detail.messages.len(), 1);
+        assert_eq!(detail.messages[0].role, Role::User);
+        assert_eq!(detail.messages[0].text, "question");
+        assert_eq!(detail.presentations.iter().filter(|record| matches!(&record.content, crate::protocol::TurnPresentationContent::Message { text, .. } if text == "partial reply")).count(), 1);
+        let attempt_state: String = connection
+            .query_row(
+                "SELECT delivery_state FROM turn_attempt WHERE turn_id = ?1 AND attempt_no = ?2",
+                rusqlite::params![spec.turn_id, retry.attempt_no],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempt_state, "interrupted");
+        drop(connection);
+        drop(supervisor);
+        drop(history);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn stream_failure_claim_is_once_per_attempt_and_rejects_stale_or_terminal_identity() {
+        let history = store("failure-claim");
+        let (supervisor, spec, generation) = prepared_supervisor(&history);
+        let binding = supervisor
+            .inner
+            .current
+            .lock()
+            .unwrap()
+            .get("history")
+            .unwrap()
+            .binding
+            .clone();
+        for (history_id, turn_id, epoch) in [
+            ("missing", "turn-1", 1),
+            ("history", "old-turn", 1),
+            ("history", "turn-1", 0),
+        ] {
+            assert!(!supervisor.report_stream_failure(history_id, turn_id, epoch, &binding));
+        }
+        for stale_binding in [
+            AttemptBinding {
+                owner: RuntimeOwnerRef::Session("other-history".into()),
+                ..binding.clone()
+            },
+            AttemptBinding {
+                attempt_no: binding.attempt_no + 1,
+                ..binding.clone()
+            },
+            AttemptBinding {
+                runtime_generation_id: "old-generation".into(),
+                ..binding.clone()
+            },
+        ] {
+            assert!(!supervisor.report_stream_failure("history", "turn-1", 1, &stale_binding));
+        }
+        assert!(supervisor.report_stream_failure("history", "turn-1", 1, &binding));
+        assert!(!supervisor.report_stream_failure("history", "turn-1", 1, &binding));
+        assert!(!supervisor.accept_event(
+            "history",
+            Some("turn-1"),
+            Some(1),
+            1,
+            &AgentEvent::MessageDelta {
+                session_id: "cli".into(),
+                role: Role::Assistant,
+                text: "already queued before failure".into(),
+            },
+        ));
+
+        let retry = history
+            .create_turn_attempt(&spec, &generation, None)
+            .unwrap();
+        assert_eq!(retry.attempt_no, binding.attempt_no + 1);
+        supervisor
+            .retry_attempt(
+                "history",
+                "turn-1",
+                retry.attempt_no,
+                &binding.runtime_generation_id,
+                "test pre-execution retry",
+            )
+            .unwrap();
+        let next_binding = AttemptBinding {
+            attempt_no: binding.attempt_no + 1,
+            ..binding.clone()
+        };
+        assert!(!supervisor.report_stream_failure("history", "turn-1", 1, &binding));
+        assert!(supervisor.report_stream_failure("history", "turn-1", 1, &next_binding));
+        assert!(!supervisor.report_stream_failure("history", "turn-1", 1, &next_binding));
+        assert!(supervisor.accept_event(
+            "history",
+            Some("turn-1"),
+            Some(1),
+            1,
+            &AgentEvent::Error {
+                session_id: Some("cli".into()),
+                message: "runtime exited".into(),
+                recoverable: false,
+                kind: Some("process_crash".into()),
+                stalled_kind: None,
+            },
+        ));
+        assert_eq!(
+            supervisor.snapshot("history").unwrap().unwrap().status,
+            TurnStatus::Failed
+        );
+
+        supervisor.begin("history", "turn-2", 2, "build", "auto");
+        assert!(supervisor.accept_event(
+            "history",
+            Some("turn-2"),
+            Some(2),
+            1,
+            &AgentEvent::MessageDelta {
+                session_id: "cli".into(),
+                role: Role::Assistant,
+                text: "new turn".into(),
+            },
+        ));
+        assert!(!supervisor.report_stream_failure("history", "turn-1", 1, &next_binding));
+        assert!(supervisor.accept_event(
+            "history",
+            Some("turn-2"),
+            Some(2),
+            2,
+            &AgentEvent::TurnComplete {
+                session_id: "cli".into(),
+                stop_reason: StopReason::End,
+            },
+        ));
+        assert!(!supervisor.report_stream_failure("history", "turn-2", 2, &binding));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closed_queue_or_worker_reply_reports_only_the_frozen_attempt() {
+        for (queue_closed, stale_reply) in [(true, false), (false, false), (false, true)] {
+            let (history, original) =
+                supervisor(&format!("failure-transport-{queue_closed}-{stale_reply}"));
+            let current = original.inner.current.lock().unwrap().clone();
+            let (queue, mut receiver) = mpsc::channel::<QueuedCandidate>(1);
+            let supervisor = TurnSupervisor {
+                inner: Arc::new(SupervisorInner {
+                    store: history.clone(),
+                    app: None,
+                    current: Mutex::new(current),
+                    diagnostics: Mutex::new(StreamDiagnostics::default()),
+                    processing: Mutex::new(()),
+                    ingress: tokio::sync::Mutex::new(()),
+                    queue,
+                }),
+            };
+            drop(original);
+            let submitted = supervisor.submit_event(
+                "history",
+                Some("turn-1"),
+                Some(1),
+                AgentEvent::MessageDelta {
+                    session_id: "cli".into(),
+                    role: Role::Assistant,
+                    text: "uncommitted reply".into(),
+                },
+            );
+            tokio::pin!(submitted);
+            if queue_closed {
+                receiver.close();
+            } else {
+                let queued = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    tokio::select! {
+                        result = &mut submitted => panic!("提交必须等待 worker 回执：{result:?}"),
+                        queued = receiver.recv() => queued.expect("候选必须先入队"),
+                    }
+                })
+                .await
+                .expect("入队不应阻塞 Tokio");
+                if stale_reply {
+                    supervisor
+                        .retry_attempt(
+                            "history",
+                            "turn-1",
+                            queued.candidate.attempt_no + 1,
+                            &queued.candidate.runtime_generation_id,
+                            "test retry before worker reply closes",
+                        )
+                        .unwrap();
+                }
+                drop(queued);
+            }
+            let error = tokio::time::timeout(std::time::Duration::from_secs(1), &mut submitted)
+                .await
+                .expect("传输关闭必须结束提交等待")
+                .unwrap_err();
+            assert!(error.contains("[stream_worker_closed]"));
+            {
+                let current = supervisor.inner.current.lock().unwrap();
+                let turn = current.get("history").unwrap();
+                assert_eq!(turn.stream_failure_reported, !stale_reply);
+                assert_eq!(turn.binding.attempt_no, u64::from(stale_reply));
+                assert_eq!(turn.snapshot.event_seq, 0);
+                assert_eq!(turn.last_source_seq, 0);
+                assert_eq!(turn.budget.output_bytes, 0);
+                assert_eq!(turn.budget.tool_count, 0);
+                assert_eq!(turn.snapshot.status, TurnStatus::Running);
+            }
+            let stored = history.load_turn_snapshot("history").unwrap().unwrap();
+            assert_eq!(stored.event_seq, 0);
+            assert_eq!(stored.status, TurnStatus::Running);
+        }
+    }
+
+    #[test]
+    fn turn_stream_failure_serializes_only_control_plane_identity_and_safe_message() {
+        let failure = TurnStreamFailure {
+            history_id: "history".into(),
+            turn_id: "turn-1".into(),
+            turn_epoch: 7,
+            attempt_no: 2,
+            runtime_generation_id: "generation-3".into(),
+            message: STREAM_FAILURE_MESSAGE.to_string(),
+        };
+        let payload = serde_json::to_value(&failure).unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "historyId": "history",
+                "turnId": "turn-1",
+                "turnEpoch": 7,
+                "attemptNo": 2,
+                "runtimeGenerationId": "generation-3",
+                "message": "消息流保存/投递失败，已请求停止执行；部分显示内容可能尚未保存，请检查磁盘空间与访问权限",
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<TurnStreamFailure>(payload).unwrap(),
+            failure
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_event_cannot_adopt_a_new_attempt_identity() {
+        let (_history, supervisor) = supervisor("frozen-ingress");
+        let ingress = supervisor.inner.ingress.lock().await;
+        let submitted = supervisor.submit_event(
+            "history",
+            Some("turn-1"),
+            Some(1),
+            AgentEvent::MessageDelta {
+                session_id: "cli".into(),
+                role: Role::Assistant,
+                text: "old".into(),
+            },
+        );
+        tokio::pin!(submitted);
+        assert!(futures_util::poll!(&mut submitted).is_pending());
+        supervisor
+            .inner
+            .current
+            .lock()
+            .unwrap()
+            .get_mut("history")
+            .unwrap()
+            .binding
+            .attempt_no += 1;
+        drop(ingress);
+        assert!(!submitted.await.unwrap());
+        assert_eq!(
+            supervisor.snapshot("history").unwrap().unwrap().event_seq,
+            0
+        );
+    }
+
+    #[test]
+    fn final_tool_diff_and_fallback_progress_share_a_budget_and_reject_late_progress() {
+        let (history, supervisor) = supervisor("tool-progress-fallback");
+        let progress = AgentEvent::ToolProgress {
+            session_id: "cli".into(),
+            id: "tool".into(),
+            chunk: "中文".repeat(40_000),
+        };
+        let events = [
+            AgentEvent::ToolCall {
+                session_id: "cli".into(),
+                id: "tool".into(),
+                name: "Edit".into(),
+                input: serde_json::json!({"path":"file.txt"}),
+                status: crate::protocol::CallStatus::Pending,
+            },
+            progress.clone(),
+            AgentEvent::ToolResult {
+                session_id: "cli".into(),
+                id: "tool".into(),
+                status: crate::protocol::ToolStatus::Success,
+                output: None,
+                diff: Some(crate::protocol::Diff {
+                    path: "file.txt".into(),
+                    hunks: vec![crate::protocol::DiffHunk {
+                        old_start: 1,
+                        new_start: 1,
+                        lines: vec![crate::protocol::DiffLine {
+                            kind: crate::protocol::DiffKind::Add,
+                            text: "line".repeat(1024),
+                        }],
+                    }],
+                }),
+                outcome: None,
+                started: None,
+                has_output: None,
+                retryable: None,
+                denial_source: None,
+                native_denial_code: None,
+            },
+        ];
+        for (index, event) in events.iter().enumerate() {
+            assert!(supervisor.accept_event(
+                "history",
+                Some("turn-1"),
+                Some(1),
+                index as u64 + 1,
+                event
+            ));
+        }
+        let detail = history.get_session("history").unwrap();
+        let tool = &detail.tool_calls[0];
+        let diff_bytes = serde_json::to_vec(tool.diff.as_ref().unwrap())
+            .unwrap()
+            .len();
+        assert!(
+            tool.output.as_ref().unwrap().len() + diff_bytes
+                <= crate::output_limits::MAX_TOOL_OUTPUT_BYTES
+        );
+        assert!(!supervisor.accept_event("history", Some("turn-1"), Some(1), 4, &progress));
+        assert_eq!(
+            history.get_session("history").unwrap().tool_calls,
+            detail.tool_calls
+        );
     }
 
     #[test]
@@ -1438,8 +2404,191 @@ mod tests {
         let loaded = history.load_turn_snapshot("history").unwrap().unwrap();
         assert_eq!(loaded.turn_id, "turn-1");
         assert_eq!(loaded.status, TurnStatus::Interrupted);
-        assert_eq!(loaded.event_seq, 1);
+        // 本轮零可见输出 → 先补一条兜底说明（占 1 个序号），终态事件顺延到 2。
+        assert_eq!(loaded.event_seq, 2);
+        assert!(loaded
+            .terminal_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("本轮已被中断"));
         assert_eq!(loaded.permission_profile, "auto");
+    }
+
+    #[test]
+    fn silent_terminal_gets_readable_reason_and_extra_event_seq() {
+        // 用户在被中断前什么都没收到：必须落库一条可读原因，并把终态事件顺延一位。
+        let (history, supervisor) = supervisor("silent-interrupt");
+        assert!(supervisor.accept_event(
+            "history",
+            Some("turn-1"),
+            Some(1),
+            1,
+            &AgentEvent::TurnComplete {
+                session_id: "cli".into(),
+                stop_reason: StopReason::Interrupted,
+            },
+        ));
+        let loaded = history.load_turn_snapshot("history").unwrap().unwrap();
+        assert_eq!(loaded.status, TurnStatus::Interrupted);
+        // 兜底 Error 占 1 个序号，终态事件顺延到 2。
+        assert_eq!(loaded.event_seq, 2);
+        let reason = loaded.terminal_reason.unwrap_or_default();
+        assert!(reason.contains("本轮已被中断"), "实际原因：{reason}");
+    }
+
+    #[test]
+    fn terminal_with_visible_content_keeps_native_reason() {
+        // 有正文的轮次不该被兜底打扰：终态原因仍是引擎原值，序号正常累加。
+        let (history, supervisor) = supervisor("loud-interrupt");
+        assert!(supervisor.accept_event(
+            "history",
+            Some("turn-1"),
+            Some(1),
+            1,
+            &AgentEvent::MessageDelta {
+                session_id: "cli".into(),
+                role: Role::Assistant,
+                text: "一半答案".into(),
+            },
+        ));
+        assert!(supervisor.accept_event(
+            "history",
+            Some("turn-1"),
+            Some(1),
+            2,
+            &AgentEvent::TurnComplete {
+                session_id: "cli".into(),
+                stop_reason: StopReason::Interrupted,
+            },
+        ));
+        let loaded = history.load_turn_snapshot("history").unwrap().unwrap();
+        assert_eq!(loaded.status, TurnStatus::Interrupted);
+        assert_eq!(loaded.event_seq, 2);
+        assert_eq!(loaded.terminal_reason.as_deref(), Some("interrupted"));
+    }
+
+    #[test]
+    fn completed_thinking_and_plan_are_restored_but_not_repeated_at_terminal() {
+        let (history, supervisor) = supervisor("presentation-complete");
+        let events = [
+            AgentEvent::ThinkingDelta {
+                session_id: "cli".into(),
+                text: "visible reasoning".into(),
+            },
+            AgentEvent::ThinkingComplete {
+                session_id: "cli".into(),
+                text: "visible reasoning".into(),
+            },
+            AgentEvent::PlanUpdate {
+                session_id: "cli".into(),
+                steps: vec![crate::protocol::PlanStep {
+                    text: "Read source".into(),
+                    status: crate::protocol::PlanStatus::Active,
+                }],
+            },
+            AgentEvent::MessageDelta {
+                session_id: "cli".into(),
+                role: Role::Assistant,
+                text: "answer".into(),
+            },
+            AgentEvent::MessageComplete {
+                session_id: "cli".into(),
+                role: Role::Assistant,
+                text: "answer".into(),
+            },
+            AgentEvent::TurnComplete {
+                session_id: "cli".into(),
+                stop_reason: StopReason::End,
+            },
+        ];
+        for (index, event) in events.iter().enumerate() {
+            assert!(supervisor.accept_event(
+                "history",
+                Some("turn-1"),
+                Some(1),
+                index as u64 + 1,
+                event
+            ));
+        }
+        let detail = history.get_session("history").unwrap();
+        assert_eq!(detail.presentations.len(), 2);
+        assert_eq!(
+            detail
+                .messages
+                .iter()
+                .filter(|message| message.text == "answer")
+                .count(),
+            1
+        );
+        assert!(
+            matches!(&detail.presentations[0].content, crate::protocol::TurnPresentationContent::Thinking { complete: true, text } if text == "visible reasoning")
+        );
+        assert!(
+            matches!(&detail.presentations[1].content, crate::protocol::TurnPresentationContent::Plan { steps, truncated: false } if steps.len() == 1)
+        );
+        assert!(detail
+            .presentations
+            .iter()
+            .all(|record| record.turn_id == "turn-1"));
+    }
+
+    #[test]
+    fn interrupted_turn_keeps_partial_text_thinking_and_tool_output() {
+        let (history, supervisor) = supervisor("presentation-interrupted");
+        let events = [
+            AgentEvent::MessageDelta {
+                session_id: "cli".into(),
+                role: Role::Assistant,
+                text: "partial answer".into(),
+            },
+            AgentEvent::ThinkingDelta {
+                session_id: "cli".into(),
+                text: "visible partial".into(),
+            },
+            AgentEvent::ToolCall {
+                session_id: "cli".into(),
+                id: "tool".into(),
+                name: "Read".into(),
+                input: serde_json::json!({"path":"file.txt"}),
+                status: crate::protocol::CallStatus::Pending,
+            },
+            AgentEvent::ToolProgress {
+                session_id: "cli".into(),
+                id: "tool".into(),
+                chunk: "partial output".into(),
+            },
+            AgentEvent::TurnComplete {
+                session_id: "cli".into(),
+                stop_reason: StopReason::Interrupted,
+            },
+        ];
+        for (index, event) in events.iter().enumerate() {
+            assert!(supervisor.accept_event(
+                "history",
+                Some("turn-1"),
+                Some(1),
+                index as u64 + 1,
+                event
+            ));
+        }
+        let detail = history.get_session("history").unwrap();
+        assert_eq!(detail.presentations.len(), 2);
+        assert!(detail.presentations.iter().any(|record| matches!(&record.content, crate::protocol::TurnPresentationContent::Message { text, complete: false, .. } if text == "partial answer")));
+        assert!(detail.presentations.iter().any(|record| matches!(&record.content, crate::protocol::TurnPresentationContent::Thinking { text, complete: false } if text == "visible partial")));
+        assert_eq!(detail.tool_calls.len(), 1);
+        assert_eq!(
+            detail.tool_calls[0].output.as_deref(),
+            Some("partial output")
+        );
+        assert_eq!(
+            detail.tool_calls[0].status,
+            crate::sessions::HistoryToolStatus::Error
+        );
+        assert!(!supervisor.accept_event("history", Some("turn-1"), Some(1), 9, &events[0]));
+        assert_eq!(
+            history.get_session("history").unwrap().presentations,
+            detail.presentations
+        );
     }
 
     #[test]
@@ -1486,6 +2635,7 @@ mod tests {
         let mut state = BudgetRuntimeState {
             snapshot,
             output_bytes: 0,
+            tool_output_bytes: HashMap::new(),
             tool_count: 0,
             repeat_digests: HashMap::new(),
             started_at: 100,

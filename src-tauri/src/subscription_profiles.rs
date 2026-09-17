@@ -1,6 +1,12 @@
+use crate::capability_registry::binary_identity;
+use crate::probe_cache::AsyncProbeCache;
+use crate::providers::ModelConfig;
+use crate::settings::CliLoginState;
+use crate::turn_start::digest_json;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, UNIX_EPOCH};
 use tokio::process::Command;
 
 /// 订阅技能镜像同步的结果计数（复制/更新/删除）。
@@ -14,13 +20,62 @@ pub struct SkillSyncResult {
 #[derive(Debug, Clone)]
 pub struct SubscriptionProfileStore {
     root: PathBuf,
+    pub(crate) login_probes: AsyncProbeCache<CliLoginState>,
+    pub(crate) model_probes: AsyncProbeCache<Vec<ModelConfig>>,
 }
 
 impl SubscriptionProfileStore {
     pub fn new(app_config_dir: PathBuf) -> Self {
         Self {
             root: app_config_dir.join("cli-profiles"),
+            login_probes: AsyncProbeCache::new(Duration::from_secs(60), 16),
+            model_probes: AsyncProbeCache::new(Duration::from_secs(120), 16),
         }
+    }
+
+    pub(crate) fn probe_key(&self, engine: &str, configured_bin: &str) -> Result<String, String> {
+        let profile = self.profile_dir(engine)?;
+        let profile = profile
+            .canonicalize()
+            .map_err(|error| format!("解析订阅配置目录失败：{error}"))?;
+        let auth_file = match engine {
+            "claude-code" => ".credentials.json",
+            "codex" => "auth.json",
+            other => return Err(format!("未知引擎：{other}")),
+        };
+        let auth_metadata = match fs::symlink_metadata(profile.join(auth_file)) {
+            Ok(metadata) => Some((
+                metadata.len(),
+                metadata
+                    .modified()
+                    .map_err(|error| format!("读取订阅认证元数据失败：{error}"))?
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|error| format!("订阅认证时间无效：{error}"))?
+                    .as_nanos(),
+                metadata.file_type().is_symlink(),
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(format!("读取订阅认证元数据失败：{error}")),
+        };
+        let identity = digest_json(&(
+            engine,
+            binary_identity(configured_bin)?,
+            profile,
+            auth_file,
+            auth_metadata,
+        ))?;
+        Ok(format!("{engine}:{identity}"))
+    }
+
+    pub fn invalidate_probes(&self, engine: &str) -> Result<(), String> {
+        if !matches!(engine, "claude-code" | "codex") {
+            return Err(format!("未知引擎：{engine}"));
+        }
+        let prefix = format!("{engine}:");
+        self.login_probes
+            .invalidate_where(|key| key.starts_with(&prefix))?;
+        self.model_probes
+            .invalidate_where(|key| key.starts_with(&prefix))
     }
 
     pub fn profile_dir(&self, engine: &str) -> Result<PathBuf, String> {
@@ -227,6 +282,87 @@ fn copy_skill_dir_recursive(source: &Path, destination: &Path) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_identity_tracks_only_its_binary_profile_and_auth_metadata() {
+        let config_dir = temp_config_dir("probe-identity");
+        fs::create_dir_all(&config_dir).unwrap();
+        let binary = config_dir.join("configured-engine.exe");
+        fs::write(&binary, "first-binary").unwrap();
+        let bin = binary.to_str().unwrap();
+        let store = SubscriptionProfileStore::new(config_dir.clone());
+        let original = store.probe_key("codex", bin).unwrap();
+        let unrelated = config_dir.join("unrelated-user-profile");
+        fs::create_dir_all(&unrelated).unwrap();
+        fs::write(unrelated.join("auth.json"), "unrelated-sentinel").unwrap();
+        assert_eq!(original, store.probe_key("codex", bin).unwrap());
+        fs::write(
+            store.profile_dir("codex").unwrap().join("auth.json"),
+            "isolated-sentinel",
+        )
+        .unwrap();
+        let authenticated = store.probe_key("codex", bin).unwrap();
+        assert_ne!(original, authenticated);
+        fs::write(&binary, "second-binary-with-different-length").unwrap();
+        let upgraded = store.probe_key("codex", bin).unwrap();
+        assert_ne!(authenticated, upgraded);
+        assert_ne!(upgraded, store.probe_key("claude-code", bin).unwrap());
+        let other = SubscriptionProfileStore::new(config_dir.join("other-app"));
+        assert_ne!(upgraded, other.probe_key("codex", bin).unwrap());
+        assert_eq!(
+            fs::read_to_string(unrelated.join("auth.json")).unwrap(),
+            "unrelated-sentinel"
+        );
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_invalidation_clears_both_probe_types_for_only_one_engine() {
+        let config_dir = temp_config_dir("probe-invalidation");
+        let store = SubscriptionProfileStore::new(config_dir);
+        let state = CliLoginState {
+            state: "ok".into(),
+            auth_method: Some("subscription".into()),
+            account_label: None,
+            plan: None,
+            detail: "verified".into(),
+        };
+        store
+            .login_probes
+            .put("codex:key".into(), state.clone())
+            .unwrap();
+        store
+            .login_probes
+            .put("claude-code:key".into(), state.clone())
+            .unwrap();
+        store
+            .model_probes
+            .put("codex:key:models".into(), Vec::new())
+            .unwrap();
+        store.invalidate_probes("codex").unwrap();
+        assert!(store
+            .login_probes
+            .get_or_probe("codex:key".into(), |_| async { Err("fresh login".into()) })
+            .await
+            .is_err());
+        assert!(store
+            .model_probes
+            .get_or_probe("codex:key:models".into(), |_| async {
+                Err("fresh catalog".into())
+            })
+            .await
+            .is_err());
+        assert_eq!(
+            store
+                .login_probes
+                .get_or_probe("claude-code:key".into(), |_| async {
+                    Err("must remain cached".into())
+                })
+                .await
+                .unwrap(),
+            state
+        );
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_config_dir(label: &str) -> PathBuf {

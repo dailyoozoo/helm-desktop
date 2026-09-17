@@ -181,18 +181,8 @@ export function Workspace({
 }) {
   const sessionDefaults = useMemo(() => sessionDefaultsFromSettings(settings), [settings]);
   const defaultTurnMode = useMemo(() => defaultTurnModeFromSettings(settings), [settings]);
-  const {
-    state,
-    send,
-    stop,
-    reset,
-    approve,
-    selectEngine,
-    selectModel,
-    toggleMcpServer,
-    restoreCheckpoint,
-    undoRevert,
-  } = useSession(sessionDefaults);
+  const { state, send, stop, reset, approve, selectEngine, selectModel, toggleMcpServer } =
+    useSession(sessionDefaults);
   const engineDefaultTurnMode = useMemo(
     () => defaultTurnModeForEngine(settings, state.engine),
     [settings, state.engine],
@@ -1707,8 +1697,6 @@ export function Workspace({
             key={state.historyId ?? state.sessionId ?? 'empty'}
             state={state}
             onApprove={approve}
-            onRestoreCheckpoint={restoreCheckpoint}
-            onUndoRevert={undoRevert}
             locateTarget={activityTarget}
             onOpenPane={(tab) => openArtifactPane(tab)}
             onRetryTool={handleRetryTool}

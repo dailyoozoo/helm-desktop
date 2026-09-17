@@ -1,12 +1,15 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { AgentEvent, AgentEventEnvelope } from '@helm/protocol';
+import type { AgentEvent, AgentEventEnvelope, Diff, TurnStreamFailure } from '@helm/protocol';
+import { MAX_TOOL_OUTPUT_BYTES, OUTPUT_TRUNCATED } from '@helm/protocol';
 import {
   applyEnvelopeToLiveRegistry,
+  applyTurnStreamFailureToLiveRegistry,
   classifyClientErrorKind,
   itemsFromHistory,
   liveSessionHandle,
   liveSessionActivity,
   liveSessionWorking,
+  livePendingApprovalSessionIds,
   liveWorkingSessionIds,
   registerLiveSession,
   resetLiveSessionsForTests,
@@ -18,6 +21,77 @@ import {
   subscribeLiveSessions,
   type SessionState,
 } from './useSession';
+
+describe('stream failure identity and live status', () => {
+  const failure: TurnStreamFailure = {
+    historyId: 'failure-history',
+    turnId: 'current-turn',
+    turnEpoch: 4,
+    attemptNo: 2,
+    runtimeGenerationId: 'current-runtime',
+    message: '消息流保存失败，部分内容可能未保存',
+  };
+  const progress: AgentEvent = {
+    type: 'message_delta',
+    sessionId: 'native',
+    role: 'assistant',
+    text: 'partial',
+  };
+
+  function begin() {
+    resetLiveSessionsForTests();
+    registerLiveSession(failure.historyId, 'failure-handle', true);
+    applyEnvelopeToLiveRegistry({ ...failure, event: progress });
+  }
+
+  afterEach(resetLiveSessionsForTests);
+
+  it.each([
+    { historyId: 'another-history' },
+    { turnId: 'older-turn', turnEpoch: 3 },
+    { turnId: 'other-turn' },
+    { attemptNo: 1 },
+    { runtimeGenerationId: 'old-runtime' },
+  ])('ignores unrelated or stale failure identity %j', (older) => {
+    begin();
+    expect(applyTurnStreamFailureToLiveRegistry({ ...failure, ...older })).toBe(false);
+    expect(liveSessionWorking(failure.historyId)).toBe(true);
+  });
+
+  it('settles only once and rejects late progress while allowing the real terminal boundary', () => {
+    begin();
+    expect(applyTurnStreamFailureToLiveRegistry(failure)).toBe(true);
+    expect(applyTurnStreamFailureToLiveRegistry(failure)).toBe(false);
+    expect(applyEnvelopeToLiveRegistry({ ...failure, event: progress })).toBe(false);
+    expect(liveSessionWorking(failure.historyId)).toBe(false);
+    expect(
+      applyEnvelopeToLiveRegistry({
+        ...failure,
+        event: { type: 'turn_complete', sessionId: 'native', stopReason: 'interrupted' },
+      }),
+    ).toBe(true);
+  });
+
+  it('allows a new attempt without accepting a failure from the previous runtime', () => {
+    begin();
+    applyTurnStreamFailureToLiveRegistry(failure);
+    const next = { ...failure, attemptNo: 3, runtimeGenerationId: 'new-runtime' };
+    expect(applyEnvelopeToLiveRegistry({ ...next, event: progress })).toBe(true);
+    expect(liveSessionWorking(failure.historyId)).toBe(true);
+    expect(applyTurnStreamFailureToLiveRegistry(failure)).toBe(false);
+    expect(applyTurnStreamFailureToLiveRegistry(next)).toBe(true);
+  });
+
+  it('does not reopen or rewrite a confirmed terminal turn', () => {
+    begin();
+    applyEnvelopeToLiveRegistry({
+      ...failure,
+      event: { type: 'turn_complete', sessionId: 'native', stopReason: 'end' },
+    });
+    expect(applyTurnStreamFailureToLiveRegistry(failure)).toBe(false);
+    expect(liveSessionWorking(failure.historyId)).toBe(false);
+  });
+});
 
 describe('Tauri 命令错误分类', () => {
   it('把会话创建阶段的无效工作目录识别为 cwd_invalid', () => {
@@ -675,7 +749,6 @@ describe('历史先行（resume_history，B 方案）', () => {
     costUsd: 0.01,
     messages: [{ role: 'user', text: '继续', ts: 1000 }],
     toolCalls: [],
-    checkpoints: [],
     approvals: [],
   } as unknown as Parameters<typeof itemsFromHistory>[0];
 
@@ -1016,7 +1089,7 @@ describe('轮次活动追踪', () => {
     expect(failed).toMatchObject({ turnActivity: null, turnStartedAt: null });
   });
 
-  it('ends the current turn on recoverable session errors', () => {
+  it('keeps the current turn active on recoverable session errors', () => {
     const current = { stage: 'retrying' as const, since: 9_000, retryAttempt: 2 };
     const next = reduceSessionEvent(sessionState({ turnActivity: current }), {
       type: 'error',
@@ -1025,9 +1098,10 @@ describe('轮次活动追踪', () => {
       recoverable: true,
     });
 
-    expect(next.status).toBe('idle');
-    expect(next.turnActivity).toBeNull();
-    expect(next.turnStartedAt).toBeNull();
+    expect(next.status).toBe('working');
+    expect(next.turnActivity).toBe(current);
+    expect(next.turnStartedAt).toBe(1);
+    expect(next.items.at(-1)).toMatchObject({ kind: 'error', message: '网络抖动' });
   });
 
   it.each([
@@ -1072,6 +1146,300 @@ describe('轮次活动追踪', () => {
   });
 });
 
+describe('terminal event projection', () => {
+  it('does not deduplicate a public thinking summary against another turn', () => {
+    const initial = sessionState({
+      items: [
+        {
+          kind: 'thinking',
+          id: 'previous',
+          text: 'same summary',
+          done: true,
+          turnId: 'previous-turn',
+          turnStatus: 'succeeded',
+        },
+      ],
+    });
+    const next = reduceSessionEvent(
+      initial,
+      { type: 'thinking_complete', sessionId: 'native', text: 'same summary' },
+      'current-turn',
+    );
+    expect(next.items).toHaveLength(2);
+    expect(next.items[0]).toBe(initial.items[0]);
+    expect(next.items[1]).toMatchObject({
+      kind: 'thinking',
+      text: 'same summary',
+      done: true,
+      turnId: 'current-turn',
+    });
+  });
+
+  function streamingState(): SessionState {
+    return sessionState({
+      openAssistantId: 'answer',
+      openThinkingId: 'thinking',
+      items: [
+        { kind: 'thinking', id: 'legacy', text: 'old', done: true, turnStatus: 'succeeded' },
+        {
+          kind: 'tool',
+          id: 'other',
+          name: 'Read',
+          input: {},
+          status: 'pending',
+          turnId: 'other-turn',
+        },
+        { kind: 'user', id: 'user', text: 'request' },
+        {
+          kind: 'thinking',
+          id: 'thinking',
+          text: 'public thought',
+          done: false,
+          startedAt: 0,
+          turnId: 'turn-current',
+        },
+        {
+          kind: 'tool',
+          id: 'tool',
+          name: 'Bash',
+          input: {},
+          status: 'pending',
+          output: 'partial tool output',
+          startedAt: 10,
+          turnId: 'turn-current',
+        },
+        {
+          kind: 'approval',
+          id: 'approval',
+          action: 'Bash',
+          detail: 'command',
+          status: 'applying',
+          availableDecisions: ['allow', 'deny'],
+          turnId: 'turn-current',
+        },
+        { kind: 'assistant', id: 'answer', text: 'partial answer', turnId: 'turn-current' },
+      ],
+    });
+  }
+
+  it('settles only this turn on a fatal error without inventing approval decisions or success', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(5_000);
+    const initial = streamingState();
+    const failed = reduceSessionEvent(
+      initial,
+      { type: 'error', message: 'runtime failed', recoverable: false },
+      'turn-current',
+    );
+    expect(failed).toMatchObject({
+      status: 'idle',
+      openAssistantId: null,
+      openThinkingId: null,
+      turnActivity: null,
+      turnStartedAt: null,
+    });
+    expect(failed.items[0]).toBe(initial.items[0]);
+    expect(failed.items[1]).toBe(initial.items[1]);
+    expect(failed.items[2]).toMatchObject({ turnId: 'turn-current', turnStatus: 'failed' });
+    expect(failed.items[3]).toMatchObject({ done: true, endedAt: 5_000, turnStatus: 'failed' });
+    expect(failed.items[4]).toMatchObject({
+      status: 'error',
+      endedAt: 5_000,
+      turnStatus: 'failed',
+    });
+    expect(failed.items[4]).toHaveProperty(
+      'output',
+      '[tool_result_missing] 轮次已结束，但 Runtime 未返回最终结果\npartial tool output',
+    );
+    expect(failed.items[5]).toMatchObject({
+      status: 'resolved',
+      availableDecisions: [],
+      endedAt: 5_000,
+      turnStatus: 'failed',
+    });
+    expect(failed.items[5]).not.toHaveProperty('decision');
+    expect(failed.items[6]).toMatchObject({
+      text: 'partial answer',
+      turnStatus: 'failed',
+      endedAt: 5_000,
+    });
+    expect(failed.items.at(-1)).toMatchObject({
+      kind: 'error',
+      turnId: 'turn-current',
+      turnStatus: 'failed',
+    });
+  });
+
+  it('leaves ongoing entities untouched on recoverable errors', () => {
+    const initial = streamingState();
+    const retrying = reduceSessionEvent(
+      initial,
+      { type: 'error', message: 'retrying', recoverable: true },
+      'turn-current',
+    );
+    expect(retrying.status).toBe('working');
+    expect(retrying.openAssistantId).toBe(initial.openAssistantId);
+    expect(retrying.openThinkingId).toBe(initial.openThinkingId);
+    expect(retrying.turnActivity).toBe(initial.turnActivity);
+    initial.items.forEach((item, index) => expect(retrying.items[index]).toBe(item));
+  });
+
+  it('does not stop background activity or clear pending approval on recoverable errors', () => {
+    resetLiveSessionsForTests();
+    registerLiveSession('history', 'handle', true);
+    applyEnvelopeToLiveRegistry(
+      envelope('history', {
+        type: 'approval_request',
+        sessionId: 'cli',
+        id: 'approval',
+        action: 'Bash',
+        detail: 'command',
+        availableDecisions: ['allow', 'deny'],
+      }),
+    );
+    const activity = liveSessionActivity('history');
+    applyEnvelopeToLiveRegistry(
+      envelope('history', { type: 'error', message: 'retrying', recoverable: true }),
+    );
+    expect(liveSessionWorking('history')).toBe(true);
+    expect(liveSessionActivity('history')).toBe(activity);
+    expect(livePendingApprovalSessionIds()).toContain('history');
+    applyEnvelopeToLiveRegistry(
+      envelope('history', { type: 'error', message: 'failed', recoverable: false }),
+    );
+    expect(liveSessionWorking('history')).toBe(false);
+    expect(livePendingApprovalSessionIds()).not.toContain('history');
+    resetLiveSessionsForTests();
+  });
+
+  it('closes interruption once and ignores late tool progress or results', () => {
+    const interrupted = reduceSessionEvent(
+      streamingState(),
+      { type: 'turn_complete', sessionId: 'cli', stopReason: 'interrupted' },
+      'turn-current',
+    );
+    expect(interrupted.items[6]).toMatchObject({ interrupted: true, turnStatus: 'interrupted' });
+    const lateProgress = reduceSessionEvent(
+      interrupted,
+      { type: 'tool_progress', sessionId: 'cli', id: 'tool', chunk: 'late output' },
+      'turn-current',
+    );
+    const lateResult = reduceSessionEvent(
+      lateProgress,
+      {
+        type: 'tool_result',
+        sessionId: 'cli',
+        id: 'tool',
+        status: 'success',
+        output: 'late success',
+      },
+      'turn-current',
+    );
+    expect(lateResult.items[4]).toBe(interrupted.items[4]);
+    const duplicateEnd = reduceSessionEvent(
+      lateResult,
+      { type: 'turn_complete', sessionId: 'cli', stopReason: 'end' },
+      'turn-current',
+    );
+    expect(duplicateEnd.items[4]).toBe(interrupted.items[4]);
+    expect(duplicateEnd.items[6]).toBe(interrupted.items[6]);
+  });
+
+  it('does not idle a newer turn when settling a different turn', () => {
+    const initial = streamingState();
+    const prior = reduceSessionEvent(
+      initial,
+      { type: 'turn_complete', sessionId: 'cli', stopReason: 'error' },
+      'other-turn',
+    );
+    expect(prior.status).toBe('working');
+    expect(prior.openAssistantId).toBe('answer');
+    expect(prior.items[1]).toMatchObject({ status: 'error', turnStatus: 'failed' });
+    for (let index = 2; index < initial.items.length; index += 1)
+      expect(prior.items[index]).toBe(initial.items[index]);
+  });
+});
+
+describe('tool output projection budget', () => {
+  const encoder = new TextEncoder();
+  const diff: Diff = {
+    path: 'file.ts',
+    hunks: [{ oldStart: 1, newStart: 1, lines: [{ kind: 'add', text: '新增内容' }] }],
+  };
+
+  it.each(['diff-only', 'output-only'] as const)(
+    'bounds the final per-item fallback combination for %s results',
+    (kind) => {
+      const current = sessionState({
+        items: [
+          {
+            kind: 'tool',
+            id: 'tool',
+            name: 'Edit',
+            input: {},
+            status: 'success',
+            output: 'other turn',
+            turnId: 'other-turn',
+          },
+          {
+            kind: 'tool',
+            id: 'tool',
+            name: 'Edit',
+            input: {},
+            status: 'pending',
+            output: 'x'.repeat(MAX_TOOL_OUTPUT_BYTES),
+            ...(kind === 'output-only' ? { diff } : {}),
+            turnId: 'current-turn',
+          },
+        ],
+      });
+      const next = reduceSessionEvent(
+        current,
+        {
+          type: 'tool_result',
+          sessionId: 'cli',
+          id: 'tool',
+          status: 'success',
+          ...(kind === 'diff-only' ? { diff } : { output: 'x'.repeat(MAX_TOOL_OUTPUT_BYTES) }),
+        },
+        'current-turn',
+      );
+      expect(next.items[0]).toBe(current.items[0]);
+      const tool = next.items[1];
+      expect(tool.kind).toBe('tool');
+      if (tool.kind !== 'tool') throw new Error('expected tool');
+      expect(tool.diff).toBe(diff);
+      expect(tool.output?.endsWith(OUTPUT_TRUNCATED)).toBe(true);
+      expect(
+        encoder.encode(tool.output).length + encoder.encode(JSON.stringify(tool.diff)).length,
+      ).toBeLessThanOrEqual(MAX_TOOL_OUTPUT_BYTES);
+    },
+  );
+
+  it('does not restore an oversized previous diff after omitting it', () => {
+    const current = sessionState({
+      items: [
+        {
+          kind: 'tool',
+          id: 'tool',
+          name: 'Edit',
+          input: {},
+          status: 'pending',
+          diff: { ...diff, path: 'x'.repeat(MAX_TOOL_OUTPUT_BYTES) },
+          turnId: 'turn',
+        },
+      ],
+    });
+    const next = reduceSessionEvent(
+      current,
+      { type: 'tool_result', sessionId: 'cli', id: 'tool', status: 'error', output: '' },
+      'turn',
+    );
+    expect(next.items[0]).toMatchObject({ diff: undefined, status: 'error' });
+    expect(next.items[0]).toHaveProperty('output', expect.stringContaining('tool_diff_omitted'));
+  });
+});
+
 describe('resetSessionState', () => {
   it('uses settings defaults instead of carrying over the previous session selection', () => {
     const previous: SessionState = {
@@ -1109,7 +1477,7 @@ describe('resetSessionState', () => {
 });
 
 describe('itemsFromHistory', () => {
-  it('interleaves messages, tools and checkpoints by timestamp（变更-10）', () => {
+  it('interleaves messages and tools by timestamp（变更-10）', () => {
     const items = itemsFromHistory({
       id: 'local-2',
       cliSessionId: null,
@@ -1133,7 +1501,6 @@ describe('itemsFromHistory', () => {
         { id: 't-read', name: 'Read', status: 'success', input: {}, output: 'ok', ts: 3000 },
         { id: 't-edit', name: 'Edit', status: 'success', input: {}, output: 'ok', ts: 4000 },
       ],
-      checkpoints: [{ id: 'c-1', label: '改动前：config.ts', ts: 3500 }],
       approvals: [],
       turns: [
         {
@@ -1152,7 +1519,6 @@ describe('itemsFromHistory', () => {
       'user', // 1000
       'assistant', // 2000
       'tool', // 3000 Read
-      'checkpoint', // 3500
       'tool', // 4000 Edit
       'assistant', // 5000
     ]);
@@ -1162,7 +1528,7 @@ describe('itemsFromHistory', () => {
       permissionProfile: 'auto',
     });
     expect(items[1]).toMatchObject({ kind: 'assistant', turnId: 'turn-1' });
-    expect(items[5]).toMatchObject({ kind: 'assistant', turnId: 'turn-1' });
+    expect(items[4]).toMatchObject({ kind: 'assistant', turnId: 'turn-1' });
   });
 
   it('只在唯一已结束 Turn 的时间区间内恢复旧 assistant 归属', () => {
@@ -1186,7 +1552,6 @@ describe('itemsFromHistory', () => {
         { role: 'assistant', text: '第二轮完成', ts: 3900 },
       ],
       toolCalls: [],
-      checkpoints: [],
       approvals: [],
       turns: [
         {
@@ -1259,7 +1624,6 @@ describe('itemsFromHistory', () => {
           },
         },
       ],
-      checkpoints: [{ id: 'ckpt-1', label: '改动前：demo.ts', ts: 1_717_171_703_000 }],
       approvals: [
         { id: 'appr-1', action: 'Bash', detail: 'pnpm test', status: 'pending', ts: 2 },
         { id: 'appr-2', action: 'Write', detail: 'x.txt', status: 'expired', ts: 3 },
@@ -1312,16 +1676,6 @@ describe('itemsFromHistory', () => {
           },
         ],
       },
-    });
-    expect(items).toContainEqual({
-      kind: 'checkpoint',
-      id: 'ckpt-1',
-      label: '改动前：demo.ts',
-      ts: 1_717_171_703_000,
-      restored: false,
-      restorable: false,
-      fileCount: 0,
-      reason: undefined,
     });
   });
 });

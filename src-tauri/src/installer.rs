@@ -3,7 +3,7 @@
 //!
 //! 前置：CLI 安装需要本机已有 Node.js/npm；npm 不可用时返回「先装 Node」引导
 //! （`install_node` 会用国内镜像下载 Node LTS 静默安装，`install_git` 下载 git-for-windows）。
-//! 安装完成后立即复检（where/which + --version），把真实路径与版本返回给前端。
+//! 安装完成后立即复检（PATH 定位 + --version），把真实路径与版本返回给前端。
 
 use regex::Regex;
 use serde::Serialize;
@@ -278,12 +278,14 @@ pub async fn install_cli_engine(engine: String) -> Result<CliInstallResult, Stri
         }
 
         // 安装成功后立即复检，拿真实路径与版本；复检失败说明 PATH 未刷新或安装目录不在 PATH
-        let detected = crate::settings::detect_cli_engine(engine.clone()).map_err(|e| {
-            format!(
-                "安装命令已成功，但复检未找到 {}：{e}。可能需要重启 Helm 让 PATH 生效。",
-                engine_executable(&engine)
-            )
-        })?;
+        let detected = crate::settings::detect_engine_binary(&engine, engine_executable(&engine))
+            .await
+            .map_err(|e| {
+                format!(
+                    "安装命令已成功，但复检未找到 {}：{e}。可能需要重启 Helm 让 PATH 生效。",
+                    engine_executable(&engine)
+                )
+            })?;
         return Ok(CliInstallResult {
             path: detected.path,
             version: detected.version,

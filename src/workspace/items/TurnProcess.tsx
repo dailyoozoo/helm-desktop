@@ -18,6 +18,7 @@ export function TurnProcess({
   entries,
   completed,
   terminalStatus,
+  terminalReason,
   waitingApproval,
   locateTarget,
   summary,
@@ -31,6 +32,8 @@ export function TurnProcess({
   entries: ThreadRenderEntry[];
   completed: boolean;
   terminalStatus?: 'succeeded' | 'failed' | 'interrupted';
+  /** 终态原因原文（后端落库的 terminalReason）：中断/失败时展示，告诉用户发生了什么。 */
+  terminalReason?: string | null;
   waitingApproval: boolean;
   locateTarget?: { id: string; request: number } | null;
   /** 变更-34/35 · B2：轮次摘要（第N轮/模型/耗时/工具数/±行数），缺省不显示胶囊。 */
@@ -100,6 +103,16 @@ export function TurnProcess({
   // 运行态呼吸点仅在真正进行中（未终态、未等审批）时出现；终态失败不显示 live。
   const live = !completed && terminalStatus == null && !waitingApproval;
   const hasProcess = process != null;
+  // 裸 stop reason 枚举值没有细节量（旧库 terminal_reason 遗留），失败/中断状态
+  // 已由摘要胶囊表达，不再把 "error" 这样的原词渲染成 note 行。
+  const BARE_STOP_REASONS = new Set(['end', 'interrupted', 'error']);
+  const terminalNote =
+    terminalStatus &&
+    terminalStatus !== 'succeeded' &&
+    terminalReason &&
+    !BARE_STOP_REASONS.has(terminalReason.trim().toLowerCase())
+      ? terminalReason
+      : null;
 
   return (
     <div className="item ai-turn" data-turn-process-id={id} data-turn-id={turnId}>
@@ -123,6 +136,11 @@ export function TurnProcess({
             />
           ) : null}
         </div>
+        {terminalNote ? (
+          <p className="turn-note" title={terminalNote}>
+            {terminalNote}
+          </p>
+        ) : null}
         {hasProcess ? (
           <div className={'turn-process' + (collapsed ? ' is-collapsed' : '')}>
             <div className="turn-process__body">{process}</div>

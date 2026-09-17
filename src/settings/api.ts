@@ -21,6 +21,9 @@ export interface UpdateCheckResult {
   available: boolean;
   version: string | null;
   notes: string | null;
+  /** feed = 已配置签名发布源，可应用内安装；github = 仅比对到新版本，需前往发布页下载 */
+  source: 'feed' | 'github';
+  releaseUrl: string | null;
 }
 
 export async function checkForUpdate(): Promise<UpdateCheckResult> {
@@ -230,6 +233,8 @@ export interface ImportableHistoryScan {
   totalFound: number;
   skippedTooLarge: number;
   skippedUnparsable: number;
+  /** 无实质内容（无模型回复/仅 synthetic 错误行）或 Codex 内部派生线程被过滤的数量 */
+  skippedTrivial: number;
 }
 
 /** 扫描本机 Claude Code / Codex 记录文件（只读）。 */

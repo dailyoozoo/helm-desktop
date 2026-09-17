@@ -912,8 +912,7 @@ impl CodexRuntimeProfileStore {
             return;
         }
         dirs.sort_by_key(|(_, mtime)| std::cmp::Reverse(*mtime));
-        let cutoff = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(24 * 60 * 60);
+        let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 60 * 60);
         for (path, mtime) in dirs.into_iter().skip(keep) {
             if mtime > cutoff {
                 continue;
@@ -1010,9 +1009,7 @@ fn select_codex_runtime_profile_path(
             ));
         }
     }
-    Ok(current_candidate.unwrap_or_else(|| {
-        (canonical_path.to_path_buf(), false, false)
-    }))
+    Ok(current_candidate.unwrap_or_else(|| (canonical_path.to_path_buf(), false, false)))
 }
 
 /// 信任快路径的廉价守卫：只遍历候选目录 prompts/skills/目录文件的
@@ -1236,7 +1233,7 @@ impl Drop for CodexAuthHome {
                 Ok(()) => return,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
                 Err(error) if attempt + 1 == ATTEMPTS => {
-                    eprintln!(
+                    log::warn!(
                         "[helm] 无法清理 Codex 临时认证目录（已重试 {ATTEMPTS} 次）：{}：{error}",
                         self.path.display()
                     );
@@ -1718,7 +1715,11 @@ where
 
 pub(crate) fn apply_inherited_agent_environment(cmd: &mut Command) {
     cmd.env_clear();
-    cmd.envs(filter_inherited_agent_environment(std::env::vars()));
+    let mut env = filter_inherited_agent_environment(std::env::vars());
+    if let Some(extra) = crate::agent_env::detect_login_shell_path() {
+        crate::agent_env::merge_path_extra(&mut env, extra);
+    }
+    cmd.envs(env);
 }
 
 fn official_claude_npm_binary(wrapper: &Path) -> Option<PathBuf> {
@@ -2162,6 +2163,71 @@ fn apply_claude_setting_source_policy(command: &mut Command, use_user_setting_so
     }
 }
 
+fn subscription_launch_matches_profile(
+    env: &[(String, String)],
+    profile_key: &str,
+    expected_profile: &Path,
+) -> bool {
+    if env.iter().any(|(key, value)| {
+        matches!(
+            key.as_str(),
+            "ANTHROPIC_API_KEY" | "ANTHROPIC_AUTH_TOKEN" | "OPENAI_API_KEY"
+        ) && !value.trim().is_empty()
+    }) {
+        return false;
+    }
+    let Some((_, actual_profile)) = env.iter().rev().find(|(key, _)| key == profile_key) else {
+        return false;
+    };
+    if actual_profile.trim().is_empty() {
+        return false;
+    }
+    let actual_profile = Path::new(actual_profile);
+    actual_profile == expected_profile
+        || fs::canonicalize(actual_profile)
+            .ok()
+            .zip(fs::canonicalize(expected_profile).ok())
+            .is_some_and(|(actual, expected)| actual == expected)
+}
+
+fn sync_subscription_user_skills(app: &AppHandle, engine: &str, env: &[(String, String)]) {
+    let profile_key = match engine {
+        "claude-code" => "CLAUDE_CONFIG_DIR",
+        "codex" => "CODEX_HOME",
+        _ => return,
+    };
+    if !env
+        .iter()
+        .any(|(key, value)| key == profile_key && !value.trim().is_empty())
+    {
+        return;
+    }
+    let Some(profiles) = app.try_state::<crate::subscription_profiles::SubscriptionProfileStore>()
+    else {
+        return;
+    };
+    let expected_profile = match profiles.command_env(engine) {
+        Ok((_, profile)) => profile,
+        Err(error) => {
+            log::warn!("订阅技能同步失败（忽略，不阻断会话）：{error}");
+            return;
+        }
+    };
+    if !subscription_launch_matches_profile(env, profile_key, &expected_profile) {
+        return;
+    }
+    match profiles.sync_user_skills(engine) {
+        Ok(result) if result.copied > 0 || result.updated > 0 || result.deleted > 0 => {
+            log::info!(
+                "订阅技能同步完成：复制 {}、更新 {}、删除 {}",
+                result.copied, result.updated, result.deleted
+            );
+        }
+        Ok(_) => {}
+        Err(error) => log::warn!("订阅技能同步失败（忽略，不阻断会话）：{error}"),
+    }
+}
+
 pub(crate) fn build_codex_command(bin: &str) -> Command {
     #[cfg(target_os = "windows")]
     {
@@ -2241,6 +2307,29 @@ fn codex_app_server_prompt(
     } else {
         current_prompt.to_string()
     }
+}
+
+fn codex_needs_initial_history_rebuild(
+    history: &[crate::sessions::SessionMessage],
+    native_thread_id: Option<&str>,
+    fork_source_thread_id: Option<&str>,
+) -> bool {
+    !history.is_empty()
+        && native_thread_id.is_none_or(str::is_empty)
+        && fork_source_thread_id.is_none_or(str::is_empty)
+}
+
+fn rebuild_codex_prompt_from_ledger(
+    history_store: &SessionHistoryStore,
+    history_session_id: &str,
+    turn_id: &str,
+    current_prompt: &str,
+    context_window: Option<u64>,
+) -> Result<String, String> {
+    let history =
+        crate::commands::ledger_rebuild_messages(history_store, history_session_id, Some(turn_id))?;
+    crate::commands::ensure_ledger_fits_context_window(&history, current_prompt, context_window)?;
+    Ok(codex_app_server_prompt(true, &history, current_prompt))
 }
 
 fn is_codex_thread_missing_error(message: &str) -> bool {
@@ -2475,11 +2564,11 @@ fn normalize_runtime_search_tool_result(event: &AgentEvent) -> AgentEvent {
 static RUNTIME_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 /// 运行时排查日志：同时打到 stderr（dev 可见）并追加到
-/// `<app_config_dir>/helm-runtime.log`（打包后也持久，便于事后还原现场）。
-/// 不引第三方日志库，保持最小依赖。用于记录每轮 turn 的生死关键节点，
-/// 解决「进程卡死/漏发终态时无法还原现场」的问题。
+/// `<app_log_dir>/helm-runtime.log`（与设置页「打开日志文件夹」同目录，打包后也持久，
+/// 便于事后还原现场）。不引第三方日志库，保持最小依赖。
+/// 用于记录每轮 turn 的生死关键节点，解决「进程卡死/漏发终态时无法还原现场」的问题。
 pub(crate) fn log_runtime_event(app: &AppHandle, tag: &str, detail: &str) {
-    if let Ok(dir) = app.path().app_config_dir() {
+    if let Ok(dir) = app.path().app_log_dir() {
         let _ = RUNTIME_LOG_PATH.set(dir.join("helm-runtime.log"));
     }
     log_runtime_line(tag, detail);
@@ -2487,13 +2576,11 @@ pub(crate) fn log_runtime_event(app: &AppHandle, tag: &str, detail: &str) {
 
 pub(crate) fn log_runtime_line(tag: &str, detail: &str) {
     let line = format!("[helm-{}] ts={} {}", tag, now_millis(), detail);
-    eprintln!("{}", line);
+    log::info!("{}", line);
     let path = RUNTIME_LOG_PATH.get().cloned().or_else(|| {
-        std::env::var_os("APPDATA").map(|dir| {
-            PathBuf::from(dir)
-                .join("com.helm.desktop")
-                .join("helm-runtime.log")
-        })
+        // 与 app_log_dir 的 Windows 布局保持一致：{LocalAppData}/com.helm.desktop/logs
+        dirs::data_local_dir()
+            .map(|dir| dir.join("com.helm.desktop").join("logs").join("helm-runtime.log"))
     });
     if let Some(path) = path {
         let _ = std::fs::OpenOptions::new()
@@ -2519,7 +2606,6 @@ fn loggable_event_type(event: &AgentEvent) -> Option<&'static str> {
         AgentEvent::ToolResult { .. } => Some("tool_result"),
         AgentEvent::ApprovalRequest { .. } => Some("approval_request"),
         AgentEvent::PlanUpdate { .. } => Some("plan_update"),
-        AgentEvent::Checkpoint { .. } => Some("checkpoint"),
         AgentEvent::TokenUsage { .. } => Some("token_usage"),
         AgentEvent::ContextUsage { .. } => Some("context_usage"),
         AgentEvent::ContextCompaction { .. } => Some("context_compaction"),
@@ -2528,7 +2614,11 @@ fn loggable_event_type(event: &AgentEvent) -> Option<&'static str> {
     }
 }
 
-fn emit_agent_event(app: &AppHandle, history_session_id: &str, event: &AgentEvent) {
+async fn emit_agent_event(
+    app: &AppHandle,
+    history_session_id: &str,
+    event: &AgentEvent,
+) -> Result<(), String> {
     if let Some(t) = loggable_event_type(event) {
         let mut detail = format!("history={} type={}", history_session_id, t);
         if let AgentEvent::SessionStarted { engine, .. } = event {
@@ -2543,34 +2633,42 @@ fn emit_agent_event(app: &AppHandle, history_session_id: &str, event: &AgentEven
         context.as_ref().map(|(turn_id, _)| turn_id.as_str()),
         context.as_ref().map(|(_, epoch)| *epoch),
         event,
-    );
+    )
+    .await
 }
 
-fn emit_agent_event_in_turn(
+async fn emit_agent_event_in_turn(
     app: &AppHandle,
     history_session_id: &str,
     explicit_turn_id: Option<&str>,
     explicit_turn_epoch: Option<u64>,
     event: &AgentEvent,
-) {
+) -> Result<(), String> {
     // 性能：脱敏收敛到两处——TurnSupervisor 入口（覆盖 adapter 与 runtime_registry
     // 两条提交路径）与落库前。同一条事件此前在同步链上被全量正则扫描 3 次。
     let event = normalize_runtime_search_tool_result(event);
     let turn_id = explicit_turn_id.map(ToString::to_string);
     let turn_epoch = explicit_turn_epoch;
     if let Some(supervisor) = app.try_state::<crate::turn_supervisor::TurnSupervisor>() {
-        let _ = supervisor.submit_event(history_session_id, turn_id.as_deref(), turn_epoch, event);
-        return;
+        return supervisor
+            .submit_event(history_session_id, turn_id.as_deref(), turn_epoch, event)
+            .await
+            .map(|_| ())
+            .map_err(|error| log_stream_submission_error(app, history_session_id, &error));
     }
     // 只供未安装 Tauri state 的旧测试壳使用；生产 setup 始终安装 Supervisor。
     if let Some(store) = app.try_state::<SessionHistoryStore>() {
         if let Err(err) =
             store.record_event_for_session_in_turn(history_session_id, turn_id.as_deref(), &event)
         {
-            eprintln!("[helm] 会话历史写入失败：{err}");
+            return Err(log_stream_submission_error(
+                app,
+                history_session_id,
+                &format!("[stream_persistence_failed] {err}"),
+            ));
         }
     }
-    let _ = app.emit(
+    app.emit(
         EVENT_NAME,
         serde_json::json!({
             "historyId": history_session_id,
@@ -2579,11 +2677,37 @@ fn emit_agent_event_in_turn(
             "turnEpoch": turn_epoch,
             "event": event,
         }),
+    )
+    .map_err(|error| {
+        log_stream_submission_error(
+            app,
+            history_session_id,
+            &format!("[stream_publish_failed] {error}"),
+        )
+    })
+}
+
+fn log_stream_submission_error(app: &AppHandle, history_session_id: &str, error: &str) -> String {
+    let error = crate::redaction::redact_text(error);
+    log_runtime_event(
+        app,
+        "stream-submit-failed",
+        &format!("history={history_session_id} error=<{error}>"),
     );
+    error
+}
+
+fn is_stream_submission_error(error: &str) -> bool {
+    [
+        "[stream_persistence_failed]",
+        "[stream_worker_closed]",
+        "[stream_publish_failed]",
+    ]
+    .iter()
+    .any(|prefix| error.starts_with(prefix))
 }
 
 /// delta 合批（变更-09）：event 与缓冲中的 delta 同类且同会话时并入缓冲，返回 true。
-/// 只合并 MessageDelta / ThinkingDelta——其他事件必须保序发出。
 fn merge_pending_delta(pending: &mut Option<AgentEvent>, event: &AgentEvent) -> bool {
     match (pending.as_mut(), event) {
         (
@@ -2611,7 +2735,109 @@ fn merge_pending_delta(pending: &mut Option<AgentEvent>, event: &AgentEvent) -> 
             buf.push_str(text);
             true
         }
+        (
+            Some(AgentEvent::ToolProgress {
+                session_id: buffered_session,
+                id: buffered_id,
+                chunk: buffered_output,
+            }),
+            AgentEvent::ToolProgress {
+                session_id,
+                id,
+                chunk,
+            },
+        ) if buffered_session == session_id && buffered_id == id => {
+            buffered_output.push_str(chunk);
+            true
+        }
         _ => false,
+    }
+}
+
+const STREAM_BATCH_BYTES: usize = 16 * 1024;
+const STREAM_BATCH_INTERVAL: Duration = Duration::from_millis(33);
+type BufferedStreamDelta = (AgentEvent, Option<(String, u64)>);
+
+#[derive(Default)]
+struct StreamDeltaBuffer {
+    event: Option<AgentEvent>,
+    context: Option<(String, u64)>,
+    deadline: Option<tokio::time::Instant>,
+}
+
+fn stream_delta_bytes(event: &AgentEvent) -> Option<usize> {
+    match event {
+        AgentEvent::MessageDelta { text, .. } | AgentEvent::ThinkingDelta { text, .. } => {
+            Some(text.len())
+        }
+        AgentEvent::ToolProgress { chunk, .. } => Some(chunk.len()),
+        _ => None,
+    }
+}
+
+impl StreamDeltaBuffer {
+    fn due(&self) -> bool {
+        self.due_at(tokio::time::Instant::now())
+    }
+
+    fn due_at(&self, now: tokio::time::Instant) -> bool {
+        self.deadline.is_some_and(|deadline| now >= deadline)
+    }
+
+    fn push(
+        &mut self,
+        event: AgentEvent,
+        context: Option<(String, u64)>,
+    ) -> (Option<BufferedStreamDelta>, Option<AgentEvent>) {
+        self.push_at(event, context, tokio::time::Instant::now())
+    }
+
+    fn push_at(
+        &mut self,
+        event: AgentEvent,
+        context: Option<(String, u64)>,
+        now: tokio::time::Instant,
+    ) -> (Option<BufferedStreamDelta>, Option<AgentEvent>) {
+        let merged_bytes = self
+            .event
+            .as_ref()
+            .and_then(stream_delta_bytes)
+            .unwrap_or(0)
+            .saturating_add(stream_delta_bytes(&event).unwrap_or(STREAM_BATCH_BYTES + 1));
+        if self.context == context
+            && !self.due_at(now)
+            && merged_bytes <= STREAM_BATCH_BYTES
+            && merge_pending_delta(&mut self.event, &event)
+        {
+            return (None, None);
+        }
+        let buffered = self.take();
+        if stream_delta_bytes(&event).is_some_and(|bytes| bytes <= STREAM_BATCH_BYTES) {
+            self.event = Some(event);
+            self.context = context;
+            self.deadline = Some(now + STREAM_BATCH_INTERVAL);
+            (buffered, None)
+        } else {
+            (buffered, Some(event))
+        }
+    }
+
+    fn take(&mut self) -> Option<BufferedStreamDelta> {
+        self.deadline = None;
+        self.event.take().map(|event| (event, self.context.take()))
+    }
+}
+
+async fn emit_stream_event(
+    app: &AppHandle,
+    history_session_id: &str,
+    context: Option<&(String, u64)>,
+    event: &AgentEvent,
+) -> Result<(), String> {
+    if let Some((turn_id, epoch)) = context {
+        emit_agent_event_in_turn(app, history_session_id, Some(turn_id), Some(*epoch), event).await
+    } else {
+        emit_agent_event(app, history_session_id, event).await
     }
 }
 
@@ -3457,177 +3683,15 @@ fn extract_tool_target(tool_name: &str, input: &serde_json::Value) -> Option<Str
     }
 }
 
-fn checkpoint_target_path(
-    tool_name: &str,
-    input: &serde_json::Value,
-    cwd: &Path,
-) -> Option<PathBuf> {
-    match tool_name {
-        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
-            let target = extract_tool_target(tool_name, input)?;
-            let target = target.trim();
-            if target.is_empty() || target.eq_ignore_ascii_case("null") {
-                return None;
-            }
-            let path = PathBuf::from(target);
-            if path
-                .components()
-                .any(|component| matches!(component, std::path::Component::ParentDir))
-            {
-                return None;
-            }
-            let path = if path.is_absolute() {
-                path
-            } else {
-                cwd.join(path)
-            };
-            let normalized = path
-                .to_string_lossy()
-                .replace('\\', "/")
-                .to_ascii_lowercase();
-            let file_name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default()
-                .trim_end_matches('.')
-                .to_ascii_lowercase();
-            if normalized == "/dev/null"
-                || normalized.starts_with("//./")
-                || normalized.starts_with("//?/")
-                || matches!(
-                    file_name.as_str(),
-                    "nul"
-                        | "con"
-                        | "prn"
-                        | "aux"
-                        | "clock$"
-                        | "com1"
-                        | "com2"
-                        | "com3"
-                        | "com4"
-                        | "com5"
-                        | "com6"
-                        | "com7"
-                        | "com8"
-                        | "com9"
-                        | "lpt1"
-                        | "lpt2"
-                        | "lpt3"
-                        | "lpt4"
-                        | "lpt5"
-                        | "lpt6"
-                        | "lpt7"
-                        | "lpt8"
-                        | "lpt9"
-                )
-            {
-                return None;
-            }
-            let canonical_cwd = cwd.canonicalize().ok()?;
-            let scoped_path = if path.exists() {
-                path.canonicalize().ok()?
-            } else {
-                let parent = path.parent()?.canonicalize().ok()?;
-                parent.join(path.file_name()?)
-            };
-            let scope_key = |value: &Path| {
-                value
-                    .to_string_lossy()
-                    .replace('\\', "/")
-                    .trim_end_matches('/')
-                    .to_ascii_lowercase()
-            };
-            let cwd_key = scope_key(&canonical_cwd);
-            let target_key = scope_key(&scoped_path);
-            if target_key != cwd_key && !target_key.starts_with(&format!("{cwd_key}/")) {
-                return None;
-            }
-            Some(scoped_path)
-        }
-        _ => None,
-    }
-}
-
-fn checkpoint_id_for_tool(tool_id: &str) -> String {
-    let safe = tool_id
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    if safe.is_empty() {
-        format!("ckpt-{}", now_millis())
-    } else {
-        format!("ckpt-{safe}")
-    }
-}
-
-fn create_auto_checkpoint_for_tool(
-    history_store: &SessionHistoryStore,
-    snapshots_dir: &Path,
-    history_session_id: &str,
-    cli_session_id: &str,
-    cwd: &Path,
-    tool_id: &str,
-    tool_name: &str,
-    input: &serde_json::Value,
-    turn_id: &str,
-) -> Result<Option<AgentEvent>, String> {
-    let Some(target) = checkpoint_target_path(tool_name, input, cwd) else {
-        return Ok(None);
-    };
-
-    let checkpoint_id = checkpoint_id_for_tool(tool_id);
-    let snapshot_store = crate::snapshots::SnapshotStore::new(snapshots_dir.to_path_buf());
-    let snapshot = snapshot_store.capture_files(std::slice::from_ref(&target))?;
-    if snapshot.files.is_empty() {
-        return Ok(None);
-    }
-    snapshot_store.save(&checkpoint_id, &snapshot)?;
-
-    let label_target = target
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| target.to_string_lossy().to_string());
-    let ts = now_millis();
-    history_store.save_checkpoint(
-        &checkpoint_id,
-        history_session_id,
-        0,
-        &format!("改动前：{label_target}"),
-        &checkpoint_id,
-        ts,
-        turn_id,
-        true,
-        snapshot.files.len() as u64,
-        None,
-    )?;
-
-    Ok(Some(AgentEvent::Checkpoint {
-        session_id: cli_session_id.to_string(),
-        id: checkpoint_id,
-        label: format!("改动前：{label_target}"),
-        ts,
-        restorable: true,
-        file_count: snapshot.files.len() as u64,
-        reason: None,
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         abort_codex_turn_task, agent_environment_from_settings, apply_codex_native_search,
         apply_codex_search_catalog, auto_fallback_decision, build_approval_action,
-        checkpoint_target_path, claude_exit_disposition, claude_permission_mode,
+        claude_exit_disposition, claude_permission_mode,
         claude_permission_mode_for_capability, codex_native_search_enabled,
         codex_provider_config_args, codex_runtime_profile_policy, codex_sandbox_for_mode,
-        create_auto_checkpoint_for_tool, create_codex_auth_home,
+        create_codex_auth_home,
         create_codex_auth_home_with_source, create_runtime_approval_hook_files,
         extract_tool_target, filter_inherited_agent_environment, finish_codex_interrupt_terminal,
         full_access_lease, lease_is_valid, merge_pending_delta,
@@ -3651,6 +3715,46 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::{mpsc, Mutex, Notify};
+
+    #[test]
+    fn subscription_skill_sync_gate_requires_isolated_profile_without_api_credentials() {
+        let profiles = super::unique_temp_dir("helm-subscription-skill-gate");
+        for (profile_key, profile_name) in [
+            ("CLAUDE_CONFIG_DIR", "claude-subscription"),
+            ("CODEX_HOME", "codex-subscription"),
+        ] {
+            let expected = profiles.join(profile_name);
+            let expected_value = expected.to_string_lossy().into_owned();
+            let other_value = profiles.join("external").to_string_lossy().into_owned();
+            let matches = |environment: Vec<(String, String)>| {
+                super::subscription_launch_matches_profile(&environment, profile_key, &expected)
+            };
+
+            assert!(matches(vec![(profile_key.into(), expected_value.clone())]));
+            assert!(!matches(Vec::new()));
+            for actual in [String::new(), " ".into(), other_value.clone()] {
+                assert!(!matches(vec![(profile_key.into(), actual)]));
+            }
+            for credential_key in [
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "OPENAI_API_KEY",
+            ] {
+                assert!(!matches(vec![
+                    (profile_key.into(), expected_value.clone()),
+                    (credential_key.into(), "test-credential".into()),
+                ]));
+            }
+            assert!(!matches(vec![
+                (profile_key.into(), expected_value.clone()),
+                (profile_key.into(), other_value.clone()),
+            ]));
+            assert!(matches(vec![
+                (profile_key.into(), other_value),
+                (profile_key.into(), expected_value),
+            ]));
+        }
+    }
 
     #[test]
     fn missing_runtime_search_tool_is_normalized_without_fallback_service() {
@@ -4097,6 +4201,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_runtime_is_shutdown_when_preparation_is_cancelled() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+        let preparation = tokio::spawn(async move {
+            let pending = crate::runtime_registry::PendingRuntimeSession::new(
+                AgentSession::Claude(ClaudeSession {
+                    tx: sender,
+                    cwd: "D:/repo".to_string(),
+                    control: None,
+                }),
+            );
+            ready_sender.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(pending);
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), ready_receiver)
+            .await
+            .expect("replacement 创建不应阻塞")
+            .expect("replacement 应在取消前创建");
+        preparation.abort();
+        assert!(tokio::time::timeout(Duration::from_secs(1), preparation)
+            .await
+            .expect("取消应完成 guard 回收")
+            .expect_err("准备任务应被取消")
+            .is_cancelled());
+
+        let responder = match tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("取消后必须请求 Runtime shutdown")
+        {
+            Some(SessionCmd::Interrupt {
+                responder: Some(responder),
+            }) => responder,
+            _ => panic!("shutdown 必须等待 manager 回执，不能仅丢弃 Runtime"),
+        };
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        responder.send(Ok(())).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .expect("shutdown 回执后必须释放唯一 Runtime owner")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn always_decision_without_pending_tool_info_is_rejected() {
         let root = super::unique_temp_dir("helm-approval-missing-pending-test");
         fs::create_dir_all(&root).unwrap();
@@ -4364,6 +4518,91 @@ mod tests {
     }
 
     #[test]
+    fn codex_history_rebuild_reads_latest_ledger_and_excludes_current_turn() {
+        use crate::protocol::{EngineId, Role};
+        use crate::sessions::NewSessionRecord;
+        use crate::turn_supervisor::TurnSupervisor;
+
+        let root = super::unique_temp_dir("helm-codex-ledger-rebuild");
+        fs::create_dir_all(&root).unwrap();
+        let history = SessionHistoryStore::new(root.join("sessions.sqlite"));
+        history
+            .create_session(NewSessionRecord {
+                id: "history".into(),
+                engine: EngineId::Codex,
+                model: "model".into(),
+                cwd: root.to_string_lossy().into_owned(),
+                created_at: 1,
+            })
+            .unwrap();
+        let supervisor = TurnSupervisor::new(history.clone());
+        supervisor.begin("history", "previous-turn", 1, "build", "auto");
+        for (source_seq, event) in [
+            AgentEvent::MessageComplete {
+                session_id: "native".into(),
+                role: Role::User,
+                text: "previous-question".into(),
+            },
+            AgentEvent::MessageComplete {
+                session_id: "native".into(),
+                role: Role::Assistant,
+                text: "previous-answer".into(),
+            },
+            AgentEvent::TurnComplete {
+                session_id: "native".into(),
+                stop_reason: StopReason::End,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(supervisor.accept_event(
+                "history",
+                Some("previous-turn"),
+                Some(1),
+                source_seq as u64 + 1,
+                &event,
+            ));
+        }
+        supervisor.begin("history", "current-turn", 2, "build", "auto");
+        assert!(supervisor.accept_event(
+            "history",
+            Some("current-turn"),
+            Some(2),
+            1,
+            &AgentEvent::MessageComplete {
+                session_id: "native".into(),
+                role: Role::User,
+                text: "current-question".into(),
+            },
+        ));
+        let rebuild = |window| {
+            super::rebuild_codex_prompt_from_ledger(
+                &history,
+                "history",
+                "current-turn",
+                "current-question",
+                window,
+            )
+        };
+        let first = rebuild(Some(4096)).unwrap();
+        assert!(first.contains("previous-question") && first.contains("previous-answer"));
+        assert_eq!(first.matches("current-question").count(), 1);
+        history
+            .record_user_message("history", "newly-persisted-history", 4)
+            .unwrap();
+        let refreshed = rebuild(Some(4096)).unwrap();
+        assert!(refreshed.contains("newly-persisted-history"));
+        assert_eq!(refreshed.matches("current-question").count(), 1);
+        assert!(rebuild(Some(1))
+            .unwrap_err()
+            .contains("[ledger_context_window_insufficient]"));
+        drop(supervisor);
+        drop(history);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn codex_rewind_clears_native_thread_and_forces_one_history_rebuild() {
         let thread_id = std::sync::Arc::new(std::sync::Mutex::new(Some(
             "thread-before-rewind".to_string(),
@@ -4605,10 +4844,17 @@ mod tests {
         });
 
         tokio::task::yield_now().await;
-        finish_codex_interrupt_terminal(&terminals, &notify, Some("turn-1".to_string()), || {
-            terminal_event_emitted.store(true, Ordering::Release);
-        })
-        .await;
+        finish_codex_interrupt_terminal(
+            &terminals,
+            &notify,
+            Some("turn-1".to_string()),
+            || async {
+                terminal_event_emitted.store(true, Ordering::Release);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
 
         tokio::time::timeout(Duration::from_secs(1), waiter)
             .await
@@ -4627,16 +4873,58 @@ mod tests {
             &terminals,
             &Notify::new(),
             Some("turn-1".to_string()),
-            || {
+            || async {
                 emitted.store(true, Ordering::Release);
+                Ok(())
             },
         )
-        .await;
+        .await
+        .unwrap();
         assert!(emitted.load(Ordering::Acquire));
         assert_eq!(
             terminal_turn_outcome(&terminals, "turn-1").await,
             Some(Ok(()))
         );
+    }
+
+    #[tokio::test]
+    async fn codex_interrupt_submission_failure_preserves_terminal_state() {
+        for initial_outcome in [
+            None,
+            Some(Err(
+                "Codex app-server notification stream closed".to_string()
+            )),
+        ] {
+            for error in ["[stream_persistence_failed]", "[stream_worker_closed]"] {
+                let terminals = Mutex::new(HashMap::new());
+                if let Some(outcome) = initial_outcome.clone() {
+                    terminals.lock().await.insert("turn-1".to_string(), outcome);
+                }
+                let notify = Notify::new();
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                assert!(!notified.as_mut().enable());
+
+                let result = finish_codex_interrupt_terminal(
+                    &terminals,
+                    &notify,
+                    Some("turn-1".to_string()),
+                    || async { Err(error.to_string()) },
+                )
+                .await;
+
+                assert_eq!(result, Err(error.to_string()));
+                assert_eq!(
+                    terminal_turn_outcome(&terminals, "turn-1").await,
+                    initial_outcome
+                );
+                tokio::select! {
+                    biased;
+                    _ = &mut notified => panic!("提交失败不得通知等待器终态已确认"),
+                    _ = std::future::ready(()) => {},
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -4779,90 +5067,189 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn checkpoint_target_resolves_write_paths_and_ignores_read_tools() {
-        let cwd = std::env::temp_dir().join("helm-checkpoint-cwd");
-        let _ = fs::remove_dir_all(&cwd);
-        fs::create_dir_all(cwd.join("src")).unwrap();
-        let input = json!({ "file_path": "src/main.rs" });
+    fn stream_message(text: &str) -> AgentEvent {
+        AgentEvent::MessageDelta {
+            session_id: "stream-session".into(),
+            role: Role::Assistant,
+            text: text.into(),
+        }
+    }
 
-        assert_eq!(
-            checkpoint_target_path("Write", &input, &cwd),
-            Some(cwd.canonicalize().unwrap().join("src/main.rs"))
-        );
-        assert_eq!(checkpoint_target_path("Read", &input, &cwd), None);
-        assert_eq!(
-            checkpoint_target_path("Bash", &json!({ "command": "which wm 2>/dev/null" }), &cwd),
-            None
-        );
-        assert_eq!(
-            checkpoint_target_path("Bash", &json!({ "command": "echo x > file" }), &cwd),
-            None
-        );
-        assert_eq!(
-            checkpoint_target_path("Write", &json!({ "file_path": "../outside.txt" }), &cwd),
-            None
-        );
-        assert_eq!(
-            checkpoint_target_path("Write", &json!({ "file_path": "NUL" }), &cwd),
-            None
-        );
-        let _ = fs::remove_dir_all(&cwd);
+    fn stream_tool_progress(id: &str, chunk: &str) -> AgentEvent {
+        AgentEvent::ToolProgress {
+            session_id: "stream-session".into(),
+            id: id.into(),
+            chunk: chunk.into(),
+        }
     }
 
     #[test]
-    fn create_auto_checkpoint_for_tool_saves_snapshot_and_event() {
-        let root =
-            std::env::temp_dir().join(format!("helm-auto-checkpoint-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let cwd = root.join("workspace");
-        fs::create_dir_all(cwd.join("src")).unwrap();
-        let file_path = cwd.join("src/main.rs");
-        fs::write(&file_path, "old content").unwrap();
+    fn stream_batch_deadline_is_fixed_from_first_delta_under_continuous_input() {
+        let mut buffer = super::StreamDeltaBuffer::default();
+        let started = tokio::time::Instant::now();
+        let context = Some(("turn-1".into(), 7));
+        let (flushed, immediate) =
+            buffer.push_at(stream_message("first"), context.clone(), started);
+        assert!(flushed.is_none() && immediate.is_none());
+        for offset in [4, 8, 16, 24, 32] {
+            let (flushed, immediate) = buffer.push_at(
+                stream_message("+"),
+                context.clone(),
+                started + Duration::from_millis(offset),
+            );
+            assert!(flushed.is_none() && immediate.is_none());
+            assert_eq!(
+                buffer.deadline,
+                Some(started + super::STREAM_BATCH_INTERVAL)
+            );
+        }
+        assert!(!buffer.due_at(started + Duration::from_millis(32)));
+        assert!(buffer.due_at(started + Duration::from_millis(33)));
+        let (flushed, immediate) = buffer.push_at(
+            stream_message("next"),
+            context.clone(),
+            started + Duration::from_millis(33),
+        );
+        let (event, flushed_context) = flushed.expect("fixed deadline must flush the old batch");
+        assert!(matches!(event, AgentEvent::MessageDelta { text, .. } if text == "first+++++"));
+        assert_eq!(flushed_context, context);
+        assert!(immediate.is_none());
+        assert_eq!(buffer.deadline, Some(started + Duration::from_millis(66)));
+    }
 
-        let history_store = SessionHistoryStore::new(root.join("sessions.sqlite"));
-        history_store
-            .create_session(NewSessionRecord {
-                id: "history-1".to_string(),
-                engine: EngineId::ClaudeCode,
-                model: "claude-sonnet".to_string(),
-                cwd: cwd.to_string_lossy().to_string(),
-                created_at: 1,
-            })
-            .unwrap();
+    #[test]
+    fn stream_batch_bounds_utf8_bytes_without_losing_or_splitting_output() {
+        let mut buffer = super::StreamDeltaBuffer::default();
+        let now = tokio::time::Instant::now();
+        let prefix = "界".repeat(super::STREAM_BATCH_BYTES / 3);
+        buffer.push_at(stream_tool_progress("tool-1", &prefix), None, now);
+        let (flushed, immediate) = buffer.push_at(stream_tool_progress("tool-1", "!"), None, now);
+        assert!(flushed.is_none() && immediate.is_none());
+        assert_eq!(
+            buffer.event.as_ref().and_then(super::stream_delta_bytes),
+            Some(super::STREAM_BATCH_BYTES)
+        );
+        let (flushed, immediate) = buffer.push_at(stream_tool_progress("tool-1", "尾"), None, now);
+        assert!(
+            matches!(flushed, Some((AgentEvent::ToolProgress { chunk, .. }, None)) if chunk == format!("{prefix}!"))
+        );
+        assert!(immediate.is_none());
+        let oversized = "x".repeat(super::STREAM_BATCH_BYTES + 1);
+        let (flushed, immediate) =
+            buffer.push_at(stream_tool_progress("tool-1", &oversized), None, now);
+        assert!(
+            matches!(flushed, Some((AgentEvent::ToolProgress { chunk, .. }, None)) if chunk == "尾")
+        );
+        assert!(
+            matches!(immediate, Some(AgentEvent::ToolProgress { chunk, .. }) if chunk == oversized)
+        );
+        assert!(buffer.event.is_none());
+        assert!(buffer.deadline.is_none());
+    }
 
-        let event = create_auto_checkpoint_for_tool(
-            &history_store,
-            &root.join("snapshots"),
-            "history-1",
-            "cli-1",
-            &cwd,
-            "tool-1",
-            "Edit",
-            &json!({ "file_path": "src/main.rs" }),
-            "turn-1",
-        )
-        .unwrap()
-        .expect("Edit should create checkpoint");
+    #[test]
+    fn stream_batches_never_merge_across_turn_or_epoch_boundaries() {
+        let now = tokio::time::Instant::now();
+        let contexts = [
+            Some(("turn-1".into(), 1)),
+            Some(("turn-2".into(), 1)),
+            Some(("turn-2".into(), 2)),
+            None,
+        ];
+        let mut buffer = super::StreamDeltaBuffer::default();
+        for (index, context) in contexts.iter().enumerate() {
+            let (flushed, immediate) =
+                buffer.push_at(stream_message("piece"), context.clone(), now);
+            assert!(immediate.is_none());
+            if index == 0 {
+                assert!(flushed.is_none());
+            } else {
+                let (event, previous) = flushed.expect("identity changes must flush");
+                assert_eq!(previous, contexts[index - 1]);
+                assert!(matches!(event, AgentEvent::MessageDelta { text, .. } if text == "piece"));
+            }
+        }
+        let (_, context) = buffer.take().unwrap();
+        assert_eq!(context, None);
+        assert!(buffer.take().is_none());
+    }
 
-        let AgentEvent::Checkpoint { id, session_id, .. } = event else {
-            panic!("expected checkpoint event");
+    #[test]
+    fn stream_batches_preserve_type_tool_and_terminal_order() {
+        let events = [
+            stream_message("正文"),
+            AgentEvent::ThinkingDelta {
+                session_id: "stream-session".into(),
+                text: "思考".into(),
+            },
+            stream_tool_progress("tool-1", "one"),
+            stream_tool_progress("tool-1", "two"),
+            stream_tool_progress("tool-2", "three"),
+            stream_message("结尾"),
+            AgentEvent::TurnComplete {
+                session_id: "stream-session".into(),
+                stop_reason: StopReason::End,
+            },
+        ];
+        let expected = [
+            stream_message("正文"),
+            AgentEvent::ThinkingDelta {
+                session_id: "stream-session".into(),
+                text: "思考".into(),
+            },
+            stream_tool_progress("tool-1", "onetwo"),
+            stream_tool_progress("tool-2", "three"),
+            stream_message("结尾"),
+            AgentEvent::TurnComplete {
+                session_id: "stream-session".into(),
+                stop_reason: StopReason::End,
+            },
+        ];
+        let now = tokio::time::Instant::now();
+        let mut buffer = super::StreamDeltaBuffer::default();
+        let mut emitted = Vec::new();
+        for event in events {
+            let (flushed, immediate) = buffer.push_at(event, None, now);
+            if let Some((event, _)) = flushed {
+                emitted.push(event);
+            }
+            if let Some(event) = immediate {
+                emitted.push(event);
+            }
+        }
+        assert!(buffer.take().is_none());
+        assert_eq!(
+            serde_json::to_value(emitted).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn stream_error_boundary_flushes_body_before_error_and_clears_deadline() {
+        let mut buffer = super::StreamDeltaBuffer::default();
+        let now = tokio::time::Instant::now();
+        let context = Some(("turn-1".into(), 9));
+        buffer.push_at(stream_message("已到达的正文"), context.clone(), now);
+        let error = AgentEvent::Error {
+            session_id: Some("stream-session".into()),
+            message: "notification protocol failed".into(),
+            recoverable: false,
+            kind: None,
+            stalled_kind: None,
         };
-        assert_eq!(session_id, "cli-1");
-
-        let checkpoint = history_store.get_checkpoint(&id).unwrap().unwrap();
-        assert_eq!(checkpoint.snapshot_ref, id);
-        assert_eq!(checkpoint.turn_id.as_deref(), Some("turn-1"));
-        assert!(checkpoint.restorable);
-        assert_eq!(checkpoint.file_count, 1);
-
-        fs::write(&file_path, "new content").unwrap();
-        let snapshot_store = crate::snapshots::SnapshotStore::new(root.join("snapshots"));
-        let snapshot = snapshot_store.load(&checkpoint.snapshot_ref).unwrap();
-        snapshot_store.restore_files(&snapshot).unwrap();
-        assert_eq!(fs::read_to_string(&file_path).unwrap(), "old content");
-
-        let _ = fs::remove_dir_all(root);
+        let (flushed, immediate) = buffer.push_at(error, context.clone(), now);
+        let (event, previous) = flushed.unwrap();
+        assert_eq!(previous, context);
+        assert!(matches!(event, AgentEvent::MessageDelta { text, .. } if text == "已到达的正文"));
+        assert!(matches!(
+            immediate,
+            Some(AgentEvent::Error {
+                recoverable: false,
+                ..
+            })
+        ));
+        assert!(buffer.deadline.is_none());
+        assert!(buffer.take().is_none());
     }
 
     #[test]
@@ -5966,7 +6353,7 @@ pub(crate) fn classify_error(message: &str) -> Option<String> {
 async fn emit_error(runtime: &SessionRuntime, message: String, recoverable: bool) {
     let session_id = runtime.session_id.lock().await.clone();
     let kind = classify_error(&message);
-    emit_agent_event(
+    if emit_agent_event(
         &runtime.app,
         &runtime.history_session_id,
         &AgentEvent::Error {
@@ -5976,10 +6363,19 @@ async fn emit_error(runtime: &SessionRuntime, message: String, recoverable: bool
             kind,
             stalled_kind: None,
         },
-    );
+    )
+    .await
+    .is_err()
+    {
+        let pid = *runtime.running_pid.lock().await;
+        kill_tree(pid).await;
+    }
 }
 
-async fn emit_interrupted(runtime: &SessionRuntime) {
+async fn emit_interrupted(runtime: &SessionRuntime) -> Result<(), String> {
+    if runtime.current_turn_spec.lock().await.is_none() {
+        return Ok(());
+    }
     if let Some(sid) = runtime.session_id.lock().await.clone() {
         emit_agent_event(
             &runtime.app,
@@ -5988,11 +6384,13 @@ async fn emit_interrupted(runtime: &SessionRuntime) {
                 session_id: sid,
                 stop_reason: StopReason::Interrupted,
             },
-        );
+        )
+        .await?;
     }
+    Ok(())
 }
 
-async fn emit_denied_turn(runtime: &SessionRuntime, request_id: String) {
+async fn emit_denied_turn(runtime: &SessionRuntime, request_id: String) -> Result<(), String> {
     if let Some(sid) = runtime.session_id.lock().await.clone() {
         emit_agent_event(
             &runtime.app,
@@ -6010,7 +6408,8 @@ async fn emit_denied_turn(runtime: &SessionRuntime, request_id: String) {
                 denial_source: Some(crate::protocol::ToolDenialSource::Runtime),
                 native_denial_code: Some("user_denied".to_string()),
             },
-        );
+        )
+        .await?;
         emit_agent_event(
             &runtime.app,
             &runtime.history_session_id,
@@ -6018,8 +6417,10 @@ async fn emit_denied_turn(runtime: &SessionRuntime, request_id: String) {
                 session_id: sid,
                 stop_reason: StopReason::Interrupted,
             },
-        );
+        )
+        .await?;
     }
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -6570,24 +6971,32 @@ async fn run_claude_turn(
     let stdout_saw_executed_tool = saw_executed_tool.clone();
     let stdout_terminal_candidate = terminal_candidate.clone();
     let stdout_last_activity = last_activity_ms.clone();
+    let stdout_context = event_turn_context(&runtime.history_session_id);
     let stdout_task = tokio::spawn(async move {
+        let result = async {
         let mut lines = BufReader::new(stdout).lines();
         // delta 合批（变更-09）：逐 chunk emit 会造成每字符级 IPC + 前端全量重渲染。
         // 连续同类 delta 在 ~33ms 窗口内合并成一条再发；任何其他事件先冲刷缓冲保证顺序。
-        let mut pending_delta: Option<AgentEvent> = None;
+        let mut pending_delta = StreamDeltaBuffer::default();
         loop {
-            let next = if pending_delta.is_some() {
-                match tokio::time::timeout(std::time::Duration::from_millis(33), lines.next_line())
+            if pending_delta.due() {
+                if let Some((event, context)) = pending_delta.take() {
+                    emit_stream_event(&stdout_runtime.app, &stdout_runtime.history_session_id, context.as_ref(), &event).await?;
+                }
+            }
+            let next = if let Some(deadline) = pending_delta.deadline {
+                match tokio::time::timeout_at(deadline, lines.next_line())
                     .await
                 {
                     Ok(result) => result,
                     Err(_elapsed) => {
-                        if let Some(event) = pending_delta.take() {
-                            emit_agent_event(
+                        if let Some((event, context)) = pending_delta.take() {
+                            emit_stream_event(
                                 &stdout_runtime.app,
                                 &stdout_runtime.history_session_id,
+                                context.as_ref(),
                                 &event,
-                            );
+                            ).await?;
                         }
                         continue;
                     }
@@ -6601,7 +7010,7 @@ async fn run_claude_turn(
             stdout_last_activity.store(now_millis() as u64, Ordering::Release);
             let events = parse_claude_line(&line);
 
-            for mut event in events {
+            for event in events {
                 let session_started = stdout_saw_session_started.load(Ordering::Acquire);
                 let current_approved_tool_result = match &event {
                     AgentEvent::ToolResult { id, .. } => {
@@ -6619,23 +7028,16 @@ async fn run_claude_turn(
                 if matches!(&event, AgentEvent::SessionStarted { .. }) {
                     stdout_saw_session_started.store(true, Ordering::Release);
                 }
-                if merge_pending_delta(&mut pending_delta, &event) {
-                    continue;
-                }
-                if let Some(buffered) = pending_delta.take() {
-                    emit_agent_event(
+                let (buffered, event) = pending_delta.push(event, stdout_context.clone());
+                if let Some((buffered, context)) = buffered {
+                    emit_stream_event(
                         &stdout_runtime.app,
                         &stdout_runtime.history_session_id,
+                        context.as_ref(),
                         &buffered,
-                    );
+                    ).await?;
                 }
-                if matches!(
-                    event,
-                    AgentEvent::MessageDelta { .. } | AgentEvent::ThinkingDelta { .. }
-                ) {
-                    pending_delta = Some(event);
-                    continue;
-                }
+                let Some(mut event) = event else { continue; };
                 let mut suppress_event = false;
                 let mut post_event_error = None;
                 match &mut event {
@@ -6669,13 +7071,7 @@ async fn run_claude_turn(
                             *capabilities = Some(capability_snapshot.runtime_projection());
                         }
                     }
-                    AgentEvent::ToolCall {
-                        session_id,
-                        id,
-                        name,
-                        input,
-                        ..
-                    } => {
+                    AgentEvent::ToolCall { id, name, input, .. } => {
                         // ✅ 在 ToolCall 时就记录，供后续 stderr 的 APPROVAL_NEEDED 使用
                         stdout_runtime.pending_tools.lock().await.insert(
                             id.clone(),
@@ -6684,65 +7080,6 @@ async fn run_claude_turn(
                                 input: input.clone(),
                             },
                         );
-                        if let Some(history_store) =
-                            stdout_runtime.app.try_state::<SessionHistoryStore>()
-                        {
-                            let cwd = PathBuf::from(&stdout_runtime.cwd);
-                            match stdout_runtime.app.path().app_data_dir() {
-                                Ok(app_data_dir) => match create_auto_checkpoint_for_tool(
-                                    &history_store,
-                                    &app_data_dir.join("snapshots"),
-                                    &stdout_runtime.history_session_id,
-                                    session_id,
-                                    &cwd,
-                                    id,
-                                    name,
-                                    input,
-                                    &stdout_runtime.current_turn_id.lock().await,
-                                ) {
-                                    Ok(Some(checkpoint)) => emit_agent_event(
-                                        &stdout_runtime.app,
-                                        &stdout_runtime.history_session_id,
-                                        &checkpoint,
-                                    ),
-                                    Ok(None) => {}
-                                    Err(err) => {
-                                        emit_agent_event(
-                                            &stdout_runtime.app,
-                                            &stdout_runtime.history_session_id,
-                                            &AgentEvent::Error {
-                                                session_id: Some(session_id.clone()),
-                                                message: format!(
-                                                    "自动创建检查点失败，已终止本轮：{err}"
-                                                ),
-                                                recoverable: false,
-                                                kind: Some("checkpoint_failed".to_string()),
-                                                stalled_kind: None,
-                                            },
-                                        );
-                                        let pid = *stdout_runtime.running_pid.lock().await;
-                                        kill_tree(pid).await;
-                                    }
-                                },
-                                Err(err) => {
-                                    emit_agent_event(
-                                        &stdout_runtime.app,
-                                        &stdout_runtime.history_session_id,
-                                        &AgentEvent::Error {
-                                            session_id: Some(session_id.clone()),
-                                            message: format!(
-                                                "获取检查点目录失败，已终止本轮：{err}"
-                                            ),
-                                            recoverable: false,
-                                            kind: Some("checkpoint_failed".to_string()),
-                                            stalled_kind: None,
-                                        },
-                                    );
-                                    let pid = *stdout_runtime.running_pid.lock().await;
-                                    kill_tree(pid).await;
-                                }
-                            }
-                        }
                     }
                     AgentEvent::ApprovalRequest {
                         id,
@@ -6900,7 +7237,7 @@ async fn run_claude_turn(
                     &stdout_runtime.app,
                     &stdout_runtime.history_session_id,
                     &event,
-                );
+                ).await?;
                 if let Some(message) = post_event_error {
                     emit_agent_event(
                         &stdout_runtime.app,
@@ -6912,18 +7249,26 @@ async fn run_claude_turn(
                             kind: Some("permission_audit_failed".to_string()),
                             stalled_kind: None,
                         },
-                    );
+                    ).await?;
                 }
             }
         }
         // 流结束：冲刷残留缓冲
-        if let Some(event) = pending_delta.take() {
-            emit_agent_event(
+        if let Some((event, context)) = pending_delta.take() {
+            emit_stream_event(
                 &stdout_runtime.app,
                 &stdout_runtime.history_session_id,
+                context.as_ref(),
                 &event,
-            );
+            ).await?;
         }
+        Ok::<(), String>(())
+        }.await;
+        if result.is_err() {
+            let pid = *stdout_runtime.running_pid.lock().await;
+            kill_tree(pid).await;
+        }
+        result
     });
 
     let stderr_runtime = runtime.clone();
@@ -6933,74 +7278,83 @@ async fn run_claude_turn(
     // 认证/配额类失败（欠费、Key 失效、403）在 stream-json 模式下 CLI 可能长期
     // 挂住不退出，仅 stderr 有错误行；首次命中立即浮出错误，不等进程退出。
     let stderr_task = tokio::spawn(async move {
-        let mut buf = String::new();
-        let mut lines = BufReader::new(stderr).lines();
-        let mut auth_error_reported = false;
-        while let Ok(Some(line)) = lines.next_line().await {
-            stderr_last_activity.store(now_millis() as u64, Ordering::Release);
-            if !auth_error_reported
-                && (line.contains("Failed to authenticate")
-                    || line.contains("AccessDenied")
-                    || line.contains("Current user is in debt")
-                    || line.contains("API Error: 4"))
-            {
-                auth_error_reported = true;
-                eprintln!(
-                    "[helm] claude stderr auth/api failure surfaced early: {}",
-                    &line[..line.len().min(200)]
-                );
-                emit_error(
-                    &stderr_runtime,
-                    format!("模型调用被拒绝（认证或账户问题）：{line}"),
-                    false,
-                )
-                .await;
-            }
-            // 检测 Hook 的审批通知（兜底通道：常规链路走 stdout 的 deferred_tool_use）
-            if line.starts_with("APPROVAL_NEEDED:")
-                && stderr_saw_session_started.load(Ordering::Acquire)
-            {
-                stderr_saw_approval.store(true, Ordering::Release);
-                if let Some(request_id) = line.strip_prefix("APPROVAL_NEEDED:") {
-                    let pending_info = stderr_runtime
-                        .pending_tools
-                        .lock()
-                        .await
-                        .get(request_id)
-                        .cloned();
-                    // pending_tools 查不到也必须发卡片（变更-07 S7）：否则既无审批卡
-                    // 也无终态事件，saw_approval 又豁免了兜底错误，UI 永久卡 working
-                    let (name, input) = pending_info
-                        .map(|info| (info.name, info.input))
-                        .unwrap_or_else(|| ("未知工具".to_string(), serde_json::Value::Null));
-                    let detail =
-                        serde_json::to_string_pretty(&input).unwrap_or_else(|_| input.to_string());
-                    let session_id = stderr_runtime
-                        .session_id
-                        .lock()
-                        .await
-                        .clone()
-                        .unwrap_or_default();
-                    emit_agent_event(
-                        &stderr_runtime.app,
-                        &stderr_runtime.history_session_id,
-                        &AgentEvent::ApprovalRequest {
-                            session_id,
-                            id: request_id.to_string(),
-                            action: name,
-                            detail,
-                            input: Some(input),
-                            available_decisions: available_approval_decisions(None),
-                            persistent_label: None,
-                            matcher_summary: None,
-                        },
+        let result = async {
+            let mut buf = String::new();
+            let mut lines = BufReader::new(stderr).lines();
+            let mut auth_error_reported = false;
+            while let Ok(Some(line)) = lines.next_line().await {
+                stderr_last_activity.store(now_millis() as u64, Ordering::Release);
+                if !auth_error_reported
+                    && (line.contains("Failed to authenticate")
+                        || line.contains("AccessDenied")
+                        || line.contains("Current user is in debt")
+                        || line.contains("API Error: 4"))
+                {
+                    auth_error_reported = true;
+                    log::warn!(
+                        "[helm] claude stderr auth/api failure surfaced early: {}",
+                        &line[..line.len().min(200)]
                     );
+                    emit_error(
+                        &stderr_runtime,
+                        format!("模型调用被拒绝（认证或账户问题）：{line}"),
+                        false,
+                    )
+                    .await;
                 }
+                // 检测 Hook 的审批通知（兜底通道：常规链路走 stdout 的 deferred_tool_use）
+                if line.starts_with("APPROVAL_NEEDED:")
+                    && stderr_saw_session_started.load(Ordering::Acquire)
+                {
+                    stderr_saw_approval.store(true, Ordering::Release);
+                    if let Some(request_id) = line.strip_prefix("APPROVAL_NEEDED:") {
+                        let pending_info = stderr_runtime
+                            .pending_tools
+                            .lock()
+                            .await
+                            .get(request_id)
+                            .cloned();
+                        // pending_tools 查不到也必须发卡片（变更-07 S7）：否则既无审批卡
+                        // 也无终态事件，saw_approval 又豁免了兜底错误，UI 永久卡 working
+                        let (name, input) = pending_info
+                            .map(|info| (info.name, info.input))
+                            .unwrap_or_else(|| ("未知工具".to_string(), serde_json::Value::Null));
+                        let detail = serde_json::to_string_pretty(&input)
+                            .unwrap_or_else(|_| input.to_string());
+                        let session_id = stderr_runtime
+                            .session_id
+                            .lock()
+                            .await
+                            .clone()
+                            .unwrap_or_default();
+                        emit_agent_event(
+                            &stderr_runtime.app,
+                            &stderr_runtime.history_session_id,
+                            &AgentEvent::ApprovalRequest {
+                                session_id,
+                                id: request_id.to_string(),
+                                action: name,
+                                detail,
+                                input: Some(input),
+                                available_decisions: available_approval_decisions(None),
+                                persistent_label: None,
+                                matcher_summary: None,
+                            },
+                        )
+                        .await?;
+                    }
+                }
+                buf.push_str(&line);
+                buf.push('\n');
             }
-            buf.push_str(&line);
-            buf.push('\n');
+            Ok::<String, String>(buf)
         }
-        buf
+        .await;
+        if result.is_err() {
+            let pid = *stderr_runtime.running_pid.lock().await;
+            kill_tree(pid).await;
+        }
+        result
     });
 
     // 看门狗：进程长时间无任何输出时提示用户（不强杀，用户可自行停止）。
@@ -7026,7 +7380,7 @@ async fn run_claude_turn(
                     .await
                     .clone()
                     .unwrap_or_else(|| watchdog_runtime.history_session_id.clone());
-                emit_agent_event(
+                if emit_agent_event(
                     &watchdog_runtime.app,
                     &watchdog_runtime.history_session_id,
                     &AgentEvent::TurnStage {
@@ -7036,7 +7390,14 @@ async fn run_claude_turn(
                         engine_reported_ttft_ms: None,
                         retry_attempt: None,
                     },
-                );
+                )
+                .await
+                .is_err()
+                {
+                    let pid = *watchdog_runtime.running_pid.lock().await;
+                    kill_tree(pid).await;
+                    return;
+                }
                 log_runtime_event(
                     &watchdog_runtime.app,
                     "watchdog",
@@ -7058,7 +7419,9 @@ async fn run_claude_turn(
                         idle / 1000,
                     ),
                 );
-                interrupt_running(watchdog_runtime.clone()).await;
+                if interrupt_running(watchdog_runtime.clone()).await.is_err() {
+                    return;
+                }
                 return;
             }
         }
@@ -7066,9 +7429,24 @@ async fn run_claude_turn(
 
     let status = child.wait().await;
     watchdog.abort();
-    let _ = stdout_task.await;
-    let detail = stderr_task.await.unwrap_or_default().trim().to_string();
+    let stdout_result = stdout_task.await;
+    let stderr_result = stderr_task.await;
     set_running_pid(&runtime.running_pid, None).await;
+    let detail = match (stdout_result, stderr_result) {
+        (Ok(Ok(())), Ok(Ok(detail))) => detail.trim().to_string(),
+        (Ok(Err(error)), _) | (_, Ok(Err(error))) => {
+            log_stream_submission_error(&runtime.app, &runtime.history_session_id, &error);
+            return;
+        }
+        (Err(error), _) | (_, Err(error)) => {
+            log_stream_submission_error(
+                &runtime.app,
+                &runtime.history_session_id,
+                &format!("[stream_reader_failed] {error}"),
+            );
+            return;
+        }
+    };
 
     // 退出码判定：wait 出错或被信号杀死（无退出码）一律视为异常，绝不能默认成功——
     // 否则既无报错也无 turn_complete，UI 会永远停在"思考中"。
@@ -7182,7 +7560,7 @@ async fn run_claude_turn(
     if disposition == ClaudeExitDisposition::ProcessError {
         let current_model = runtime.model.lock().await.clone();
         let resume_sid = runtime.session_id.lock().await.clone();
-        eprintln!(
+        log::warn!(
             "[helm] claude ProcessError: code={code}, model={current_model}, resume={resume_sid:?}, stderr_len={}, stderr_preview={}",
             detail.len(),
             if detail.is_empty() { "(empty)" } else { &detail[..detail.len().min(500)] }
@@ -7213,7 +7591,12 @@ async fn run_claude_turn(
     } else if disposition == ClaudeExitDisposition::EmitCandidate {
         if let Some(event) = terminal_candidate.take() {
             log_runtime_event(&runtime.app, "emit", "emit=turn_complete(candidate)");
-            emit_agent_event(&runtime.app, &runtime.history_session_id, &event);
+            if emit_agent_event(&runtime.app, &runtime.history_session_id, &event)
+                .await
+                .is_err()
+            {
+                return;
+            }
         } else {
             log_runtime_event(
                 &runtime.app,
@@ -7246,13 +7629,13 @@ async fn run_claude_turn(
     }
 }
 
-async fn interrupt_running(runtime: Arc<SessionRuntime>) {
+async fn interrupt_running(runtime: Arc<SessionRuntime>) -> Result<(), String> {
     runtime.interrupted.store(true, Ordering::Release);
     runtime.idle_notify.notify_waiters();
     let pid = *runtime.running_pid.lock().await;
     kill_tree(pid).await;
     set_running_pid(&runtime.running_pid, None).await;
-    emit_interrupted(&runtime).await;
+    emit_interrupted(&runtime).await
 }
 
 fn select_effective_codex_home(
@@ -7309,6 +7692,7 @@ pub async fn start_claude_with_resume_and_reasoning(
         .map_err(|error| format!("工作目录不可用：{error}"))?
         .to_string_lossy()
         .to_string();
+    sync_subscription_user_skills(&app, "claude-code", &env);
     let execution_cwd = canonical_cwd.clone();
     let policy_cwd = canonical_cwd.clone();
     let permission_service = app
@@ -7473,7 +7857,7 @@ pub async fn start_claude_with_resume_and_reasoning(
                                     let pid = *approval_runtime.running_pid.lock().await;
                                     kill_tree(pid).await;
                                     set_running_pid(&approval_runtime.running_pid, None).await;
-                                    emit_denied_turn(&approval_runtime, request_id).await;
+                                    emit_denied_turn(&approval_runtime, request_id).await?;
                                     return Ok(());
                                 }
                                 wait_until_idle_and_begin(
@@ -7595,9 +7979,9 @@ pub async fn start_claude_with_resume_and_reasoning(
                     }
                 }
                 SessionCmd::Interrupt { responder } => {
-                    interrupt_running(manager_runtime.clone()).await;
+                    let result = interrupt_running(manager_runtime.clone()).await;
                     if let Some(responder) = responder {
-                        let _ = responder.send(Ok(()));
+                        let _ = responder.send(result);
                     }
                 }
             }
@@ -7754,12 +8138,17 @@ fn spawn_codex_app_server_loops(session: CodexSession, process: Arc<CodexAppServ
                 .ok()
                 .and_then(|guard| guard.clone())
                 .unwrap_or_else(|| approval_session.history_session_id.clone());
-            emit_agent_event(
+            if let Err(error) = emit_agent_event(
                 &approval_session.app,
                 &approval_session.history_session_id,
                 &codex_turn_stage(&session_id, TurnStage::WaitingApproval),
-            );
-            emit_agent_event(
+            )
+            .await
+            {
+                fail_codex_active_turn(&approval_session, &error).await;
+                break;
+            }
+            if let Err(error) = emit_agent_event(
                 &approval_session.app,
                 &approval_session.history_session_id,
                 &AgentEvent::ApprovalRequest {
@@ -7774,7 +8163,12 @@ fn spawn_codex_app_server_loops(session: CodexSession, process: Arc<CodexAppServ
                         .map(|display| display.persistent_label.clone()),
                     matcher_summary: grant_display.map(|display| display.matcher_summary),
                 },
-            );
+            )
+            .await
+            {
+                fail_codex_active_turn(&approval_session, &error).await;
+                break;
+            }
         }
     });
 
@@ -7784,15 +8178,42 @@ fn spawn_codex_app_server_loops(session: CodexSession, process: Arc<CodexAppServ
     let mut saw_content = false;
     let mut last_output_tokens: Option<u64> = None;
     spawn_agent_task(async move {
-        while let Some(notification) = notification_rpc.next_notification().await {
+        let mut pending_delta = StreamDeltaBuffer::default();
+        let mut stream_error = 'notifications: loop {
+            if pending_delta.due() {
+                if let Some((event, context)) = pending_delta.take() {
+                    if let Err(error) = emit_stream_event(
+                        &notification_session.app,
+                        &notification_session.history_session_id,
+                        context.as_ref(),
+                        &event,
+                    )
+                    .await
+                    {
+                        break 'notifications error;
+                    }
+                }
+            }
+            let next = if let Some(deadline) = pending_delta.deadline {
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(deadline) => {
+                        if let Some((event, context)) = pending_delta.take() {
+                            if let Err(error) = emit_stream_event(&notification_session.app, &notification_session.history_session_id, context.as_ref(), &event).await { break 'notifications error; }
+                        }
+                        continue;
+                    }
+                    notification = notification_rpc.next_notification() => notification,
+                }
+            } else {
+                notification_rpc.next_notification().await
+            };
+            let Some(notification) = next else {
+                break "Codex app-server notification stream closed".to_string();
+            };
             let notification = match notification {
                 Ok(notification) => notification,
-                Err(error) => {
-                    let _ = notification_session.turn_completions.send(Err(error));
-                    fail_codex_active_turn(&notification_session, "Codex app-server 通知协议失败")
-                        .await;
-                    break;
-                }
+                Err(error) => break error,
             };
             if matches!(
                 notification
@@ -7874,7 +8295,7 @@ fn spawn_codex_app_server_loops(session: CodexSession, process: Arc<CodexAppServ
                                         )
                                     })
                                 {
-                                    eprintln!(
+                                    log::warn!(
                                         "[helm] 持久化 Codex WebSearch 能力观察失败：{error}"
                                     );
                                 }
@@ -8001,25 +8422,29 @@ fn spawn_codex_app_server_loops(session: CodexSession, process: Arc<CodexAppServ
                 &notification,
                 notification_session.interrupted.load(Ordering::Acquire),
             ) {
+                if let Some((event, context)) = pending_delta.take() {
+                    if let Err(error) = emit_stream_event(
+                        &notification_session.app,
+                        &notification_session.history_session_id,
+                        context.as_ref(),
+                        &event,
+                    )
+                    .await
+                    {
+                        break 'notifications error;
+                    }
+                }
                 continue;
             }
-            if let Some((turn_id, outcome)) = &terminal_outcome {
-                let inserted = {
-                    let mut terminal_turns = notification_session.terminal_turns.lock().await;
-                    record_codex_terminal_once(
-                        &mut terminal_turns,
-                        turn_id.clone(),
-                        outcome.clone(),
-                    )
-                };
-                if !inserted {
+            if let Some((turn_id, _)) = &terminal_outcome {
+                if notification_session
+                    .terminal_turns
+                    .lock()
+                    .await
+                    .contains_key(turn_id)
+                {
                     continue;
                 }
-                let completion = match outcome {
-                    Ok(()) => Ok(turn_id.clone()),
-                    Err(error) => Err(error.clone()),
-                };
-                let _ = notification_session.turn_completions.send(completion);
             }
             let session_id = notification_session
                 .thread_id
@@ -8044,37 +8469,82 @@ fn spawn_codex_app_server_loops(session: CodexSession, process: Arc<CodexAppServ
                             Some((format!("unknown-native-turn:{digest}"), 0))
                         })
                 } else {
-                    None
+                    event_turn_context(&notification_session.history_session_id)
                 };
             for event in parse_codex_app_server_notification(&session_id, &event_notification) {
-                if let Some((helm_turn_id, turn_epoch)) = explicit_context.as_ref() {
-                    emit_agent_event_in_turn(
+                let (buffered, event) = pending_delta.push(event, explicit_context.clone());
+                if let Some((buffered, context)) = buffered {
+                    if let Err(error) = emit_stream_event(
                         &notification_session.app,
                         &notification_session.history_session_id,
-                        Some(helm_turn_id),
-                        Some(*turn_epoch),
-                        &event,
-                    );
-                } else {
-                    emit_agent_event(
+                        context.as_ref(),
+                        &buffered,
+                    )
+                    .await
+                    {
+                        break 'notifications error;
+                    }
+                }
+                if let Some(event) = event {
+                    if let Err(error) = emit_stream_event(
                         &notification_session.app,
                         &notification_session.history_session_id,
+                        explicit_context.as_ref(),
                         &event,
-                    );
+                    )
+                    .await
+                    {
+                        break 'notifications error;
+                    }
                 }
             }
-            if terminal_outcome.is_some() {
+            if let Some((turn_id, outcome)) = terminal_outcome {
+                if let Some((event, context)) = pending_delta.take() {
+                    if let Err(error) = emit_stream_event(
+                        &notification_session.app,
+                        &notification_session.history_session_id,
+                        context.as_ref(),
+                        &event,
+                    )
+                    .await
+                    {
+                        break 'notifications error;
+                    }
+                }
+                let inserted = {
+                    let mut terminal_turns = notification_session.terminal_turns.lock().await;
+                    record_codex_terminal_once(
+                        &mut terminal_turns,
+                        turn_id.clone(),
+                        outcome.clone(),
+                    )
+                };
+                if inserted {
+                    let _ = notification_session
+                        .turn_completions
+                        .send(outcome.map(|()| turn_id));
+                }
                 notification_session.terminal_notify.notify_waiters();
             }
+        };
+        if !is_stream_submission_error(&stream_error) {
+            if let Some((event, context)) = pending_delta.take() {
+                if let Err(error) = emit_stream_event(
+                    &notification_session.app,
+                    &notification_session.history_session_id,
+                    context.as_ref(),
+                    &event,
+                )
+                .await
+                {
+                    stream_error = error;
+                }
+            }
         }
-        let _ = notification_session.turn_completions.send(Err(
-            "Codex app-server notification stream closed".to_string(),
-        ));
-        fail_codex_active_turn(
-            &notification_session,
-            "Codex app-server notification stream closed",
-        )
-        .await;
+        let _ = notification_session
+            .turn_completions
+            .send(Err(stream_error.clone()));
+        fail_codex_active_turn(&notification_session, &stream_error).await;
     });
 }
 
@@ -8096,7 +8566,7 @@ async fn fail_codex_active_turn(session: &CodexSession, error: &str) {
 }
 
 impl CodexSession {
-    fn emit_stage(&self, stage: TurnStage) {
+    async fn emit_stage(&self, stage: TurnStage) -> Result<(), String> {
         let session_id = self
             .thread_id
             .lock()
@@ -8113,33 +8583,12 @@ impl CodexSession {
                 engine_reported_ttft_ms: None,
                 retry_attempt: None,
             },
-        );
+        )
+        .await
     }
 
     async fn emit_stage_without_blocking_runtime(&self, stage: TurnStage) -> Result<(), String> {
-        let app = self.app.clone();
-        let history_session_id = self.history_session_id.clone();
-        let session_id = self
-            .thread_id
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
-            .unwrap_or_else(|| history_session_id.clone());
-        tokio::task::spawn_blocking(move || {
-            emit_agent_event(
-                &app,
-                &history_session_id,
-                &AgentEvent::TurnStage {
-                    session_id,
-                    stage,
-                    ts: now_millis(),
-                    engine_reported_ttft_ms: None,
-                    retry_attempt: None,
-                },
-            );
-        })
-        .await
-        .map_err(|error| format!("Codex 阶段事件持久化任务失败：{error}"))
+        self.emit_stage(stage).await
     }
 
     async fn ensure_app_server(&self) -> Result<Arc<CodexAppServerProcess>, String> {
@@ -8267,7 +8716,7 @@ impl CodexSession {
         }
         let (sandbox, native_network_allowed, approval_policy) =
             codex_runtime_profile_policy(mode, permission_profile);
-        self.emit_stage(TurnStage::PreparingRuntime);
+        self.emit_stage(TurnStage::PreparingRuntime).await?;
         let process = self.ensure_app_server().await?;
         if self.interrupted.load(Ordering::Acquire) {
             return Err("[turn_interrupted] Codex Runtime 准备已停止".to_string());
@@ -8305,13 +8754,26 @@ impl CodexSession {
         };
         let existing_thread = self.thread_id.lock().ok().and_then(|guard| guard.clone());
         let force_rebuild = self.force_history_rebuild.load(Ordering::Acquire);
-        let history = self
-            .history_messages
-            .lock()
-            .map(|history| history.clone())
-            .unwrap_or_default();
         let base_prompt = prompt;
-        let mut prompt = codex_app_server_prompt(force_rebuild, &history, &base_prompt);
+        let mut prompt = if force_rebuild {
+            let history_store = self
+                .app
+                .try_state::<SessionHistoryStore>()
+                .ok_or_else(|| "历史存储未启动，无法重建 Codex 上下文".to_string())?;
+            rebuild_codex_prompt_from_ledger(
+                &history_store,
+                &self.history_session_id,
+                &helm_turn_id,
+                &base_prompt,
+                self.capability_snapshot
+                    .lock()
+                    .await
+                    .capabilities
+                    .context_window,
+            )?
+        } else {
+            base_prompt.clone()
+        };
         let execution_cwd = self
             .execution_cwd
             .lock()
@@ -8381,6 +8843,9 @@ impl CodexSession {
                     {
                         Ok(thread_id) => thread_id,
                         Err(error) if is_codex_thread_missing_error(&error) => {
+                            if self.interrupted.load(Ordering::Acquire) {
+                                return Err("[turn_interrupted] Codex 上下文恢复已停止".to_string());
+                            }
                             // app-server reports a missing rollout synchronously from
                             // thread/resume, before the turn stream can trigger the normal
                             // exec-path fallback. Rebuild from Helm's local history here.
@@ -8389,7 +8854,21 @@ impl CodexSession {
                             }
                             self.force_history_rebuild.store(true, Ordering::Release);
                             self.app_server_thread_ready.store(false, Ordering::Release);
-                            prompt = codex_app_server_prompt(true, &history, &base_prompt);
+                            let history_store =
+                                self.app.try_state::<SessionHistoryStore>().ok_or_else(|| {
+                                    "历史存储未启动，无法重建 Codex 上下文".to_string()
+                                })?;
+                            prompt = rebuild_codex_prompt_from_ledger(
+                                &history_store,
+                                &self.history_session_id,
+                                &helm_turn_id,
+                                &base_prompt,
+                                self.capability_snapshot
+                                    .lock()
+                                    .await
+                                    .capabilities
+                                    .context_window,
+                            )?;
                             emit_agent_event(
                                 &self.app,
                                 &self.history_session_id,
@@ -8402,7 +8881,8 @@ impl CodexSession {
                                     kind: Some("thread_missing".to_string()),
                                     stalled_kind: None,
                                 },
-                            );
+                            )
+                            .await?;
                             emit_agent_event(
                                 &self.app,
                                 &self.history_session_id,
@@ -8413,7 +8893,8 @@ impl CodexSession {
                                     engine_reported_ttft_ms: None,
                                     retry_attempt: Some(1),
                                 },
-                            );
+                            )
+                            .await?;
                             process
                                 .rpc
                                 .start_thread_with_policy(
@@ -8431,7 +8912,6 @@ impl CodexSession {
             if let Ok(mut guard) = self.thread_id.lock() {
                 *guard = Some(thread_id.clone());
             }
-            self.force_history_rebuild.store(false, Ordering::Release);
             self.app_server_thread_ready.store(true, Ordering::Release);
             if let Some(history_store) = self.app.try_state::<SessionHistoryStore>() {
                 history_store
@@ -8450,8 +8930,12 @@ impl CodexSession {
                 ts: now_millis(),
                 capabilities: Some(self.capability_snapshot.lock().await.runtime_projection()),
             },
-        );
+        )
+        .await?;
         self.tool_item_facts.lock().await.clear();
+        if self.interrupted.load(Ordering::Acquire) {
+            return Err("[turn_interrupted] Codex 输入投递已停止".to_string());
+        }
         log_runtime_event(
             &self.app,
             "codex-rpc",
@@ -8473,6 +8957,7 @@ impl CodexSession {
             .await
         {
             Ok(turn_id) => {
+                self.force_history_rebuild.store(false, Ordering::Release);
                 log_runtime_event(
                     &self.app,
                     "codex-rpc",
@@ -8541,7 +9026,7 @@ impl CodexSession {
                 };
                 if !tool_stall_reported && stalled_tools.is_some() {
                     tool_stall_reported = true;
-                    self.emit_stage(TurnStage::Stalled);
+                    self.emit_stage(TurnStage::Stalled).await?;
                     let stalled_kind = {
                         let tools = self.tool_item_facts.lock().await;
                         stalled_codex_tool_kind(&tools)
@@ -8563,12 +9048,13 @@ impl CodexSession {
                             kind: Some("tool_stalled".to_string()),
                             stalled_kind: stalled_kind.map(str::to_string),
                         },
-                    );
+                    )
+                    .await?;
                 } else if !turn_stall_reported
                     && terminal_wait_started.elapsed() >= Duration::from_secs(60)
                 {
                     turn_stall_reported = true;
-                    self.emit_stage(TurnStage::Stalled);
+                    self.emit_stage(TurnStage::Stalled).await?;
                     log_runtime_event(
                         &self.app,
                         "turn-stall",
@@ -8664,40 +9150,51 @@ impl CodexSession {
         self.interrupted.store(false, Ordering::Release);
         let task = tauri::async_runtime::spawn(async move {
             if let Err(error) = session.run_app_server_turn(text, attachments, spec).await {
-                if session.interrupted.load(Ordering::Acquire) {
-                    busy.store(false, Ordering::Release);
-                    return;
-                }
-                let error_kind = codex_error_kind(&error).to_string();
-                emit_agent_event(
-                    &session.app,
-                    &session.history_session_id,
-                    &AgentEvent::Error {
-                        session_id: session
+                if !session.interrupted.load(Ordering::Acquire)
+                    && !is_stream_submission_error(&error)
+                {
+                    let emission_result = async {
+                        let error_kind = codex_error_kind(&error).to_string();
+                        emit_agent_event(
+                            &session.app,
+                            &session.history_session_id,
+                            &AgentEvent::Error {
+                                session_id: session
+                                    .thread_id
+                                    .lock()
+                                    .ok()
+                                    .and_then(|guard| guard.clone()),
+                                message: error,
+                                recoverable: true,
+                                kind: Some(error_kind),
+                                stalled_kind: None,
+                            },
+                        )
+                        .await?;
+                        let session_id = session
                             .thread_id
                             .lock()
                             .ok()
-                            .and_then(|guard| guard.clone()),
-                        message: error,
-                        recoverable: true,
-                        kind: Some(error_kind),
-                        stalled_kind: None,
-                    },
-                );
-                let session_id = session
-                    .thread_id
-                    .lock()
-                    .ok()
-                    .and_then(|guard| guard.clone())
-                    .unwrap_or_else(|| session.history_session_id.clone());
-                emit_agent_event(
-                    &session.app,
-                    &session.history_session_id,
-                    &AgentEvent::TurnComplete {
-                        session_id,
-                        stop_reason: StopReason::Error,
-                    },
-                );
+                            .and_then(|guard| guard.clone())
+                            .unwrap_or_else(|| session.history_session_id.clone());
+                        emit_agent_event(
+                            &session.app,
+                            &session.history_session_id,
+                            &AgentEvent::TurnComplete {
+                                session_id,
+                                stop_reason: StopReason::Error,
+                            },
+                        )
+                        .await
+                    }
+                    .await;
+                    if let Err(error) = emission_result {
+                        session.interrupted.store(true, Ordering::Release);
+                        fail_codex_active_turn(&session, &error).await;
+                    }
+                } else if is_stream_submission_error(&error) {
+                    session.interrupted.store(true, Ordering::Release);
+                }
             }
             busy.store(false, Ordering::Release);
             if let Ok(mut slot) = turn_task.lock() {
@@ -8710,6 +9207,8 @@ impl CodexSession {
     }
 
     async fn interrupt_and_wait(&self) -> Result<(), String> {
+        let has_turn =
+            self.busy.load(Ordering::Acquire) || self.current_helm_turn_id.lock().await.is_some();
         let process = self.app_server.clone();
         let app = self.app.clone();
         let history_session_id = self.history_session_id.clone();
@@ -8744,22 +9243,32 @@ impl CodexSession {
         }
         app_server_thread_ready.store(false, Ordering::Release);
         let active_turn_id = turn_id.lock().await.clone();
-        finish_codex_interrupt_terminal(&terminal_turns, &terminal_notify, active_turn_id, || {
-            let session_id = thread_id
-                .lock()
-                .ok()
-                .and_then(|guard| guard.clone())
-                .unwrap_or_else(|| history_session_id.clone());
-            emit_agent_event(
-                &app,
-                &history_session_id,
-                &AgentEvent::TurnComplete {
-                    session_id,
-                    stop_reason: StopReason::Interrupted,
+        let terminal_result = if has_turn {
+            finish_codex_interrupt_terminal(
+                &terminal_turns,
+                &terminal_notify,
+                active_turn_id,
+                || async {
+                    let session_id = thread_id
+                        .lock()
+                        .ok()
+                        .and_then(|guard| guard.clone())
+                        .unwrap_or_else(|| history_session_id.clone());
+                    emit_agent_event(
+                        &app,
+                        &history_session_id,
+                        &AgentEvent::TurnComplete {
+                            session_id,
+                            stop_reason: StopReason::Interrupted,
+                        },
+                    )
+                    .await
                 },
-            );
-        })
-        .await;
+            )
+            .await
+        } else {
+            Ok(())
+        };
         let drained = tokio::time::timeout(CODEX_INTERRUPT_TASK_DRAIN_TIMEOUT, async {
             while self.busy.load(Ordering::Acquire) {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -8777,7 +9286,7 @@ impl CodexSession {
             )
             .await?;
         }
-        Ok(())
+        terminal_result
     }
 }
 
@@ -8804,6 +9313,7 @@ pub(crate) fn start_codex_with_reasoning(
             .map_err(|error| format!("工作目录不可用：{error}"))?
             .to_string_lossy(),
     );
+    sync_subscription_user_skills(&app, "codex", &env);
     let (turn_completions, _) = broadcast::channel(32);
     let runtime_profile = if env
         .iter()
@@ -8827,6 +9337,11 @@ pub(crate) fn start_codex_with_reasoning(
         .or_else(|| auth_home.as_ref().map(|home| home.path.clone()));
     let effective_home =
         select_effective_codex_home(session_home.as_ref(), subscription_home.as_ref());
+    let force_history_rebuild = codex_needs_initial_history_rebuild(
+        &history_messages,
+        native_thread_id.as_deref(),
+        fork_source_thread_id.as_deref(),
+    );
     Ok(AgentSession::Codex(CodexSession {
         app,
         history_session_id,
@@ -8846,7 +9361,7 @@ pub(crate) fn start_codex_with_reasoning(
         fork_last_turn_id: Arc::new(std::sync::Mutex::new(fork_last_turn_id)),
         auth_home: Arc::new(std::sync::Mutex::new(auth_home)),
         effective_home: Arc::new(std::sync::Mutex::new(effective_home)),
-        force_history_rebuild: Arc::new(AtomicBool::new(false)),
+        force_history_rebuild: Arc::new(AtomicBool::new(force_history_rebuild)),
         app_server: Arc::new(Mutex::new(None)),
         app_server_thread_ready: Arc::new(AtomicBool::new(false)),
         pending_approvals: Arc::new(Mutex::new(HashMap::new())),
@@ -9023,33 +9538,45 @@ fn record_codex_terminal_once(
     true
 }
 
-async fn finish_codex_interrupt_terminal<F>(
+async fn finish_codex_interrupt_terminal<Callback, Completion>(
     terminal_turns: &Mutex<HashMap<String, Result<(), String>>>,
     terminal_notify: &Notify,
     active_turn_id: Option<String>,
-    emit_terminal: F,
-) where
-    F: FnOnce(),
+    emit_terminal: Callback,
+) -> Result<(), String>
+where
+    Callback: FnOnce() -> Completion,
+    Completion: Future<Output = Result<(), String>>,
 {
     let should_emit = if let Some(active_turn_id) = active_turn_id.as_ref() {
-        let mut terminal_turns = terminal_turns.lock().await;
+        let terminal_turns = terminal_turns.lock().await;
         match terminal_turns.get(active_turn_id) {
-            Some(Err(error)) if error == "Codex app-server notification stream closed" => {
-                terminal_turns.insert(active_turn_id.clone(), Ok(()));
-                true
-            }
+            Some(Err(error)) if error == "Codex app-server notification stream closed" => true,
             Some(_) => false,
-            None => record_codex_terminal_once(&mut terminal_turns, active_turn_id.clone(), Ok(())),
+            None => true,
         }
     } else {
         true
     };
     if should_emit {
-        emit_terminal();
+        emit_terminal().await?;
+        if let Some(active_turn_id) = active_turn_id.as_ref() {
+            let mut terminal_turns = terminal_turns.lock().await;
+            match terminal_turns.get(active_turn_id) {
+                Some(Err(error)) if error == "Codex app-server notification stream closed" => {
+                    terminal_turns.insert(active_turn_id.clone(), Ok(()));
+                }
+                Some(_) => {}
+                None => {
+                    record_codex_terminal_once(&mut terminal_turns, active_turn_id.clone(), Ok(()));
+                }
+            }
+        }
     }
     if active_turn_id.is_some() {
         terminal_notify.notify_waiters();
     }
+    Ok(())
 }
 
 pub(crate) fn codex_app_server_failure_message(notification: &serde_json::Value) -> String {
@@ -9101,6 +9628,12 @@ fn parse_codex_app_server_notification(
         .get("params")
         .unwrap_or(&serde_json::Value::Null);
     match method {
+        "turn/plan/updated"
+        | "item/commandExecution/outputDelta"
+        | "item/fileChange/outputDelta"
+        | "item/mcpToolCall/progress" => {
+            crate::parse::parse_codex_app_server_progress_notification(session_id, notification)
+        }
         "thread/started" | "turn/started" => {
             vec![codex_turn_stage(session_id, TurnStage::WaitingModel)]
         }
@@ -10074,6 +10607,95 @@ mod turn_stage_tests {
             .into_iter()
             .map(|event| serde_json::to_value(event).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn production_codex_parser_maps_native_plan_statuses_and_turn_identity() {
+        let notification = serde_json::json!({
+            "method": "turn/plan/updated",
+            "params": {
+                "threadId": "native-thread",
+                "turnId": "native-turn",
+                "explanation": "Inspect before changing files",
+                "plan": [
+                    { "step": "Inspect", "status": "completed" },
+                    { "step": "Repair", "status": "inProgress" },
+                    { "step": "Verify", "status": "pending" }
+                ]
+            }
+        });
+        let events = parse_codex_app_server_notification("codex-session", &notification);
+        assert_eq!(events.len(), 1);
+        let crate::protocol::AgentEvent::PlanUpdate { session_id, steps } = &events[0] else {
+            panic!("the production parser must publish plan updates");
+        };
+        assert_eq!(session_id, "codex-session");
+        assert_eq!(
+            serde_json::to_value(steps).unwrap(),
+            serde_json::json!([
+                { "text": "Inspect", "status": "done" },
+                { "text": "Repair", "status": "active" },
+                { "text": "Verify", "status": "pending" }
+            ])
+        );
+        assert_eq!(
+            codex_notification_native_turn_id(&notification),
+            Some("native-turn")
+        );
+        let mut contexts = CodexTurnContextIndex::default();
+        contexts.insert("native-turn".into(), "helm-turn".into(), 12);
+        assert_eq!(
+            contexts.resolve(codex_notification_native_turn_id(&notification).unwrap()),
+            Some(("helm-turn".into(), 12))
+        );
+    }
+
+    #[test]
+    fn production_codex_parser_maps_command_mcp_and_legacy_file_progress() {
+        for (method, field) in [
+            ("item/commandExecution/outputDelta", "delta"),
+            ("item/mcpToolCall/progress", "message"),
+            ("item/fileChange/outputDelta", "delta"),
+        ] {
+            let mut notification = serde_json::json!({
+                "method": method,
+                "params": { "threadId": "native-thread", "turnId": "native-turn", "itemId": "native-tool" }
+            });
+            notification["params"][field] = serde_json::json!("正在处理\n");
+            let events = parse_codex_app_server_notification("codex-session", &notification);
+            assert!(
+                matches!(events.as_slice(), [crate::protocol::AgentEvent::ToolProgress { session_id, id, chunk }]
+                if session_id == "codex-session" && id == "native-tool" && chunk == "正在处理\n"),
+                "method={method}"
+            );
+            assert_eq!(
+                codex_notification_native_turn_id(&notification),
+                Some("native-turn")
+            );
+            notification["params"]
+                .as_object_mut()
+                .unwrap()
+                .remove("turnId");
+            assert!(parse_codex_app_server_notification("codex-session", &notification).is_empty());
+        }
+    }
+
+    #[test]
+    fn production_codex_parser_rejects_malformed_plan_without_guessing_statuses() {
+        for status in [
+            serde_json::json!("active"),
+            serde_json::json!("done"),
+            serde_json::json!(null),
+        ] {
+            let notification = serde_json::json!({
+                "method": "turn/plan/updated",
+                "params": {
+                    "threadId": "native-thread", "turnId": "native-turn",
+                    "plan": [{ "step": "Inspect", "status": status }]
+                }
+            });
+            assert!(parse_codex_app_server_notification("codex-session", &notification).is_empty());
+        }
     }
 
     #[test]

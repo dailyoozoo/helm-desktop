@@ -4,6 +4,7 @@
 // CLI 侧 sessionId 每轮可能变化（Codex 每轮新 id），只作展示/关联用，不作路由键。
 import { useCallback, useEffect, useReducer, useRef } from 'react';
 import { isTauriRuntime } from '../lib/env';
+import { appendToolOutput, boundedToolResult } from '@helm/protocol';
 import type {
   AgentEvent,
   AgentEventEnvelope,
@@ -15,6 +16,8 @@ import type {
   ReasoningEffort,
   RuntimeCapabilitySnapshot,
   TurnStage,
+  TurnPresentation,
+  TurnStreamFailure,
 } from '@helm/protocol';
 import { showToast } from '../components/toast';
 import {
@@ -24,12 +27,11 @@ import {
   appendRuntimeLog,
   interrupt,
   onAgentEvent,
+  onTurnStreamFailure,
   respondApproval,
-  restoreCheckpoint,
   sendMessage,
   setSessionMcpDisabled,
   setSessionTurnPreference,
-  undoRevert,
   type TurnMode,
   type PermissionProfile,
 } from './transport';
@@ -60,12 +62,19 @@ export type ApprovalUiStatus = 'pending' | 'applying' | 'resolved' | 'failed';
 // 通过 subscribeLiveSessions 订阅变化，杜绝「只增不删」的永久误报。
 // ---------------------------------------------------------------------------
 
-interface LiveSessionEntry {
+type LiveTurnIdentity = Pick<
+  AgentEventEnvelope,
+  'turnId' | 'turnEpoch' | 'attemptNo' | 'runtimeGenerationId'
+>;
+
+interface LiveSessionEntry extends LiveTurnIdentity {
   handleId: string;
   working: boolean;
   activity: TurnActivity | null;
   /** 有待处理的审批请求（变更-12）：侧栏黄色徽标 */
   pendingApproval?: boolean;
+  turnFinished?: boolean;
+  streamFailed?: boolean;
 }
 
 const liveSessions = new Map<string, LiveSessionEntry>();
@@ -138,6 +147,7 @@ export function registerLiveSession(
   const existing = liveSessions.get(historyId);
   const sameHandle = existing?.handleId === handleId;
   liveSessions.set(historyId, {
+    ...(sameHandle ? existing : {}),
     handleId,
     working,
     activity: sameHandle ? existing.activity : activity,
@@ -152,7 +162,10 @@ function setLiveSessionWorking(historyId: string, working: boolean): void {
   const changed = entry.working !== working || (!working && entry.activity !== null);
   if (!changed) return;
   entry.working = working;
-  if (!working) entry.activity = null;
+  if (!working) {
+    entry.activity = null;
+    entry.turnFinished = true;
+  }
   notifyLiveChanged();
 }
 
@@ -195,18 +208,92 @@ function sweepIdleHandles(exceptHistoryId: string | null): void {
  * 注册表随事件流自愈：轮次终态置空闲；有输出/新轮次视为运行中。
  * 对所有会话生效（含后台并行会话），与具体视图无关。
  */
-export function applyEnvelopeToLiveRegistry(envelope: AgentEventEnvelope): void {
+function isOlderLiveTurn(entry: LiveSessionEntry, identity: LiveTurnIdentity): boolean {
+  if (entry.turnEpoch !== undefined && identity.turnEpoch !== undefined) {
+    if (identity.turnEpoch < entry.turnEpoch) return true;
+    if (
+      identity.turnEpoch === entry.turnEpoch &&
+      entry.turnId &&
+      identity.turnId &&
+      identity.turnId !== entry.turnId
+    )
+      return true;
+  }
+  if (entry.turnId !== identity.turnId) return false;
+  if (entry.attemptNo !== undefined && identity.attemptNo !== undefined) {
+    if (identity.attemptNo < entry.attemptNo) return true;
+    if (
+      identity.attemptNo === entry.attemptNo &&
+      entry.runtimeGenerationId &&
+      identity.runtimeGenerationId &&
+      identity.runtimeGenerationId !== entry.runtimeGenerationId
+    )
+      return true;
+  }
+  return false;
+}
+
+function sameLiveTurn(entry: LiveSessionEntry, identity: LiveTurnIdentity): boolean {
+  return (
+    entry.turnId === identity.turnId &&
+    (identity.turnEpoch === undefined ||
+      entry.turnEpoch === undefined ||
+      identity.turnEpoch === entry.turnEpoch) &&
+    (identity.attemptNo === undefined ||
+      entry.attemptNo === undefined ||
+      identity.attemptNo === entry.attemptNo)
+  );
+}
+
+function recordLiveTurn(entry: LiveSessionEntry, identity: LiveTurnIdentity): void {
+  if (!identity.turnId) return;
+  if (!sameLiveTurn(entry, identity)) {
+    entry.turnFinished = false;
+    entry.streamFailed = false;
+  }
+  entry.turnId = identity.turnId;
+  entry.turnEpoch = identity.turnEpoch ?? entry.turnEpoch;
+  entry.attemptNo = identity.attemptNo ?? entry.attemptNo;
+  entry.runtimeGenerationId = identity.runtimeGenerationId ?? entry.runtimeGenerationId;
+}
+
+export function applyTurnStreamFailureToLiveRegistry(failure: TurnStreamFailure): boolean {
+  const entry = liveSessions.get(failure.historyId);
+  if (!entry?.working || isOlderLiveTurn(entry, failure)) return false;
+  if (sameLiveTurn(entry, failure) && (entry.turnFinished || entry.streamFailed)) return false;
+  recordLiveTurn(entry, failure);
+  entry.working = false;
+  entry.activity = null;
+  entry.pendingApproval = false;
+  entry.turnFinished = true;
+  entry.streamFailed = true;
+  notifyLiveChanged();
+  return true;
+}
+
+export function applyEnvelopeToLiveRegistry(envelope: AgentEventEnvelope): boolean {
   const entry = liveSessions.get(envelope.historyId);
-  if (!entry) return;
+  if (!entry) return true;
+  if (isOlderLiveTurn(entry, envelope)) return false;
   const event = envelope.event;
   // tool_stalled 是可恢复停顿不是轮次终态（9/4）：轮次还在跑，不能置空闲。
-  const isTerminalError = event.type === 'error' && event.kind !== 'tool_stalled';
+  const isTerminalError =
+    event.type === 'error' && !event.recoverable && event.kind !== 'tool_stalled';
+  if (
+    entry.streamFailed &&
+    (!envelope.turnId || sameLiveTurn(entry, envelope)) &&
+    event.type !== 'turn_complete' &&
+    !isTerminalError
+  )
+    return false;
+  recordLiveTurn(entry, envelope);
   if (event.type === 'turn_complete' || isTerminalError) {
     entry.working = false;
     entry.activity = null;
     entry.pendingApproval = false;
+    entry.turnFinished = true;
     notifyLiveChanged();
-    return;
+    return true;
   }
   if (event.type === 'approval_request') {
     entry.working = true;
@@ -216,7 +303,7 @@ export function applyEnvelopeToLiveRegistry(envelope: AgentEventEnvelope): void 
     };
     entry.pendingApproval = true;
     notifyLiveChanged();
-    return;
+    return true;
   }
   if (event.type === 'turn_stage') {
     entry.activity = {
@@ -258,6 +345,7 @@ export function applyEnvelopeToLiveRegistry(envelope: AgentEventEnvelope): void 
     // 有新输出说明审批已被处理（恢复轮开始），徽标撤下
     if (!wasWorking || wasPending || entry.activity) notifyLiveChanged();
   }
+  return true;
 }
 
 // 工作区最后打开的会话（变更-06）：切页卸载后回来时复用存活句柄恢复线程，
@@ -280,19 +368,36 @@ function rememberLastWorkspaceSession(historyId: string | null): void {
 type EnvelopeListener = (envelope: AgentEventEnvelope) => void;
 const envelopeListeners = new Set<EnvelopeListener>();
 let globalListenerStarted = false;
+type StreamFailureListener = (failure: TurnStreamFailure) => boolean;
+const streamFailureListeners = new Set<StreamFailureListener>();
+let globalFailureListenerStarted = false;
 
 function dispatchEnvelope(envelope: AgentEventEnvelope): void {
-  applyEnvelopeToLiveRegistry(envelope);
+  if (!applyEnvelopeToLiveRegistry(envelope)) return;
   for (const listener of envelopeListeners) listener(envelope);
 }
 
+function dispatchTurnStreamFailure(failure: TurnStreamFailure): void {
+  if (!applyTurnStreamFailureToLiveRegistry(failure)) return;
+  let consumed = false;
+  for (const listener of streamFailureListeners) consumed = listener(failure) || consumed;
+  if (!consumed) showToast(failure.message, 'error');
+}
+
 function ensureGlobalAgentListener(): void {
-  if (globalListenerStarted) return;
-  globalListenerStarted = true;
-  onAgentEvent(dispatchEnvelope).catch(() => {
-    // 浏览器预览（无 Tauri）下没有事件桥，保持静态空态即可；允许后续重试
-    globalListenerStarted = false;
-  });
+  if (!globalFailureListenerStarted) {
+    globalFailureListenerStarted = true;
+    onTurnStreamFailure(dispatchTurnStreamFailure).catch(() => {
+      globalFailureListenerStarted = false;
+    });
+  }
+  if (!globalListenerStarted) {
+    globalListenerStarted = true;
+    onAgentEvent(dispatchEnvelope).catch(() => {
+      // 浏览器预览（无 Tauri）下没有事件桥，保持静态空态即可；允许后续重试
+      globalListenerStarted = false;
+    });
+  }
 }
 
 /// 放弃一个句柄：轮次进行中 → 挂后台保活（P3-3 并行会话）；空闲 → 通知后端回收。
@@ -370,16 +475,12 @@ export type ThreadItem =
       matcherSummary?: string;
       reverted?: boolean;
     } & ThreadItemMeta)
-  | ({ kind: 'plan'; id: string; steps: PlanStep[]; reverted?: boolean } & ThreadItemMeta)
   | ({
-      kind: 'checkpoint';
+      kind: 'plan';
       id: string;
-      label: string;
-      ts: number;
-      restored: boolean;
-      restorable: boolean;
-      fileCount: number;
-      reason?: string;
+      steps: PlanStep[];
+      truncated?: boolean;
+      reverted?: boolean;
     } & ThreadItemMeta)
   | ({
       kind: 'error';
@@ -439,6 +540,7 @@ export interface SessionState {
 
 type Action =
   | { type: 'event'; event: AgentEvent; turnId?: string }
+  | { type: 'stream_failure'; failure: TurnStreamFailure }
   | {
       type: 'send';
       id: string;
@@ -448,6 +550,7 @@ type Action =
       permissionProfile?: PermissionProfile;
     }
   | { type: 'handle'; handleId: string }
+  | { type: 'discard_handle'; handleId: string }
   | { type: 'idle' }
   | { type: 'reset'; defaults?: SessionDefaults }
   | { type: 'apply_defaults'; defaults: SessionDefaults }
@@ -457,8 +560,6 @@ type Action =
   | { type: 'approval_resolved'; approvalId: string; decision: Decision }
   | { type: 'approval_failed'; approvalId: string; error: string }
   | { type: 'working' }
-  | { type: 'restore_checkpoint'; checkpointId: string }
-  | { type: 'undo_revert' }
   | { type: 'set_cwd'; cwd: string }
   | { type: 'set_disabled_mcp'; disabled: string[] }
   /** B 方案「历史先行」：CLI 还在后台重建时，先把已拉到的历史渲染出来。
@@ -768,7 +869,11 @@ export function reduceSessionEvent(s: SessionState, e: AgentEvent, turnId?: stri
       }
       // 流式项已被正文/工具关闭（变更-09 S2）：优先合并回最后一个未落定的 thinking 项；
       // 内容与已有项一致则视为轮末重放，去重跳过；都不是才追加新项
-      const openIndex = findLastIndex(s.items, (it) => it.kind === 'thinking' && !it.done);
+      const openIndex = findLastIndex(
+        s.items,
+        (it) =>
+          it.kind === 'thinking' && !it.done && !it.turnStatus && (!turnId || it.turnId === turnId),
+      );
       if (openIndex >= 0) {
         return {
           ...s,
@@ -785,7 +890,11 @@ export function reduceSessionEvent(s: SessionState, e: AgentEvent, turnId?: stri
           ),
         };
       }
-      if (s.items.some((it) => it.kind === 'thinking' && it.text === e.text)) {
+      if (
+        s.items.some(
+          (it) => it.kind === 'thinking' && it.text === e.text && (!turnId || it.turnId === turnId),
+        )
+      ) {
         return { ...s, ...activity };
       }
       return {
@@ -837,33 +946,43 @@ export function reduceSessionEvent(s: SessionState, e: AgentEvent, turnId?: stri
       return {
         ...s,
         items: s.items.map((it) =>
-          it.kind === 'tool' && it.id === e.id
-            ? { ...it, output: (it.output ?? '') + e.chunk }
+          it.kind === 'tool' &&
+          it.id === e.id &&
+          it.status === 'pending' &&
+          !it.turnStatus &&
+          (!turnId || !it.turnId || it.turnId === turnId)
+            ? { ...it, output: appendToolOutput(it.output ?? '', e.chunk) }
             : it,
         ),
       };
 
-    case 'tool_result':
+    case 'tool_result': {
       return {
         ...s,
-        items: s.items.map((it) =>
-          it.kind === 'tool' && it.id === e.id
-            ? {
-                ...it,
-                status: e.status,
-                output: e.output ?? it.output,
-                diff: e.diff ?? it.diff,
-                outcome: e.outcome,
-                started: e.started,
-                hasOutput: e.hasOutput,
-                retryable: e.retryable,
-                denialSource: e.denialSource,
-                nativeDenialCode: e.nativeDenialCode,
-                ...(it.startedAt ? { endedAt: Date.now() } : {}),
-              }
-            : it,
-        ),
+        items: s.items.map((item) => {
+          if (
+            item.kind !== 'tool' ||
+            item.id !== e.id ||
+            item.turnStatus ||
+            (turnId && item.turnId && item.turnId !== turnId)
+          )
+            return item;
+          const bounded = boundedToolResult(e.output ?? item.output, e.diff ?? item.diff);
+          return {
+            ...item,
+            ...bounded,
+            status: e.status,
+            outcome: e.outcome,
+            started: e.started,
+            hasOutput: e.hasOutput,
+            retryable: e.retryable,
+            denialSource: e.denialSource,
+            nativeDenialCode: e.nativeDenialCode,
+            ...(item.startedAt != null ? { endedAt: Date.now() } : {}),
+          };
+        }),
       };
+    }
 
     case 'token_usage':
       return {
@@ -928,33 +1047,62 @@ export function reduceSessionEvent(s: SessionState, e: AgentEvent, turnId?: stri
           : e.stopReason === 'interrupted'
             ? 'interrupted'
             : 'failed';
-      const items = s.items.map((it) => {
-        const terminal = turnId && it.turnId === turnId ? { turnStatus } : {};
-        if (interrupted && it.kind === 'assistant' && it.id === s.openAssistantId) {
-          return { ...it, ...terminal, interrupted: true };
+      const endedAt = Date.now();
+      const currentTurnStart = Math.max(
+        0,
+        findLastIndex(s.items, (item) => item.kind === 'user'),
+      );
+      const currentTurnId = s.items.find(
+        (item, index) => index >= currentTurnStart && item.turnId,
+      )?.turnId;
+      const settlesCurrentTurn = !turnId || !currentTurnId || currentTurnId === turnId;
+      const items = s.items.map((it, index) => {
+        const belongsToTurn = turnId
+          ? it.turnId === turnId || (!it.turnId && index >= currentTurnStart && settlesCurrentTurn)
+          : index >= currentTurnStart;
+        if (!belongsToTurn || it.turnStatus) return it;
+        const terminal = { turnStatus, ...(turnId ? { turnId } : {}) };
+        if (it.kind === 'thinking' && !it.done) {
+          return { ...it, ...terminal, done: true, endedAt };
+        }
+        if (it.kind === 'approval' && it.status !== 'resolved') {
+          return {
+            ...it,
+            ...terminal,
+            status: 'resolved' as const,
+            availableDecisions: [],
+            endedAt,
+          };
+        }
+        if (it.kind === 'assistant' && it.id === s.openAssistantId) {
+          return { ...it, ...terminal, ...(interrupted ? { interrupted: true } : {}), endedAt };
         }
         if (it.kind === 'tool' && it.status === 'pending') {
+          const notice = interrupted
+            ? '[turn_interrupted] 轮次已中断，工具调用未完成'
+            : '[tool_result_missing] 轮次已结束，但 Runtime 未返回最终结果';
           return {
             ...it,
             ...terminal,
             status: 'error' as const,
-            output:
-              e.stopReason === 'interrupted'
-                ? '[turn_interrupted] 轮次已中断，工具调用未完成'
-                : '[tool_result_missing] 轮次已结束，但 Runtime 未返回最终结果',
-            ...(it.startedAt ? { endedAt: Date.now() } : {}),
+            ...boundedToolResult(it.output ? `${notice}\n${it.output}` : notice, it.diff),
+            endedAt,
           };
         }
-        return Object.keys(terminal).length ? { ...it, ...terminal } : it;
+        return { ...it, ...terminal };
       });
       return {
         ...s,
-        status: 'idle',
-        openAssistantId: null,
-        openThinkingId: null,
-        turnActivity: null,
-        turnStartedAt: null,
-        items: closeOpenThinking(items, s.openThinkingId),
+        ...(settlesCurrentTurn
+          ? {
+              status: 'idle' as const,
+              openAssistantId: null,
+              openThinkingId: null,
+              turnActivity: null,
+              turnStartedAt: null,
+            }
+          : {}),
+        items,
       };
     }
 
@@ -973,13 +1121,21 @@ export function reduceSessionEvent(s: SessionState, e: AgentEvent, turnId?: stri
           },
         };
       }
+      const settled = e.recoverable
+        ? s
+        : reduceSessionEvent(
+            s,
+            {
+              type: 'turn_complete',
+              sessionId: e.sessionId ?? s.sessionId ?? '',
+              stopReason: 'error',
+            },
+            turnId,
+          );
       return {
-        ...s,
-        status: 'idle',
-        turnActivity: null,
-        turnStartedAt: null,
+        ...settled,
         items: [
-          ...s.items,
+          ...settled.items,
           {
             kind: 'error',
             id: uid('e'),
@@ -987,6 +1143,7 @@ export function reduceSessionEvent(s: SessionState, e: AgentEvent, turnId?: stri
             errorKind: e.kind,
             stalledKind: e.stalledKind,
             ...(turnId ? { turnId } : {}),
+            ...(!e.recoverable ? { turnStatus: 'failed' as const } : {}),
           },
         ],
       };
@@ -1031,37 +1188,20 @@ export function reduceSessionEvent(s: SessionState, e: AgentEvent, turnId?: stri
     }
 
     case 'plan_update': {
-      const id = `plan-${e.sessionId}`;
+      const id = `plan-${turnId ?? e.sessionId}`;
       const hasPlan = s.items.some((it) => it.kind === 'plan' && it.id === id);
       return {
         ...s,
         openAssistantId: null,
         items: hasPlan
           ? s.items.map((it) =>
-              it.kind === 'plan' && it.id === id ? { ...it, steps: e.steps } : it,
+              it.kind === 'plan' && it.id === id
+                ? { ...it, steps: e.steps, truncated: undefined }
+                : it,
             )
           : [...s.items, { kind: 'plan', id, steps: e.steps, ...(turnId ? { turnId } : {}) }],
       };
     }
-
-    case 'checkpoint':
-      return {
-        ...s,
-        items: [
-          ...s.items,
-          {
-            kind: 'checkpoint',
-            id: e.id,
-            label: e.label,
-            ts: e.ts,
-            restored: false,
-            restorable: e.restorable,
-            fileCount: e.fileCount,
-            reason: e.reason,
-            ...(turnId ? { turnId } : {}),
-          },
-        ],
-      };
 
     default:
       return s;
@@ -1070,6 +1210,13 @@ export function reduceSessionEvent(s: SessionState, e: AgentEvent, turnId?: stri
 
 export function reduceSessionAction(s: SessionState, a: Action): SessionState {
   switch (a.type) {
+    case 'stream_failure':
+      if (s.historyId !== a.failure.historyId || s.status !== 'working') return s;
+      return reduceSessionEvent(
+        s,
+        { type: 'error', message: a.failure.message, recoverable: false },
+        a.failure.turnId,
+      );
     case 'event':
       return reduceSessionEvent(s, a.event, a.turnId);
     case 'send': {
@@ -1104,6 +1251,16 @@ export function reduceSessionAction(s: SessionState, a: Action): SessionState {
     case 'handle':
       // 新会话：句柄 id 即历史会话 id（后端 bind_history_session(handle, handle)）
       return { ...s, handleId: a.handleId, historyId: a.handleId };
+    case 'discard_handle':
+      if (s.handleId !== a.handleId) return s;
+      return {
+        ...reduceSessionAction(s, { type: 'idle' }),
+        handleId: null,
+        historyId: null,
+        sessionId: null,
+        runtimeModel: undefined,
+        runtimeCapabilities: undefined,
+      };
     case 'idle':
       return {
         ...s,
@@ -1135,7 +1292,7 @@ export function reduceSessionAction(s: SessionState, a: Action): SessionState {
       return {
         ...s,
         items: s.items.map((it) =>
-          it.kind === 'approval' && it.id === a.approvalId
+          it.kind === 'approval' && it.id === a.approvalId && !it.turnStatus
             ? { ...it, status: 'applying', error: undefined }
             : it,
         ),
@@ -1144,7 +1301,7 @@ export function reduceSessionAction(s: SessionState, a: Action): SessionState {
       return {
         ...s,
         items: s.items.map((it) =>
-          it.kind === 'approval' && it.id === a.approvalId
+          it.kind === 'approval' && it.id === a.approvalId && !it.turnStatus
             ? { ...it, status: 'resolved', decision: a.decision, error: undefined }
             : it,
         ),
@@ -1153,37 +1310,11 @@ export function reduceSessionAction(s: SessionState, a: Action): SessionState {
       return {
         ...s,
         items: s.items.map((it) =>
-          it.kind === 'approval' && it.id === a.approvalId
+          it.kind === 'approval' && it.id === a.approvalId && !it.turnStatus
             ? { ...it, status: 'failed', error: a.error }
             : it,
         ),
       };
-    case 'restore_checkpoint': {
-      const idx = s.items.findIndex((it) => it.kind === 'checkpoint' && it.id === a.checkpointId);
-      if (idx === -1) return s;
-      return {
-        ...s,
-        // 回溯后旧 CLI 会话已作废（P2-5）：清除绑定，等下一轮新 session_started 重新绑定
-        sessionId: null,
-        items: s.items.map((it, i) => {
-          if (it.kind === 'checkpoint' && it.id === a.checkpointId) {
-            return { ...it, restored: true };
-          }
-          if (i > idx) {
-            if (
-              it.kind === 'assistant' ||
-              it.kind === 'thinking' ||
-              it.kind === 'tool' ||
-              it.kind === 'approval' ||
-              it.kind === 'plan'
-            ) {
-              return { ...it, reverted: true };
-            }
-          }
-          return it;
-        }),
-      };
-    }
     case 'set_cwd':
       // 仅在会话未开始时切换用户选择的工作目录。
       return { ...s, cwd: a.cwd };
@@ -1227,20 +1358,6 @@ export function reduceSessionAction(s: SessionState, a: Action): SessionState {
       };
     case 'set_disabled_mcp':
       return { ...s, disabledMcp: a.disabled };
-    case 'undo_revert':
-      return {
-        ...s,
-        items: s.items.map((it) => {
-          if (it.kind === 'checkpoint') {
-            return { ...it, restored: false };
-          }
-          if ('reverted' in it && it.reverted) {
-            const { reverted: _reverted, ...rest } = it;
-            return rest as ThreadItem;
-          }
-          return it;
-        }),
-      };
     case 'resume_handle':
       return {
         ...s,
@@ -1475,7 +1592,6 @@ export function itemsFromHistory(detail: SessionDetail): ThreadItem[] {
   detail.approvals?.forEach((approval) =>
     rememberEvent(approval.turnId, approval.resolvedAt ?? approval.ts),
   );
-  detail.checkpoints.forEach((checkpoint) => rememberEvent(checkpoint.turnId, checkpoint.ts));
 
   const inferLegacyAssistantTurnId = (message: SessionDetail['messages'][number]) => {
     if (message.role !== 'assistant' || message.turnId) return message.turnId ?? undefined;
@@ -1581,20 +1697,89 @@ export function itemsFromHistory(detail: SessionDetail): ThreadItem[] {
       },
     });
   }
-  for (const checkpoint of detail.checkpoints) {
+  const presentations = [...(detail.presentations ?? [])].sort(
+    (left, right) => left.ts - right.ts || left.eventSeq - right.eventSeq,
+  );
+  const latestPlans = new Map<string, TurnPresentation>();
+  for (const presentation of presentations) {
+    if (presentation.kind !== 'plan') continue;
+    const previous = latestPlans.get(presentation.turnId);
+    if (!previous || previous.eventSeq < presentation.eventSeq) {
+      latestPlans.set(presentation.turnId, presentation);
+    }
+  }
+  const seenPresentations = new Set<string>();
+  for (const presentation of presentations) {
+    if (presentation.kind === 'plan' && latestPlans.get(presentation.turnId) !== presentation)
+      continue;
+    const id = `history-p-${presentation.turnId}-${presentation.eventSeq}-${presentation.kind}${presentation.kind === 'message' ? `-${presentation.role}` : ''}`;
+    if (seenPresentations.has(id)) continue;
+    seenPresentations.add(id);
+    const turn = turnsById.get(presentation.turnId);
+    const turnStatus = terminalTurnStatus(presentation.turnId);
+    const meta = {
+      id,
+      turnId: presentation.turnId,
+      ...(turnStatus ? { turnStatus } : {}),
+      ...(presentation.reverted ? { reverted: true } : {}),
+    };
+    let item: ThreadItem;
+    if (presentation.kind === 'thinking') {
+      item = {
+        ...meta,
+        kind: 'thinking',
+        text: presentation.text,
+        done: true,
+        ...(presentation.endedAt != null ? { startedAt: presentation.ts } : {}),
+        endedAt:
+          presentation.endedAt ??
+          (presentation.complete ? presentation.ts : (turn?.endedAt ?? presentation.ts)),
+      };
+    } else if (presentation.kind === 'plan') {
+      item = {
+        ...meta,
+        kind: 'plan',
+        id: `plan-${presentation.turnId}`,
+        steps: presentation.steps,
+        ...(presentation.truncated ? { truncated: true } : {}),
+      };
+    } else if (presentation.role === 'user') {
+      item = {
+        ...meta,
+        kind: 'user',
+        text: presentation.text,
+        mode: turn?.mode,
+        permissionProfile: turn?.permissionProfile,
+      };
+    } else {
+      item = {
+        ...meta,
+        kind: 'assistant',
+        text: presentation.text,
+        ...(!presentation.complete && turnStatus === 'interrupted' ? { interrupted: true } : {}),
+      };
+    }
+    entries.push({ ts: presentation.ts, seq: seq++, item });
+  }
+  // 失败轮次重建错误卡：错误条目只存在于实时事件路径，重开会话后线程里只剩
+  // TurnProcess 的一行裸 terminal_reason。这里从轮次记录把失败原因还原成与
+  // 实时一致的错误卡；裸 stop reason 枚举值（end/interrupted/error）没有细节，
+  // 旧库轮次不重建，避免渲染一张只写着 "error" 的空卡。
+  const BARE_STOP_REASONS = new Set(['end', 'interrupted', 'error']);
+  for (const turn of detail.turns ?? []) {
+    if (turn.status !== 'failed') continue;
+    const reason = turn.terminalReason?.trim();
+    if (!reason || BARE_STOP_REASONS.has(reason.toLowerCase())) continue;
     entries.push({
-      ts: checkpoint.ts,
+      ts: turn.endedAt ?? turn.startedAt,
       seq: seq++,
       item: {
-        kind: 'checkpoint',
-        id: checkpoint.id,
-        label: checkpoint.label,
-        ts: checkpoint.ts,
-        restored: false,
-        restorable: checkpoint.restorable ?? false,
-        fileCount: checkpoint.fileCount ?? 0,
-        reason: checkpoint.reason ?? undefined,
-        ...(checkpoint.turnId ? { turnId: checkpoint.turnId } : {}),
+        kind: 'error',
+        id: `history-e-${turn.id}`,
+        message: reason,
+        errorKind: classifyClientErrorKind(reason),
+        turnId: turn.id,
+        turnStatus: 'failed',
       },
     });
   }
@@ -1604,6 +1789,13 @@ export function itemsFromHistory(detail: SessionDetail): ThreadItem[] {
 export function useSession(defaults?: SessionDefaults) {
   const [state, dispatch] = useReducer(reduceSessionAction, defaults, initialState);
   const handleRef = useRef<string | null>(null);
+  const sendEpochRef = useRef(0);
+  const terminalEpochRef = useRef(0);
+  const pendingSendRef = useRef<{
+    epoch: number;
+    dispatch: Promise<void> | null;
+    createdHandle: string | null;
+  } | null>(null);
   const disabledMcpRef = useRef<string[]>(state.disabledMcp);
   const mcpSyncQueueRef = useRef<{ handle: string; queue: McpDisabledSyncQueue } | null>(null);
   // 当前句柄对应的 history 会话 id：事件路由键 + 并行会话注册表的 key
@@ -1623,6 +1815,13 @@ export function useSession(defaults?: SessionDefaults) {
     ensureGlobalAgentListener();
     const listener: EnvelopeListener = (envelope) => {
       if (shouldConsumeAgentEvent(historyIdRef.current, envelope)) {
+        const event = envelope.event;
+        if (
+          event.type === 'turn_complete' ||
+          (event.type === 'error' && !event.recoverable && event.kind !== 'tool_stalled')
+        ) {
+          terminalEpochRef.current += 1;
+        }
         dispatch({ type: 'event', event: envelope.event, turnId: envelope.turnId });
       } else if (isTauriRuntime()) {
         // 排查日志：事件因 historyId 不匹配被丢弃——「后端发了但前端没消费」是
@@ -1637,6 +1836,13 @@ export function useSession(defaults?: SessionDefaults) {
       }
     };
     envelopeListeners.add(listener);
+    const failureListener: StreamFailureListener = (failure) => {
+      if (historyIdRef.current !== failure.historyId) return false;
+      terminalEpochRef.current += 1;
+      dispatch({ type: 'stream_failure', failure });
+      return true;
+    };
+    streamFailureListeners.add(failureListener);
 
     // 监听 window.postMessage（用于开发测试）：载荷缺 historyId 时视为发给当前线程
     const handlePostMessage = (evt: MessageEvent) => {
@@ -1654,7 +1860,14 @@ export function useSession(defaults?: SessionDefaults) {
     window.addEventListener('message', handlePostMessage);
 
     return () => {
+      if (pendingSendRef.current && !pendingSendRef.current.dispatch && handleRef.current) {
+        releaseHandle(handleRef.current, historyIdRef.current);
+        handleRef.current = null;
+      }
+      sendEpochRef.current += 1;
+      pendingSendRef.current = null;
       envelopeListeners.delete(listener);
+      streamFailureListeners.delete(failureListener);
       window.removeEventListener('message', handlePostMessage);
       // 卸载（切页）不关闭句柄：注册表保留句柄与运行状态，回到工作区时按
       // lastOpenWorkspaceSession 复用恢复线程（可靠性检查 C1/A10）。
@@ -1666,6 +1879,8 @@ export function useSession(defaults?: SessionDefaults) {
       // publishResume 同时写 pendingResume 并派发事件；事件路径消费后必须清掉
       // pendingResume，否则组件下次挂载会重放陈旧快照（可靠性检查 A4）
       consumePendingResume();
+      sendEpochRef.current += 1;
+      pendingSendRef.current = null;
       const prevHandle = handleRef.current;
       const prevHistoryId = historyIdRef.current;
       if (prevHandle && prevHandle !== payload.handleId) {
@@ -1693,6 +1908,8 @@ export function useSession(defaults?: SessionDefaults) {
     // B 方案历史先行：CLI 后台重建期间先渲染线程内容。只填身份与 items，
     // 句柄保持空——后续 helm:resume-session 到达时 applyResume 升级为完整状态。
     const applyHistoryOnly = (payload: HistoryOnlyPayload) => {
+      sendEpochRef.current += 1;
+      pendingSendRef.current = null;
       const prevHandle = handleRef.current;
       const prevHistoryId = historyIdRef.current;
       if (prevHandle && prevHistoryId && prevHistoryId !== payload.session.id) {
@@ -1757,7 +1974,15 @@ export function useSession(defaults?: SessionDefaults) {
       fullAccessConfirmed = false,
     ) => {
       const trimmed = text.trim();
-      if (!trimmed) return false;
+      if (!trimmed || pendingSendRef.current) return false;
+      const epoch = ++sendEpochRef.current;
+      const pending = {
+        epoch,
+        dispatch: null as Promise<void> | null,
+        createdHandle: null as string | null,
+      };
+      pendingSendRef.current = pending;
+      const isCurrent = () => sendEpochRef.current === epoch;
       const mountedPaths = Array.from(
         new Set(attachments.map((path) => path.trim()).filter(Boolean)),
       );
@@ -1783,6 +2008,11 @@ export function useSession(defaults?: SessionDefaults) {
             fullAccessConfirmed:
               permissionProfile === 'full_access' ? fullAccessConfirmed : undefined,
           });
+          if (!isCurrent()) {
+            await closeSession(handle).catch(() => undefined);
+            return false;
+          }
+          pending.createdHandle = handle;
           handleRef.current = handle;
           // 新会话的 history id 即句柄 id（后端 bind_history_session(handle, handle)）
           historyIdRef.current = handle;
@@ -1796,17 +2026,23 @@ export function useSession(defaults?: SessionDefaults) {
               rollback: [],
               sync: setSessionMcpDisabled,
               dispatch: (disabled) => {
+                if (!isCurrent()) return;
                 disabledMcpRef.current = disabled;
                 dispatch({ type: 'set_disabled_mcp', disabled });
               },
-              onFailed: (message) =>
-                showToast(`MCP 禁用状态下发失败，已恢复全部启用：${message}`, 'error'),
+              onFailed: (message) => {
+                if (isCurrent())
+                  showToast(`MCP 禁用状态下发失败，已恢复全部启用：${message}`, 'error');
+              },
             });
           }
         }
+        if (!isCurrent()) {
+          return false;
+        }
         registerLiveSession(historyIdRef.current ?? handle, handle, true);
         // commandText（变更-08）：斜杠命令展开结果发给 CLI，线程/历史存 text 原文
-        await sendMessage(
+        pending.dispatch = sendMessage(
           handle,
           trimmed,
           mountedPaths,
@@ -1815,49 +2051,101 @@ export function useSession(defaults?: SessionDefaults) {
           state.model,
           reasoningEffort,
         );
-        return true;
+        await pending.dispatch;
+        return isCurrent();
       } catch (err) {
+        if (!isCurrent()) return false;
         if (historyIdRef.current) setLiveSessionWorking(historyIdRef.current, false);
         dispatch({
           type: 'event',
           event: errorEvent(err),
         });
         return false;
+      } finally {
+        if (pendingSendRef.current?.epoch === epoch) pendingSendRef.current = null;
       }
     },
     [state.cwd, state.disabledMcp, state.engine, state.model],
   );
 
   const stop = useCallback(async () => {
+    const pending = pendingSendRef.current;
+    const stopEpoch = ++sendEpochRef.current;
+    pendingSendRef.current = null;
     const handle = handleRef.current;
+    const historyId = historyIdRef.current;
     if (!handle) {
       dispatch({ type: 'idle' });
       return;
     }
     try {
+      if (pending?.createdHandle === handle && !pending.dispatch) {
+        handleRef.current = null;
+        historyIdRef.current = null;
+        mcpSyncQueueRef.current = null;
+        rememberLastWorkspaceSession(null);
+        dispatch({ type: 'discard_handle', handleId: handle });
+        await closeSession(handle);
+        return;
+      }
       await interrupt(handle);
+      if (sendEpochRef.current !== stopEpoch) return;
+      if (
+        pending &&
+        (!pending.dispatch ||
+          !(await pending.dispatch.then(
+            () => true,
+            () => false,
+          )))
+      ) {
+        if (sendEpochRef.current !== stopEpoch) return;
+        if (historyId) setLiveSessionWorking(historyId, false);
+        dispatch({ type: 'idle' });
+        return;
+      }
       // Stop 是控制面请求；只有后端快照确认终态后才改变前端状态。
       // 这样即使 CLI/IPC 迟到，UI 也不会先显示“已停止”而实际仍在执行。
       for (let attempt = 0; attempt < 40; attempt += 1) {
         const snapshot = await getTurnSnapshot(handle).catch(() => null);
+        if (sendEpochRef.current !== stopEpoch) return;
         if (
           snapshot &&
+          snapshot.historySessionId === historyId &&
           (snapshot.status === 'succeeded' ||
             snapshot.status === 'failed' ||
             snapshot.status === 'interrupted')
         ) {
-          dispatch({ type: 'idle' });
+          if (historyId) setLiveSessionWorking(historyId, false);
+          terminalEpochRef.current += 1;
+          dispatch({
+            type: 'event',
+            turnId: snapshot.turnId,
+            event: {
+              type: 'turn_complete',
+              sessionId: handle,
+              stopReason:
+                snapshot.status === 'succeeded'
+                  ? 'end'
+                  : snapshot.status === 'interrupted'
+                    ? 'interrupted'
+                    : 'error',
+            },
+          });
           return;
         }
         await new Promise((resolve) => window.setTimeout(resolve, 50));
       }
-      showToast('停止请求已发送，正在等待运行时确认终态', 'info');
+      if (sendEpochRef.current === stopEpoch)
+        showToast('停止请求已发送，正在等待运行时确认终态', 'info');
     } catch (error) {
-      showToast(error instanceof Error ? error.message : '发送停止请求失败', 'error');
+      if (sendEpochRef.current === stopEpoch)
+        showToast(error instanceof Error ? error.message : '发送停止请求失败', 'error');
     }
   }, []);
 
   const releaseCurrent = useCallback(() => {
+    sendEpochRef.current += 1;
+    pendingSendRef.current = null;
     const handle = handleRef.current;
     if (handle) releaseHandle(handle, historyIdRef.current);
     handleRef.current = null;
@@ -1936,51 +2224,34 @@ export function useSession(defaults?: SessionDefaults) {
   const approve = useCallback(async (approvalId: string, decision: Decision) => {
     const handle = handleRef.current;
     if (!handle) return;
+    const historyId = historyIdRef.current;
+    const sendEpoch = sendEpochRef.current;
+    const terminalEpoch = terminalEpochRef.current;
+    const isCurrent = () =>
+      handleRef.current === handle &&
+      sendEpochRef.current === sendEpoch &&
+      terminalEpochRef.current === terminalEpoch;
     await submitApprovalTransaction({
       approvalId,
       decision,
       respond: (id, nextDecision) => respondApproval(handle, id, nextDecision),
-      dispatch,
+      dispatch: (action) => {
+        if (isCurrent()) dispatch(action);
+      },
       onResolved: (resolvedDecision) => {
+        if (!isCurrent()) return;
         // 审批事务已提交（后端账本 pending → applying → resolved），立即撤下
         // 侧栏「待审批」徽标；deny 后不再有恢复轮事件，主动清理避免悬挂。
-        if (historyIdRef.current) clearLiveSessionApproval(historyIdRef.current);
+        if (historyId) clearLiveSessionApproval(historyId);
         if (resolvedDecision === 'deny') return;
         // 后端确认恢复轮已接管后，线程才回到运行中。
         dispatch({ type: 'working' });
-        if (historyIdRef.current) setLiveSessionWorking(historyIdRef.current, true);
+        if (historyId) setLiveSessionWorking(historyId, true);
       },
-      onFailed: (message) => showToast(`审批失败：${message}，可重试`, 'error'),
+      onFailed: (message) => {
+        if (isCurrent()) showToast(`审批失败：${message}，可重试`, 'error');
+      },
     });
-  }, []);
-
-  const restoreCheckpointAction = useCallback(async (checkpointId: string) => {
-    try {
-      await restoreCheckpoint(checkpointId);
-      dispatch({ type: 'restore_checkpoint', checkpointId });
-      showToast('已回溯：文件已还原，后续对话将基于截断后的历史重建上下文', 'success');
-    } catch (err) {
-      dispatch({
-        type: 'event',
-        event: errorEvent(err),
-      });
-    }
-  }, []);
-
-  const undoRevertAction = useCallback(async () => {
-    // 回溯会作废 CLI 会话 id，因此撤销按内部句柄定位会话
-    const handle = handleRef.current;
-    if (!handle) return;
-    try {
-      await undoRevert(handle);
-      dispatch({ type: 'undo_revert' });
-      showToast('已撤销回溯：完整历史将重新进入 Agent 上下文', 'success');
-    } catch (err) {
-      dispatch({
-        type: 'event',
-        event: errorEvent(err),
-      });
-    }
   }, []);
 
   return {
@@ -1993,7 +2264,5 @@ export function useSession(defaults?: SessionDefaults) {
     selectModel,
     setCwd,
     toggleMcpServer,
-    restoreCheckpoint: restoreCheckpointAction,
-    undoRevert: undoRevertAction,
   };
 }

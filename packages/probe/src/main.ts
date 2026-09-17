@@ -56,9 +56,6 @@ function render(event: AgentEvent): void {
         `\n${GRAY}计划：${event.steps.map((s) => `[${s.status}] ${s.text}`).join(' | ')}${RESET}\n`,
       );
       break;
-    case 'checkpoint':
-      process.stdout.write(`\n${GRAY}⏺ 检查点 ${event.label} [${event.id}]${RESET}\n`);
-      break;
     case 'token_usage':
       process.stdout.write(
         `\n${GRAY}── 用量：in=${event.inputTokens} out=${event.outputTokens} cost=$${event.costUsd.toFixed(6)}${RESET}\n`,

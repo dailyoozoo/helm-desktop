@@ -17,17 +17,11 @@ import { ToolBlock } from './items/ToolBlock';
 import { ErrorItem } from './items/ErrorItem';
 import { ActivityRow } from './items/ActivityRow';
 import { ApprovalCard } from './items/ApprovalCard';
-import { CheckpointItem } from './items/CheckpointItem';
 import { PlanItem } from './items/PlanItem';
 import { ThinkingItem } from './items/ThinkingItem';
 import { CompactItem } from './items/CompactItem';
 import { DEFAULT_THREAD_WINDOW, expandThreadWindow, threadWindow } from './threadWindow';
-import {
-  isLiftedFailureEntry,
-  layoutThreadItems,
-  type ThreadLayoutEntry,
-  type ThreadRenderEntry,
-} from './threadGroups';
+import { layoutThreadItems, type ThreadLayoutEntry, type ThreadRenderEntry } from './threadGroups';
 import { ToolGroup } from './items/ToolGroup';
 import { TurnProcess } from './items/TurnProcess';
 import { SubagentCard } from './items/SubagentCard';
@@ -39,8 +33,6 @@ import { ThreadTurnRail } from './ThreadTurnRail';
 const useClientLayoutEffect = typeof window === 'undefined' ? useEffect : useLayoutEffect;
 
 type ApproveFn = (approvalId: string, decision: Decision) => void;
-type RestoreCheckpointFn = (checkpointId: string) => void;
-type UndoRevertFn = () => void;
 
 /** 距底部小于该值视为「贴底」，继续自动跟随流式输出 */
 const AT_BOTTOM_THRESHOLD = 80;
@@ -101,8 +93,6 @@ const fmtClock = (ts?: number) =>
 export function Thread({
   state,
   onApprove,
-  onRestoreCheckpoint,
-  onUndoRevert,
   locateTarget,
   onOpenPane,
   onRetryTool,
@@ -112,8 +102,6 @@ export function Thread({
 }: {
   state: SessionState;
   onApprove: ApproveFn;
-  onRestoreCheckpoint: RestoreCheckpointFn;
-  onUndoRevert: UndoRevertFn;
   locateTarget?: { id: string; request: number } | null;
   /** 变更-34 · A4/C1：请求在右栏打开交付物 tab（修改记录/全部文件/计划/终端/任务）。 */
   onOpenPane?: (tab: 'changes' | 'files' | 'plan' | 'term' | 'tasks') => void;
@@ -184,6 +172,15 @@ export function Thread({
   );
   const renderEntries = useMemo(() => layoutThreadItems(visibleItems), [visibleItems]);
   const blocks = useMemo(() => groupIntoTurnBlocks(renderEntries), [renderEntries]);
+  const ledgerByTurnId = useMemo(() => {
+    const result = new Map<string, { turn: SessionTurn; previousModel?: string }>();
+    let previousModel: string | undefined;
+    for (const turn of turns ?? []) {
+      result.set(turn.id, { turn, previousModel });
+      if (turn.routedModelId) previousModel = turn.routedModelId;
+    }
+    return result;
+  }, [turns]);
   // 第 N 轮：按完整 item 序列中的用户消息计数派生（与原型 turnHead 语义一致），
   // 不随窗口截断变化；首个用户消息前的活动内容计为第 1 轮。
   const userOrdinalByItemId = useMemo(() => {
@@ -312,22 +309,7 @@ export function Thread({
         return (
           <div key={`plan-${it.id}`} data-thread-item-id={it.id}>
             <PlanItem item={it} className={className} />
-          </div>
-        );
-      case 'checkpoint':
-        return (
-          <div key={`checkpoint-${it.id}`} data-thread-item-id={it.id}>
-            <CheckpointItem
-              id={it.id}
-              label={it.label}
-              ts={it.ts}
-              restored={it.restored}
-              restorable={it.restorable}
-              fileCount={it.fileCount}
-              reason={it.reason}
-              onRestore={onRestoreCheckpoint}
-              onUndo={onUndoRevert}
-            />
+            {it.truncated ? <p className="muted">计划过长，历史仅保留部分步骤。</p> : null}
           </div>
         );
       case 'error':
@@ -357,29 +339,26 @@ export function Thread({
 
   /** 模型切换标记行（原型 .swch__line）：相邻两轮真实路由模型不同时显示。 */
   const swchFor = (turnId: string | undefined) => {
-    if (!turns || !turnId) return null;
-    const index = turns.findIndex((candidate) => candidate.id === turnId);
-    if (index <= 0) return null;
-    const current = turns[index];
-    if (!current.routedModelId) return null;
-    for (let prev = index - 1; prev >= 0; prev -= 1) {
-      const candidate = turns[prev];
-      if (!candidate.routedModelId) continue;
-      if (candidate.routedModelId === current.routedModelId) return null;
-      return (
-        <div className="swch">
-          <span className="swch__line">
-            <Icon name="sparkles" />
-            <span>模型切换</span>
-            <span className="mono">
-              {candidate.routedModelId} → {current.routedModelId}
-            </span>
-            {current.startedAt ? <span className="t">{fmtClock(current.startedAt)}</span> : null}
+    const ledger = turnId ? ledgerByTurnId.get(turnId) : undefined;
+    if (
+      !ledger?.previousModel ||
+      !ledger.turn.routedModelId ||
+      ledger.previousModel === ledger.turn.routedModelId
+    )
+      return null;
+    const { turn, previousModel } = ledger;
+    return (
+      <div className="swch">
+        <span className="swch__line">
+          <Icon name="sparkles" />
+          <span>模型切换</span>
+          <span className="mono">
+            {previousModel} → {turn.routedModelId}
           </span>
-        </div>
-      );
-    }
-    return null;
+          {turn.startedAt ? <span className="t">{fmtClock(turn.startedAt)}</span> : null}
+        </span>
+      </div>
+    );
   };
 
   const renderTurnBlocks = () =>
@@ -395,7 +374,12 @@ export function Thread({
         (entry): entry is Extract<ThreadLayoutEntry, { kind: 'item' }> =>
           entry.kind === 'item' && Boolean(entry.item.turnId),
       );
-      const turnId = withTurnId?.item.turnId;
+      // 零输出轮次（本轮除用户消息外一条条目都没有）在 rest 里取不到 turnId，
+      // 必须回落到用户消息自身携带的 turnId，否则终态状态永远读不到、
+      // UI 会把「已中断」错显示成「已完成」。
+      const turnId =
+        withTurnId?.item.turnId ??
+        (block.user && block.user.kind === 'item' ? block.user.item.turnId : undefined);
       if (!block.user && block.rest.length === 0) return null;
       // 渲染形态 B（ADR 0019，对齐 WorkBuddy 截图 2026-08-31）：块内条目按真实时序
       // 平铺为 flatEntries，再切「过程条目」与「常驻条目」两段：
@@ -405,8 +389,7 @@ export function Thread({
       //   待处理审批、失败/压缩/检查点/计划标记。
       // 注意：isProcessEntry 依赖 lastAssistantEntry，故在其后定义。
       const flatEntries = block.rest;
-      const ledgerTurn =
-        turnId && turns ? (turns.find((candidate) => candidate.id === turnId) ?? null) : null;
+      const ledgerTurn = turnId ? (ledgerByTurnId.get(turnId)?.turn ?? null) : null;
       const ordinal = Math.max(
         1,
         block.user && block.user.kind === 'item'
@@ -415,11 +398,12 @@ export function Thread({
       );
       const summary = summarizeTurn(flatEntries, ordinal, ledgerTurn);
       const waitingApproval = turnId
-        ? state.items.some(
-            (item) =>
-              item.kind === 'approval' &&
-              item.turnId === turnId &&
-              (item.status === 'pending' || item.status === 'applying'),
+        ? flatEntries.some(
+            (entry) =>
+              entry.kind === 'item' &&
+              entry.item.kind === 'approval' &&
+              entry.item.turnId === turnId &&
+              (entry.item.status === 'pending' || entry.item.status === 'applying'),
           )
         : false;
       // 交付物行（批次②裁决）：数据取本轮真实工具调用，口径与计数由
@@ -436,9 +420,10 @@ export function Thread({
             entry.kind === 'item' && entry.item.kind === 'assistant',
         );
       const isProcessEntry = (entry: ThreadRenderEntry): boolean => {
-        // 失败工具例外（TurnProcess 渲染契约）：独立失败工具提成 children 常驻可见，
-        // 不依赖整轮折叠——收起轮次的 .failc 也要可见（2026-09-04 视觉矩阵断言）。
-        if (isLiftedFailureEntry(entry)) return false;
+        // 变更-37/38：失败工具一律就地留在过程区、按真实时序穿插（不再抽到 children
+        // 底部切断时序，也不再无条件 sticky 常驻）。轮次成败只影响过程区的默认展开态：
+        // 失败/中断轮次 completed=false 默认展开（失败交代由「执行失败」胶囊 +
+        // terminalReason 原因行承担），成功轮次折叠、点开才见完整时序。
         if (entry.kind === 'tool-group' || entry.kind === 'subagent') return true;
         if (entry.kind !== 'item') return false;
         const it = entry.item;
@@ -469,8 +454,10 @@ export function Thread({
         (lastAssistant == null ||
           ((lastAssistant.turnStatus == null || lastAssistant.turnStatus === 'succeeded') &&
             !lastAssistant.interrupted));
+      // 变更-37：交付物行只在**真的产出**时出现（changeCount>0）。纯读取的轮次不再显示
+      // 「查看全部文件 N」——用户看到「全部文件」会理解成本轮产出的文件，只读却计数会误导。
       const deliverables: AnswerDeliverables | undefined =
-        lastAssistantEntry && completed && onOpenPane && turnDeliverables.fileCount > 0
+        lastAssistantEntry && completed && onOpenPane && turnDeliverables.changeCount > 0
           ? {
               documents: turnDeliverables.documents,
               fileCount: turnDeliverables.fileCount,
@@ -483,6 +470,11 @@ export function Thread({
         block.user && block.user.kind === 'item' && block.user.item.kind === 'user'
           ? renderEntry(block.user)
           : null;
+      // 块内已有错误卡（实时错误条目或历史重建的失败原因卡）时，terminalReason
+      // 行会与卡片重复展示同一段消息——失败态由摘要胶囊「执行失败」+ 错误卡承担。
+      const hasErrorCard = flatEntries.some(
+        (entry) => entry.kind === 'item' && entry.item.kind === 'error',
+      );
       return (
         <div className="turn" key={`turn-block-${blockIndex}`}>
           {userNode}
@@ -498,16 +490,16 @@ export function Thread({
                   ? 'interrupted'
                   : undefined
             }
+            terminalReason={hasErrorCard ? null : (ledgerTurn?.terminalReason ?? null)}
             waitingApproval={waitingApproval}
             locateTarget={locateTarget}
             summary={summary}
             process={
               processEntries.length
-                ? processEntries.map((pe) => (
-                    <Fragment key={pe.kind === 'item' ? pe.item.id : pe.id}>
-                      {renderEntry(pe)}
-                    </Fragment>
-                  ))
+                ? processEntries.map((pe) => {
+                    const key = pe.kind === 'item' ? pe.item.id : pe.id;
+                    return <Fragment key={key}>{renderEntry(pe)}</Fragment>;
+                  })
                 : undefined
             }
             swch={swchFor(turnId) ?? undefined}

@@ -688,7 +688,7 @@ pub fn list_skills(
     // 合并 Claude Code marketplace plugin 里的 skills
     match list_plugin_skills_from_marketplaces() {
         Ok(plugin_skills) => skills.extend(plugin_skills),
-        Err(e) => eprintln!("读取插件市场技能失败（忽略）: {e}"),
+        Err(e) => log::warn!("读取插件市场技能失败（忽略）: {e}"),
     }
     skills.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(skills)

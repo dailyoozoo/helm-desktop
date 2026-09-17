@@ -672,20 +672,32 @@ fn change_29_migrates_tool_outcome_and_checkpoint_recovery_facts_from_v29_to_v30
     drop(conn);
 
     let reopened = SessionHistoryStore::new(path.clone());
-    let detail = reopened.get_session("session-v29-v30").unwrap();
-    assert_eq!(detail.checkpoints.len(), 1);
-    assert!(!detail.checkpoints[0].restorable);
-    assert_eq!(detail.checkpoints[0].file_count, 0);
-    assert_eq!(
-        detail.checkpoints[0].reason.as_deref(),
-        Some("legacy_empty_snapshot")
-    );
+    let _detail = reopened.get_session("session-v29-v30").unwrap();
     let conn = rusqlite::Connection::open(path).unwrap();
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
         SCHEMA_VERSION
     );
+    // 检查点能力已退役（2026-09-09）：历史 checkpoint 行保留在库中，
+    // 迁移仍需补齐 restorable/file_count/restorable_reason 列以保持 schema 兼容。
+    let checkpoint_columns: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('checkpoint')
+             WHERE name IN ('restorable', 'file_count', 'restorable_reason')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(checkpoint_columns, 3);
+    let legacy_reason: String = conn
+        .query_row(
+            "SELECT restorable_reason FROM checkpoint WHERE id = 'legacy-empty'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(legacy_reason, "legacy_empty_snapshot");
     let tool_fact_columns: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('tool_call')
@@ -945,21 +957,6 @@ fn change_27d_tool_integrity_reconciles_duplicates_orphans_and_pending() {
         .record_event_for_session_in_turn(
             "session-27d-tools",
             Some(&spec.turn_id),
-            &AgentEvent::Checkpoint {
-                session_id: "native".into(),
-                id: "checkpoint".into(),
-                label: "before write".into(),
-                ts: 10_100,
-                restorable: true,
-                file_count: 1,
-                reason: None,
-            },
-        )
-        .unwrap();
-    store
-        .record_event_for_session_in_turn(
-            "session-27d-tools",
-            Some(&spec.turn_id),
             &AgentEvent::TokenUsage {
                 session_id: "native".into(),
                 input_tokens: 10,
@@ -1051,7 +1048,6 @@ fn change_27d_tool_integrity_reconciles_duplicates_orphans_and_pending() {
     assert_eq!(ledger.len(), 1);
     assert_eq!(ledger[0].tool_calls.len(), 3);
     assert_eq!(ledger[0].approvals.len(), 1);
-    assert_eq!(ledger[0].checkpoints.len(), 1);
     assert_eq!(ledger[0].usage.len(), 1);
     assert_eq!(ledger[0].usage[0].model_evidence, "launch_spec");
     assert_eq!(
@@ -1082,6 +1078,95 @@ fn start_change_27d_turn(
     let mut spec = resolve_test_route(&change_27c_route(), &command);
     spec.session_context = store.freeze_session_contexts(session_id).unwrap();
     store.start_turn(&command, spec).unwrap().1
+}
+
+#[test]
+fn interrupted_visible_messages_survive_ledger_rebuild_and_branch_copy() {
+    let path = temp_history_path("presentation-ledger");
+    let store = SessionHistoryStore::new(path.clone());
+    for session_id in ["presentation-source", "presentation-target"] {
+        store
+            .create_session(NewSessionRecord {
+                id: session_id.into(),
+                engine: EngineId::Codex,
+                model: "gpt-fixture".into(),
+                cwd: "D:/work/fixture".into(),
+                created_at: 100,
+            })
+            .unwrap();
+    }
+    let command = change_27c_command(
+        "presentation-source",
+        "question",
+        helm_lib::util::now_millis(),
+    );
+    let spec = resolve_test_route(&change_27c_route(), &command);
+    let (_, spec) = store.start_turn(&command, spec).unwrap();
+    let supervisor = helm_lib::turn_supervisor::TurnSupervisor::new(store.clone());
+    supervisor.begin(
+        "presentation-source",
+        &spec.turn_id,
+        spec.turn_epoch,
+        "build",
+        "standard",
+    );
+    assert!(supervisor.accept_event(
+        "presentation-source",
+        Some(&spec.turn_id),
+        Some(spec.turn_epoch),
+        1,
+        &AgentEvent::MessageDelta {
+            session_id: "native".into(),
+            role: Role::Assistant,
+            text: "partial reply".into()
+        }
+    ));
+    assert!(supervisor.accept_event(
+        "presentation-source",
+        Some(&spec.turn_id),
+        Some(spec.turn_epoch),
+        2,
+        &AgentEvent::TurnComplete {
+            session_id: "native".into(),
+            stop_reason: StopReason::Interrupted
+        }
+    ));
+    let ledger = store.get_turn_ledger("presentation-source").unwrap();
+    assert_eq!(ledger.len(), 1);
+    assert_eq!(
+        ledger[0]
+            .messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["question", "partial reply"]
+    );
+    assert_eq!(
+        store
+            .clone_messages_into_session_upto(
+                "presentation-source",
+                "presentation-target",
+                Some(&spec.turn_id)
+            )
+            .unwrap(),
+        2
+    );
+    let copied = store.get_session("presentation-target").unwrap();
+    assert_eq!(
+        copied
+            .messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["question", "partial reply"]
+    );
+    assert!(copied
+        .messages
+        .iter()
+        .all(|message| message.turn_id.is_none()));
+    drop(supervisor);
+    drop(store);
+    let _ = std::fs::remove_file(path);
 }
 
 fn change_27c_route() -> RuntimeRoute {
@@ -1496,8 +1581,8 @@ fn change_27f_supervisor_owns_sequence_boundaries_and_the_only_terminal() {
     );
 }
 
-#[test]
-fn change_27f_startup_recovery_is_deterministic_read_only_and_idempotent() {
+#[tokio::test]
+async fn change_27f_startup_recovery_is_deterministic_read_only_and_idempotent() {
     let path = temp_history_path("change-27f-recovery");
     let store = SessionHistoryStore::new(path.clone());
     let make_attempt = |session_id: &str, created_at: i64| {
@@ -1549,21 +1634,24 @@ fn change_27f_startup_recovery_is_deterministic_read_only_and_idempotent() {
     store
         .mark_turn_attempt_accepted(&approval_spec.turn_id, approval_attempt.attempt_no, 21_003)
         .unwrap();
-    assert!(approval_supervisor.submit_event(
-        "approval",
-        Some(&approval_spec.turn_id),
-        Some(approval_spec.turn_epoch),
-        AgentEvent::ApprovalRequest {
-            session_id: "thread-approval".into(),
-            id: "request-approval".into(),
-            action: "Bash".into(),
-            detail: "echo pending".into(),
-            input: None,
-            available_decisions: Vec::new(),
-            persistent_label: None,
-            matcher_summary: None,
-        },
-    ));
+    assert!(approval_supervisor
+        .submit_event(
+            "approval",
+            Some(&approval_spec.turn_id),
+            Some(approval_spec.turn_epoch),
+            AgentEvent::ApprovalRequest {
+                session_id: "thread-approval".into(),
+                id: "request-approval".into(),
+                action: "Bash".into(),
+                detail: "echo pending".into(),
+                input: None,
+                available_decisions: Vec::new(),
+                persistent_label: None,
+                matcher_summary: None,
+            },
+        )
+        .await
+        .unwrap());
     let (unknown_spec, _, unknown_attempt, _) = make_attempt("unknown", 22_000);
     store
         .mark_turn_attempt_accepted(&unknown_spec.turn_id, unknown_attempt.attempt_no, 22_003)
@@ -2789,17 +2877,17 @@ fn persistent_runtime_allow_is_mirrored_and_revoked_in_schema_v13() {
     let p95 = samples[samples.len() * 95 / 100];
     eprintln!("runtime-grant-warm-p95-us={}", p95.as_micros());
     assert!(p95 < std::time::Duration::from_millis(5));
-    let moved = path.with_extension("sqlite.moved");
-    let _ = fs::remove_file(&moved);
-    fs::rename(&path, &moved).unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("ALTER TABLE runtime_grant RENAME TO runtime_grant_probe_unavailable;")
+        .unwrap();
     assert!(
         store
             .runtime_grant_matches(&rule.id, &later_search)
             .unwrap(),
-        "a warm RuntimeGrant match must not reopen SQLite"
+        "a warm RuntimeGrant match must not query SQLite"
     );
-    fs::rename(&moved, &path).unwrap();
-    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("ALTER TABLE runtime_grant_probe_unavailable RENAME TO runtime_grant;")
+        .unwrap();
     let grant: (String, String, Option<i64>) = conn
         .query_row(
             "SELECT matcher_kind, matcher_value, revoked_at FROM runtime_grant WHERE id = ?1",
@@ -3715,47 +3803,6 @@ fn tool_call_replay_is_idempotent_but_input_collision_is_rejected() {
 }
 
 #[test]
-fn session_history_returns_checkpoints_for_restore_timeline() {
-    let path = temp_history_path("checkpoints");
-    let store = SessionHistoryStore::new(path);
-    store
-        .create_session(NewSessionRecord {
-            id: "local-1".to_string(),
-            engine: EngineId::ClaudeCode,
-            model: "claude-sonnet-4.6".to_string(),
-            cwd: "D:\\work\\demo".to_string(),
-            created_at: 1_717_171_700,
-        })
-        .unwrap();
-    store
-        .record_event(&AgentEvent::SessionStarted {
-            session_id: "claude-real-1".to_string(),
-            engine: EngineId::ClaudeCode,
-            model: "claude-sonnet-4.6".to_string(),
-            cwd: "D:\\work\\demo".to_string(),
-            ts: 1_717_171_702,
-            capabilities: None,
-        })
-        .unwrap();
-    store
-        .record_event(&AgentEvent::Checkpoint {
-            session_id: "claude-real-1".to_string(),
-            id: "ckpt-1".to_string(),
-            label: "改动前：demo.ts".to_string(),
-            ts: 1_717_171_703_000,
-            restorable: false,
-            file_count: 0,
-            reason: Some("legacy_empty_snapshot".to_string()),
-        })
-        .unwrap();
-
-    let detail = store.get_session("local-1").unwrap();
-    assert_eq!(detail.checkpoints.len(), 1);
-    assert_eq!(detail.checkpoints[0].id, "ckpt-1");
-    assert_eq!(detail.checkpoints[0].label, "改动前：demo.ts");
-}
-
-#[test]
 fn session_history_persists_across_store_instances() {
     let path = temp_history_path("roundtrip");
     let store = SessionHistoryStore::new(path.clone());
@@ -3834,177 +3881,6 @@ fn session_history_handles_concurrent_internal_writes() {
     }
     let detail = store.get_session("local-1").unwrap();
     assert_eq!(detail.messages.len(), 32);
-}
-
-#[test]
-fn checkpoint_revert_truncates_agent_context_semantics() {
-    // P2-5 回溯语义：检查点之后的消息打 reverted 标记、CLI 会话 id 作废，
-    // 重建上下文时（resume/live reset）据此剔除被回滚的轮次。
-    let path = temp_history_path("revert-context");
-    let store = SessionHistoryStore::new(path.clone());
-    store
-        .create_session(NewSessionRecord {
-            id: "local-1".to_string(),
-            engine: EngineId::ClaudeCode,
-            model: "claude-sonnet-4.6".to_string(),
-            cwd: r"D:\work\demo".to_string(),
-            created_at: 1_717_171_700,
-        })
-        .unwrap();
-
-    store
-        .record_user_message("local-1", "第一轮提问", 1_717_171_701)
-        .unwrap();
-    store
-        .record_event_for_session(
-            "local-1",
-            &AgentEvent::MessageComplete {
-                session_id: "cli-1".to_string(),
-                role: Role::Assistant,
-                text: "第一轮回复".to_string(),
-            },
-        )
-        .unwrap();
-    store
-        .record_user_message("local-1", "第二轮提问", 1_717_171_704)
-        .unwrap();
-    store
-        .record_event_for_session(
-            "local-1",
-            &AgentEvent::MessageComplete {
-                session_id: "cli-1".to_string(),
-                role: Role::Assistant,
-                text: "第二轮回复（将被回滚）".to_string(),
-            },
-        )
-        .unwrap();
-    // MessageComplete 落库用的是真实时钟；为了让「检查点之后」的边界确定，
-    // 这里直接把四条消息的 ts 依次固定为 1..4，检查点打在 ts=2 之后。
-    {
-        let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute_batch("UPDATE message SET ts = id;").unwrap();
-    }
-    store
-        .save_checkpoint(
-            "ckpt-1",
-            "local-1",
-            0,
-            "写文件前",
-            "snap-1",
-            2,
-            "turn-1",
-            true,
-            1,
-            None,
-        )
-        .unwrap();
-
-    store.revert_messages_after("local-1", 2).unwrap();
-    store.clear_cli_session("local-1").unwrap();
-
-    let detail = store.get_session("local-1").unwrap();
-    assert_eq!(
-        detail.summary.cli_session_id, None,
-        "回溯后必须作废 CLI 会话 id"
-    );
-    let kept: Vec<&str> = detail
-        .messages
-        .iter()
-        .filter(|message| !message.reverted)
-        .map(|message| message.text.as_str())
-        .collect();
-    assert_eq!(kept, vec!["第一轮提问", "第一轮回复"]);
-    assert!(
-        detail.messages.iter().any(|message| message.reverted),
-        "检查点之后的消息必须带 reverted 标记"
-    );
-
-    // 撤销回溯：标记清空，完整历史重新可用
-    store.unrevert_messages("local-1").unwrap();
-    let detail = store.get_session("local-1").unwrap();
-    assert!(detail.messages.iter().all(|message| !message.reverted));
-}
-
-#[test]
-fn checkpoint_revert_works_with_real_millisecond_timestamps() {
-    // 变更-07 回归：检查点 ts 与 message.ts 必须同为毫秒。
-    // 修复前 message.ts 是秒（~1.7e9）、检查点是毫秒（~1.7e12），
-    // 「ts > 检查点」永远不成立 → 回溯的消息截断完全失效。
-    let path = temp_history_path("revert-ms-units");
-    let store = SessionHistoryStore::new(path.clone());
-    store
-        .create_session(NewSessionRecord {
-            id: "local-1".to_string(),
-            engine: EngineId::ClaudeCode,
-            model: "claude-sonnet-4.6".to_string(),
-            cwd: r"D:\work\demo".to_string(),
-            created_at: 1_717_171_700,
-        })
-        .unwrap();
-
-    let before_millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
-
-    // 走真实写入路径（内部时钟），不手工改 ts
-    store
-        .record_user_message("local-1", "改动前的提问", before_millis)
-        .unwrap();
-    store
-        .record_event_for_session(
-            "local-1",
-            &AgentEvent::MessageComplete {
-                session_id: "cli-1".to_string(),
-                role: Role::Assistant,
-                text: "检查点之后的回复（应被回滚）".to_string(),
-            },
-        )
-        .unwrap();
-
-    // 落库的 message.ts 必须是毫秒量级
-    {
-        let conn = rusqlite::Connection::open(&path).unwrap();
-        let min_ts: i64 = conn
-            .query_row("SELECT MIN(ts) FROM message", [], |row| row.get(0))
-            .unwrap();
-        assert!(
-            min_ts > 100_000_000_000,
-            "message.ts 应为毫秒（实际 {min_ts}）"
-        );
-    }
-
-    // 检查点打在用户消息之后、助手回复之前（真实自动检查点的时序）
-    store
-        .save_checkpoint(
-            "ckpt-1",
-            "local-1",
-            0,
-            "写文件前",
-            "snap-1",
-            before_millis,
-            "turn-1",
-            true,
-            1,
-            None,
-        )
-        .unwrap();
-    store
-        .revert_messages_after("local-1", before_millis)
-        .unwrap();
-
-    let detail = store.get_session("local-1").unwrap();
-    let reverted: Vec<&str> = detail
-        .messages
-        .iter()
-        .filter(|message| message.reverted)
-        .map(|message| message.text.as_str())
-        .collect();
-    assert_eq!(
-        reverted,
-        vec!["检查点之后的回复（应被回滚）"],
-        "检查点之后的助手回复必须被标记 reverted（毫秒单位比较生效）"
-    );
 }
 
 #[test]
@@ -6069,21 +5945,6 @@ fn schema_v20_persists_context_usage_token_split_and_activity_turn_links() {
             },
         )
         .unwrap();
-    store
-        .record_event_for_session_in_turn(
-            "session-v20",
-            turn_id,
-            &AgentEvent::Checkpoint {
-                session_id: "cli-v20".to_string(),
-                id: "checkpoint-v20".to_string(),
-                label: "读取前".to_string(),
-                ts: 1_717_171_700_000,
-                restorable: false,
-                file_count: 0,
-                reason: Some("legacy_empty_snapshot".to_string()),
-            },
-        )
-        .unwrap();
 
     let detail = store.get_session("session-v20").unwrap();
     assert_eq!(detail.summary.cached_input_tokens, 70);
@@ -6093,7 +5954,6 @@ fn schema_v20_persists_context_usage_token_split_and_activity_turn_links() {
     assert_eq!(detail.messages[0].turn_id.as_deref(), turn_id);
     assert_eq!(detail.tool_calls[0].turn_id.as_deref(), turn_id);
     assert!(detail.tool_calls[0].ended_at.is_some());
-    assert_eq!(detail.checkpoints[0].turn_id.as_deref(), turn_id);
 }
 
 #[test]

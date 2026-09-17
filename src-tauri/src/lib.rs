@@ -1,5 +1,6 @@
 //! Helm 桌面后端入口（Tauri 2）。组装应用：注册会话存储与命令、加载配置启动。
 
+mod agent_env;
 pub mod adapter;
 pub mod budget;
 pub mod capability_registry;
@@ -14,11 +15,13 @@ pub mod git;
 pub mod handoff;
 pub mod installer;
 pub mod operations;
+mod output_limits;
 pub mod parse;
 pub mod permission_kernel;
 pub mod permission_service;
 pub mod permissions;
 pub mod pricing;
+mod probe_cache;
 pub mod protocol;
 pub mod providers;
 pub mod reasoning;
@@ -35,6 +38,7 @@ pub mod snapshots;
 pub mod subscription_profiles;
 pub mod titler;
 pub mod tray;
+pub mod turn_presentation;
 pub mod turn_start;
 pub mod turn_supervisor;
 pub mod updater;
@@ -80,16 +84,15 @@ use commands::{
     list_provider_models_config, list_session_contexts, list_sessions, list_skills,
     list_slash_commands, list_subagents, market_install_skill, market_search_skills,
     read_engine_config_file, read_skill_source, remove_permission_rule, remove_session_context,
-    rename_provider_model, rename_session, restore_checkpoint, resume_session,
+    rename_provider_model, rename_session, resume_session,
     retry_background_operation, reveal_provider_secret, review_changes, save_binding_config,
     save_engine_config, save_hook, save_mcp_server, save_model_config, save_pasted_image,
     save_provider_config, save_provider_model_selection, save_provider_models_config,
-    save_slash_command, save_subagent,
-    search_workspace_files, send_message, set_budget, set_folder_collapsed, set_mcp_server_enabled,
-    set_session_archived, set_session_mcp_disabled, set_session_permission_profile,
-    set_session_pinned, set_session_turn_preference, side_query, start_session_branch,
-    start_session_fork, sync_provider_models_config, test_engine_config, test_mcp_connection,
-    test_provider_config, test_provider_draft_config, toggle_skill, undo_revert,
+    save_slash_command, save_subagent, search_workspace_files, send_message, set_budget,
+    set_folder_collapsed, set_mcp_server_enabled, set_session_archived, set_session_mcp_disabled,
+    set_session_permission_profile, set_session_pinned, set_session_turn_preference, side_query,
+    start_session_branch, start_session_fork, sync_provider_models_config, test_engine_config,
+    test_mcp_connection, test_provider_config, test_provider_draft_config, toggle_skill,
     write_engine_config_file, SessionStore,
 };
 use installer::{detect_workspace_deps, install_cli_engine, install_git, install_node};
@@ -116,6 +119,18 @@ use updater::{check_for_update, install_update};
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // 文件日志（写入 app_log_dir，与设置页「打开日志文件夹」同目录）
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Info)
+                .targets([
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
+                        file_name: Some("helm".into()),
+                    }),
+                ])
+                .build(),
+        )
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
@@ -155,13 +170,13 @@ pub fn run() {
                 .reconcile_stream_recovery()
                 .map_err(|error| format!("Stream Supervisor 启动恢复失败：{error}"))?;
             if recovery != Default::default() {
-                eprintln!("[helm] Stream Supervisor 启动恢复：{recovery:?}");
+                log::info!("[helm] Stream Supervisor 启动恢复：{recovery:?}");
             }
             let operation_recovery = history_store
                 .reconcile_background_operations()
                 .map_err(|error| format!("BackgroundOperation 启动恢复失败：{error}"))?;
             if operation_recovery > 0 {
-                eprintln!(
+                log::info!(
                     "[helm] BackgroundOperation 启动恢复：{} 个不确定 Attempt 已收口为 delivery_unknown",
                     operation_recovery
                 );
@@ -172,7 +187,7 @@ pub fn run() {
                 RuntimeRegistry::with_supervisor(history_store.clone(), turn_supervisor.clone())
                     .map_err(|error| format!("初始化 RuntimeRegistry 失败：{error}"))?;
             if !runtime_registry.recovery_inputs().is_empty() {
-                eprintln!(
+                log::info!(
                     "[helm] 检测到 {} 个未收口 TurnAttempt，已加载为 27F 恢复输入",
                     runtime_registry.recovery_inputs().len()
                 );
@@ -185,7 +200,7 @@ pub fn run() {
             // 把强杀/崩溃留下的 active 尸体会话归位为 idle
             if let Some(history) = app.try_state::<SessionHistoryStore>() {
                 if let Err(err) = history.normalize_stale_active_sessions() {
-                    eprintln!("[helm] 启动归位会话状态失败：{err}");
+                    log::warn!("[helm] 启动归位会话状态失败：{err}");
                 }
             }
             if let Some(history) = app.try_state::<SessionHistoryStore>() {
@@ -197,7 +212,7 @@ pub fn run() {
             }
             // 用量托盘（P3-2）：常驻托盘失败不阻断主窗口启动，只留诊断日志
             if let Err(err) = tray::setup(app) {
-                eprintln!("[helm] 初始化系统托盘失败：{err}");
+                log::warn!("[helm] 初始化系统托盘失败：{err}");
             }
             Ok(())
         })
@@ -241,8 +256,6 @@ pub fn run() {
 retry_background_operation,
             review_changes,
             get_turn_snapshot,
-            restore_checkpoint,
-            undo_revert,
             get_provider_config,
             reveal_provider_secret,
             save_provider_config,
@@ -325,6 +338,7 @@ retry_background_operation,
             git::get_git_status,
             git::get_git_staged,
             file_preview::read_file_preview,
+            file_preview::read_file_preview_bytes,
             file_preview::open_path_in_system,
             file_preview::open_external_url,
             append_runtime_log

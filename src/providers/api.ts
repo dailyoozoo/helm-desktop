@@ -18,6 +18,20 @@ import type {
   ProviderRoleKey,
 } from '@helm/protocol';
 
+export const PROVIDER_CONFIG_CHANGED_EVENT = 'helm-provider-config-changed';
+
+function invokeWithConfigInvalidation<Result>(
+  command: string,
+  args?: Record<string, unknown>,
+): Promise<Result> {
+  return invoke<Result>(command, args).then((result) => {
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new Event(PROVIDER_CONFIG_CHANGED_EVENT));
+    }
+    return result;
+  });
+}
+
 export type EngineStatus = 'ready' | 'missing' | 'error';
 export type ProviderConfig = Provider;
 export type { ProviderKind };
@@ -54,15 +68,15 @@ export interface CliLoginState {
 }
 
 export function detectCliLogin(engine: 'claude-code' | 'codex'): Promise<CliLoginState> {
-  return invoke<CliLoginState>('detect_cli_login', { engine });
+  return invokeWithConfigInvalidation<CliLoginState>('detect_cli_login', { engine });
 }
 
 export function loginCliAccount(engine: 'claude-code' | 'codex'): Promise<CliLoginState> {
-  return invoke<CliLoginState>('login_cli_account', { engine });
+  return invokeWithConfigInvalidation<CliLoginState>('login_cli_account', { engine });
 }
 
 export function logoutCliAccount(engine: 'claude-code' | 'codex'): Promise<CliLoginState> {
-  return invoke<CliLoginState>('logout_cli_account', { engine });
+  return invokeWithConfigInvalidation<CliLoginState>('logout_cli_account', { engine });
 }
 
 export interface EngineConfigFile {
@@ -78,30 +92,40 @@ export function revealProviderSecret(providerId: string): Promise<string> {
   return invoke<string>('reveal_provider_secret', { providerId });
 }
 
-export function saveProviderConfig(provider: ProviderConfig, apiKey?: string): Promise<AppConfig> {
-  return invoke<AppConfig>('save_provider_config', {
+export function saveProviderConfig(
+  provider: ProviderConfig,
+  apiKey?: string,
+  models?: ModelConfig[],
+  modelRenames: [string, string][] = [],
+): Promise<AppConfig> {
+  return invokeWithConfigInvalidation<AppConfig>('save_provider_config', {
     provider,
     apiKey: apiKey && apiKey.trim() ? apiKey.trim() : null,
+    models: models ?? null,
+    modelRenames,
   });
 }
 
 export function deleteProviderConfig(providerId: string): Promise<AppConfig> {
-  return invoke<AppConfig>('delete_provider_config', { providerId });
+  return invokeWithConfigInvalidation<AppConfig>('delete_provider_config', { providerId });
 }
 
 export function saveEngineConfig(engine: EngineConfig): Promise<AppConfig> {
-  return invoke<AppConfig>('save_engine_config', { engine });
+  return invokeWithConfigInvalidation<AppConfig>('save_engine_config', { engine });
 }
 
 export function saveModelConfig(model: ModelConfig): Promise<AppConfig> {
-  return invoke<AppConfig>('save_model_config', { model });
+  return invokeWithConfigInvalidation<AppConfig>('save_model_config', { model });
 }
 
 export function saveProviderModelSelection(
   providerId: string,
   enabledModelIds: string[],
 ): Promise<AppConfig> {
-  return invoke<AppConfig>('save_provider_model_selection', { providerId, enabledModelIds });
+  return invokeWithConfigInvalidation<AppConfig>('save_provider_model_selection', {
+    providerId,
+    enabledModelIds,
+  });
 }
 
 /** 模型改名（2026-09-03）：在用模型也允许改；后端原地改名/合并并级联 binding 与会话偏好。 */
@@ -110,11 +134,15 @@ export function renameProviderModel(
   oldModelId: string,
   newModelId: string,
 ): Promise<AppConfig> {
-  return invoke<AppConfig>('rename_provider_model', { providerId, oldModelId, newModelId });
+  return invokeWithConfigInvalidation<AppConfig>('rename_provider_model', {
+    providerId,
+    oldModelId,
+    newModelId,
+  });
 }
 
 export function deleteProviderModel(providerId: string, modelId: string): Promise<AppConfig> {
-  return invoke<AppConfig>('delete_provider_model', { providerId, modelId });
+  return invokeWithConfigInvalidation<AppConfig>('delete_provider_model', { providerId, modelId });
 }
 
 /** 用系统默认浏览器打开外链（仅 https；Tauri webview 不放行 target=_blank）。 */
@@ -126,15 +154,18 @@ export function saveProviderModelsConfig(
   providerId: string,
   models: ModelConfig[],
 ): Promise<AppConfig> {
-  return invoke<AppConfig>('save_provider_models_config', { providerId, models });
+  return invokeWithConfigInvalidation<AppConfig>('save_provider_models_config', {
+    providerId,
+    models,
+  });
 }
 
 export function syncProviderModels(providerId: string): Promise<AppConfig> {
-  return invoke<AppConfig>('sync_provider_models_config', { providerId });
+  return invokeWithConfigInvalidation<AppConfig>('sync_provider_models_config', { providerId });
 }
 
 export function saveBindingConfig(binding: BindingConfig): Promise<AppConfig> {
-  return invoke<AppConfig>('save_binding_config', { binding });
+  return invokeWithConfigInvalidation<AppConfig>('save_binding_config', { binding });
 }
 
 export function getEquivalentEnv(binding: BindingConfig): Promise<[string, string][]> {
@@ -149,11 +180,14 @@ export function writeEngineConfigFile(
   engineId: string,
   content: string,
 ): Promise<EngineConfigFile> {
-  return invoke<EngineConfigFile>('write_engine_config_file', { engineId, content });
+  return invokeWithConfigInvalidation<EngineConfigFile>('write_engine_config_file', {
+    engineId,
+    content,
+  });
 }
 
 export function testProviderConfig(providerId: string): Promise<ConnectionResult> {
-  return invoke<ConnectionResult>('test_provider_config', { providerId });
+  return invokeWithConfigInvalidation<ConnectionResult>('test_provider_config', { providerId });
 }
 
 /** 添加流程「测试连接」：对未保存草稿（URL + 密钥 + 协议）做真实 HTTP 探活。 */
@@ -162,7 +196,11 @@ export function testProviderDraft(
   apiKey: string,
   protocol: string,
 ): Promise<ConnectionResult> {
-  return invoke<ConnectionResult>('test_provider_draft_config', { baseUrl, apiKey, protocol });
+  return invokeWithConfigInvalidation<ConnectionResult>('test_provider_draft_config', {
+    baseUrl,
+    apiKey,
+    protocol,
+  });
 }
 
 /** 「同步模型」候选拉取结果：远端模型 ID + 最新配置；候选不写入模型行。 */
@@ -175,7 +213,7 @@ export function listProviderModels(
   providerId: string,
   draft?: { baseUrl?: string; apiKey?: string },
 ): Promise<ProviderModelListing> {
-  return invoke<ProviderModelListing>('list_provider_models_config', {
+  return invokeWithConfigInvalidation<ProviderModelListing>('list_provider_models_config', {
     providerId,
     baseUrl: draft?.baseUrl?.trim() ? draft.baseUrl.trim() : null,
     apiKey: draft?.apiKey?.trim() ? draft.apiKey.trim() : null,
@@ -183,7 +221,7 @@ export function listProviderModels(
 }
 
 export function testEngineConfig(bin: string): Promise<ConnectionResult> {
-  return invoke<ConnectionResult>('test_engine_config', { bin });
+  return invokeWithConfigInvalidation<ConnectionResult>('test_engine_config', { bin });
 }
 
 export function getPricingCatalogStatus(): Promise<PricingCatalogStatus> {
@@ -196,14 +234,14 @@ export function getPricingCatalogEntries(): Promise<PricingCatalogEntry[]> {
 }
 
 export function refreshPricingCatalog(): Promise<PricingCatalogStatus> {
-  return invoke<PricingCatalogStatus>('refresh_pricing_catalog');
+  return invokeWithConfigInvalidation<PricingCatalogStatus>('refresh_pricing_catalog');
 }
 
 export function importPricingCatalog(
   catalogPath: string,
   signaturePath?: string,
 ): Promise<PricingCatalogStatus> {
-  return invoke<PricingCatalogStatus>('import_pricing_catalog', {
+  return invokeWithConfigInvalidation<PricingCatalogStatus>('import_pricing_catalog', {
     catalogPath,
     signaturePath: signaturePath ?? null,
   });
@@ -216,11 +254,16 @@ export function listModelPriceOverrides(): Promise<ModelPriceOverride[]> {
 export function saveModelPriceOverride(
   priceOverride: ModelPriceOverride,
 ): Promise<ModelPriceOverride> {
-  return invoke<ModelPriceOverride>('save_model_price_override', { priceOverride });
+  return invokeWithConfigInvalidation<ModelPriceOverride>('save_model_price_override', {
+    priceOverride,
+  });
 }
 
 export function deleteModelPriceOverride(providerId: string, modelId: string): Promise<boolean> {
-  return invoke<boolean>('delete_model_price_override', { providerId, modelId });
+  return invokeWithConfigInvalidation<boolean>('delete_model_price_override', {
+    providerId,
+    modelId,
+  });
 }
 
 export function getProviderPricingPreference(
@@ -232,5 +275,8 @@ export function getProviderPricingPreference(
 export function saveProviderPricingPreference(
   preference: ProviderPricingPreference,
 ): Promise<ProviderPricingPreference> {
-  return invoke<ProviderPricingPreference>('save_provider_pricing_preference', { preference });
+  return invokeWithConfigInvalidation<ProviderPricingPreference>(
+    'save_provider_pricing_preference',
+    { preference },
+  );
 }

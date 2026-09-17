@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { Diff } from '@helm/protocol';
+import type { Diff, TurnPresentation } from '@helm/protocol';
 import type { SessionFolder, SessionSummary } from './sessionTypes';
 
 export interface SessionMessage {
@@ -44,16 +44,6 @@ export interface SessionToolCall {
   nativeDenialCode?: string | null;
 }
 
-export interface SessionCheckpoint {
-  id: string;
-  label: string;
-  ts: number;
-  turnId?: string | null;
-  restorable?: boolean;
-  fileCount?: number;
-  reason?: string | null;
-}
-
 /** 审批请求持久化记录（变更-07）：pending 的悬空审批在重开会话时重建审批卡 */
 export interface SessionApproval {
   id: string;
@@ -90,8 +80,8 @@ export interface SessionTurn {
 export interface SessionDetail extends SessionSummary {
   messages: SessionMessage[];
   toolCalls: SessionToolCall[];
-  checkpoints: SessionCheckpoint[];
   approvals: SessionApproval[];
+  presentations?: TurnPresentation[];
   /** schema v17：逐轮权限审计；旧导入数据可为空。 */
   turns?: SessionTurn[];
   sessionContext?: SessionContextRecord[];

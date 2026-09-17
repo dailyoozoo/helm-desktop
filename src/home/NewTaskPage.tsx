@@ -17,6 +17,7 @@ import { Icon } from '../shell/icons';
 import { EngineBrand } from '../shell/EngineBrand';
 import { showToast } from '../components/toast';
 import { FullAccessConfirm } from '../components/FullAccessConfirm';
+import { useFileDrop } from '../lib/fileDrop';
 import { ContextPill, contextPillLabel, type ContextPillItem } from '../workspace/ContextPill';
 import { defaultModelForEngine, workspaceEngineOptions } from '../workspace/workspaceViewModel';
 import { searchWorkspaceFiles } from '../workspace/workspaceApi';
@@ -291,6 +292,9 @@ export function NewTaskPage({
     setBarMenu(null);
     setCapMenuOpen(false);
     setReadinessOpen(false);
+    // 跳页时一并收掉目录/中心弹层：其遮罩若残留会挡住目标页的首次点击。
+    setDirModalOpen(false);
+    setCenter(null);
     onNavigate(page);
   };
 
@@ -330,14 +334,24 @@ export function NewTaskPage({
   };
 
   const handlePickDirectory = async () => {
+    // 与文件中心共用 busy 锁：系统目录选择器期间禁止重复点击。
+    if (fileDialogBusy) return;
+    setFileDialogBusy(true);
     try {
       const dir = await selectDirectory();
       if (!dir) return;
       // 系统目录选择器只返回真实存在的目录
       setDirectory({ path: dir, exists: true });
       setInstallNote(null);
+      // 六次反馈修复：走「从电脑选择…」时此前不关本弹层，选完目录后弹层仍盖在
+      // 就绪检查之上（表现为「工作目录弹框没消失」）。与 chooseDirectoryPath 对齐：
+      // 选完即关，并复用真实就绪报告复检。
+      setDirModalOpen(false);
+      refreshReadiness().catch(() => undefined);
     } catch {
       showToast('目录选择器不可用，请在设置中配置默认目录', 'error');
+    } finally {
+      setFileDialogBusy(false);
     }
   };
 
@@ -493,6 +507,15 @@ export function NewTaskPage({
     }
   };
 
+  // 拖拽附加（变更-37）：拖进来的文件/目录直接挂成上下文药丸，与「从电脑选择」同链路。
+  const dropRef = useRef<HTMLFormElement>(null);
+  const drop = useFileDrop(dropRef, (paths) => {
+    paths
+      .map((path) => path.trim())
+      .filter(Boolean)
+      .forEach((path) => addPill(path));
+  });
+
   const insertTrigger = (trigger: string) => {
     setText((current) => {
       const spacer = current && !/\s$/.test(current) ? ' ' : '';
@@ -535,12 +558,22 @@ export function NewTaskPage({
 
         <div className="cm-compose-shell">
           <form
-            className="cm-composer"
+            className={'cm-composer' + (drop.dragging ? ' is-drop' : '')}
+            ref={dropRef}
             onSubmit={(event) => {
               event.preventDefault();
               submit();
             }}
+            onDragEnter={drop.onDragEnter}
+            onDragOver={drop.onDragOver}
+            onDragLeave={drop.onDragLeave}
+            onDrop={drop.onDrop}
           >
+            {drop.dragging ? (
+              <div className="cm-composer__drop" aria-hidden="true">
+                松开即可附加文件/目录
+              </div>
+            ) : null}
             <div className="cm-composer__body">
               <textarea
                 ref={inputRef}
@@ -1118,6 +1151,7 @@ export function NewTaskPage({
                 className="cm-menu__item"
                 type="button"
                 data-home-pick-dir
+                disabled={fileDialogBusy}
                 onClick={() => void handlePickDirectory()}
               >
                 <Icon name="folderopen" />

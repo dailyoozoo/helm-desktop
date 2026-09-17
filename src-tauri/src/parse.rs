@@ -16,8 +16,8 @@
 //! 无状态：所需 sessionId 每行都带；tool_use 入参直接取自已定稿的 assistant 消息。
 
 use crate::protocol::{
-    AgentEvent, CallStatus, Diff, DiffHunk, DiffKind, DiffLine, EngineId, Role,
-    RuntimeCapabilityAvailability, RuntimeCapabilitySnapshot, StopReason, ToolDenialSource,
+    AgentEvent, CallStatus, Diff, DiffHunk, DiffKind, DiffLine, EngineId, PlanStatus, PlanStep,
+    Role, RuntimeCapabilityAvailability, RuntimeCapabilitySnapshot, StopReason, ToolDenialSource,
     ToolOutcomeKind, ToolStatus, TurnStage,
 };
 use crate::util::now_millis;
@@ -26,6 +26,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 const ENGINE: EngineId = EngineId::ClaudeCode;
+const DIFF_LCS_CELL_LIMIT: usize = 262_144;
+const DIFF_LOOKAHEAD_LINES: usize = 64;
 
 /// 缓存 tool_use 的 input（key = tool_use_id），用于在 tool_result 时构造 diff。
 /// Claude Code 的 Write 工具在 tool_result 中只返回纯文本，不包含 diff 结构，
@@ -69,8 +71,7 @@ fn extract_diff(content: &Value) -> Option<Diff> {
     let mut new_text = String::new();
 
     for block in blocks {
-        let block_type = block.get("type").and_then(Value::as_str)?;
-        if block_type == "diff" {
+        if block.get("type").and_then(Value::as_str) == Some("diff") {
             path = block
                 .get("path")
                 .and_then(Value::as_str)
@@ -104,96 +105,108 @@ fn extract_diff(content: &Value) -> Option<Diff> {
     Some(Diff { path, hunks })
 }
 
-/// 根据两组行列表计算 diff hunks（前后缀 + 找共同起点算法）。
 fn compute_diff_hunks(old_lines: &[&str], new_lines: &[&str]) -> Vec<DiffHunk> {
-    if old_lines.is_empty() && new_lines.is_empty() {
-        return vec![];
-    }
-
-    // 找前后缀（不变化的行）
-    let mut pre = 0;
-    while pre < old_lines.len() && pre < new_lines.len() && old_lines[pre] == new_lines[pre] {
-        pre += 1;
-    }
-    let mut suff = 0;
-    while suff < old_lines.len() - pre
-        && suff < new_lines.len() - pre
-        && old_lines[old_lines.len() - 1 - suff] == new_lines[new_lines.len() - 1 - suff]
+    let mut prefix = 0;
+    while prefix < old_lines.len()
+        && prefix < new_lines.len()
+        && old_lines[prefix] == new_lines[prefix]
     {
-        suff += 1;
+        prefix += 1;
     }
-
-    let mid_old = &old_lines[pre..old_lines.len() - suff];
-    let mid_new = &new_lines[pre..new_lines.len() - suff];
-
-    if mid_old.is_empty() && mid_new.is_empty() {
-        return vec![];
+    let mut suffix = 0;
+    while suffix < old_lines.len() - prefix
+        && suffix < new_lines.len() - prefix
+        && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
+    {
+        suffix += 1;
     }
-
-    // 用 LCS 矩阵计算中间段差异
-    let lcs = lcs_matrix(mid_old, mid_new);
-    let mut lines: Vec<DiffLine> = Vec::new();
-    let mut oi = 0;
-    let mut ni = 0;
-    let mut lcs_prev = 0;
-
-    while oi < mid_old.len() || ni < mid_new.len() {
-        let lcs_cur = if oi < mid_old.len() && ni < mid_new.len() {
-            lcs[oi][ni]
-        } else {
-            0
-        };
-
-        if lcs_cur == lcs_prev + 1 {
+    let old = &old_lines[prefix..old_lines.len() - suffix];
+    let new = &new_lines[prefix..new_lines.len() - suffix];
+    if old.is_empty() && new.is_empty() {
+        return Vec::new();
+    }
+    let width = new.len() + 1;
+    let cells = (old.len() + 1).saturating_mul(width);
+    let matrix = if cells <= DIFF_LCS_CELL_LIMIT {
+        let mut matrix = vec![0u32; cells];
+        for old_index in (0..old.len()).rev() {
+            for new_index in (0..new.len()).rev() {
+                matrix[old_index * width + new_index] = if old[old_index] == new[new_index] {
+                    matrix[(old_index + 1) * width + new_index + 1] + 1
+                } else {
+                    matrix[(old_index + 1) * width + new_index]
+                        .max(matrix[old_index * width + new_index + 1])
+                };
+            }
+        }
+        Some(matrix)
+    } else {
+        None
+    };
+    let mut lines = Vec::with_capacity(old.len() + new.len());
+    let mut old_index = 0;
+    let mut new_index = 0;
+    while old_index < old.len() || new_index < new.len() {
+        if old_index < old.len() && new_index < new.len() && old[old_index] == new[new_index] {
             lines.push(DiffLine {
                 kind: DiffKind::Ctx,
-                text: mid_old[oi].to_string(),
+                text: old[old_index].to_string(),
             });
-            lcs_prev = lcs_cur;
-            oi += 1;
-            ni += 1;
-        } else if oi < mid_old.len() && (ni >= mid_new.len() || lcs[oi][ni] <= lcs_prev) {
+            old_index += 1;
+            new_index += 1;
+            continue;
+        }
+        let delete_first = if new_index == new.len() {
+            true
+        } else if old_index == old.len() {
+            false
+        } else if let Some(matrix) = matrix.as_ref() {
+            matrix[(old_index + 1) * width + new_index] >= matrix[old_index * width + new_index + 1]
+        } else {
+            let next_old = old[old_index + 1..old.len().min(old_index + DIFF_LOOKAHEAD_LINES + 1)]
+                .iter()
+                .position(|line| *line == new[new_index]);
+            let next_new = new[new_index + 1..new.len().min(new_index + DIFF_LOOKAHEAD_LINES + 1)]
+                .iter()
+                .position(|line| *line == old[old_index]);
+            match (next_old, next_new) {
+                (Some(deletions), Some(additions)) => deletions <= additions,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => {
+                    lines.push(DiffLine {
+                        kind: DiffKind::Del,
+                        text: old[old_index].to_string(),
+                    });
+                    lines.push(DiffLine {
+                        kind: DiffKind::Add,
+                        text: new[new_index].to_string(),
+                    });
+                    old_index += 1;
+                    new_index += 1;
+                    continue;
+                }
+            }
+        };
+        if delete_first {
             lines.push(DiffLine {
                 kind: DiffKind::Del,
-                text: mid_old[oi].to_string(),
+                text: old[old_index].to_string(),
             });
-            oi += 1;
+            old_index += 1;
         } else {
             lines.push(DiffLine {
                 kind: DiffKind::Add,
-                text: mid_new[ni].to_string(),
+                text: new[new_index].to_string(),
             });
-            ni += 1;
+            new_index += 1;
         }
     }
-
-    if lines.is_empty() {
-        return vec![];
-    }
-
     vec![DiffHunk {
-        old_start: (pre + 1) as u32,
-        new_start: (pre + 1) as u32,
+        old_start: (prefix + 1) as u32,
+        new_start: (prefix + 1) as u32,
         lines,
     }]
-}
-
-/// 计算 LCS 长度矩阵。
-fn lcs_matrix(a: &[&str], b: &[&str]) -> Vec<Vec<usize>> {
-    let m = a.len();
-    let n = b.len();
-    let mut matrix = vec![vec![0usize; n + 1]; m + 1];
-
-    for i in 1..=m {
-        for j in 1..=n {
-            if a[i - 1] == b[j - 1] {
-                matrix[i][j] = matrix[i - 1][j - 1] + 1;
-            } else {
-                matrix[i][j] = matrix[i - 1][j].max(matrix[i][j - 1]);
-            }
-        }
-    }
-    matrix
 }
 
 fn parse_system(obj: &Value, session_id: &str) -> Vec<AgentEvent> {
@@ -589,6 +602,277 @@ pub fn parse_claude_line(raw: &str) -> Vec<AgentEvent> {
         Some("user") => parse_user(&obj, &session_id),
         Some("result") => parse_result(&obj, &session_id),
         _ => vec![],
+    }
+}
+
+pub(crate) fn parse_codex_app_server_progress_notification(
+    session_id: &str,
+    notification: &Value,
+) -> Vec<AgentEvent> {
+    let Some(method) = notification.get("method").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let Some(params) = notification.get("params") else {
+        return Vec::new();
+    };
+    if session_id.is_empty()
+        || ["threadId", "turnId"].iter().any(|field| {
+            !params
+                .get(*field)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+        })
+    {
+        return Vec::new();
+    }
+    match method {
+        "turn/plan/updated" => {
+            let Some(plan) = params.get("plan").and_then(Value::as_array) else {
+                return Vec::new();
+            };
+            let mut steps = Vec::with_capacity(plan.len());
+            for step in plan {
+                let Some(text) = step.get("step").and_then(Value::as_str) else {
+                    return Vec::new();
+                };
+                let status = match step.get("status").and_then(Value::as_str) {
+                    Some("pending") => PlanStatus::Pending,
+                    Some("inProgress") => PlanStatus::Active,
+                    Some("completed") => PlanStatus::Done,
+                    _ => return Vec::new(),
+                };
+                steps.push(PlanStep {
+                    text: text.to_string(),
+                    status,
+                });
+            }
+            vec![AgentEvent::PlanUpdate {
+                session_id: session_id.to_string(),
+                steps,
+            }]
+        }
+        "item/commandExecution/outputDelta"
+        | "item/fileChange/outputDelta"
+        | "item/mcpToolCall/progress" => {
+            let Some(id) = params
+                .get("itemId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            else {
+                return Vec::new();
+            };
+            let chunk_field = if method == "item/mcpToolCall/progress" {
+                "message"
+            } else {
+                "delta"
+            };
+            let Some(chunk) = params
+                .get(chunk_field)
+                .and_then(Value::as_str)
+                .filter(|chunk| !chunk.is_empty())
+            else {
+                return Vec::new();
+            };
+            vec![AgentEvent::ToolProgress {
+                session_id: session_id.to_string(),
+                id: id.to_string(),
+                chunk: chunk.to_string(),
+            }]
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod codex_app_server_progress_tests {
+    use super::parse_codex_app_server_progress_notification;
+    use crate::protocol::AgentEvent;
+    use serde_json::{json, Value};
+
+    const TOOL_NOTIFICATIONS: [(&str, &str); 3] = [
+        ("item/commandExecution/outputDelta", "delta"),
+        ("item/fileChange/outputDelta", "delta"),
+        ("item/mcpToolCall/progress", "message"),
+    ];
+
+    fn notification(method: &str, params: Value) -> Value {
+        let mut fields = json!({"threadId": "native-thread", "turnId": "native-turn"});
+        fields
+            .as_object_mut()
+            .unwrap()
+            .extend(params.as_object().unwrap().clone());
+        json!({"method": method, "params": fields})
+    }
+
+    fn parse(notification: &Value) -> Vec<AgentEvent> {
+        parse_codex_app_server_progress_notification("helm-session", notification)
+    }
+
+    #[test]
+    fn plan_notification_maps_only_native_steps_and_statuses() {
+        let raw = notification(
+            "turn/plan/updated",
+            json!({
+                "explanation": "This is not an extra step or a progress percentage",
+                "plan": [
+                    {"step": "检查源码", "status": "completed"},
+                    {"step": "执行测试🙂", "status": "inProgress"},
+                    {"step": "  保留文本  ", "status": "pending"}
+                ]
+            }),
+        );
+        assert_eq!(
+            serde_json::to_value(parse(&raw)).unwrap(),
+            json!([{
+                "type": "plan_update",
+                "sessionId": "helm-session",
+                "steps": [
+                    {"text": "检查源码", "status": "done"},
+                    {"text": "执行测试🙂", "status": "active"},
+                    {"text": "  保留文本  ", "status": "pending"}
+                ]
+            }])
+        );
+    }
+
+    #[test]
+    fn empty_native_plan_is_a_valid_clear_not_an_invented_step() {
+        for params in [
+            json!({"plan": []}),
+            json!({"plan": [], "explanation": null}),
+        ] {
+            let raw = notification("turn/plan/updated", params);
+            assert_eq!(
+                serde_json::to_value(parse(&raw)).unwrap(),
+                json!([{"type": "plan_update", "sessionId": "helm-session", "steps": []}])
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_plan_snapshots_are_not_guessed_or_partially_emitted() {
+        for params in [
+            json!({}),
+            json!({"plan": null}),
+            json!({"plan": {"step": "not-an-array", "status": "pending"}}),
+            json!({"plan": [null]}),
+            json!({"plan": [{"step": 1, "status": "pending"}]}),
+            json!({"plan": [{"step": "missing-status"}]}),
+            json!({"plan": [{"title": "missing-step", "status": "pending"}]}),
+        ] {
+            assert!(parse(&notification("turn/plan/updated", params)).is_empty());
+        }
+        for status in ["in_progress", "active", "done", "unknown", ""] {
+            let raw = notification(
+                "turn/plan/updated",
+                json!({"plan": [
+                    {"step": "valid", "status": "completed"},
+                    {"step": "invalid", "status": status}
+                ]}),
+            );
+            assert!(parse(&raw).is_empty(), "unexpected status: {status}");
+        }
+    }
+
+    #[test]
+    fn native_tool_notifications_preserve_item_id_and_exact_text() {
+        for (method, field) in TOOL_NOTIFICATIONS {
+            for chunk in ["  输出🙂\r\n下一行\n", " \n", "100%"] {
+                let mut params = json!({
+                    "itemId": "native-tool-工具",
+                    "delta": "wrong field",
+                    "message": "wrong field"
+                });
+                params[field] = json!(chunk);
+                let raw = notification(method, params);
+                assert_eq!(
+                    serde_json::to_value(parse(&raw)).unwrap(),
+                    json!([{
+                        "type": "tool_progress",
+                        "sessionId": "helm-session",
+                        "id": "native-tool-工具",
+                        "chunk": chunk
+                    }]),
+                    "method: {method}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_or_empty_tool_output_does_not_fabricate_progress() {
+        for (method, field) in TOOL_NOTIFICATIONS {
+            for invalid_chunk in [Value::Null, json!(42), json!({"text": "nested"}), json!("")] {
+                let mut params = json!({"itemId": "native-tool"});
+                params[field] = invalid_chunk;
+                assert!(parse(&notification(method, params)).is_empty());
+            }
+            assert!(parse(&notification(method, json!({"itemId": "native-tool"}))).is_empty());
+            let mut params = json!({});
+            params[field] = json!("real output");
+            assert!(parse(&notification(method, params.clone())).is_empty());
+            for invalid_id in [Value::Null, json!(42), json!("")] {
+                params["itemId"] = invalid_id;
+                assert!(parse(&notification(method, params.clone())).is_empty());
+            }
+            let wrong_field = if field == "delta" { "message" } else { "delta" };
+            let mut wrong_params = json!({"itemId": "native-tool"});
+            wrong_params[wrong_field] = json!("do not use another notification's field");
+            assert!(parse(&notification(method, wrong_params)).is_empty());
+        }
+    }
+
+    #[test]
+    fn progress_notifications_require_session_thread_and_turn_attribution() {
+        let valid = [
+            notification("turn/plan/updated", json!({"plan": []})),
+            notification(
+                "item/commandExecution/outputDelta",
+                json!({"itemId": "native-tool", "delta": "output"}),
+            ),
+            notification(
+                "item/fileChange/outputDelta",
+                json!({"itemId": "native-tool", "delta": "output"}),
+            ),
+            notification(
+                "item/mcpToolCall/progress",
+                json!({"itemId": "native-tool", "message": "output"}),
+            ),
+        ];
+        for raw in valid {
+            assert!(parse_codex_app_server_progress_notification("", &raw).is_empty());
+            for field in ["threadId", "turnId"] {
+                let mut missing = raw.clone();
+                missing["params"].as_object_mut().unwrap().remove(field);
+                assert!(parse(&missing).is_empty());
+                for invalid_id in [Value::Null, json!(42), json!("")] {
+                    let mut invalid = raw.clone();
+                    invalid["params"][field] = invalid_id;
+                    assert!(parse(&invalid).is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unrelated_and_legacy_notifications_do_not_invent_progress() {
+        for raw in [
+            Value::Null,
+            json!({}),
+            json!({"method": "turn/plan/updated"}),
+            json!({"method": "turn/plan/updated", "params": null}),
+            notification(
+                "item/commandExecution/terminalInteraction",
+                json!({"delta": "input"}),
+            ),
+            notification(
+                "item/unknown/progress",
+                json!({"itemId": "native-tool", "delta": "text"}),
+            ),
+            json!({"type": "item.updated", "item": {"type": "todo_list", "items": []}}),
+        ] {
+            assert!(parse(&raw).is_empty());
+        }
     }
 }
 

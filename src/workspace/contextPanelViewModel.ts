@@ -1,5 +1,6 @@
 import type { ThreadItem } from '../engine/useSession';
 import type { GitStatus, StagedFile } from '../engine/transport';
+import { diffStats } from './diffStats';
 
 /** S3（2026-08-22 路线图）：右栏常驻 tab 冻结为「修改记录 / 全部文件」，标签与原型一致。 */
 export type ContextPanelFixedTab = 'changes' | 'files';
@@ -36,20 +37,49 @@ export const DYN_TAB_LABELS: Record<ArtifactPaneTab, string> = {
   tools: '工具',
 };
 
-/** 变更-34 · A4：动态 tab 打开/关闭的纯状态机（供单测，UI 层直接投影）。 */
-export interface DynTabsState {
-  open: ArtifactPaneTab[];
-  active: ArtifactPaneTab | null;
+/**
+ * 文件动态 tab 标识（对齐原型 ws.js openFilePreview：点「全部文件」行时按路径开 tab，
+ * 同一路径复用同一 tab）。id 前缀 `file:` 与交付物类 tab 区分。
+ */
+export type FilePaneTabId = `file:${string}`;
+
+export function fileTabId(path: string): FilePaneTabId {
+  return `file:${path}`;
 }
 
-export function openDynTab(state: DynTabsState, tab: ArtifactPaneTab): DynTabsState {
+export function isFilePaneTabId(id: string): id is FilePaneTabId {
+  return id.startsWith('file:');
+}
+
+/** 文件 tab 上的短标签：路径最后一段文件名（与原型一致，完整路径放 title）。 */
+export function fileTabLabel(idOrPath: string): string {
+  const path = isFilePaneTabId(idOrPath) ? idOrPath.slice('file:'.length) : idOrPath;
+  const normalized = path.replace(/\\/g, '/');
+  return normalized.slice(normalized.lastIndexOf('/') + 1) || path;
+}
+
+/** 文件 tab id 还原为工作区相对路径。 */
+export function fileTabPath(id: FilePaneTabId): string {
+  return id.slice('file:'.length);
+}
+
+/** 动态 tab 标识 = 交付物类 tab 或文件 tab。 */
+export type CtxDynTabId = ArtifactPaneTab | FilePaneTabId;
+
+/** 变更-34 · A4：动态 tab 打开/关闭的纯状态机（供单测，UI 层直接投影）。 */
+export interface DynTabsState {
+  open: CtxDynTabId[];
+  active: CtxDynTabId | null;
+}
+
+export function openDynTab(state: DynTabsState, tab: CtxDynTabId): DynTabsState {
   return {
     open: state.open.includes(tab) ? state.open : [...state.open, tab],
     active: tab,
   };
 }
 
-export function closeDynTab(state: DynTabsState, tab: ArtifactPaneTab): DynTabsState {
+export function closeDynTab(state: DynTabsState, tab: CtxDynTabId): DynTabsState {
   const open = state.open.filter((t) => t !== tab);
   // 关闭当前动态 tab 后 active 置空；UI 层把 null 绑定到默认常驻 tab「修改记录」（S3）。
   return {
@@ -141,6 +171,36 @@ export function billingSummary(cost?: ContextPanelCost): BillingTokenSummary {
   };
 }
 
+export function messageContextSummary(items: ThreadItem[]) {
+  const attachments = new Set<string>();
+  let messageCount = 0;
+  for (const item of items) {
+    if ('reverted' in item && item.reverted) continue;
+    if (item.kind === 'user' || item.kind === 'assistant') messageCount += 1;
+    if (item.kind === 'user') {
+      for (const path of item.attachments ?? []) {
+        if (path.trim()) attachments.add(path.trim());
+      }
+    }
+  }
+  return { messageCount, historicalAttachments: [...attachments] };
+}
+
+export function contextUsageSummary(cost?: ContextPanelCost): ContextUsageSummary {
+  const tokens = typeof cost?.contextTokens === 'number' ? cost.contextTokens : undefined;
+  const maxTokens =
+    typeof cost?.contextWindow === 'number' && cost.contextWindow > 0
+      ? cost.contextWindow
+      : undefined;
+  const ratio = tokens != null && maxTokens ? Math.min(1, tokens / maxTokens) : undefined;
+  return {
+    ...(tokens != null ? { tokens } : {}),
+    ...(maxTokens ? { maxTokens } : {}),
+    ...(ratio != null ? { ratio } : {}),
+    level: ratio == null ? 'none' : ratio >= 0.95 ? 'danger' : ratio >= 0.8 ? 'warning' : 'normal',
+  };
+}
+
 export function contextPanelData(
   items: ThreadItem[],
   cost?: ContextPanelCost,
@@ -148,24 +208,13 @@ export function contextPanelData(
   stagedFiles?: StagedFile[],
 ): ContextPanelData {
   const changedFiles = new Map<string, ChangedFileSummary>();
-  const mountedPaths = new Set<string>();
-  let messageCount = 0;
+  const { messageCount, historicalAttachments } = messageContextSummary(items);
   const tools: ToolSummary[] = [];
 
   for (const item of items) {
     // 回溯过滤（变更-11）：被回滚的轮次不再计入右栏（文件已还原、上下文已截断），
     // 与线程的 reverted 淡化语义一致
     if ('reverted' in item && item.reverted) continue;
-
-    if (item.kind === 'user' || item.kind === 'assistant') messageCount += 1;
-
-    if (item.kind === 'user') {
-      for (const path of item.attachments ?? []) {
-        const trimmed = path.trim();
-        if (trimmed) mountedPaths.add(trimmed);
-      }
-      continue;
-    }
 
     if (item.kind !== 'tool') continue;
 
@@ -180,52 +229,31 @@ export function contextPanelData(
       };
       current.edits += 1;
 
-      for (const hunk of item.diff.hunks) {
-        for (const line of hunk.lines) {
-          if (line.kind === 'add') current.added += 1;
-          else if (line.kind === 'del') current.removed += 1;
-        }
-      }
+      const stats = diffStats(item.diff);
+      current.added += stats.added;
+      current.removed += stats.removed;
 
       changedFiles.set(item.diff.path, current);
     }
   }
 
-  const contextTokens = typeof cost?.contextTokens === 'number' ? cost.contextTokens : undefined;
-  const maxTokens =
-    typeof cost?.contextWindow === 'number' && cost.contextWindow > 0
-      ? cost.contextWindow
-      : undefined;
-  const usedRatio = maxTokens && contextTokens != null ? Math.min(1, contextTokens / maxTokens) : 0;
-  const usageLevel =
-    contextTokens == null || !maxTokens
-      ? 'none'
-      : usedRatio >= 0.95
-        ? 'danger'
-        : usedRatio >= 0.8
-          ? 'warning'
-          : 'normal';
+  const contextUsage = contextUsageSummary(cost);
   const billing = billingSummary(cost);
 
   return {
     changedFiles: Array.from(changedFiles.values()),
     messageCount,
-    historicalAttachments: Array.from(mountedPaths.values()),
-    mountedPaths: Array.from(mountedPaths.values()),
+    historicalAttachments,
+    mountedPaths: historicalAttachments,
     contextWindow: {
-      usedTokens: contextTokens ?? 0,
-      ...(maxTokens ? { maxTokens } : {}),
-      usedRatio,
-      mountedPathCount: mountedPaths.size,
+      usedTokens: contextUsage.tokens ?? 0,
+      ...(contextUsage.maxTokens ? { maxTokens: contextUsage.maxTokens } : {}),
+      usedRatio: contextUsage.ratio ?? 0,
+      mountedPathCount: historicalAttachments.length,
       fileTokenDetailAvailable: false,
     },
     tools,
-    contextUsage: {
-      ...(contextTokens != null ? { tokens: contextTokens } : {}),
-      ...(maxTokens ? { maxTokens } : {}),
-      ...(contextTokens != null && maxTokens ? { ratio: usedRatio } : {}),
-      level: usageLevel,
-    },
+    contextUsage,
     billing,
     gitStatus,
     stagedFiles,

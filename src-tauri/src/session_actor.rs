@@ -1,13 +1,32 @@
-use crate::adapter::{ApprovalDecision, PermissionProfile};
-use crate::runtime_registry::{RuntimeOwnerRef, RuntimeRegistry};
+use crate::adapter::{AgentSession, ApprovalDecision, PermissionProfile};
+use crate::capability_registry::EngineCapabilitySnapshot;
+use crate::runtime_registry::{PendingRuntimeSession, RuntimeOwnerRef, RuntimeRegistry};
 use crate::sessions::SessionMessage;
-use crate::turn_start::TurnExecutionSpec;
+use crate::turn_start::{RuntimeRoute, TurnExecutionSpec};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use tokio::sync::{mpsc, oneshot};
 
 enum SessionActorCommand {
-    ReserveTurn(oneshot::Sender<Result<(), String>>),
-    ReleaseTurn,
+    ReserveTurn {
+        epoch: u64,
+        responder: oneshot::Sender<Result<(), String>>,
+    },
+    ReleaseTurn {
+        epoch: u64,
+    },
+    ConfigureReservedRuntime {
+        epoch: u64,
+        replacement: Option<PendingRuntimeSession>,
+        route: RuntimeRoute,
+        capability: EngineCapabilitySnapshot,
+        cwd: String,
+        responder: oneshot::Sender<Result<(), String>>,
+    },
     SendReserved {
+        epoch: u64,
         text: String,
         attachments: Vec<String>,
         spec: TurnExecutionSpec,
@@ -39,29 +58,20 @@ enum SessionActorCommand {
 
 #[derive(Default)]
 struct DispatchReservation {
-    reserved: bool,
-    cancelled: bool,
+    epoch: Option<u64>,
 }
 
 impl DispatchReservation {
-    fn reserve(&mut self) {
-        self.reserved = true;
-        self.cancelled = false;
+    fn reserve(&mut self, epoch: u64) {
+        self.epoch = Some(epoch);
     }
 
-    fn cancel(&mut self) {
-        if self.reserved {
-            self.cancelled = true;
-        }
-    }
-
-    fn consume(&mut self) -> Result<bool, String> {
-        if !self.reserved {
+    fn consume(&mut self, epoch: u64) -> Result<(), String> {
+        if self.epoch != Some(epoch) {
             return Err("SessionActor 没有对应的 Send reservation".to_string());
         }
-        let cancelled = self.cancelled;
         *self = Self::default();
-        Ok(cancelled)
+        Ok(())
     }
 
     fn clear(&mut self) {
@@ -73,40 +83,108 @@ impl DispatchReservation {
 pub struct SessionActorHandle {
     owner: RuntimeOwnerRef,
     tx: mpsc::UnboundedSender<SessionActorCommand>,
+    dispatch_epoch: Arc<AtomicU64>,
 }
 
 impl SessionActorHandle {
     pub fn start(owner: RuntimeOwnerRef, registry: RuntimeRegistry) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let actor_owner = owner.clone();
+        let dispatch_epoch = Arc::new(AtomicU64::new(0));
+        let actor_epoch = dispatch_epoch.clone();
         tauri::async_runtime::spawn(async move {
             let mut dispatch = DispatchReservation::default();
             while let Some(command) = rx.recv().await {
                 match command {
-                    SessionActorCommand::ReserveTurn(responder) => {
-                        let result = registry.reserve_turn(&actor_owner).await;
+                    SessionActorCommand::ReserveTurn { epoch, responder } => {
+                        if responder.is_closed() || actor_epoch.load(Ordering::SeqCst) != epoch {
+                            let _ = responder
+                                .send(Err("发送准备期间已取消，当前 Turn 未投递".to_string()));
+                            continue;
+                        }
+                        let mut result = registry.reserve_turn(&actor_owner).await;
                         if result.is_ok() {
-                            dispatch.reserve();
+                            if !responder.is_closed() && actor_epoch.load(Ordering::SeqCst) == epoch
+                            {
+                                dispatch.reserve(epoch);
+                            } else {
+                                let _ = registry.release_turn_reservation(&actor_owner).await;
+                                result = Err("发送准备期间已取消，当前 Turn 未投递".to_string());
+                            }
+                        }
+                        let reserved = result.is_ok();
+                        if responder.send(result).is_err()
+                            && reserved
+                            && dispatch.consume(epoch).is_ok()
+                        {
+                            let _ = registry.release_turn_reservation(&actor_owner).await;
+                        }
+                    }
+                    SessionActorCommand::ReleaseTurn { epoch } => {
+                        if dispatch.consume(epoch).is_ok() {
+                            let _ = registry.release_turn_reservation(&actor_owner).await;
+                        }
+                    }
+                    SessionActorCommand::ConfigureReservedRuntime {
+                        epoch,
+                        replacement,
+                        route,
+                        capability,
+                        cwd,
+                        responder,
+                    } => {
+                        if responder.is_closed()
+                            || dispatch.epoch != Some(epoch)
+                            || actor_epoch.load(Ordering::SeqCst) != epoch
+                        {
+                            if let Some(replacement) = replacement {
+                                replacement.shutdown().await;
+                            }
+                            if dispatch.consume(epoch).is_ok() {
+                                let _ = registry.release_turn_reservation(&actor_owner).await;
+                            }
+                            let _ = responder
+                                .send(Err("发送准备期间已取消，当前 Turn 未投递".to_string()));
+                            continue;
+                        }
+                        let mut result = if let Some(replacement) = replacement {
+                            registry
+                                .replace_reserved_session(
+                                    &actor_owner,
+                                    replacement.into_session(),
+                                    &route,
+                                    &capability,
+                                    &cwd,
+                                )
+                                .await
+                                .map(|_| ())
+                        } else {
+                            registry
+                                .update_reserved_capability_snapshot(&actor_owner, capability)
+                                .await
+                        };
+                        if responder.is_closed() || actor_epoch.load(Ordering::SeqCst) != epoch {
+                            if dispatch.consume(epoch).is_ok() {
+                                let _ = registry.release_turn_reservation(&actor_owner).await;
+                            }
+                            result = Err("发送准备期间已取消，当前 Turn 未投递".to_string());
                         }
                         let _ = responder.send(result);
                     }
-                    SessionActorCommand::ReleaseTurn => {
-                        let _ = registry.release_turn_reservation(&actor_owner).await;
-                        dispatch.clear();
-                    }
                     SessionActorCommand::SendReserved {
+                        epoch,
                         text,
                         attachments,
                         spec,
                         responder,
                     } => {
-                        let result = match dispatch.consume() {
+                        let result = match dispatch.consume(epoch) {
                             Err(error) => Err(error),
-                            Ok(true) => {
+                            Ok(()) if actor_epoch.load(Ordering::SeqCst) != epoch => {
                                 let _ = registry.release_turn_reservation(&actor_owner).await;
                                 Err("发送提交前已收到 Stop，当前 Turn 未投递".to_string())
                             }
-                            Ok(false) => {
+                            Ok(()) => {
                                 registry
                                     .send_reserved(&actor_owner, text, attachments, spec)
                                     .await
@@ -134,7 +212,10 @@ impl SessionActorHandle {
                             .send(registry.approve(&actor_owner, request_id, decision).await);
                     }
                     SessionActorCommand::Interrupt(responder) => {
-                        dispatch.cancel();
+                        if dispatch.epoch.is_some() {
+                            dispatch.clear();
+                            let _ = registry.release_turn_reservation(&actor_owner).await;
+                        }
                         let _ = responder.send(registry.interrupt(&actor_owner).await);
                     }
                     SessionActorCommand::CompactContext(responder) => {
@@ -161,7 +242,11 @@ impl SessionActorHandle {
                 }
             }
         });
-        Self { owner, tx }
+        Self {
+            owner,
+            tx,
+            dispatch_epoch,
+        }
     }
 
     pub fn owner(&self) -> &RuntimeOwnerRef {
@@ -180,21 +265,55 @@ impl SessionActorHandle {
             .map_err(|_| "SessionActor 未返回结果".to_string())?
     }
 
-    pub async fn reserve_turn(&self) -> Result<(), String> {
-        self.request(SessionActorCommand::ReserveTurn).await
+    pub fn begin_dispatch(&self) -> u64 {
+        self.dispatch_epoch.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    pub fn release_turn_reservation(&self) {
-        let _ = self.tx.send(SessionActorCommand::ReleaseTurn);
+    pub fn ensure_dispatch_current(&self, epoch: u64) -> Result<(), String> {
+        if self.dispatch_epoch.load(Ordering::SeqCst) == epoch {
+            Ok(())
+        } else {
+            Err("发送准备期间已取消，当前 Turn 未投递".to_string())
+        }
+    }
+
+    pub async fn reserve_turn(&self, epoch: u64) -> Result<(), String> {
+        self.request(|responder| SessionActorCommand::ReserveTurn { epoch, responder })
+            .await
+    }
+
+    pub fn release_turn_reservation(&self, epoch: u64) {
+        let _ = self.tx.send(SessionActorCommand::ReleaseTurn { epoch });
+    }
+
+    pub async fn configure_reserved_runtime(
+        &self,
+        epoch: u64,
+        replacement: Option<AgentSession>,
+        route: RuntimeRoute,
+        capability: EngineCapabilitySnapshot,
+        cwd: String,
+    ) -> Result<(), String> {
+        self.request(|responder| SessionActorCommand::ConfigureReservedRuntime {
+            epoch,
+            replacement: replacement.map(PendingRuntimeSession::new),
+            route,
+            capability,
+            cwd,
+            responder,
+        })
+        .await
     }
 
     pub async fn send_reserved(
         &self,
+        epoch: u64,
         text: String,
         attachments: Vec<String>,
         spec: TurnExecutionSpec,
     ) -> Result<(), String> {
         self.request(|responder| SessionActorCommand::SendReserved {
+            epoch,
             text,
             attachments,
             spec,
@@ -231,6 +350,7 @@ impl SessionActorHandle {
     }
 
     pub async fn interrupt(&self) -> Result<(), String> {
+        self.dispatch_epoch.fetch_add(1, Ordering::SeqCst);
         self.request(SessionActorCommand::Interrupt).await
     }
 
@@ -255,6 +375,7 @@ impl SessionActorHandle {
     }
 
     pub async fn close(&self) -> Result<(), String> {
+        self.dispatch_epoch.fetch_add(1, Ordering::SeqCst);
         self.request(SessionActorCommand::Close).await
     }
 }
@@ -264,13 +385,38 @@ mod tests {
     use super::DispatchReservation;
 
     #[test]
-    fn stop_between_reserve_and_dispatch_cancels_exactly_that_send() {
+    fn stale_dispatch_cannot_consume_or_release_a_new_reservation() {
         let mut state = DispatchReservation::default();
-        state.reserve();
-        state.cancel();
-        assert_eq!(state.consume().unwrap(), true);
-        assert!(state.consume().is_err());
-        state.reserve();
-        assert_eq!(state.consume().unwrap(), false);
+        state.reserve(1);
+        state.clear();
+        state.reserve(2);
+        assert!(state.consume(1).is_err());
+        assert!(state.consume(2).is_ok());
+        assert!(state.consume(2).is_err());
+    }
+
+    #[tokio::test]
+    async fn stop_invalidates_preflight_before_any_reservation_exists() {
+        let (tx, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let handle = super::SessionActorHandle {
+            owner: crate::runtime_registry::RuntimeOwnerRef::Session("session".into()),
+            tx,
+            dispatch_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let first = handle.begin_dispatch();
+        assert!(handle.ensure_dispatch_current(first).is_ok());
+        let pending_stop = handle.interrupt();
+        tokio::pin!(pending_stop);
+        tokio::select! {
+            _ = &mut pending_stop => panic!("interrupt must wait for the actor"),
+            command = receiver.recv() => match command.unwrap() {
+                super::SessionActorCommand::Interrupt(responder) => { responder.send(Ok(())).unwrap(); }
+                _ => panic!("unexpected command"),
+            }
+        }
+        pending_stop.await.unwrap();
+        assert!(handle.ensure_dispatch_current(first).is_err());
+        let next = handle.begin_dispatch();
+        assert!(handle.ensure_dispatch_current(next).is_ok());
     }
 }

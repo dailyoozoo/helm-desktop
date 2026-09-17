@@ -1,9 +1,20 @@
 // @helm/protocol —— CLI↔UI 流式协议的单一真值。
 // 前端、后端、契约测试都从这里 import，不允许各写一份。
 
+export {
+  MAX_TOOL_OUTPUT_BYTES,
+  OUTPUT_TRUNCATED,
+  boundedToolOutput,
+  appendToolOutput,
+  boundedToolResult,
+} from './outputLimits';
+
+export type { TurnPresentation } from './history';
+
 export type {
   AgentEvent,
   AgentEventEnvelope,
+  TurnStreamFailure,
   AgentEventType,
   ErrorKind,
   EventServiceTier,

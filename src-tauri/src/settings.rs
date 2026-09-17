@@ -1,4 +1,5 @@
-use crate::providers::{KeyringSecretStore, ProviderStore};
+use crate::capability_registry::{resolve_binary_path, EngineCapabilityRegistry};
+use crate::providers::{AppConfig, EngineStatus, KeyringSecretStore, ProviderStore};
 use crate::sessions::SessionHistoryStore;
 use crate::subscription_profiles::SubscriptionProfileStore;
 use serde::{Deserialize, Serialize};
@@ -297,74 +298,35 @@ pub struct EngineDetectionResult {
     pub version: String,
 }
 
-/// 按可执行文件名做真实检测：where/which 定位 + `--version`。
-/// 供手动检测命令与启动时的就绪度检查共用。
-fn detect_engine_binary(executable: &str) -> Result<EngineDetectionResult, String> {
-    #[cfg(windows)]
-    let which_cmd = "where";
-    #[cfg(not(windows))]
-    let which_cmd = "which";
-
-    let mut locate = std::process::Command::new(which_cmd);
-    locate.arg(executable);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        locate.creation_flags(0x0800_0000);
-    }
-    let output = locate
-        .output()
-        .map_err(|e| format!("执行 {which_cmd} 失败：{e}"))?;
-
+pub(crate) async fn detect_engine_binary(
+    engine: &str,
+    bin: &str,
+) -> Result<EngineDetectionResult, String> {
+    let path = resolve_binary_path(bin)?;
+    let mut command = engine_command(engine, bin)?;
+    command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+        .await
+        .map_err(|_| "引擎版本检测超时".to_string())?
+        .map_err(|error| format!("无法执行配置的引擎：{error}"))?;
     if !output.status.success() {
-        return Err(format!("在 PATH 中找不到 {executable}，可能尚未安装"));
+        return Err("配置的引擎无法完成版本检测，请检查可执行文件".to_string());
     }
-
-    let path = String::from_utf8_lossy(&output.stdout)
+    let version = String::from_utf8_lossy(&output.stdout)
         .lines()
         .next()
-        .unwrap_or("")
+        .unwrap_or("unknown")
         .trim()
         .to_string();
-
-    if path.is_empty() {
-        return Err(format!("在 PATH 中找不到 {executable}，可能尚未安装"));
-    }
-
-    // Windows：npm 全局安装的 claude/codex 是 .cmd 垫片，CreateProcess 不能直接执行，
-    // 必须经 cmd /C 中转（与 providers.rs build_version_command 同款处理），否则版本恒为 unknown。
-    #[cfg(windows)]
-    let version = {
-        use std::os::windows::process::CommandExt;
-        let mut version_cmd = std::process::Command::new("cmd");
-        version_cmd.arg("/C").arg(&path).arg("--version");
-        version_cmd.creation_flags(0x0800_0000);
-        match version_cmd.output() {
-            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .next()
-                .unwrap_or("unknown")
-                .trim()
-                .to_string(),
-            _ => "unknown".to_string(),
-        }
-    };
-    #[cfg(not(windows))]
-    let version = {
-        let mut version_cmd = std::process::Command::new(&path);
-        version_cmd.arg("--version");
-        match version_cmd.output() {
-            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .next()
-                .unwrap_or("unknown")
-                .trim()
-                .to_string(),
-            _ => "unknown".to_string(),
-        }
-    };
-
-    Ok(EngineDetectionResult { path, version })
+    Ok(EngineDetectionResult {
+        path: path.to_string_lossy().to_string(),
+        version,
+    })
 }
 
 fn engine_executable(engine: &str) -> Result<&'static str, String> {
@@ -376,8 +338,45 @@ fn engine_executable(engine: &str) -> Result<&'static str, String> {
 }
 
 #[tauri::command]
-pub fn detect_cli_engine(engine: String) -> Result<EngineDetectionResult, String> {
-    detect_engine_binary(engine_executable(&engine)?)
+pub async fn detect_cli_engine(
+    config_store: State<'_, ProviderStore<KeyringSecretStore>>,
+    profiles: State<'_, SubscriptionProfileStore>,
+    capability_registry: State<'_, EngineCapabilityRegistry>,
+    engine: String,
+) -> Result<EngineDetectionResult, String> {
+    let config = config_store.load()?;
+    let bin = configured_engine_bin(&config, &engine)?;
+    invalidate_engine_probes(&profiles, &capability_registry, &engine)?;
+    detect_engine_binary(&engine, bin).await
+}
+
+pub(crate) fn configured_engine_bin<'a>(
+    config: &'a AppConfig,
+    engine: &str,
+) -> Result<&'a str, String> {
+    engine_executable(engine)?;
+    config
+        .engine_bin(engine)
+        .map(str::trim)
+        .filter(|bin| !bin.is_empty())
+        .ok_or_else(|| format!("请先配置 {engine} 引擎的可执行文件"))
+}
+
+fn engine_command(engine: &str, bin: &str) -> Result<tokio::process::Command, String> {
+    match engine {
+        "claude-code" => Ok(crate::adapter::build_command(bin)),
+        "codex" => Ok(crate::adapter::build_codex_command(bin)),
+        other => Err(format!("未知引擎：{other}")),
+    }
+}
+
+pub(crate) fn invalidate_engine_probes(
+    profiles: &SubscriptionProfileStore,
+    capability_registry: &EngineCapabilityRegistry,
+    engine: &str,
+) -> Result<(), String> {
+    profiles.invalidate_probes(engine)?;
+    capability_registry.invalidate_engine(engine)
 }
 
 /// 单个引擎的就绪度。
@@ -493,22 +492,14 @@ fn parse_auth_status(engine: &str, success: bool, stdout: &[u8], stderr: &[u8]) 
 async fn run_auth_status(
     profiles: &SubscriptionProfileStore,
     engine: &str,
+    bin: &str,
 ) -> Result<CliLoginState, String> {
-    let (bin, args): (&str, &[&str]) = match engine {
-        "claude-code" => ("claude", &["auth", "status"]),
-        "codex" => ("codex", &["login", "status"]),
+    let args: &[&str] = match engine {
+        "claude-code" => &["auth", "status"],
+        "codex" => &["login", "status"],
         other => return Err(format!("未知引擎：{other}")),
     };
-    let mut command = match engine {
-        "claude-code" => crate::adapter::build_command(bin),
-        "codex" => crate::adapter::build_codex_command(bin),
-        _ => unreachable!("engine was validated above"),
-    };
-    profiles.configure_command(&mut command, engine)?;
-    command
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut command = auth_command(profiles, engine, bin, args)?;
     let output = match tokio::time::timeout(Duration::from_secs(10), command.output()).await {
         Ok(Ok(output)) => output,
         Ok(Err(error)) => {
@@ -557,9 +548,48 @@ fn validate_subscription_login(state: &CliLoginState) -> Result<(), String> {
 pub(crate) async fn ensure_subscription_login(
     profiles: &SubscriptionProfileStore,
     engine: &str,
+    bin: &str,
 ) -> Result<(), String> {
-    let state = run_auth_status(profiles, engine).await?;
+    let state = cached_auth_status(profiles, engine, bin).await?;
     validate_subscription_login(&state)
+}
+
+async fn cached_auth_status(
+    profiles: &SubscriptionProfileStore,
+    engine: &str,
+    bin: &str,
+) -> Result<CliLoginState, String> {
+    let key = profiles.probe_key(engine, bin)?;
+    profiles
+        .login_probes
+        .get_or_probe_if(
+            key,
+            |_| run_auth_status(profiles, engine, bin),
+            |state| validate_subscription_login(state).is_ok(),
+        )
+        .await
+}
+
+fn auth_command(
+    profiles: &SubscriptionProfileStore,
+    engine: &str,
+    bin: &str,
+    args: &[&str],
+) -> Result<tokio::process::Command, String> {
+    let mut command = engine_command(engine, bin)?;
+    crate::adapter::apply_inherited_agent_environment(&mut command);
+    profiles.configure_command(&mut command, engine)?;
+    if engine == "codex" {
+        command.args(["-c", "model_provider=\"openai\""]);
+    }
+    command
+        .args(args)
+        .current_dir(std::env::temp_dir())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    Ok(command)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -584,21 +614,11 @@ fn auth_command_spec(
 async fn run_auth_lifecycle(
     profiles: &SubscriptionProfileStore,
     engine: &str,
+    bin: &str,
     action: AuthAction,
 ) -> Result<(), String> {
-    let (bin, args) = auth_command_spec(engine, action)?;
-    let mut command = match engine {
-        "claude-code" => crate::adapter::build_command(bin),
-        "codex" => crate::adapter::build_codex_command(bin),
-        _ => unreachable!("engine was validated above"),
-    };
-    profiles.configure_command(&mut command, engine)?;
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    let (_, args) = auth_command_spec(engine, action)?;
+    let mut command = auth_command(profiles, engine, bin, &args)?;
     let timeout = match action {
         AuthAction::Login => Duration::from_secs(300),
         AuthAction::Logout => Duration::from_secs(30),
@@ -623,64 +643,75 @@ async fn run_auth_lifecycle(
 #[tauri::command]
 pub async fn login_cli_account(
     profiles: State<'_, SubscriptionProfileStore>,
+    config_store: State<'_, ProviderStore<KeyringSecretStore>>,
+    capability_registry: State<'_, EngineCapabilityRegistry>,
     engine: String,
 ) -> Result<CliLoginState, String> {
-    run_auth_lifecycle(&profiles, &engine, AuthAction::Login).await?;
-    run_auth_status(&profiles, &engine).await
+    let config = config_store.load()?;
+    let bin = configured_engine_bin(&config, &engine)?;
+    invalidate_engine_probes(&profiles, &capability_registry, &engine)?;
+    let result = run_auth_lifecycle(&profiles, &engine, bin, AuthAction::Login).await;
+    invalidate_engine_probes(&profiles, &capability_registry, &engine)?;
+    result?;
+    let state = cached_auth_status(&profiles, &engine, bin).await?;
+    validate_subscription_login(&state)?;
+    Ok(state)
 }
 
 #[tauri::command]
 pub async fn logout_cli_account(
     profiles: State<'_, SubscriptionProfileStore>,
+    config_store: State<'_, ProviderStore<KeyringSecretStore>>,
+    capability_registry: State<'_, EngineCapabilityRegistry>,
     engine: String,
 ) -> Result<CliLoginState, String> {
-    run_auth_lifecycle(&profiles, &engine, AuthAction::Logout).await?;
-    run_auth_status(&profiles, &engine).await
+    let config = config_store.load()?;
+    let bin = configured_engine_bin(&config, &engine)?;
+    invalidate_engine_probes(&profiles, &capability_registry, &engine)?;
+    let result = run_auth_lifecycle(&profiles, &engine, bin, AuthAction::Logout).await;
+    invalidate_engine_probes(&profiles, &capability_registry, &engine)?;
+    result?;
+    cached_auth_status(&profiles, &engine, bin).await
 }
 
 /// 检测某个引擎的 Helm-owned 订阅 Profile 登录态。
 #[tauri::command]
 pub async fn detect_cli_login(
     profiles: State<'_, SubscriptionProfileStore>,
+    config_store: State<'_, ProviderStore<KeyringSecretStore>>,
+    capability_registry: State<'_, EngineCapabilityRegistry>,
     engine: String,
 ) -> Result<CliLoginState, String> {
-    run_auth_status(&profiles, &engine).await
-}
-
-async fn engine_login_state(
-    profiles: &SubscriptionProfileStore,
-    executable: &str,
-) -> CliLoginState {
-    match executable {
-        "claude" => run_auth_status(profiles, "claude-code")
-            .await
-            .unwrap_or_else(|error| login_state("unknown", "unknown", &error)),
-        "codex" => run_auth_status(profiles, "codex")
-            .await
-            .unwrap_or_else(|error| login_state("unknown", "unknown", &error)),
-        _ => login_state("unknown", "unknown", "未知引擎，无法检测登录状态"),
-    }
+    let config = config_store.load()?;
+    let bin = configured_engine_bin(&config, &engine)?;
+    invalidate_engine_probes(&profiles, &capability_registry, &engine)?;
+    cached_auth_status(&profiles, &engine, bin).await
 }
 
 async fn engine_readiness(
     profiles: &SubscriptionProfileStore,
-    executable: &str,
+    engine: &str,
+    bin: &str,
 ) -> EngineReadiness {
-    let login = engine_login_state(profiles, executable).await;
-    match detect_engine_binary(executable) {
-        Ok(result) => EngineReadiness {
-            installed: true,
-            path: Some(result.path),
-            version: Some(result.version),
-            error: None,
-            login,
-        },
+    match detect_engine_binary(engine, bin).await {
+        Ok(result) => {
+            let login = cached_auth_status(profiles, engine, bin)
+                .await
+                .unwrap_or_else(|error| login_state("unknown", "unknown", &error));
+            EngineReadiness {
+                installed: true,
+                path: Some(result.path),
+                version: Some(result.version),
+                error: None,
+                login,
+            }
+        }
         Err(error) => EngineReadiness {
             installed: false,
             path: None,
             version: None,
             error: Some(error),
-            login,
+            login: login_state("unknown", "unknown", "引擎不可执行，无法检测登录状态"),
         },
     }
 }
@@ -716,33 +747,43 @@ pub async fn get_readiness_report(
     profiles: State<'_, SubscriptionProfileStore>,
 ) -> Result<ReadinessReport, String> {
     let settings = load_app_settings_from_store(&history_store)?;
-    let claude = engine_readiness(&profiles, "claude").await;
-    let codex = engine_readiness(&profiles, "codex").await;
-
-    let mut config = config_store.load()?;
-    let mut changed = false;
-    for engine in config.engines.iter_mut() {
-        let readiness = match engine.id.as_str() {
-            "claude-code" => &claude,
-            "codex" => &codex,
-            _ => continue,
-        };
+    let initial = config_store.load()?;
+    let claude_bin = configured_engine_bin(&initial, "claude-code")?.to_string();
+    let codex_bin = configured_engine_bin(&initial, "codex")?.to_string();
+    let (mut claude, mut codex) = tokio::join!(
+        engine_readiness(&profiles, "claude-code", &claude_bin),
+        engine_readiness(&profiles, "codex", &codex_bin),
+    );
+    for (engine_id, bin, readiness) in [
+        ("claude-code", claude_bin.as_str(), &claude),
+        ("codex", codex_bin.as_str(), &codex),
+    ] {
         let next_status = if readiness.installed {
-            crate::providers::EngineStatus::Ready
+            EngineStatus::Ready
         } else {
-            crate::providers::EngineStatus::Missing
+            EngineStatus::Missing
         };
-        if engine.status != next_status || engine.version != readiness.version {
-            engine.status = next_status;
-            engine.version = readiness.version.clone();
-            if let Some(path) = &readiness.path {
-                engine.bin = path.clone();
-            }
-            changed = true;
-        }
+        config_store.record_engine_detection(
+            engine_id,
+            bin,
+            next_status,
+            readiness.version.clone(),
+        )?;
     }
-    if changed {
-        config_store.save(&config)?;
+    let config = config_store.load()?;
+    for (engine_id, bin, readiness) in [
+        ("claude-code", claude_bin.as_str(), &mut claude),
+        ("codex", codex_bin.as_str(), &mut codex),
+    ] {
+        if config.engine_bin(engine_id).map(str::trim) != Some(bin) {
+            *readiness = EngineReadiness {
+                installed: false,
+                path: None,
+                version: None,
+                error: Some("引擎配置已更新，请重新检测".to_string()),
+                login: login_state("unknown", "unknown", "引擎配置已更新，请重新检测"),
+            };
+        }
     }
 
     let cwd_path = settings.general.default_directory.trim().to_string();
@@ -820,6 +861,81 @@ mod permission_settings_compat_tests {
 #[cfg(test)]
 mod auth_status_tests {
     use super::*;
+
+    #[test]
+    fn configured_engine_paths_are_used_for_auth_status_login_and_logout() {
+        let root = std::env::temp_dir().join(format!(
+            "helm-configured-auth-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let profiles = SubscriptionProfileStore::new(root.clone());
+        let mut config = crate::providers::seed_config();
+        for engine in ["claude-code", "codex"] {
+            let binary = root.join(format!("configured-{engine}.exe"));
+            std::fs::write(&binary, "command-construction-fixture").unwrap();
+            config
+                .engines
+                .iter_mut()
+                .find(|candidate| candidate.id == engine)
+                .unwrap()
+                .bin = binary.to_string_lossy().to_string();
+            let bin = configured_engine_bin(&config, engine).unwrap();
+            assert_eq!(Path::new(bin), binary);
+            let mut argument_sets = vec![if engine == "codex" {
+                vec!["login", "status"]
+            } else {
+                vec!["auth", "status"]
+            }];
+            for action in [AuthAction::Login, AuthAction::Logout] {
+                argument_sets.push(auth_command_spec(engine, action).unwrap().1);
+            }
+            for arguments in argument_sets {
+                let command = auth_command(&profiles, engine, bin, &arguments).unwrap();
+                assert_eq!(
+                    Path::new(command.as_std().get_program())
+                        .canonicalize()
+                        .unwrap(),
+                    binary.canonicalize().unwrap()
+                );
+                let actual_args = command
+                    .as_std()
+                    .get_args()
+                    .map(|argument| argument.to_string_lossy().to_string())
+                    .collect::<Vec<_>>();
+                assert!(actual_args.ends_with(
+                    &arguments
+                        .iter()
+                        .map(|argument| argument.to_string())
+                        .collect::<Vec<_>>()
+                ));
+                let (variable, profile) = profiles.command_env(engine).unwrap();
+                assert!(command
+                    .as_std()
+                    .get_envs()
+                    .any(|(name, value)| name == variable && value == Some(profile.as_os_str())));
+                if engine == "codex" {
+                    assert!(actual_args.contains(&"model_provider=\"openai\"".to_string()));
+                }
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_configured_binary_does_not_fall_back_to_a_different_cli() {
+        let mut config = crate::providers::seed_config();
+        config
+            .engines
+            .iter_mut()
+            .find(|engine| engine.id == "codex")
+            .unwrap()
+            .bin
+            .clear();
+        assert!(configured_engine_bin(&config, "codex").is_err());
+        assert!(configured_engine_bin(&config, "unknown").is_err());
+    }
 
     #[test]
     fn legacy_worktree_settings_are_ignored_and_not_serialized_again() {

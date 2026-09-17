@@ -95,7 +95,7 @@ describe('Tauri command contract', () => {
     ]
       .flatMap((path) => [
         ...readFileSync(resolve(root, path), 'utf8').matchAll(
-          /invoke(?:<[^;()]*?>)?\(\s*['"]([A-Za-z0-9_]+)['"]/g,
+          /\b(?:invoke|invokeWithConfigInvalidation)(?:<[^;()]*?>)?\(\s*['"]([A-Za-z0-9_]+)['"]/g,
         ),
       ])
       .map((match) => match[1]);

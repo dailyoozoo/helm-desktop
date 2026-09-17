@@ -41,14 +41,15 @@ export const ApprovalCard = memo(function ApprovalCard({ item, onRespond, classN
   // 保留完整警示卡片只会让折叠后的过程区显得层层嵌套；待处理审批保持卡片。
   if (item.status === 'resolved') {
     const denied = item.decision === 'deny';
+    const expired = !item.decision;
     return (
       <div className={className} data-kind="approve">
         <div className="approve-lite">
-          <Icon name={denied ? 'close' : 'check'} />
+          <Icon name={expired || denied ? 'close' : 'check'} />
           <span className="approve-lite__act">{item.detail || item.action}</span>
           <span
             className="approve-lite__res"
-            style={{ color: denied ? 'var(--danger)' : 'var(--success)' }}
+            style={{ color: expired ? 'var(--fg-3)' : denied ? 'var(--danger)' : 'var(--success)' }}
           >
             {item.decision ? RESOLVED_LABELS[item.decision] : '审批已失效'}
           </span>

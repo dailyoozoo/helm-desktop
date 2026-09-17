@@ -956,6 +956,11 @@ body.cm-page * {
 .cm-switch input:checked + i::after {
   transform: translateX(15px);
 }
+/* 禁用态（角色模型等不可单独启停的路径）：降透明度 + 禁用光标，避免误以为可切换 */
+.cm-switch input:disabled + i {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
 
 .cm-option-row {
   display: flex;
@@ -1221,6 +1226,48 @@ body.cm-page * {
   display: flex;
   align-items: center;
   gap: 12px;
+}
+
+/* —— 关于页：检查更新状态条（对齐原型 settings.html） —— */
+.cm-about-status-bar {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 12px;
+  padding: 11px 16px;
+  border-radius: var(--r-sm);
+  font-size: 12px;
+  background: color-mix(in oklch, var(--success) 8%, transparent);
+  color: var(--success);
+}
+.cm-about-status-bar[hidden] {
+  display: none;
+}
+.cm-about-status-bar__icon {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  display: inline-flex;
+}
+.cm-about-status-bar__icon svg {
+  width: 100%;
+  height: 100%;
+  stroke-width: 1.75;
+}
+.cm-about-status-bar.is-checking {
+  background: color-mix(in oklch, var(--accent) 8%, transparent);
+  color: var(--accent-hi);
+}
+.cm-about-status-bar.is-checking .cm-about-status-bar__icon {
+  animation: spin 1s linear infinite;
+}
+.cm-about-status-bar.is-available {
+  background: color-mix(in oklch, var(--accent) 8%, transparent);
+  color: var(--accent-hi);
+}
+.cm-about-status-bar.is-error {
+  background: color-mix(in oklch, var(--danger) 8%, transparent);
+  color: var(--danger);
 }
 
 .cm-theme-preview {
@@ -1727,6 +1774,26 @@ body.cm-page * {
 .cm-composer:focus-within {
   border-color: var(--accent-line);
   box-shadow: 0 0 0 3px var(--accent-soft);
+}
+/* 变更-37 · 拖拽附加：落点高亮与提示层，与 focus-within 同一套强调语言 */
+.cm-composer.is-drop {
+  position: relative;
+  border-color: var(--accent-line);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.cm-composer__drop {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: inherit;
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 13px;
+  font-weight: 600;
+  pointer-events: none;
 }
 .cm-composer__body {
   padding: 16px 17px 8px;

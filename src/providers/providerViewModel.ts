@@ -12,6 +12,7 @@ import type {
   ProviderProtocol,
   ProviderTest,
   ProviderRoleKey,
+  PricingCatalogEntry,
 } from './api';
 
 export const PROTOCOL_LABELS: Record<ProviderProtocol, string> = {
@@ -709,10 +710,7 @@ export function modelCatalog(config: AppConfig): ModelConfig[] {
 export function normalizeBindingDraft(config: AppConfig, draft: BindingConfig): BindingConfig {
   const models = bindingModelOptions(config, draft.providerId);
   const modelIds = new Set(models.map((model) => model.id));
-  // 方案 b：role: 前缀表示绑定到角色，启动时解析，不参与目录校验
-  if (draft.primaryModel.startsWith('role:')) {
-    return { ...draft, primaryModel: draft.primaryModel };
-  }
+  for (const model of sessionModelOptions(config, draft.providerId)) modelIds.add(model.id);
   const primaryModel = modelIds.has(draft.primaryModel)
     ? draft.primaryModel
     : (models[0]?.id ?? '');
@@ -765,9 +763,10 @@ export interface ProviderCardStatus {
   tone: 'ready' | 'warn' | 'muted';
 }
 
-/** 服务商卡片状态 pill：只消费真实 ready/lastTest/登录态/模型数，不估算 */
+/** 服务商卡片状态 pill：只消费真实 ready/lastTest/登录态/模型数/角色配置，不估算 */
 export function providerCardStatus(
-  provider: Pick<ProviderConfig, 'kind' | 'ready' | 'lastTest'>,
+  provider: Pick<ProviderConfig, 'kind' | 'protocol' | 'ready' | 'lastTest'> &
+    Partial<Pick<ProviderConfig, 'roleModels'>>,
   login: Pick<CliLoginState, 'state' | 'authMethod'> | null,
   modelCount: number,
 ): ProviderCardStatus {
@@ -780,9 +779,23 @@ export function providerCardStatus(
     }
     return { label: loginStateLabel(login), tone: 'warn' };
   }
+  // 角色模式（Anthropic 兼容中转）：模型写在 provider.roleModels，不进模型目录，
+  // 因此按已配置角色数判定，否则已选完模型也会一直显示「待选模型」。
+  if (providerModelMode(provider) === 'roles-anthropic') {
+    if (configuredRoleCount(provider) === 0) return { label: '待选模型', tone: 'warn' };
+    return provider.lastTest?.result === 'fail'
+      ? { label: '探活失败', tone: 'warn' }
+      : { label: '配置就绪', tone: 'ready' };
+  }
   if (modelCount === 0) return { label: '待选模型', tone: 'warn' };
   if (provider.lastTest?.result === 'fail') return { label: '探活失败', tone: 'warn' };
   return { label: '配置就绪', tone: 'ready' };
+}
+
+/** 已填写非空的角色模型去重数量（角色模式判定「是否已选模型」的依据） */
+export function configuredRoleCount(provider: Partial<Pick<ProviderConfig, 'roleModels'>>): number {
+  return new Set(Object.values(provider.roleModels ?? {}).filter((id) => (id ?? '').trim() !== ''))
+    .size;
 }
 
 /** 与 Rust pricing::normalize_model_id 同口径：模型 Tab 按规范 ID 聚合接入路径。
@@ -796,6 +809,53 @@ export function normalizeModelGroupId(modelId: string): string {
     while (s.startsWith(prefix)) s = s.slice(prefix.length);
   }
   return s;
+}
+
+export function catalogPriceMatch(
+  entries: PricingCatalogEntry[],
+  modelId: string,
+  protocol: ProviderProtocol,
+): PricingCatalogEntry | null {
+  const normalized = normalizeModelGroupId(modelId);
+  return (
+    entries.find(
+      (entry) =>
+        entry.protocols?.includes(protocol) &&
+        [entry.modelId, ...(entry.aliases ?? [])].some(
+          (candidate) => normalizeModelGroupId(candidate) === normalized,
+        ),
+    ) ?? null
+  );
+}
+
+export function buildManualModel(
+  providerId: string,
+  id: string,
+  match: PricingCatalogEntry | null,
+): ModelConfig {
+  return {
+    id,
+    providerId,
+    displayName: id,
+    inputPricePerMtok: match?.input ?? 0,
+    cachedInputPricePerMtok: match?.cachedInput ?? undefined,
+    outputPricePerMtok: match?.output ?? 0,
+    priceSource: match ? 'builtin' : 'unknown',
+    enabled: true,
+  };
+}
+
+export function mergeSyncedModelSelection(
+  catalog: ModelConfig[],
+  drafts: ModelConfig[],
+): ModelConfig[] {
+  const selections = new Map(
+    drafts.map((model) => [JSON.stringify([model.providerId, model.id]), model.enabled]),
+  );
+  return catalog.map((model) => ({
+    ...model,
+    enabled: selections.get(JSON.stringify([model.providerId, model.id])) ?? model.enabled,
+  }));
 }
 
 /** 服务商卡片的模型数＝勾选启用的模型数（用户口径），不是同步全集 */
@@ -820,13 +880,15 @@ export const PROVIDER_ROLE_ROWS: Record<
   ],
 };
 
-/** 模型配置展示模式（用户裁决）：Anthropic 兼容=按角色；其余（含 OpenAI 系订阅）=同步全量可勾选列表 */
+/** 模型配置展示模式：非订阅 Anthropic 兼容按角色；订阅与其余协议展示模型列表。 */
 export type ProviderModelMode = 'roles-anthropic' | 'list-openai';
 
 export function providerModelMode(
   provider: Pick<ProviderConfig, 'kind' | 'protocol'>,
 ): ProviderModelMode {
-  return provider.protocol === 'anthropic' ? 'roles-anthropic' : 'list-openai';
+  return provider.kind !== 'subscription' && provider.protocol === 'anthropic'
+    ? 'roles-anthropic'
+    : 'list-openai';
 }
 
 /** 列表卡/网格品牌键：套餐按预设品牌，其余按协议家族 */
@@ -853,15 +915,17 @@ export function sessionModelOptions(config: AppConfig, providerId: string): Mode
   const provider = config.providers.find((item) => item.id === providerId);
   if (!provider) return [];
   if (providerModelMode(provider) === 'roles-anthropic') {
-    return PROVIDER_ROLE_ROWS.anthropic.map((role) => ({
-      id: `role:${role.key}`,
-      providerId,
-      displayName: role.label.toUpperCase(),
-      inputPricePerMtok: 0,
-      outputPricePerMtok: 0,
-      priceSource: 'manual' as const,
-      enabled: true,
-    }));
+    return PROVIDER_ROLE_ROWS.anthropic
+      .filter((role) => provider.roleModels?.[role.key]?.trim())
+      .map((role) => ({
+        id: `role:${role.key}`,
+        providerId,
+        displayName: role.label.toUpperCase(),
+        inputPricePerMtok: 0,
+        outputPricePerMtok: 0,
+        priceSource: 'unknown' as const,
+        enabled: true,
+      }));
   }
   return modelsForProvider(config, providerId);
 }
@@ -978,6 +1042,8 @@ export interface ModelAccessPath {
   billing: string;
   /** 该路径当前被哪些引擎绑定（主或快速模型命中即算，取引擎显示名） */
   boundEngines: string[];
+  /** 角色模式路径覆盖的角色名（默认/Sonnet/Opus/Haiku）；存在时行内开关禁用（勾选在服务商详情的角色行上） */
+  roles?: string[];
 }
 
 export interface ModelAccessGroup {
@@ -1004,25 +1070,87 @@ export function modelBoundEngineNames(
     );
 }
 
-/** 跨服务商把同一模型的接入路径聚合到一起；空目录返回空数组 */
+/** 跨服务商把同一模型的接入路径聚合到一起；空目录返回空数组。
+ *  口径：模型列表只展示「服务商里添加过的模型」——list-openai / 订阅来自模型目录条目
+ *  （含未勾选），角色模式（非订阅 Anthropic 兼容）来自 provider.roleModels，
+ *  目录里的历史同步残留一律不展示。 */
 export function modelAccessGroups(config: AppConfig): ModelAccessGroup[] {
   const groups = new Map<string, ModelAccessGroup>();
-  for (const model of uniqueModels(config.models)) {
-    const provider = config.providers.find((item) => item.id === model.providerId);
-    if (!provider) continue;
+  const pushPath = (
+    model: ModelConfig,
+    provider: ProviderConfig,
+    boundEngines: string[],
+    roles?: string[],
+  ) => {
     const key = normalizeModelGroupId(model.displayName || model.id);
     let group = groups.get(key);
     if (!group) {
       group = { key, displayName: key, paths: [] };
       groups.set(key, group);
     }
-
     group.paths.push({
       model,
       provider,
       billing: pathBillingLabel(provider),
-      boundEngines: modelBoundEngineNames(config, model.providerId, model.id),
+      boundEngines,
+      roles,
     });
+  };
+  // 角色模式服务商：接入路径来自角色配置。同一服务商多个角色指向同一模型时
+  // 合并为一条路径并标注角色（避免四个角色共用一个模型时出现 N 条一模一样的行）；
+  // 绑定按 role: 键匹配，命中任一覆盖角色即算。
+  for (const provider of config.providers) {
+    if (providerModelMode(provider) !== 'roles-anthropic') continue;
+    const byModel = new Map<string, { labels: string[]; keys: ProviderRoleKey[] }>();
+    for (const role of PROVIDER_ROLE_ROWS.anthropic) {
+      const modelId = provider.roleModels?.[role.key]?.trim();
+      if (!modelId) continue;
+      const entry = byModel.get(modelId) ?? { labels: [], keys: [] };
+      entry.labels.push(role.label);
+      entry.keys.push(role.key);
+      byModel.set(modelId, entry);
+    }
+    for (const [modelId, roles] of byModel) {
+      const boundEngines = [
+        ...new Set(
+          config.bindings
+            .filter(
+              (binding) =>
+                binding.providerId === provider.id &&
+                roles.keys.some(
+                  (key) =>
+                    binding.primaryModel === `role:${key}` || binding.fastModel === `role:${key}`,
+                ),
+            )
+            .map(
+              (binding) =>
+                config.engines.find((engine) => engine.id === binding.engineId)?.name ??
+                binding.engineId,
+            ),
+        ),
+      ];
+      pushPath(
+        {
+          id: modelId,
+          providerId: provider.id,
+          displayName: modelId,
+          inputPricePerMtok: 0,
+          outputPricePerMtok: 0,
+          priceSource: 'unknown',
+          enabled: true,
+        },
+        provider,
+        boundEngines,
+        roles.labels,
+      );
+    }
+  }
+  for (const model of uniqueModels(config.models)) {
+    const provider = config.providers.find((item) => item.id === model.providerId);
+    if (!provider) continue;
+    // 角色模式服务商的目录条目是历史同步残留（角色模型不进目录），不展示
+    if (providerModelMode(provider) === 'roles-anthropic') continue;
+    pushPath(model, provider, modelBoundEngineNames(config, model.providerId, model.id));
   }
   const list = [...groups.values()];
   for (const group of list) {

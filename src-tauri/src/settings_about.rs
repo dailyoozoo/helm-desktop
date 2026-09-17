@@ -120,11 +120,10 @@ pub struct LogDirInfo {
 
 fn log_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     use tauri::Manager;
-    let config_dir = app
-        .path()
-        .app_config_dir()
-        .map_err(|e| format!("获取配置目录失败：{e}"))?;
-    Ok(config_dir.join("logs"))
+    // 与 tauri-plugin-log 的 LogDir target 同目录，保证「打开日志文件夹」能看到真实日志
+    app.path()
+        .app_log_dir()
+        .map_err(|e| format!("获取日志目录失败：{e}"))
 }
 
 fn read_last_diagnostics_marker(dir: &Path) -> Option<LastDiagnosticsExport> {
@@ -303,7 +302,7 @@ pub fn export_diagnostics_bundle(
         "exportedAt": iso_now(),
     });
     if let Err(err) = std::fs::write(dir.join("last-diagnostics-export.json"), marker.to_string()) {
-        eprintln!("[helm] 写入诊断导出记录失败：{err}");
+        log::warn!("[helm] 写入诊断导出记录失败：{err}");
     }
 
     Ok(Some(DiagnosticsExport {
@@ -336,6 +335,9 @@ pub struct ImportableHistoryScan {
     pub total_found: usize,
     pub skipped_too_large: usize,
     pub skipped_unparsable: usize,
+    /// 无实质内容（无 assistant 回复 / 仅 synthetic 错误行）或 Codex 内部派生线程
+    /// （subagent thread_spawn / fork）被过滤的数量：这些不是可独立导入的对话。
+    pub skipped_trivial: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -358,6 +360,40 @@ struct ParsedHistoryFile {
     model: Option<String>,
     engine: Option<EngineId>,
     skipped_lines: usize,
+    /// 模型真实回复的 assistant 消息数（synthetic 错误行不计入）。
+    real_assistant_messages: usize,
+    /// 全部消息的总字符数（用于识别一句话测试会话）。
+    total_text_chars: usize,
+    /// 是否存在真人输入的用户消息（排除 CLI 注入的 AGENTS.md/环境上下文与一次性系统提示词）。
+    has_meaningful_user_input: bool,
+    /// 第一条真人输入的用户消息文本（列表预览用；无则退回第一条用户消息）。
+    first_meaningful_user_text: Option<String>,
+    /// Codex 内部派生线程（subagent thread_spawn / fork 出来的 rollout），不是独立对话。
+    derived_thread: bool,
+}
+
+/// 判断一条用户消息是否是真人输入：CLI 会把 AGENTS.md 指令（`# ...`）、
+/// 环境上下文（`<...>`）注入为 user 消息；`You are ...` 开头是其他工具
+/// 用 `claude -p` 跑的一次性系统提示词。这些都不算真人对话。
+fn looks_like_real_user_text(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    !(trimmed.starts_with('#')
+        || trimmed.starts_with('<')
+        || trimmed.starts_with("You are ")
+        || trimmed.starts_with("You're ")
+        || trimmed.starts_with("You're a"))
+}
+
+/// 无实质内容/不值得导入：
+/// - Codex 内部派生线程（fork/subagent 复制产物）；
+/// - 没有任何模型真实回复（只有用户输入或 synthetic 错误行）；
+/// - 没有任何真人输入（纯 CLI 注入或一次性 agent 调用）；
+/// - 一两句话的微会话（≤3 条消息且总字符 <500，如"今天周几"式测试）。
+fn is_trivial_history(parsed: &ParsedHistoryFile) -> bool {
+    parsed.derived_thread
+        || parsed.real_assistant_messages == 0
+        || !parsed.has_meaningful_user_input
+        || (parsed.messages.len() <= 3 && parsed.total_text_chars < 500)
 }
 
 fn history_root_dir(engine: EngineId) -> Result<PathBuf, String> {
@@ -388,6 +424,7 @@ pub fn list_importable_histories(engine: String) -> Result<ImportableHistoryScan
             total_found: 0,
             skipped_too_large: 0,
             skipped_unparsable: 0,
+            skipped_trivial: 0,
         });
     }
 
@@ -396,6 +433,7 @@ pub fn list_importable_histories(engine: String) -> Result<ImportableHistoryScan
     let total_found = files.len();
     let mut skipped_too_large = 0usize;
     let mut skipped_unparsable = 0usize;
+    let mut skipped_trivial = 0usize;
 
     let mut entries: Vec<ImportableHistoryEntry> = Vec::new();
     for path in files {
@@ -422,6 +460,10 @@ pub fn list_importable_histories(engine: String) -> Result<ImportableHistoryScan
             skipped_unparsable += 1;
             continue;
         }
+        if is_trivial_history(&parsed) {
+            skipped_trivial += 1;
+            continue;
+        }
         let modified_at_ms = meta
             .modified()
             .ok()
@@ -439,10 +481,16 @@ pub fn list_importable_histories(engine: String) -> Result<ImportableHistoryScan
             cwd: parsed.cwd,
             message_count: parsed.messages.len(),
             first_message_preview: parsed
-                .messages
-                .iter()
-                .find(|message| message.role == "user")
-                .map(|message| truncate_chars(&message.text, PREVIEW_MAX_CHARS)),
+                .first_meaningful_user_text
+                .clone()
+                .or_else(|| {
+                    parsed
+                        .messages
+                        .iter()
+                        .find(|message| message.role == "user")
+                        .map(|message| message.text.clone())
+                })
+                .map(|text| truncate_chars(&text, PREVIEW_MAX_CHARS)),
             model: parsed.model,
             size_bytes: meta.len(),
             modified_at_ms,
@@ -457,6 +505,7 @@ pub fn list_importable_histories(engine: String) -> Result<ImportableHistoryScan
         total_found,
         skipped_too_large,
         skipped_unparsable,
+        skipped_trivial,
     })
 }
 
@@ -668,8 +717,31 @@ fn parse_claude_jsonl(contents: &str) -> ParsedHistoryFile {
             .unwrap_or(0);
         match claude_content_text(message.get("content")) {
             Some(text) if !text.trim().is_empty() => {
+                // <synthetic> 是 Claude Code 写入的本地提示/错误行（如 API Error），不是模型回复
+                let is_synthetic =
+                    message.get("model").and_then(|v| v.as_str()) == Some("<synthetic>");
+                let is_assistant = role.eq_ignore_ascii_case("assistant");
+                let is_user = role.eq_ignore_ascii_case("user");
                 match ImportedHistoryMessage::new(role, text, ts) {
-                    Ok(message) => parsed.messages.push(message),
+                    Ok(message) => {
+                        parsed.total_text_chars += message.text.chars().count();
+                        if is_user {
+                            if looks_like_real_user_text(&message.text) {
+                                parsed.has_meaningful_user_input = true;
+                                if parsed
+                                    .first_meaningful_user_text
+                                    .as_ref()
+                                    .map_or(true, |existing| existing.is_empty())
+                                {
+                                    parsed.first_meaningful_user_text =
+                                        Some(message.text.trim().to_string());
+                                }
+                            }
+                        } else if is_assistant && !is_synthetic {
+                            parsed.real_assistant_messages += 1;
+                        }
+                        parsed.messages.push(message);
+                    }
                     Err(_) => parsed.skipped_lines += 1,
                 }
             }
@@ -728,6 +800,15 @@ fn parse_codex_rollout(contents: &str) -> ParsedHistoryFile {
                     if let Some(cwd) = payload.get("cwd").and_then(|v| v.as_str()) {
                         parsed.cwd.get_or_insert(cwd.to_string());
                     }
+                    // fork / subagent 派生线程是 CLI 内部复制出来的，不是独立对话
+                    let forked = payload.get("forked_from_id").is_some();
+                    let subagent = payload
+                        .get("source")
+                        .and_then(|source| source.get("subagent"))
+                        .is_some();
+                    if forked || subagent {
+                        parsed.derived_thread = true;
+                    }
                 }
             }
             "response_item" => {
@@ -748,8 +829,27 @@ fn parse_codex_rollout(contents: &str) -> ParsedHistoryFile {
                 }
                 match codex_content_text(payload.get("content")) {
                     Some(text) if !text.trim().is_empty() => {
+                        let is_assistant = role.eq_ignore_ascii_case("assistant");
+                        let is_user = role.eq_ignore_ascii_case("user");
                         match ImportedHistoryMessage::new(role, text, ts) {
-                            Ok(message) => parsed.messages.push(message),
+                            Ok(message) => {
+                                parsed.total_text_chars += message.text.chars().count();
+                                if is_user && looks_like_real_user_text(&message.text) {
+                                    parsed.has_meaningful_user_input = true;
+                                    if parsed
+                                        .first_meaningful_user_text
+                                        .as_ref()
+                                        .map_or(true, |existing| existing.is_empty())
+                                    {
+                                        parsed.first_meaningful_user_text =
+                                            Some(message.text.trim().to_string());
+                                    }
+                                }
+                                if is_assistant {
+                                    parsed.real_assistant_messages += 1;
+                                }
+                                parsed.messages.push(message);
+                            }
                             Err(_) => parsed.skipped_lines += 1,
                         }
                     }
@@ -905,6 +1005,129 @@ mod tests {
         assert_eq!(codex.engine, Some(EngineId::Codex));
         let claude = parse_history_contents(None, &claude_sample());
         assert_eq!(claude.engine, Some(EngineId::ClaudeCode));
+    }
+
+    #[test]
+    fn synthetic_error_only_claude_session_is_trivial() {
+        let contents = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "model": "<synthetic>",
+                "content": [{"type": "text", "text": "API Error: 502"}]
+            },
+            "timestamp": "2026-09-08T06:00:00Z"
+        })
+        .to_string();
+        let parsed = parse_claude_jsonl(&contents);
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.real_assistant_messages, 0);
+        assert!(is_trivial_history(&parsed));
+    }
+
+    /// 多轮真实对话样本（两轮问答，总字符超过微会话阈值）。
+    fn multi_turn_claude_sample() -> String {
+        let turn = |user: &str, assistant: &str, minute: u64| {
+            let u = serde_json::json!({
+                "type": "user",
+                "message": {"role": "user", "content": user},
+                "timestamp": format!("2026-09-08T09:{:02}:00Z", minute)
+            });
+            let a = serde_json::json!({
+                "type": "assistant",
+                "message": {"role": "assistant", "model": "claude-sonnet-5", "content": [{"type": "text", "text": assistant}]},
+                "timestamp": format!("2026-09-08T09:{:02}:30Z", minute)
+            });
+            format!("{u}\n{a}\n")
+        };
+        format!(
+            "{}{}",
+            turn("帮我梳理资源位三层调度体系的字段口径，先看素材状态定义", "好的，素材状态分为高优显示、核心调度、递补三类，下面逐层说明判定条件与数据来源。", 0),
+            turn("第二层的行为信号有哪些", "曝光未点击、退费、关闭三类信号，各自对应不同的降权策略。", 2)
+        )
+    }
+
+    #[test]
+    fn multi_turn_real_conversation_is_not_trivial() {
+        let parsed = parse_claude_jsonl(&multi_turn_claude_sample());
+        assert_eq!(parsed.real_assistant_messages, 2);
+        assert!(parsed.has_meaningful_user_input);
+        assert!(!is_trivial_history(&parsed));
+        assert_eq!(
+            parsed.first_meaningful_user_text.as_deref(),
+            Some("帮我梳理资源位三层调度体系的字段口径，先看素材状态定义")
+        );
+    }
+
+    #[test]
+    fn tiny_single_exchange_is_trivial() {
+        let parsed = parse_claude_jsonl(&claude_sample());
+        assert!(parsed.messages.len() <= 3);
+        assert!(is_trivial_history(&parsed));
+    }
+
+    #[test]
+    fn one_shot_agent_prompt_is_trivial() {
+        // 其他工具用 claude -p 跑的一次性调用：用户消息是系统提示词
+        let contents = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": "You are a memory extractor for a persona engine."},
+            "timestamp": "2026-08-14T02:16:00Z"
+        })
+        .to_string();
+        let parsed = parse_claude_jsonl(&contents);
+        assert!(!parsed.has_meaningful_user_input);
+        assert!(is_trivial_history(&parsed));
+    }
+
+    #[test]
+    fn codex_forked_and_subagent_threads_are_trivial() {
+        let forked = serde_json::json!({
+            "timestamp": "2026-09-07T02:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "roll-fork",
+                "cwd": "D:/Projects/demo",
+                "forked_from_id": "roll-parent",
+                "source": {"subagent": {"thread_spawn": {"parent_thread_id": "roll-parent"}}}
+            }
+        })
+        .to_string();
+        let parsed = parse_codex_rollout(&forked);
+        assert!(parsed.derived_thread);
+        assert!(is_trivial_history(&parsed));
+
+        let normal = parse_codex_rollout(&codex_sample());
+        assert!(!normal.derived_thread);
+    }
+
+    #[test]
+    fn codex_agents_injection_only_probe_is_trivial() {
+        // Codex 会话总是以 "# AGENTS.md instructions..." 注入开头；
+        // 除注入外没有任何真人输入的是一次性探测调用
+        let meta = serde_json::json!({
+            "timestamp": "2026-08-06T02:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": "roll-probe", "cwd": "D:/Projects/demo"}
+        });
+        let injected = serde_json::json!({
+            "timestamp": "2026-08-06T02:00:01Z",
+            "type": "response_item",
+            "payload": {"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "# AGENTS.md instructions for D:\\demo\n\n<INSTRUCTIONS>"}]}
+        });
+        let reply = serde_json::json!({
+            "timestamp": "2026-08-06T02:00:09Z",
+            "type": "response_item",
+            "payload": {"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "已就绪。"}]}
+        });
+        let contents = format!("{meta}\n{injected}\n{reply}\n");
+        let parsed = parse_codex_rollout(&contents);
+        assert!(!parsed.has_meaningful_user_input);
+        assert!(is_trivial_history(&parsed));
+        // 预览应退回第一条用户消息而不是空
+        assert!(parsed.first_meaningful_user_text.is_none());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { toolTarget } from './toolTarget';
 import { Icon } from '../shell/icons';
 import { ChangeReview } from './ChangeReview';
@@ -9,7 +9,10 @@ import type { McpServer, Skill } from '../extensions/extensionsApi';
 import type { PermissionProfile, RuntimeCapabilityAvailability } from '@helm/protocol';
 import { activityLogGroups } from './activityLog';
 import { getGitStatus, getGitStaged, type GitStatus, type StagedFile } from '../engine/transport';
-import { openPathInSystem, readFilePreview, type FilePreview } from '../engine/transport';
+import { openPathInSystem, readFilePreview, readFilePreviewBytes } from '../engine/transport';
+import { Markdown } from '../lib/markdown';
+import mammoth from 'mammoth';
+import * as XLSX from 'xlsx';
 import { searchWorkspaceFiles } from './workspaceApi';
 import {
   CONTEXT_PANEL_DEFAULT_TAB,
@@ -18,15 +21,20 @@ import {
   DYN_TAB_LABELS,
   contextPanelData,
   closeDynTab as contextPanelDynTabsClose,
+  fileTabId,
+  fileTabLabel,
+  fileTabPath,
   isContextPanelFixedTab,
+  isFilePaneTabId,
   openDynTab as contextPanelDynTabsOpen,
   workspaceFileRows,
   type ArtifactPaneTab,
   type ContextPanelFixedTab,
+  type CtxDynTabId,
 } from './contextPanelViewModel';
 import { changeReviewFiles } from './changeReviewViewModel';
 
-type Tab = ContextPanelFixedTab | ArtifactPaneTab;
+type Tab = ContextPanelFixedTab | CtxDynTabId;
 
 /** S3：动态 tab 渲染顺序（changes/files 是常驻 tab；上下文已移入 Composer 圆环 popover）。 */
 const DYN_CONTENT_ORDER: ArtifactPaneTab[] = ['plan', 'term', 'tasks'];
@@ -45,94 +53,210 @@ export function joinPath(cwd: string, relative: string): string {
   return `${cwd.replace(/[\\/]$/, '')}/${trimmed.replace(/^[\\/]+/, '')}`;
 }
 
-/** 变更-33：文件/附件预览面板（ContextPanel 内嵌）。 */
-type PreviewState =
-  | { path: string; label: string; data: FilePreview }
-  | { path: string; label: string; error: string };
+/** 变更-33：文件/附件预览。切片「文件动态 tab」起：每个文件 tab 自加载、自渲染。 */
+type FileTabData =
+  | { type: 'text'; content: string }
+  | { type: 'markdown'; content: string }
+  | {
+      type: 'image';
+      mime?: string | null;
+      content?: string | null;
+      truncated: boolean;
+      size: number;
+    }
+  | { type: 'sheet'; sheets: { name: string; html: string }[] }
+  | { type: 'docx'; html: string }
+  | { type: 'binary'; size: number }
+  | { type: 'error'; message: string };
 
-function FilePreviewPanel({
-  preview,
-  busy,
-  onClose,
-  onOpenSystem,
+/** base64 → Uint8Array（xlsx/docx 解析库需要字节 buffer）。 */
+function base64ToUint8Array(base64: string): Uint8Array {
+  const raw = atob(base64);
+  const buffer = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i += 1) buffer[i] = raw.charCodeAt(i);
+  return buffer;
+}
+
+/** 用系统默认程序打开（失败静默：文件内容已在 tab 内可读，不打断预览）。 */
+function openInSystemAbsolute(path: string): void {
+  void openPathInSystem(path).catch(() => {});
+}
+
+function workbookSheets(path: string, source: string | Uint8Array): FileTabData {
+  const isCsvText = path.toLowerCase().endsWith('.csv');
+  const workbook = XLSX.read(source, isCsvText ? { type: 'string' } : { type: 'array' });
+  return {
+    type: 'sheet',
+    sheets: workbook.SheetNames.map((name) => ({
+      name,
+      html: XLSX.utils.sheet_to_html(workbook.Sheets[name]),
+    })),
+  };
+}
+
+function FileTabView({
+  path,
+  cwd,
 }: {
-  preview: PreviewState;
-  busy: boolean;
-  onClose: () => void;
-  onOpenSystem: () => void;
+  /** 工作区相对路径（与「全部文件」行一致） */
+  path: string;
+  cwd?: string;
 }) {
-  if ('error' in preview) {
-    return (
-      <div className="filepreview">
-        <div className="filepreview__bar">
-          <Icon name="file" />
-          <span className="filepreview__path" title={preview.path}>
-            {preview.label}
-          </span>
-          <span className="sp" />
-          <button
-            type="button"
-            className="ctx-tool"
-            onClick={onOpenSystem}
-            title="用系统默认程序打开"
-          >
-            <Icon name="upright" />
-          </button>
-          <button type="button" className="ctx-tool is-close" onClick={onClose} title="关闭预览">
-            <Icon name="x" />
-          </button>
-        </div>
-        <div className="filepreview__err">预览失败：{preview.error}</div>
-      </div>
-    );
-  }
-  const data = preview.data;
+  const absolute = joinPath(cwd ?? '', path);
+  const [data, setData] = useState<FileTabData | null>(null);
+  const [sheetIndex, setSheetIndex] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    setData(null);
+    setSheetIndex(0);
+    (async () => {
+      try {
+        const lower = path.toLowerCase();
+        const preview = await readFilePreview(absolute);
+        if (cancelled) return;
+        if (preview.kind === 'image') {
+          setData({
+            type: 'image',
+            mime: preview.mime,
+            content: preview.content,
+            truncated: preview.truncated,
+            size: preview.size,
+          });
+          return;
+        }
+        if (preview.kind === 'text') {
+          const content = preview.content ?? '';
+          if (lower.endsWith('.md') || lower.endsWith('.markdown')) {
+            setData({ type: 'markdown', content });
+          } else if (lower.endsWith('.csv')) {
+            setData(workbookSheets(path, content));
+          } else {
+            setData({ type: 'text', content });
+          }
+          return;
+        }
+        // 二进制：xlsx/xls 走 SheetJS、docx 走 mammoth 前端解析；其余维持系统打开引导
+        if (lower.endsWith('.xlsx') || lower.endsWith('.xls')) {
+          const bytes = await readFilePreviewBytes(absolute);
+          if (cancelled) return;
+          setData(workbookSheets(path, base64ToUint8Array(bytes.content)));
+          return;
+        }
+        if (lower.endsWith('.docx')) {
+          const bytes = await readFilePreviewBytes(absolute);
+          if (cancelled) return;
+          const u8 = base64ToUint8Array(bytes.content);
+          // mammoth 类型要求精确 ArrayBuffer（排除 SharedArrayBuffer）
+          const arrayBuffer = u8.buffer.slice(
+            u8.byteOffset,
+            u8.byteOffset + u8.byteLength,
+          ) as ArrayBuffer;
+          const result = await mammoth.convertToHtml({ arrayBuffer });
+          if (cancelled) return;
+          setData({ type: 'docx', html: result.value });
+          return;
+        }
+        setData({ type: 'binary', size: preview.size });
+      } catch (error) {
+        if (!cancelled) setData({ type: 'error', message: String(error) });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [absolute, path]);
+
+  const data_ = data;
+  // 正文直出（2026-09-10 用户裁决）：预览条整条去掉，tab 本身已带文件名（悬停看全路径）。
+  // 仅表格/文档类在右上角留一个悬浮「系统打开」入口，功能不丢。
+  const showOpenSystem = data_?.type === 'sheet' || data_?.type === 'docx';
   return (
     <div className="filepreview">
-      <div className="filepreview__bar">
-        <Icon name="file" />
-        <span className="filepreview__path" title={preview.path}>
-          {preview.label}
-        </span>
-        <span className="sp" />
-        {data.kind === 'binary' ? (
-          <button type="button" className="btn btn--sm" onClick={onOpenSystem}>
-            用系统默认程序打开
-          </button>
-        ) : null}
-        <button type="button" className="ctx-tool is-close" onClick={onClose} title="关闭预览">
-          <Icon name="x" />
+      {showOpenSystem ? (
+        <button
+          type="button"
+          className="btn btn--sm filepreview__open"
+          title="用系统默认程序打开"
+          aria-label="用系统默认程序打开"
+          onClick={() => openInSystemAbsolute(absolute)}
+        >
+          <Icon name="upright" />
         </button>
-      </div>
+      ) : null}
       <div className="filepreview__body">
-        {busy ? (
+        {!data_ ? (
           <div className="filepreview__hint">读取中…</div>
-        ) : data.kind === 'image' ? (
-          data.content && !data.truncated ? (
+        ) : data_.type === 'error' ? (
+          <div className="filepreview__err">预览失败：{data_.message}</div>
+        ) : data_.type === 'image' ? (
+          data_.content && !data_.truncated ? (
             <img
               className="filepreview__img"
-              src={`data:${data.mime ?? 'image/png'};base64,${data.content}`}
-              alt={preview.label}
+              src={`data:${data_.mime ?? 'image/png'};base64,${data_.content}`}
+              alt={fileTabLabel(path)}
             />
           ) : (
             <div className="filepreview__hint">
-              {data.truncated
-                ? `图片过大（${(data.size / 1024 / 1024).toFixed(1)} MB），无法内嵌预览。`
+              {data_.truncated
+                ? `图片过大（${(data_.size / 1024 / 1024).toFixed(1)} MB），无法内嵌预览。`
                 : '无法内嵌预览。'}
-              <button type="button" className="btn btn--sm" onClick={onOpenSystem}>
+              <button
+                type="button"
+                className="btn btn--sm"
+                onClick={() => openInSystemAbsolute(absolute)}
+              >
                 用系统默认程序打开
               </button>
             </div>
           )
-        ) : data.kind === 'binary' ? (
+        ) : data_.type === 'markdown' ? (
+          <div className="filepreview__md prose">
+            <Markdown text={data_.content} />
+          </div>
+        ) : data_.type === 'sheet' ? (
+          <div className="filepreview__sheet">
+            {data_.sheets.length > 1 ? (
+              <select
+                className="filepreview__sheet-select"
+                aria-label="选择工作表"
+                value={sheetIndex}
+                onChange={(event) => setSheetIndex(Number(event.target.value) || 0)}
+              >
+                {data_.sheets.map((sheet, index) => (
+                  <option key={sheet.name} value={index}>
+                    {sheet.name}
+                  </option>
+                ))}
+              </select>
+            ) : null}
+            <div
+              className="filepreview__sheet-table"
+              // SheetJS sheet_to_html 输出：单元格文本已转义，仅生成 <table> 结构
+              dangerouslySetInnerHTML={{
+                __html: data_.sheets[sheetIndex]?.html ?? '',
+              }}
+            />
+          </div>
+        ) : data_.type === 'docx' ? (
+          <div
+            className="md filepreview__docx"
+            // mammoth 输出：正文文本已转义，仅生成 p/h/table/ul 等结构标签
+            dangerouslySetInnerHTML={{ __html: data_.html }}
+          />
+        ) : data_.type === 'binary' ? (
           <div className="filepreview__hint">
-            二进制文件（{(data.size / 1024).toFixed(1)} KB），无法内嵌预览。
-            <button type="button" className="btn btn--sm" onClick={onOpenSystem}>
+            二进制文件（{(data_.size / 1024).toFixed(1)} KB），无法内嵌预览。
+            <button
+              type="button"
+              className="btn btn--sm"
+              onClick={() => openInSystemAbsolute(absolute)}
+            >
               用系统默认程序打开
             </button>
           </div>
         ) : (
-          <pre className="filepreview__code">{data.content}</pre>
+          <pre className="filepreview__code">{data_.content}</pre>
         )}
       </div>
     </div>
@@ -492,72 +616,55 @@ export function ContextPanel({
 }) {
   // S3：默认激活常驻「修改记录」，标签与原型一致。
   const [tab, setTab] = useState<Tab>(CONTEXT_PANEL_DEFAULT_TAB);
-  // 变更-34 · A4：已打开的交付物动态 tab（保持打开顺序）。
-  const [dynTabs, setDynTabs] = useState<ArtifactPaneTab[]>([]);
-  const applyDynTabs = useCallback(
-    (next: { open: ArtifactPaneTab[]; active: ArtifactPaneTab | null }) => {
-      setDynTabs(next.open);
-      // 关闭动态 tab 后回退到默认常驻 tab「修改记录」。
-      setTab(next.active ?? CONTEXT_PANEL_DEFAULT_TAB);
-    },
-    [],
-  );
+  // 变更-34 · A4：已打开的动态 tab（交付物类 + 文件 tab，保持打开顺序）。
+  const [dynTabs, setDynTabs] = useState<CtxDynTabId[]>([]);
+  const applyDynTabs = useCallback((next: { open: CtxDynTabId[]; active: CtxDynTabId | null }) => {
+    setDynTabs(next.open);
+    // 关闭动态 tab 后回退到默认常驻 tab「修改记录」。
+    setTab(next.active ?? CONTEXT_PANEL_DEFAULT_TAB);
+  }, []);
   const activeDyn = isContextPanelFixedTab(tab) ? null : tab;
   const openDynTab = useCallback(
-    (paneId: ArtifactPaneTab) => {
+    (paneId: CtxDynTabId) => {
       applyDynTabs(contextPanelDynTabsOpen({ open: dynTabs, active: activeDyn }, paneId));
     },
     [applyDynTabs, dynTabs, activeDyn],
   );
+  /** 对齐原型 ws.js openFilePreview：点文件行按路径开 tab，同一路径复用同一 tab。 */
+  const openFileTab = useCallback(
+    (path: string) => {
+      openDynTab(fileTabId(path));
+    },
+    [openDynTab],
+  );
   const closeDynTab = useCallback(
-    (paneId: ArtifactPaneTab) => {
+    (paneId: CtxDynTabId) => {
       applyDynTabs(contextPanelDynTabsClose({ open: dynTabs, active: activeDyn }, paneId));
     },
     [applyDynTabs, dynTabs, activeDyn],
   );
+  /** 动态 tab 标题：交付物类用固定文案，文件 tab 用文件名（完整路径放 title）。 */
+  const dynTabLabel = useCallback(
+    (id: CtxDynTabId) => (isFilePaneTabId(id) ? fileTabLabel(id) : DYN_TAB_LABELS[id]),
+    [],
+  );
+  // openDynTab 依赖 dynTabs/activeDyn，每次 tab 变化都会重建；副作用只应响应
+  // openPaneRequest 本身（点「查看全部文件」等入口），否则文件 tab 激活后会被
+  // 重放的旧 request 拉回常驻 tab（2026-09-10 用户实测「点文件仍显示目录」根因）。
+  const openDynTabRef = useRef(openDynTab);
+  openDynTabRef.current = openDynTab;
   useEffect(() => {
     if (!openPaneRequest) return;
     if (isContextPanelFixedTab(openPaneRequest.tab)) setTab(openPaneRequest.tab);
-    else openDynTab(openPaneRequest.tab);
-  }, [openPaneRequest, openDynTab]);
+    else openDynTabRef.current(openPaneRequest.tab);
+    // 依赖仅 openPaneRequest：request 序号变更才重放一次（openDynTab 走 ref 取最新）。
+  }, [openPaneRequest]);
   // Git 状态（批次 E）
   const [gitStatus, setGitStatus] = useState<GitStatus | undefined>();
   const [stagedFiles, setStagedFiles] = useState<StagedFile[] | undefined>();
   // S3「全部文件」：真实 search_workspace_files 结果（空查询返回最浅 30 条）
   const [allFiles, setAllFiles] = useState<string[] | null>(null);
   const [allFilesError, setAllFilesError] = useState<string | null>(null);
-  // 变更-33：文件/附件预览
-  const [preview, setPreview] = useState<PreviewState | null>(null);
-  const [previewBusy, setPreviewBusy] = useState(false);
-
-  const previewFile = useCallback(
-    async (rawPath: string, label: string, needsCwd: boolean) => {
-      setPreviewBusy(true);
-      try {
-        const path = needsCwd && state.cwd ? joinPath(state.cwd, rawPath) : rawPath;
-        const data = await readFilePreview(path);
-        setPreview({ path, label, data });
-      } catch (error) {
-        setPreview({ path: rawPath, label, error: String(error) });
-      } finally {
-        setPreviewBusy(false);
-      }
-    },
-    [state.cwd],
-  );
-
-  const openInSystem = useCallback(
-    async (rawPath: string, needsCwd: boolean) => {
-      const path = needsCwd && state.cwd ? joinPath(state.cwd, rawPath) : rawPath;
-      try {
-        await openPathInSystem(path);
-      } catch (error) {
-        // 静默展示：由系统打开失败时不强刷 UI，仅保留该路径信息
-        setPreview({ path, label: rawPath, error: String(error) });
-      }
-    },
-    [state.cwd],
-  );
 
   // S3「全部文件」：cwd 变化时经真实 search_workspace_files 列出工作区文件（空查询=最浅 30 条）
   useEffect(() => {
@@ -628,33 +735,23 @@ export function ContextPanel({
     (server) => (server.toolCount ?? 0) > 0 && !server.lastError,
   );
 
-  // 变更-34 · A5：交付物区最大化/收起。最大化覆盖 --ctx-w（还原回拖拽记忆值或 CSS 默认 clamp）。
+  // 变更-34 · A5：交付物区最大化/收起。对齐原型 ws.js setDockMax（workspace.css L628-630）：
+  // 最大化 = body.ws-ctx-max 让 .ctx fixed 覆盖线程区（保留标题栏与主侧栏），
+  // 不再用 --ctx-w 撑宽网格 —— vw 撑宽会挤爆三列网格导致左侧布局错乱、还原按钮被裁掉。
   const [paneMaximized, setPaneMaximized] = useState(false);
+  useEffect(() => {
+    // 卸载兜底：右栏关闭/会话切换时不留残留类
+    return () => document.body.classList.remove('ws-ctx-max');
+  }, []);
   const toggleMaximize = useCallback(() => {
-    const root = document.documentElement;
-    if (paneMaximized) {
-      try {
-        const saved = localStorage.getItem('helm:ctxw');
-        if (saved) {
-          // 切片 A（P1-04）：旧持久化值低于新最小宽度（360px）时丢弃，回落到 CSS clamp 默认值。
-          const numeric = parseInt(saved, 10);
-          if (saved.endsWith('px') && !Number.isNaN(numeric) && numeric < 360) {
-            root.style.removeProperty('--ctx-w');
-          } else {
-            root.style.setProperty('--ctx-w', saved);
-          }
-        } else {
-          root.style.removeProperty('--ctx-w');
-        }
-      } catch {
-        root.style.removeProperty('--ctx-w');
-      }
-      setPaneMaximized(false);
-    } else {
-      root.style.setProperty('--ctx-w', 'min(92vw, 1440px)');
-      setPaneMaximized(true);
-    }
+    const next = !paneMaximized;
+    document.body.classList.toggle('ws-ctx-max', next);
+    setPaneMaximized(next);
   }, [paneMaximized]);
+  const collapsePane = useCallback(() => {
+    if (paneMaximized) toggleMaximize();
+    onCollapse?.();
+  }, [paneMaximized, toggleMaximize, onCollapse]);
 
   return (
     <aside className="ctx">
@@ -688,7 +785,7 @@ export function ContextPanel({
         {dynTabs.length > 0 && (
           <span className="ctx__dyn">
             {dynTabs.map((id) => {
-              const label = DYN_TAB_LABELS[id];
+              const label = dynTabLabel(id);
               return (
                 <button
                   key={id}
@@ -698,6 +795,7 @@ export function ContextPanel({
                   aria-controls={`ctx-panel-${id}`}
                   className={'tab tab--dyn' + (tab === id ? ' is-active' : '')}
                   onClick={() => setTab(id)}
+                  title={isFilePaneTabId(id) ? fileTabPath(id) : undefined}
                   onKeyDown={(event) => {
                     if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') {
                       event.preventDefault();
@@ -762,361 +860,342 @@ export function ContextPanel({
             aria-pressed={paneMaximized}
             onClick={toggleMaximize}
           >
-            <Icon name={paneMaximized ? 'compress' : 'expand'} />
+            <Icon name={paneMaximized ? 'minimize' : 'maximize'} />
           </button>
           <button
             type="button"
             className="ctx-tool is-close"
             title="关闭右侧工作区"
             aria-label="关闭右侧工作区"
-            onClick={onCollapse}
+            onClick={collapsePane}
           >
             <Icon name="x" />
           </button>
         </span>
       </div>
-      {preview ? (
-        <FilePreviewPanel
-          preview={preview}
-          busy={previewBusy}
-          onClose={() => setPreview(null)}
-          onOpenSystem={() => void openInSystem(preview.path, false)}
-        />
-      ) : (
-        <div
-          className="ctx__scroll"
-          role="tabpanel"
-          id={`ctx-panel-${tab}`}
-          aria-labelledby={`ctx-tab-${tab}`}
-          tabIndex={0}
-        >
-          {tab === 'changes' && (
-            <div className="ctx__panel" data-panel="changes">
-              <ChangeReview items={state.items} />
-            </div>
-          )}
-          {tab === 'files' && (
-            <div className="ctx-pane ctx-pane--gap">
-              {/* 原型 L211-215：工作目录事实（文件夹 / 分支 / 状态） */}
-              <div>
-                <div className="csec__t">
-                  <Icon name="folder" /> 工作目录
-                </div>
-                <div className="kv">
-                  <span>文件夹</span>
-                  <span className="mono">{state.cwd || '—'}</span>
-                </div>
-                {gitStatus ? (
-                  <>
-                    <div className="kv">
-                      <span>分支</span>
-                      <span className="mono">{gitStatus.branch}</span>
-                    </div>
-                    <div className="kv">
-                      <span>状态</span>
-                      <span>
-                        {gitStatus.modified + gitStatus.added + gitStatus.deleted > 0 ? (
-                          <span className="pill pill--warn pill--compact">
-                            {gitStatus.modified + gitStatus.added + gitStatus.deleted} 项变更
-                          </span>
-                        ) : (
-                          <span className="pill pill--success pill--compact">干净</span>
-                        )}
-                      </span>
-                    </div>
-                  </>
-                ) : null}
-              </div>
-
-              {/* 原型 L216-218：全部文件（真实 search_workspace_files；空查询=最浅 30 条） */}
-              <div>
-                <div className="csec__t">
-                  <Icon name="folderopen" /> 全部文件
-                  {allFiles && !allFilesError ? (
-                    <span className="cnt">{allFiles.length}</span>
-                  ) : null}
-                </div>
-                {!state.cwd ? (
-                  <div style={hintStyle}>未设置工作目录</div>
-                ) : allFilesError ? (
-                  <div style={hintStyle}>读取失败：{allFilesError}</div>
-                ) : fileRows.length ? (
-                  <div>
-                    {fileRows.map((row) => (
-                      <button
-                        type="button"
-                        className="filerow"
-                        key={row.path}
-                        title={`预览 ${row.path}`}
-                        onClick={() => void previewFile(row.path, row.path, true)}
-                      >
-                        <span className={`st ${row.badge ? row.badge.toLowerCase() : 'none'}`}>
-                          {row.badge ? row.badge.toUpperCase() : <Icon name="dot" />}
-                        </span>
-                        <span className="nm">
-                          {row.dir ? <span className="dir">{row.dir}</span> : null}
-                          {row.base}
-                        </span>
-                        <span className="go">
-                          <Icon name="right" />
-                        </span>
-                      </button>
-                    ))}
-                    {(allFiles?.length ?? 0) >= 30 ? (
-                      <div style={hintStyle}>
-                        仅显示最浅 30 条路径；更多文件可用 @ 在输入框精确引用。
-                      </div>
-                    ) : null}
-                  </div>
-                ) : (
-                  <div style={hintStyle}>{allFiles ? '暂无文件' : '读取中…'}</div>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* S3：右栏不再有「上下文」tab —— 上下文/计费/会话上下文管理只从 Composer 圆环 popover 进入。 */}
-
-          {tab === 'log' && (
-            <div style={panelStyle}>
+      <div
+        className="ctx__scroll"
+        role="tabpanel"
+        id={`ctx-panel-${tab}`}
+        aria-labelledby={`ctx-tab-${tab}`}
+        tabIndex={0}
+      >
+        {tab === 'changes' && (
+          <div className="ctx__panel" data-panel="changes">
+            <ChangeReview items={state.items} />
+          </div>
+        )}
+        {tab === 'files' && (
+          <div className="ctx-pane ctx-pane--gap">
+            {/* 原型 L211-215：工作目录事实（文件夹 / 分支 / 状态） */}
+            <div>
               <div className="csec__t">
-                <Icon name="clock" /> 活动日志{' '}
-                <span className="faint" style={{ marginLeft: 'auto' }}>
-                  {data.tools.length} 个工具
-                </span>
+                <Icon name="folder" /> 工作目录
               </div>
-              {activityGroups.map((group) => (
-                <div key={group.id}>
-                  <div className="lgt">{group.label}</div>
-                  {group.items.map((item) => (
+              <div className="kv">
+                <span>文件夹</span>
+                <span className="mono">{state.cwd || '—'}</span>
+              </div>
+              {gitStatus ? (
+                <>
+                  <div className="kv">
+                    <span>分支</span>
+                    <span className="mono">{gitStatus.branch}</span>
+                  </div>
+                  <div className="kv">
+                    <span>状态</span>
+                    <span>
+                      {gitStatus.modified + gitStatus.added + gitStatus.deleted > 0 ? (
+                        <span className="pill pill--warn pill--compact">
+                          {gitStatus.modified + gitStatus.added + gitStatus.deleted} 项变更
+                        </span>
+                      ) : (
+                        <span className="pill pill--success pill--compact">干净</span>
+                      )}
+                    </span>
+                  </div>
+                </>
+              ) : null}
+            </div>
+
+            {/* 原型 L216-218：全部文件（真实 search_workspace_files；空查询=最浅 30 条） */}
+            <div>
+              <div className="csec__t">
+                <Icon name="folderopen" /> 全部文件
+                {allFiles && !allFilesError ? <span className="cnt">{allFiles.length}</span> : null}
+              </div>
+              {!state.cwd ? (
+                <div style={hintStyle}>未设置工作目录</div>
+              ) : allFilesError ? (
+                <div style={hintStyle}>读取失败：{allFilesError}</div>
+              ) : fileRows.length ? (
+                <div>
+                  {fileRows.map((row) => (
                     <button
-                      className={`lgrow${item.kind === 'tool' && item.status === 'error' ? ' is-err' : ''}`}
-                      key={item.id}
-                      onClick={() => onLocateItem?.(item.id)}
+                      type="button"
+                      className="filerow"
+                      key={row.path}
+                      title={`预览 ${row.path}`}
+                      onClick={() => openFileTab(row.path)}
                     >
-                      <Icon
-                        name={
-                          item.kind === 'tool'
-                            ? 'zap'
-                            : item.kind === 'checkpoint'
-                              ? 'checkc'
-                              : item.kind === 'approval'
-                                ? 'shield'
-                                : 'layers'
-                        }
-                      />
-                      <span className="nm">
-                        {item.kind === 'tool'
-                          ? `${item.name}${toolTargetShort(item) ? ` · ${toolTargetShort(item)}` : ''}`
-                          : item.kind === 'checkpoint'
-                            ? item.label
-                            : item.kind === 'approval'
-                              ? item.action
-                              : '计划'}
+                      <span className={`st ${row.badge ? row.badge.toLowerCase() : 'none'}`}>
+                        {row.badge ? row.badge.toUpperCase() : <Icon name="dot" />}
                       </span>
-                      <span className="m">{item.kind === 'tool' ? toolLogMeta(item) : ''}</span>
+                      <span className="nm">
+                        {row.dir ? <span className="dir">{row.dir}</span> : null}
+                        {row.base}
+                      </span>
+                      <span className="go">
+                        <Icon name="right" />
+                      </span>
                     </button>
                   ))}
+                  {(allFiles?.length ?? 0) >= 30 ? (
+                    <div style={hintStyle}>
+                      仅显示最浅 30 条路径；更多文件可用 @ 在输入框精确引用。
+                    </div>
+                  ) : null}
                 </div>
-              ))}
-              {activityGroups.length === 0 ? <div style={hintStyle}>暂无活动</div> : null}
+              ) : (
+                <div style={hintStyle}>{allFiles ? '暂无文件' : '读取中…'}</div>
+              )}
             </div>
-          )}
+          </div>
+        )}
 
-          {tab === 'tools' && (
-            <div style={panelStyle}>
+        {/* S3：右栏不再有「上下文」tab —— 上下文/计费/会话上下文管理只从 Composer 圆环 popover 进入。 */}
+
+        {tab === 'log' && (
+          <div style={panelStyle}>
+            <div className="csec__t">
+              <Icon name="clock" /> 活动日志{' '}
+              <span className="faint" style={{ marginLeft: 'auto' }}>
+                {data.tools.length} 个工具
+              </span>
+            </div>
+            {activityGroups.map((group) => (
+              <div key={group.id}>
+                <div className="lgt">{group.label}</div>
+                {group.items.map((item) => (
+                  <button
+                    className={`lgrow${item.kind === 'tool' && item.status === 'error' ? ' is-err' : ''}`}
+                    key={item.id}
+                    onClick={() => onLocateItem?.(item.id)}
+                  >
+                    <Icon
+                      name={
+                        item.kind === 'tool'
+                          ? 'zap'
+                          : item.kind === 'approval'
+                            ? 'shield'
+                            : 'layers'
+                      }
+                    />
+                    <span className="nm">
+                      {item.kind === 'tool'
+                        ? `${item.name}${toolTargetShort(item) ? ` · ${toolTargetShort(item)}` : ''}`
+                        : item.kind === 'approval'
+                          ? item.action
+                          : '计划'}
+                    </span>
+                    <span className="m">{item.kind === 'tool' ? toolLogMeta(item) : ''}</span>
+                  </button>
+                ))}
+              </div>
+            ))}
+            {activityGroups.length === 0 ? <div style={hintStyle}>暂无活动</div> : null}
+          </div>
+        )}
+
+        {tab === 'tools' && (
+          <div style={panelStyle}>
+            <div>
+              <div className="csec__t">
+                <Icon name="shield" /> 工具权限
+              </div>
               <div>
-                <div className="csec__t">
-                  <Icon name="shield" /> 工具权限
+                <div className="toolrow">
+                  <span className="toolrow__ic">
+                    <Icon name="shield" />
+                  </span>
+                  <span className="toolrow__meta">
+                    <b>当前会话权限</b>
+                    <small>在发送框按 Session 切换</small>
+                  </span>
+                  <span className="pill pill--success">
+                    {permissionProfile === 'standard'
+                      ? '标准'
+                      : permissionProfile === 'auto'
+                        ? '自动执行'
+                        : '全部放开'}
+                  </span>
                 </div>
+                <div className="toolrow">
+                  <span className="toolrow__ic">
+                    <Icon name="terminal" />
+                  </span>
+                  <span className="toolrow__meta">
+                    <b>Runtime</b>
+                    <small>
+                      {state.engine === 'claude-code' ? 'Claude Code' : 'Codex'} 原生工具面
+                    </small>
+                  </span>
+                  <span className="pill pill--success">托管</span>
+                </div>
+                {(
+                  [
+                    ['upright', '网页搜索', state.runtimeCapabilities?.webSearch ?? 'unknown'],
+                    ['plug', '网页抓取', state.runtimeCapabilities?.webFetch ?? 'unknown'],
+                  ] as const
+                ).map(([icon, name, availability]) => {
+                  const pill = capabilityPill(availability);
+                  return (
+                    <div className="toolrow" key={name}>
+                      <span className="toolrow__ic">
+                        <Icon name={icon} />
+                      </span>
+                      <span className="toolrow__meta">
+                        <b>{name}</b>
+                        <small>来自当前 Runtime 能力握手</small>
+                      </span>
+                      <span className={pill.className}>{pill.label}</span>
+                    </div>
+                  );
+                })}
+                <div className="toolrow">
+                  <span className="toolrow__ic">
+                    <Icon name="check" />
+                  </span>
+                  <span className="toolrow__meta">
+                    <b>Runtime 审批</b>
+                    <small>当前代际协商的审批契约</small>
+                  </span>
+                  <span
+                    className={state.runtimeCapabilities ? 'pill pill--success' : 'pill pill--warn'}
+                  >
+                    {state.runtimeCapabilities?.approvalContractVersion || '未知'}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <div>
+              <div className="csec__t">
+                <Icon name="plug" /> MCP 服务器
+                <span className="faint ctx-count">已连接 {connectedMcp.length} 个</span>
+              </div>
+              {mcpLoadError ? (
+                <div className="ctx-load-error" role="alert">
+                  <span>MCP 配置读取失败：{mcpLoadError}</span>
+                  <button type="button" className="btn btn--sm" onClick={onRetryExtensions}>
+                    重试
+                  </button>
+                </div>
+              ) : mcpServers.length ? (
                 <div>
-                  <div className="toolrow">
-                    <span className="toolrow__ic">
-                      <Icon name="shield" />
-                    </span>
-                    <span className="toolrow__meta">
-                      <b>当前会话权限</b>
-                      <small>在发送框按 Session 切换</small>
-                    </span>
-                    <span className="pill pill--success">
-                      {permissionProfile === 'standard'
-                        ? '标准'
-                        : permissionProfile === 'auto'
-                          ? '自动执行'
-                          : '全部放开'}
-                    </span>
-                  </div>
-                  <div className="toolrow">
-                    <span className="toolrow__ic">
-                      <Icon name="terminal" />
-                    </span>
-                    <span className="toolrow__meta">
-                      <b>Runtime</b>
-                      <small>
-                        {state.engine === 'claude-code' ? 'Claude Code' : 'Codex'} 原生工具面
-                      </small>
-                    </span>
-                    <span className="pill pill--success">托管</span>
-                  </div>
-                  {(
-                    [
-                      ['upright', '网页搜索', state.runtimeCapabilities?.webSearch ?? 'unknown'],
-                      ['plug', '网页抓取', state.runtimeCapabilities?.webFetch ?? 'unknown'],
-                    ] as const
-                  ).map(([icon, name, availability]) => {
-                    const pill = capabilityPill(availability);
+                  {mcpServers.map((server) => {
+                    const disabled = state.disabledMcp.includes(server.name);
                     return (
-                      <div className="toolrow" key={name}>
+                      <div className="toolrow" key={server.name}>
                         <span className="toolrow__ic">
-                          <Icon name={icon} />
+                          <Icon name="server" />
                         </span>
                         <span className="toolrow__meta">
-                          <b>{name}</b>
-                          <small>来自当前 Runtime 能力握手</small>
+                          <b>{server.name}</b>
+                          <small>
+                            {server.lastError
+                              ? '未连接'
+                              : server.toolCount != null
+                                ? `${server.toolCount} 个工具`
+                                : '未测试'}
+                          </small>
                         </span>
-                        <span className={pill.className}>{pill.label}</span>
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={!disabled}
+                          aria-label={`本会话${disabled ? '启用' : '停用'} ${server.name}`}
+                          className={'ws-switch' + (disabled ? '' : ' is-on')}
+                          title={
+                            disabled
+                              ? '本会话已停用，下一轮生效'
+                              : '本会话启用中；点击停用（下一轮生效）'
+                          }
+                          onClick={() => void onToggleMcp?.(server.name)}
+                        >
+                          <span className="ws-switch__knob" />
+                        </button>
                       </div>
                     );
                   })}
-                  <div className="toolrow">
-                    <span className="toolrow__ic">
-                      <Icon name="check" />
-                    </span>
-                    <span className="toolrow__meta">
-                      <b>Runtime 审批</b>
-                      <small>当前代际协商的审批契约</small>
-                    </span>
-                    <span
-                      className={
-                        state.runtimeCapabilities ? 'pill pill--success' : 'pill pill--warn'
-                      }
-                    >
-                      {state.runtimeCapabilities?.approvalContractVersion || '未知'}
-                    </span>
-                  </div>
+                  <div style={hintStyle}>开关只影响当前会话，下一轮对话生效。</div>
                 </div>
-              </div>
-
-              <div>
-                <div className="csec__t">
-                  <Icon name="plug" /> MCP 服务器
-                  <span className="faint ctx-count">已连接 {connectedMcp.length} 个</span>
-                </div>
-                {mcpLoadError ? (
-                  <div className="ctx-load-error" role="alert">
-                    <span>MCP 配置读取失败：{mcpLoadError}</span>
-                    <button type="button" className="btn btn--sm" onClick={onRetryExtensions}>
-                      重试
-                    </button>
-                  </div>
-                ) : mcpServers.length ? (
-                  <div>
-                    {mcpServers.map((server) => {
-                      const disabled = state.disabledMcp.includes(server.name);
-                      return (
-                        <div className="toolrow" key={server.name}>
-                          <span className="toolrow__ic">
-                            <Icon name="server" />
-                          </span>
-                          <span className="toolrow__meta">
-                            <b>{server.name}</b>
-                            <small>
-                              {server.lastError
-                                ? '未连接'
-                                : server.toolCount != null
-                                  ? `${server.toolCount} 个工具`
-                                  : '未测试'}
-                            </small>
-                          </span>
-                          <button
-                            type="button"
-                            role="switch"
-                            aria-checked={!disabled}
-                            aria-label={`本会话${disabled ? '启用' : '停用'} ${server.name}`}
-                            className={'ws-switch' + (disabled ? '' : ' is-on')}
-                            title={
-                              disabled
-                                ? '本会话已停用，下一轮生效'
-                                : '本会话启用中；点击停用（下一轮生效）'
-                            }
-                            onClick={() => void onToggleMcp?.(server.name)}
-                          >
-                            <span className="ws-switch__knob" />
-                          </button>
-                        </div>
-                      );
-                    })}
-                    <div style={hintStyle}>开关只影响当前会话，下一轮对话生效。</div>
-                  </div>
-                ) : (
-                  <div style={hintStyle}>还没有配置连接器</div>
-                )}
-                <button
-                  type="button"
-                  className="btn btn--sm ctx-fullbtn"
-                  onClick={onOpenExtensions}
-                >
-                  <Icon name="plus" /> 添加 / 管理连接器
-                </button>
-              </div>
-
-              <div>
-                <div className="csec__t">
-                  <Icon name="sparkles" /> 技能
-                  <span className="faint ctx-count">已启用 {enabledSkills.length} 个</span>
-                </div>
-                {skillsLoadError ? (
-                  <div className="ctx-load-error" role="alert">
-                    <span>技能清单读取失败：{skillsLoadError}</span>
-                    <button type="button" className="btn btn--sm" onClick={onRetryExtensions}>
-                      重试
-                    </button>
-                  </div>
-                ) : enabledSkills.length ? (
-                  <div style={listStyle}>
-                    {enabledSkills.slice(0, 6).map((skill) => (
-                      <div className="filerow" key={skill.id}>
-                        <span className="st a">S</span>
-                        <span className="nm">{skill.name}</span>
-                      </div>
-                    ))}
-                    {enabledSkills.length > 6 ? (
-                      <div style={hintStyle}>… 共 {enabledSkills.length} 个</div>
-                    ) : null}
-                  </div>
-                ) : (
-                  <div style={hintStyle}>当前引擎暂无可用技能</div>
-                )}
-                <button
-                  type="button"
-                  className="btn btn--sm ctx-fullbtn"
-                  onClick={onOpenExtensions}
-                >
-                  管理技能
-                </button>
-              </div>
+              ) : (
+                <div style={hintStyle}>还没有配置连接器</div>
+              )}
+              <button type="button" className="btn btn--sm ctx-fullbtn" onClick={onOpenExtensions}>
+                <Icon name="plus" /> 添加 / 管理连接器
+              </button>
             </div>
-          )}
-          {DYN_CONTENT_ORDER.map((id) => {
-            if (tab !== id) return null;
-            if (id === 'tasks') {
-              return (
-                <div className="ctx__panel" data-panel={id} key={id} style={{ padding: 16 }}>
-                  <TasksPanel items={state.items} onStopTask={onStopTask} onLocate={onLocateItem} />
+
+            <div>
+              <div className="csec__t">
+                <Icon name="sparkles" /> 技能
+                <span className="faint ctx-count">已启用 {enabledSkills.length} 个</span>
+              </div>
+              {skillsLoadError ? (
+                <div className="ctx-load-error" role="alert">
+                  <span>技能清单读取失败：{skillsLoadError}</span>
+                  <button type="button" className="btn btn--sm" onClick={onRetryExtensions}>
+                    重试
+                  </button>
                 </div>
-              );
-            }
-            if (id === 'plan') {
-              return <PlanPanel key={id} items={state.items} onLocateItem={onLocateItem} />;
-            }
-            if (id === 'term') {
-              return <TermPanel key={id} items={state.items} onLocateItem={onLocateItem} />;
-            }
-            // preview：当前没有真实 dev server 预览能力，不保留占位 tab。
-            return null;
-          })}
-        </div>
-      )}
+              ) : enabledSkills.length ? (
+                <div style={listStyle}>
+                  {enabledSkills.slice(0, 6).map((skill) => (
+                    <div className="filerow" key={skill.id}>
+                      <span className="st a">S</span>
+                      <span className="nm">{skill.name}</span>
+                    </div>
+                  ))}
+                  {enabledSkills.length > 6 ? (
+                    <div style={hintStyle}>… 共 {enabledSkills.length} 个</div>
+                  ) : null}
+                </div>
+              ) : (
+                <div style={hintStyle}>当前引擎暂无可用技能</div>
+              )}
+              <button type="button" className="btn btn--sm ctx-fullbtn" onClick={onOpenExtensions}>
+                管理技能
+              </button>
+            </div>
+          </div>
+        )}
+        {/* 文件动态 tab（对齐原型 openFilePreview）：预览内容占满面板区 */}
+        {isFilePaneTabId(tab) ? (
+          <div className="ctx__panel" data-panel="file">
+            <FileTabView key={tab} path={fileTabPath(tab)} cwd={state.cwd} />
+          </div>
+        ) : null}
+        {DYN_CONTENT_ORDER.map((id) => {
+          if (tab !== id) return null;
+          if (id === 'tasks') {
+            return (
+              <div className="ctx__panel" data-panel={id} key={id} style={{ padding: 16 }}>
+                <TasksPanel items={state.items} onStopTask={onStopTask} onLocate={onLocateItem} />
+              </div>
+            );
+          }
+          if (id === 'plan') {
+            return <PlanPanel key={id} items={state.items} onLocateItem={onLocateItem} />;
+          }
+          if (id === 'term') {
+            return <TermPanel key={id} items={state.items} onLocateItem={onLocateItem} />;
+          }
+          // preview：当前没有真实 dev server 预览能力，不保留占位 tab。
+          return null;
+        })}
+      </div>
     </aside>
   );
 }

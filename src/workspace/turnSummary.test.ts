@@ -113,6 +113,77 @@ describe('summarizeTurn', () => {
     expect(summary.added).toBeUndefined();
     expect(summary.removed).toBeUndefined();
   });
+
+  it('keeps a completed summary reference stable without rereading timestamps', () => {
+    let timestampReads = 0;
+    const tool = toolItem({
+      turnStatus: 'succeeded',
+      endedAt: 2_000,
+    });
+    Object.defineProperty(tool, 'startedAt', {
+      get: () => {
+        timestampReads += 1;
+        return 1_000;
+      },
+    });
+    const entries = (): ThreadRenderEntry[] => [{ kind: 'tool-group', id: 'group', items: [tool] }];
+    const first = summarizeTurn(entries(), 1);
+    const readsAfterFirst = timestampReads;
+    expect(first.durationSec).toBe(1);
+    for (let delta = 0; delta < 1_000; delta += 1) expect(summarizeTurn(entries(), 1)).toBe(first);
+    expect(timestampReads).toBe(readsAfterFirst);
+  });
+
+  it('invalidates when an earlier item, ordinal or ledger snapshot changes', () => {
+    const first = toolItem({ id: 'first', turnStatus: 'succeeded' });
+    const last: ThreadItem = {
+      kind: 'assistant',
+      id: 'answer',
+      text: 'done',
+      turnStatus: 'succeeded',
+    };
+    const entries: ThreadRenderEntry[] = [
+      { kind: 'item', item: first },
+      { kind: 'item', item: last },
+    ];
+    const summary = summarizeTurn(entries, 1);
+    const changed = [
+      {
+        kind: 'item' as const,
+        item: {
+          ...first,
+          diff: { path: 'file', hunks: [diffHunk([{ kind: 'add', text: 'added' }])] },
+        },
+      },
+      entries[1],
+    ];
+    const refreshed = summarizeTurn(changed, 1);
+    expect(refreshed).not.toBe(summary);
+    expect(refreshed.added).toBe(1);
+    expect(summarizeTurn(changed, 2)).toMatchObject({ turnNumber: 2, added: 1 });
+    const ledger = {
+      id: 'turn',
+      epoch: 1,
+      mode: 'build' as const,
+      permissionProfile: 'standard' as const,
+      status: 'succeeded' as const,
+      startedAt: 1_000,
+      endedAt: 2_000,
+      routedModelId: 'model-a',
+    };
+    const routed = summarizeTurn(changed, 2, ledger);
+    expect(summarizeTurn(changed, 2, ledger)).toBe(routed);
+    const rerouted = summarizeTurn(changed, 2, { ...ledger, routedModelId: 'model-b' });
+    expect(rerouted).not.toBe(routed);
+    expect(rerouted.model).toBe('model-b');
+  });
+
+  it('does not cache an active turn as completed', () => {
+    const tool = toolItem({ status: 'pending', startedAt: 1_000 });
+    const entries: ThreadRenderEntry[] = [{ kind: 'item', item: tool }];
+    expect(summarizeTurn(entries, 1)).not.toBe(summarizeTurn(entries, 1));
+    expect(summarizeTurn(entries, 1).durationSec).toBeUndefined();
+  });
 });
 
 describe('formatTurnDuration', () => {

@@ -133,4 +133,24 @@ describe('contextSnapshot', () => {
     expect(snap.mcpEnabled).toEqual([]);
     expect(snap.mcpDisabled).toEqual([]);
   });
+
+  it('never touches historical tool diffs when only context and billing are requested', () => {
+    const tools: ThreadItem[] = Array.from({ length: 500 }, (_, index) => ({
+      kind: 'tool',
+      id: `tool-${index}`,
+      name: 'Edit',
+      input: {},
+      status: 'success',
+      get diff(): never {
+        throw new Error('context projection must not read diffs');
+      },
+    }));
+    for (let delta = 0; delta < 20; delta += 1) {
+      const snapshot = contextSnapshot({
+        items: [...tools, { kind: 'assistant', id: 'stream', text: String(delta) }],
+      });
+      expect(snapshot.messageCount).toBe(1);
+      expect(snapshot.usage.level).toBe('none');
+    }
+  });
 });

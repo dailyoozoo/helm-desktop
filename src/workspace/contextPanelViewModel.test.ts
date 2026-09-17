@@ -7,13 +7,37 @@ import {
   CONTEXT_PANEL_FIXED_TABS,
   CONTEXT_PANEL_FIXED_TAB_LABELS,
   contextPanelData,
+  contextUsageSummary,
   DYN_TAB_LABELS,
+  fileTabId,
+  fileTabLabel,
+  fileTabPath,
   isContextPanelFixedTab,
+  isFilePaneTabId,
+  messageContextSummary,
   openDynTab,
   workspaceFileRows,
 } from './contextPanelViewModel';
 
 describe('contextPanelData', () => {
+  it('shares attachment and usage semantics with the lightweight context projections', () => {
+    const items: ThreadItem[] = [
+      { kind: 'user', id: 'user', text: 'files', attachments: [' a.ts ', '', 'a.ts', 'b.ts'] },
+      { kind: 'assistant', id: 'reply', text: 'reply' },
+      { kind: 'user', id: 'reverted', text: 'old', attachments: ['old.ts'], reverted: true },
+    ];
+    for (const contextWindow of [undefined, 0, 2_000]) {
+      const cost = { inputTokens: 9_000, outputTokens: 100, contextTokens: 1_800, contextWindow };
+      const panel = contextPanelData(items, cost);
+      expect(panel).toMatchObject(messageContextSummary(items));
+      expect(panel.messageCount).toBe(2);
+      expect(panel.historicalAttachments).toEqual(['a.ts', 'b.ts']);
+      expect(panel.mountedPaths).toBe(panel.historicalAttachments);
+      expect(panel.contextUsage).toEqual(contextUsageSummary(cost));
+      expect(panel.contextWindow.usedRatio).toBe(panel.contextUsage.ratio ?? 0);
+    }
+  });
+
   it('derives changed files, tool summary, and context window usage from real thread items', () => {
     const items: ThreadItem[] = [
       {
@@ -266,6 +290,50 @@ describe('S3 · 右栏固定 tab 模型（修改记录 / 全部文件）', () =>
     expect(DYN_TAB_LABELS.tools).toBe('工具');
     expect(Object.keys(DYN_TAB_LABELS)).not.toContain('context');
     expect(Object.keys(DYN_TAB_LABELS)).not.toContain('files');
+  });
+});
+
+describe('文件动态 tab（对齐原型 openFilePreview）', () => {
+  it('fileTabId 生成 file: 前缀标识；isFilePaneTabId 只认该前缀', () => {
+    const id = fileTabId('基金套利方案.md');
+    expect(id).toBe('file:基金套利方案.md');
+    expect(isFilePaneTabId(id)).toBe(true);
+    expect(isFilePaneTabId('plan')).toBe(false);
+    expect(isFilePaneTabId('file:docs/a.md')).toBe(true);
+  });
+
+  it('fileTabLabel 取路径最后一段文件名（兼容反斜杠）；fileTabPath 还原相对路径', () => {
+    expect(fileTabLabel('file:docs/报告.md')).toBe('报告.md');
+    expect(fileTabLabel('file:docs\\报告.md')).toBe('报告.md');
+    expect(fileTabLabel('README.md')).toBe('README.md');
+    expect(fileTabPath('file:docs/报告.md' as `file:${string}`)).toBe('docs/报告.md');
+  });
+
+  it('文件 tab 走同一动态 tab 状态机：按路径去重、关闭回退常驻', () => {
+    const opened = openDynTab({ open: [], active: null }, fileTabId('a.md'));
+    expect(opened.open).toEqual(['file:a.md']);
+    const reopened = openDynTab(opened, fileTabId('a.md'));
+    expect(reopened.open).toEqual(['file:a.md']);
+    expect(reopened.active).toBe('file:a.md');
+    const second = openDynTab(reopened, fileTabId('b.md'));
+    expect(second.open).toEqual(['file:a.md', 'file:b.md']);
+    const closed = closeDynTab(second, fileTabId('b.md'));
+    expect(closed.open).toEqual(['file:a.md']);
+    // 关闭当前 tab 后 active 置空，由 UI 回退到常驻「修改记录」（与交付物 tab 一致）
+    expect(closed.active).toBeNull();
+    const closedLast = closeDynTab(closed, fileTabId('a.md'));
+    expect(closedLast.open).toEqual([]);
+    expect(closedLast.active).toBeNull();
+  });
+
+  it('文件 tab 与交付物 tab 共存互不覆盖', () => {
+    let state = openDynTab({ open: [], active: null }, 'plan');
+    state = openDynTab(state, fileTabId('a.md'));
+    expect(state.open).toEqual(['plan', 'file:a.md']);
+    expect(state.active).toBe('file:a.md');
+    state = closeDynTab(state, 'plan');
+    expect(state.open).toEqual(['file:a.md']);
+    expect(state.active).toBe('file:a.md');
   });
 });
 

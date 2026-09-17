@@ -52,6 +52,20 @@ describe('classifyToolFailure', () => {
     ).toBe('auth');
   });
 
+  it('环境缺命令（command not found / 127）单独归类，不再误标成工具失败', () => {
+    // 回归：读 Excel 那次 bash 里 python/powershell/which 全部 127，卡片却写
+    // 「工具失败 · 重试可能自愈」，被读成"Helm 权限管太严"——其实一次都没到权限系统。
+    expect(
+      classifyToolFailure(tool('a', { output: 'Exit code 127 python: command not found' })),
+    ).toBe('env');
+    expect(
+      classifyToolFailure(tool('b', { output: '/usr/bin/bash: line 1: which: command not found' })),
+    ).toBe('env');
+    expect(classifyToolFailure(tool('c', { output: 'No such file or directory' }))).toBe('env');
+    expect(FAILURE_KIND_LABELS.env).toBe('环境缺命令');
+    expect(failureAdvice('env').selfHeal).toBe(false);
+  });
+
   it('文件系统权限错误归工具，不误判为凭据', () => {
     expect(classifyToolFailure(tool('a', { output: 'EACCES: permission denied' }))).toBe('tool');
   });

@@ -1,5 +1,6 @@
 import type { TurnActivity } from '../engine/useSession';
 import type { ThreadItem } from '../engine/useSession';
+import { diffStats } from './diffStats';
 
 /**
  * 变更-34/35 · B5：执行状态指标派生（原常驻执行状态条 StatusBar 已按原型移除，
@@ -40,12 +41,9 @@ export function statusBarModel(items: ThreadItem[], activeTurnId?: string | null
     tools += 1;
     if (item.diff && item.diff.hunks.length > 0) {
       files.add(item.diff.path);
-      for (const hunk of item.diff.hunks) {
-        for (const line of hunk.lines) {
-          if (line.kind === 'add') additions += 1;
-          else if (line.kind === 'del') deletions += 1;
-        }
-      }
+      const stats = diffStats(item.diff);
+      additions += stats.added;
+      deletions += stats.removed;
     }
   }
   return { tools, files: files.size, additions, deletions };

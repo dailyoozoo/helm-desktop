@@ -6,11 +6,72 @@ use std::sync::OnceLock;
 const REDACTED: &str = "[REDACTED]";
 
 pub fn sanitize_agent_event(event: &AgentEvent) -> AgentEvent {
+    let bounded = match event {
+        AgentEvent::ToolResult {
+            session_id,
+            id,
+            status,
+            output,
+            diff,
+            outcome,
+            started,
+            has_output,
+            retryable,
+            denial_source,
+            native_denial_code,
+        } => {
+            let (output, diff) =
+                crate::output_limits::bounded_tool_result(output.as_deref(), diff.as_ref());
+            Some(AgentEvent::ToolResult {
+                session_id: session_id.clone(),
+                id: id.clone(),
+                status: *status,
+                output,
+                diff,
+                outcome: *outcome,
+                started: *started,
+                has_output: *has_output,
+                retryable: *retryable,
+                denial_source: *denial_source,
+                native_denial_code: native_denial_code.clone(),
+            })
+        }
+        AgentEvent::ToolProgress {
+            session_id,
+            id,
+            chunk,
+        } => Some(AgentEvent::ToolProgress {
+            session_id: session_id.clone(),
+            id: id.clone(),
+            chunk: crate::output_limits::bounded_text(
+                chunk,
+                crate::output_limits::MAX_TOOL_OUTPUT_BYTES,
+            ),
+        }),
+        _ => None,
+    };
+    let event = bounded.as_ref().unwrap_or(event);
     let Ok(mut value) = serde_json::to_value(event) else {
         return event.clone();
     };
     redact_value(&mut value);
-    serde_json::from_value(value).unwrap_or_else(|_| event.clone())
+    let mut sanitized = serde_json::from_value(value).unwrap_or_else(|_| event.clone());
+    match &mut sanitized {
+        AgentEvent::ToolResult { output, diff, .. } => {
+            let (bounded_output, bounded_diff) =
+                crate::output_limits::bounded_tool_result(output.as_deref(), diff.as_ref());
+            *output = bounded_output;
+            *diff = bounded_diff;
+        }
+        AgentEvent::ToolProgress { chunk, .. } => {
+            *chunk = crate::output_limits::bounded_text(
+                chunk,
+                crate::output_limits::MAX_TOOL_OUTPUT_BYTES,
+            )
+        }
+        _ => {}
+    }
+    sanitized
 }
 
 pub fn redact_text(input: &str) -> String {

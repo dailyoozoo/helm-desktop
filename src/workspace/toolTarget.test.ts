@@ -69,9 +69,67 @@ describe('collectTurnDeliverables（轮次交付物计数）', () => {
     expect(result.changeCount).toBe(1);
   });
 
+  it('失败的工具既不计入触碰也不计入变更（变更-37）', () => {
+    // 回归：Read 一个二进制 .xls 直接报错，却仍把路径算进 touched，
+    // 导致「没产出任何文件」的轮次照样显示「查看全部文件 1」。
+    const result = collectTurnDeliverables([
+      {
+        input: { file_path: 'C:/Users/me/Downloads/配置.xls' },
+        status: 'error',
+      },
+    ]);
+    expect(result).toEqual({ documents: [], fileCount: 0, changeCount: 0 });
+  });
+
+  it('失败工具不计入，同轮成功的写入照常计入', () => {
+    const result = collectTurnDeliverables([
+      { input: { file_path: 'C:/Users/me/Downloads/配置.xls' }, status: 'error' },
+      { input: { file_path: 'src/main.ts' }, diff: { path: 'src/main.ts' }, status: 'success' },
+    ]);
+    expect(result.fileCount).toBe(1);
+    expect(result.changeCount).toBe(1);
+    expect(result.documents).toEqual(['src/main.ts']);
+  });
+
   it('已回溯的工具不计入', () => {
     const result = collectTurnDeliverables([
       { input: { file_path: 'src/a.ts' }, diff: { path: 'src/a.ts' }, reverted: true },
+    ]);
+    expect(result).toEqual({ documents: [], fileCount: 0, changeCount: 0 });
+  });
+
+  it('写族工具成功但无 diff 仍计入变更（2026-09-09 同业口径）', () => {
+    // 回归：新版 Claude Code CLI 的 Write 结果只回一行 "File created successfully"，
+    // 没有 diff 块，交付物行随之消失。写族工具的成功调用本身就是写入事实。
+    const result = collectTurnDeliverables([
+      {
+        name: 'Write',
+        input: { file_path: 'D:/6_其他/gmini/fund/基金套利方案.md', content: '# 方案' },
+        status: 'success',
+      },
+    ]);
+    expect(result.changeCount).toBe(1);
+    expect(result.fileCount).toBe(1);
+    expect(result.documents).toEqual(['D:/6_其他/gmini/fund/基金套利方案.md']);
+  });
+
+  it('无 name 的旧数据保持原口径：只有 diff 才算变更', () => {
+    const result = collectTurnDeliverables([{ input: { file_path: 'src/a.ts' } }]);
+    expect(result.changeCount).toBe(0);
+    expect(result.fileCount).toBe(1);
+  });
+
+  it('非写族工具带 file_path 不算写入', () => {
+    const result = collectTurnDeliverables([
+      { name: 'Read', input: { file_path: 'src/a.ts' }, status: 'success' },
+    ]);
+    expect(result.changeCount).toBe(0);
+    expect(result.fileCount).toBe(1);
+  });
+
+  it('写族工具失败不计入变更', () => {
+    const result = collectTurnDeliverables([
+      { name: 'Write', input: { file_path: 'src/a.ts' }, status: 'error' },
     ]);
     expect(result).toEqual({ documents: [], fileCount: 0, changeCount: 0 });
   });

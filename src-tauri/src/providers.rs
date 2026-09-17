@@ -158,9 +158,11 @@ pub struct ProviderConfig {
     /// 最近一次成功同步模型目录时间（秒级 epoch，与 last_test.at 同口径）；None = 尚未同步
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_sync_at: Option<i64>,
+    #[serde(default)]
+    pub credential_revision: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelConfig {
     pub id: String,
@@ -192,7 +194,7 @@ pub enum PriceSource {
     Unknown,
 }
 
-/// 引擎级环境变量覆盖（秘密值不落盘，仅会话生效）
+/// 引擎级环境变量；配置只保存系统钥匙串引用。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineEnvVar {
@@ -201,6 +203,8 @@ pub struct EngineEnvVar {
     pub value: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -429,7 +433,29 @@ impl<S: SecretStore> ProviderStore<S> {
         if let Some(config) = &gate.published {
             return Ok(config.clone());
         }
-        let config = self.load_from_disk()?;
+        let mut config = self.load_from_disk()?;
+        let mut created_refs = Vec::new();
+        for engine in &mut config.engines {
+            if engine
+                .env_vars
+                .as_ref()
+                .is_some_and(|rows| rows.iter().any(|row| row.value.is_some()))
+            {
+                match self.secure_engine_env(engine, None, false) {
+                    Ok(created) => created_refs.extend(created),
+                    Err(error) => {
+                        self.discard_secrets(&created_refs);
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        if !created_refs.is_empty() {
+            if let Err(error) = self.save_locked(gate, &config) {
+                self.discard_secrets(&created_refs);
+                return Err(error);
+            }
+        }
         gate.published = Some(config.clone());
         Ok(config)
     }
@@ -470,6 +496,10 @@ impl<S: SecretStore> ProviderStore<S> {
         ensure_subscription_model_catalogs(&mut config);
         deduplicate_models(&mut config.models);
         migrate_bindings(&mut config);
+        for binding in &mut config.bindings {
+            binding.thinking_enabled = None;
+            binding.context_1m = None;
+        }
         Ok(config)
     }
 
@@ -482,6 +512,14 @@ impl<S: SecretStore> ProviderStore<S> {
     }
 
     fn save_locked(&self, gate: &mut ProviderGateState, config: &AppConfig) -> Result<(), String> {
+        if config.engines.iter().any(|engine| {
+            engine
+                .env_vars
+                .as_ref()
+                .is_some_and(|rows| rows.iter().any(|row| row.value.is_some()))
+        }) {
+            return Err("环境变量必须先写入系统钥匙串，禁止明文保存".to_string());
+        }
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败：{e}"))?;
         }
@@ -501,6 +539,18 @@ impl<S: SecretStore> ProviderStore<S> {
         })
     }
 
+    pub fn with_config_gate<T>(
+        &self,
+        project: impl FnOnce(&AppConfig) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut gate = self
+            .gate
+            .lock()
+            .map_err(|_| "ProviderStore 闸门锁中毒".to_string())?;
+        let config = self.load_locked(&mut gate)?;
+        project(&config)
+    }
+
     pub fn commit_route_if_unchanged<T>(
         &self,
         expected_config_digest: &str,
@@ -515,6 +565,33 @@ impl<S: SecretStore> ProviderStore<S> {
             return Ok(None);
         }
         commit(&config).map(Some)
+    }
+
+    pub fn pricing_profile_for_model_id(
+        &self,
+        config: &AppConfig,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Result<Option<ResolvedPricingProfile>, String> {
+        let resolved = resolve_model_reference(config, provider_id, model_id)?;
+        let model = config
+            .models
+            .iter()
+            .find(|model| model.provider_id == provider_id && model.id == resolved)
+            .cloned()
+            .unwrap_or_else(|| ModelConfig {
+                id: resolved.clone(),
+                provider_id: provider_id.to_string(),
+                display_name: resolved,
+                input_price_per_mtok: 0.0,
+                output_price_per_mtok: 0.0,
+                cached_input_price_per_mtok: None,
+                enabled: true,
+                price_source: Some(PriceSource::Unknown),
+                context_window: None,
+                capabilities: None,
+            });
+        self.model_pricing_profile(config, &model)
     }
 
     pub fn model_pricing_profile(
@@ -571,103 +648,360 @@ impl<S: SecretStore> ProviderStore<S> {
 
     pub fn save_provider(
         &self,
+        provider: ProviderConfig,
+        api_key: Option<&str>,
+    ) -> Result<AppConfig, String> {
+        self.save_provider_bundle(provider, api_key, None, &[])
+    }
+
+    pub fn save_provider_bundle(
+        &self,
         mut provider: ProviderConfig,
         api_key: Option<&str>,
+        models: Option<Vec<ModelConfig>>,
+        renames: &[(String, String)],
     ) -> Result<AppConfig, String> {
         let mut gate = self
             .gate
             .lock()
             .map_err(|_| "ProviderStore 闸门锁中毒".to_string())?;
         let mut config = self.load_locked(&mut gate)?;
-        let previous_key_ref = config
+        let previous = config
             .providers
             .iter()
             .find(|existing| existing.id == provider.id)
+            .cloned();
+        let previous_key_ref = previous
+            .as_ref()
             .and_then(|existing| existing.key_ref.clone());
+        provider.key_ref = previous_key_ref.clone();
+        provider.credential_revision = previous
+            .as_ref()
+            .map(|existing| existing.credential_revision)
+            .unwrap_or_default();
+        provider.last_sync_at = previous.as_ref().and_then(|existing| existing.last_sync_at);
         if matches!(provider.auth_method, AuthMethod::OAuth) {
             provider.kind = ProviderKind::Subscription;
         } else if matches!(provider.auth_method, AuthMethod::Local) {
             provider.kind = ProviderKind::Local;
         }
-        if matches!(provider.kind, ProviderKind::Subscription) {
-            if let Some(existing) = config.providers.iter().find(|existing| {
+        let subscription = matches!(provider.kind, ProviderKind::Subscription);
+        let new_secret = api_key
+            .filter(|secret| !secret.is_empty())
+            .filter(|_| !subscription);
+        if subscription {
+            if config.providers.iter().any(|existing| {
                 existing.id != provider.id
-                    && matches!(existing.kind, ProviderKind::Subscription)
+                    && existing.kind == ProviderKind::Subscription
                     && existing.protocol == provider.protocol
             }) {
-                return Err(format!("同协议订阅「{}」已存在，请直接复用", existing.name));
+                return Err("同协议订阅已存在，请直接复用".to_string());
+            }
+            if !renames.is_empty() {
+                return Err("订阅模型不能改名，请从真实 CLI 同步官方目录".to_string());
+            }
+            if previous.as_ref().is_some_and(|previous| {
+                previous.kind != ProviderKind::Subscription
+                    || previous.protocol != provider.protocol
+            }) {
+                config
+                    .models
+                    .retain(|model| model.provider_id != provider.id);
             }
             provider.auth_method = AuthMethod::OAuth;
             provider.base_url.clear();
             provider.key_ref = None;
             provider.last_test = None;
-            let previous_secret = previous_key_ref
-                .as_deref()
-                .map(|key_ref| self.secret(key_ref))
-                .transpose()?
-                .flatten();
-            if let Some(key_ref) = previous_key_ref.as_deref() {
-                self.secrets.delete(key_ref)?;
-            }
-            provider.ready = provider_is_ready(&provider);
-            upsert_by_id(&mut config.providers, provider.clone(), |item| &item.id);
-            let seeded_models = subscription_models_for_provider(&provider);
-            if !seeded_models.is_empty() {
-                let enabled_by_id = config
-                    .models
-                    .iter()
-                    .filter(|model| model.provider_id == provider.id)
-                    .map(|model| (model.id.clone(), model.enabled))
-                    .collect::<HashMap<_, _>>();
+            let mut seeded = subscription_models_for_provider(&provider);
+            if !seeded.is_empty() {
+                for model in &mut seeded {
+                    if let Some(existing) = config.models.iter().find(|existing| {
+                        existing.provider_id == provider.id && existing.id == model.id
+                    }) {
+                        model.enabled = existing.enabled;
+                    }
+                }
                 config
                     .models
                     .retain(|model| model.provider_id != provider.id);
-                config
-                    .models
-                    .extend(seeded_models.into_iter().map(|mut model| {
-                        if let Some(enabled) = enabled_by_id.get(&model.id) {
-                            model.enabled = *enabled;
-                        }
-                        model
-                    }));
+                config.models.extend(seeded);
             }
-            if let Err(save_error) = self.save_locked(&mut gate, &config) {
-                if let (Some(key_ref), Some(secret)) =
-                    (previous_key_ref.as_deref(), previous_secret.as_deref())
-                {
-                    let _ = self.secrets.set(key_ref, secret);
-                }
-                return Err(save_error);
-            }
-            return Ok(config);
+        } else if new_secret.is_some() {
+            provider.credential_revision = provider
+                .credential_revision
+                .checked_add(1)
+                .ok_or_else(|| "凭据修订号已达上限".to_string())?;
+            provider.key_ref = Some(key_ref_for_provider(&provider.id));
         }
-        if let Some(secret) = api_key.filter(|secret| !secret.is_empty()) {
-            let key_ref = key_ref_for_provider(&provider.id);
-            self.secrets.set(&key_ref, secret)?;
-            if self.secrets.get(&key_ref)?.is_none() {
-                return Err("API 密钥写入后无法从钥匙串读回，请重新保存".to_string());
-            }
-            provider.key_ref = Some(key_ref);
-        } else if provider.key_ref.is_none() {
-            provider.key_ref = config
-                .providers
-                .iter()
-                .find(|existing| existing.id == provider.id)
-                .and_then(|existing| existing.key_ref.clone());
-        }
+        let provider_id = provider.id.clone();
+        let next_key_ref = provider.key_ref.clone();
         provider.ready = provider_is_ready(&provider);
         upsert_by_id(&mut config.providers, provider, |item| &item.id);
-        self.save_locked(&mut gate, &config)?;
+        if let Some(models) = models {
+            let models = if subscription {
+                validated_subscription_selection(&config, &provider_id, &models)?
+            } else {
+                models
+            };
+            apply_provider_model_bundle(&mut config, &provider_id, models, renames)?;
+        } else if !renames.is_empty() {
+            return Err("模型改名必须与完整模型目录一起保存".to_string());
+        } else if config.providers.iter().any(|item| {
+            item.id == provider_id
+                && item.kind != ProviderKind::Subscription
+                && item.protocol == Protocol::Anthropic
+        }) {
+            // 角色模式（非订阅 Anthropic 兼容）：模型只存 role_models，不进模型目录；
+            // 目录里的条目是历史同步残留，保存服务商时一并清掉。
+            config
+                .models
+                .retain(|model| model.provider_id != provider_id);
+        }
+        for binding in config
+            .bindings
+            .iter()
+            .filter(|binding| binding.provider_id == provider_id)
+        {
+            validate_binding(&config, binding)?;
+        }
+        let changed_key_ref = if subscription {
+            previous_key_ref.as_deref()
+        } else {
+            new_secret.and(next_key_ref.as_deref())
+        };
+        let previous_secret = changed_key_ref
+            .map(|reference| self.secrets.get(reference))
+            .transpose()?
+            .flatten();
+        let commit = (|| {
+            if let Some(reference) = changed_key_ref {
+                if let Some(secret) = new_secret {
+                    self.secrets.set(reference, secret)?;
+                    if self.secrets.get(reference)?.as_deref() != Some(secret) {
+                        return Err("API 密钥写入后无法从钥匙串读回，请重新保存".to_string());
+                    }
+                } else {
+                    self.secrets.delete(reference)?;
+                }
+            }
+            self.save_locked(&mut gate, &config)
+        })();
+        if let Err(error) = commit {
+            if let Some(reference) = changed_key_ref {
+                let restored = match previous_secret.as_deref() {
+                    Some(secret) => self.secrets.set(reference, secret),
+                    None => self.secrets.delete(reference),
+                };
+                if let Err(restore_error) = restored {
+                    return Err(format!("{error}；恢复原凭据失败：{restore_error}"));
+                }
+            }
+            return Err(error);
+        }
         Ok(config)
     }
 
-    pub fn save_engine(&self, engine: EngineConfig) -> Result<AppConfig, String> {
+    fn discard_secrets(&self, references: &[String]) {
+        for reference in references {
+            if reference.starts_with("helm:engine-env:") {
+                let _ = self.secrets.delete(reference);
+            }
+        }
+    }
+
+    pub fn read_engine_config_fragment(&self, engine_id: &str) -> Result<EngineConfigFile, String> {
+        let config = self.load()?;
+        let engine = config
+            .engines
+            .iter()
+            .find(|engine| engine.id == engine_id)
+            .ok_or_else(|| format!("未知引擎：{engine_id}"))?;
+        let content = serde_json::to_string_pretty(&serde_json::json!({
+            "bin": engine.bin,
+            "envVars": engine.env_vars,
+        }))
+        .map_err(|error| format!("生成引擎配置片段失败：{error}"))?;
+        Ok(EngineConfigFile {
+            path: self.path.clone(),
+            content,
+        })
+    }
+
+    pub fn write_engine_config_fragment(
+        &self,
+        engine_id: &str,
+        content: &str,
+    ) -> Result<EngineConfigFile, String> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Draft {
+            bin: String,
+            env_vars: Option<Vec<EngineEnvVar>>,
+        }
+        let draft: Draft = serde_json::from_str(content)
+            .map_err(|_| "配置片段必须是仅包含 bin 和 envVars 的 JSON 对象".to_string())?;
+        if draft.bin.trim().is_empty() {
+            return Err("CLI 路径不能为空".to_string());
+        }
+        let config = self.load()?;
+        let mut engine = config
+            .engines
+            .iter()
+            .find(|engine| engine.id == engine_id)
+            .cloned()
+            .ok_or_else(|| format!("未知引擎：{engine_id}"))?;
+        engine.bin = draft.bin;
+        engine.env_vars = draft.env_vars;
+        self.save_engine(engine)?;
+        self.read_engine_config_fragment(engine_id)
+    }
+
+    fn secure_engine_env(
+        &self,
+        engine: &mut EngineConfig,
+        previous: Option<&EngineConfig>,
+        validate_names: bool,
+    ) -> Result<Vec<String>, String> {
+        let mut created = Vec::new();
+        let mut names = HashSet::new();
+        let result = (|| {
+            for variable in engine.env_vars.iter_mut().flatten() {
+                variable.name = variable.name.trim().to_string();
+                if validate_names {
+                    validate_engine_env_name(&variable.name)?;
+                    if !names.insert(variable.name.to_ascii_uppercase()) {
+                        return Err(format!("环境变量名称重复：{}", variable.name));
+                    }
+                }
+                let previous_ref = previous
+                    .and_then(|original| original.env_vars.as_ref())
+                    .and_then(|rows| rows.iter().find(|row| row.name == variable.name))
+                    .and_then(|row| row.key_ref.as_deref());
+                let value = variable.value.take();
+                if value.as_ref().is_some_and(|value| !value.is_empty())
+                    || variable.key_ref.is_none()
+                {
+                    let reference = format!(
+                        "helm:engine-env:{}:{}:{:032x}",
+                        engine.id,
+                        variable.name,
+                        rand::random::<u128>()
+                    );
+                    let value = value.unwrap_or_default();
+                    self.secrets.set(&reference, &value)?;
+                    created.push(reference.clone());
+                    if self.secrets.get(&reference)?.as_deref() != Some(value.as_str()) {
+                        return Err("环境变量写入后无法从系统钥匙串读回".to_string());
+                    }
+                    variable.key_ref = Some(reference);
+                } else if validate_names && variable.key_ref.as_deref() != previous_ref {
+                    return Err(
+                        "变量改名或新增时请重新输入值，不能复用其他变量的秘密引用".to_string()
+                    );
+                }
+                variable.secret = Some(true);
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.discard_secrets(&created);
+            return Err(error);
+        }
+        Ok(created)
+    }
+
+    pub fn save_engine(&self, mut engine: EngineConfig) -> Result<AppConfig, String> {
         let mut gate = self
             .gate
             .lock()
             .map_err(|_| "ProviderStore 闸门锁中毒".to_string())?;
         let mut config = self.load_locked(&mut gate)?;
+        let previous = config
+            .engines
+            .iter()
+            .find(|existing| existing.id == engine.id)
+            .cloned();
+        let created = self.secure_engine_env(&mut engine, previous.as_ref(), true)?;
+        let retained = engine
+            .env_vars
+            .iter()
+            .flatten()
+            .filter_map(|row| row.key_ref.clone())
+            .collect::<HashSet<_>>();
         upsert_by_id(&mut config.engines, engine, |item| &item.id);
+        if let Err(error) = self.save_locked(&mut gate, &config) {
+            self.discard_secrets(&created);
+            return Err(error);
+        }
+        if let Some(previous) = previous {
+            let obsolete = previous
+                .env_vars
+                .into_iter()
+                .flatten()
+                .filter_map(|row| {
+                    row.key_ref.filter(|reference| {
+                        reference
+                            .starts_with(&format!("helm:engine-env:{}:{}:", previous.id, row.name))
+                    })
+                })
+                .filter(|reference| !retained.contains(reference))
+                .collect::<Vec<_>>();
+            self.discard_secrets(&obsolete);
+        }
+        Ok(config)
+    }
+
+    pub fn record_engine_detection(
+        &self,
+        engine_id: &str,
+        expected_bin: &str,
+        status: EngineStatus,
+        version: Option<String>,
+    ) -> Result<AppConfig, String> {
+        let mut gate = self
+            .gate
+            .lock()
+            .map_err(|_| "ProviderStore 闸门锁中毒".to_string())?;
+        let mut config = self.load_locked(&mut gate)?;
+        let Some(engine) = config
+            .engines
+            .iter_mut()
+            .find(|engine| engine.id == engine_id)
+        else {
+            return Ok(config);
+        };
+        if engine.bin.trim() != expected_bin.trim()
+            || (engine.status == status && engine.version == version)
+        {
+            return Ok(config);
+        }
+        engine.status = status;
+        engine.version = version;
+        self.save_locked(&mut gate, &config)?;
+        Ok(config)
+    }
+
+    pub fn save_provider_model_drafts(
+        &self,
+        provider_id: &str,
+        models: Vec<ModelConfig>,
+    ) -> Result<AppConfig, String> {
+        let mut gate = self
+            .gate
+            .lock()
+            .map_err(|_| "ProviderStore 闸门锁中毒".to_string())?;
+        let mut config = self.load_locked(&mut gate)?;
+        let provider = config
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .ok_or_else(|| format!("找不到服务商：{provider_id}"))?;
+        let models = if provider.kind == ProviderKind::Subscription {
+            validated_subscription_selection(&config, provider_id, &models)?
+        } else {
+            models
+        };
+        apply_provider_model_bundle(&mut config, provider_id, models, &[])?;
         self.save_locked(&mut gate, &config)?;
         Ok(config)
     }
@@ -678,6 +1012,7 @@ impl<S: SecretStore> ProviderStore<S> {
             .lock()
             .map_err(|_| "ProviderStore 闸门锁中毒".to_string())?;
         let mut config = self.load_locked(&mut gate)?;
+        ensure_manual_model_catalog(&config, &model.provider_id)?;
         let model = normalize_saved_model(model);
         if !config
             .providers
@@ -771,33 +1106,45 @@ impl<S: SecretStore> ProviderStore<S> {
             .lock()
             .map_err(|_| "ProviderStore 闸门锁中毒".to_string())?;
         let mut config = self.load_locked(&mut gate)?;
-        if !config
-            .providers
-            .iter()
-            .any(|provider| provider.id == provider_id)
+        apply_discovered_model_catalog(&mut config, provider_id, models)?;
+        self.save_locked(&mut gate, &config)?;
+        Ok(config)
+    }
+
+    pub fn save_discovered_subscription_models(
+        &self,
+        provider_id: &str,
+        engine_id: &str,
+        expected_bin: &str,
+        models: Vec<ModelConfig>,
+    ) -> Result<AppConfig, String> {
+        let mut gate = self
+            .gate
+            .lock()
+            .map_err(|_| "ProviderStore 闸门锁中毒".to_string())?;
+        let mut config = self.load_locked(&mut gate)?;
+        let protocol = match engine_id {
+            "claude-code" => Protocol::Anthropic,
+            "codex" => Protocol::OpenAiResponses,
+            _ => return Err("订阅引擎不受支持".to_string()),
+        };
+        if config.engine_bin(engine_id).map(str::trim) != Some(expected_bin.trim())
+            || !config.providers.iter().any(|provider| {
+                provider.id == provider_id
+                    && provider.kind == ProviderKind::Subscription
+                    && provider.protocol == protocol
+            })
         {
-            return Err(format!("找不到模型所属服务商：{provider_id}"));
+            return Err("订阅或引擎配置已变更，请重新同步模型".to_string());
         }
-        let enabled_by_id = config
-            .models
-            .iter()
-            .filter(|model| model.provider_id == provider_id)
-            .map(|model| (model.id.clone(), model.enabled))
-            .collect::<HashMap<_, _>>();
-        config
-            .models
-            .retain(|model| model.provider_id != provider_id);
-        config.models.extend(models.into_iter().map(|model| {
-            let mut model = normalize_saved_model(model);
-            if let Some(enabled) = enabled_by_id.get(&model.id) {
-                model.enabled = *enabled;
-            }
-            model
-        }));
-        // 目录替换后：绑定若还指着已消失的旧 ID（用户把行 ID 改了、或历史数据
-        // 已经不一致），自动改到该服务商目录里的模型，而不是保存时报
-        // 「请先更改引擎绑定」。用户明确要求：改当前绑定模型时把其它引用一起改。
-        retarget_orphaned_bindings(&mut config, provider_id, None);
+        apply_discovered_model_catalog(&mut config, provider_id, models)?;
+        if let Some(provider) = config
+            .providers
+            .iter_mut()
+            .find(|provider| provider.id == provider_id)
+        {
+            provider.last_sync_at = Some(crate::util::now_millis() / 1000);
+        }
         self.save_locked(&mut gate, &config)?;
         Ok(config)
     }
@@ -839,6 +1186,7 @@ impl<S: SecretStore> ProviderStore<S> {
         {
             return Err(format!("找不到模型所属服务商：{provider_id}"));
         }
+        ensure_manual_model_catalog(&config, provider_id)?;
         let mut owned: Vec<ModelConfig> = config
             .models
             .iter()
@@ -994,6 +1342,7 @@ impl<S: SecretStore> ProviderStore<S> {
         {
             return Err(format!("找不到服务商：{provider_id}"));
         }
+        ensure_manual_model_catalog(&config, provider_id)?;
         let before = config.models.len();
         config
             .models
@@ -1017,6 +1366,14 @@ impl<S: SecretStore> ProviderStore<S> {
     }
 
     pub fn save_binding(&self, mut binding: BindingConfig) -> Result<AppConfig, String> {
+        if binding.thinking_enabled == Some(true) || binding.context_1m == Some(true) {
+            return Err(
+                "当前 CLI 没有经验证的独立思考或 1M 强制扩容合同，请使用模型原生能力与推理强度设置"
+                    .to_string(),
+            );
+        }
+        binding.thinking_enabled = None;
+        binding.context_1m = None;
         let mut gate = self
             .gate
             .lock()
@@ -1100,7 +1457,21 @@ impl<S: SecretStore> ProviderStore<S> {
 
     pub fn equivalent_env(&self, binding: &BindingConfig) -> Result<Vec<(String, String)>, String> {
         let config = self.load()?;
-        env_for_config(&config, binding, SecretValueMode::Masked)
+        let mut env = env_for_config(&config, binding, SecretValueMode::Masked)?;
+        if let Some(engine) = config
+            .engines
+            .iter()
+            .find(|engine| engine.id == binding.engine_id)
+        {
+            env.extend(
+                engine
+                    .env_vars
+                    .iter()
+                    .flatten()
+                    .map(|row| (row.name.clone(), "••••（系统钥匙串）".to_string())),
+            );
+        }
+        Ok(env)
     }
 
     pub fn launch_env(&self, binding: &BindingConfig) -> Result<Vec<(String, String)>, String> {
@@ -1114,6 +1485,31 @@ impl<S: SecretStore> ProviderStore<S> {
         binding: &BindingConfig,
     ) -> Result<Vec<(String, String)>, String> {
         let mut env = env_for_config(config, binding, SecretValueMode::Omit)?;
+        if let Some(engine) = config
+            .engines
+            .iter()
+            .find(|engine| engine.id == binding.engine_id)
+        {
+            for variable in engine.env_vars.iter().flatten() {
+                validate_engine_env_name(&variable.name)?;
+                let reference = variable
+                    .key_ref
+                    .as_deref()
+                    .filter(|reference| {
+                        reference.starts_with(&format!(
+                            "helm:engine-env:{}:{}:",
+                            engine.id, variable.name
+                        ))
+                    })
+                    .ok_or_else(|| {
+                        format!("环境变量 {} 缺少有效秘密引用，请重新保存", variable.name)
+                    })?;
+                let value = self.secret(reference)?.ok_or_else(|| {
+                    format!("系统钥匙串中缺少环境变量 {}，请重新保存", variable.name)
+                })?;
+                env.push((variable.name.clone(), value));
+            }
+        }
         let provider = config
             .providers
             .iter()
@@ -1409,20 +1805,274 @@ fn validate_binding(config: &AppConfig, binding: &BindingConfig) -> Result<(), S
     Ok(())
 }
 
+fn apply_discovered_model_catalog(
+    config: &mut AppConfig,
+    provider_id: &str,
+    models: Vec<ModelConfig>,
+) -> Result<(), String> {
+    if !config
+        .providers
+        .iter()
+        .any(|provider| provider.id == provider_id)
+    {
+        return Err(format!("找不到模型所属服务商：{provider_id}"));
+    }
+    if models
+        .iter()
+        .any(|model| model.provider_id != provider_id || model.id.trim().is_empty())
+    {
+        return Err("模型必须属于当前服务商且 ID 不能为空".to_string());
+    }
+    let enabled_by_id = config
+        .models
+        .iter()
+        .filter(|model| model.provider_id == provider_id)
+        .map(|model| (model.id.clone(), model.enabled))
+        .collect::<HashMap<_, _>>();
+    config
+        .models
+        .retain(|model| model.provider_id != provider_id);
+    config.models.extend(models.into_iter().map(|model| {
+        let mut model = normalize_saved_model(model);
+        if let Some(enabled) = enabled_by_id.get(&model.id) {
+            model.enabled = *enabled;
+        }
+        model
+    }));
+    deduplicate_models(&mut config.models);
+    retarget_orphaned_bindings(config, provider_id, None);
+    Ok(())
+}
+
+fn ensure_manual_model_catalog(config: &AppConfig, provider_id: &str) -> Result<(), String> {
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| format!("找不到服务商：{provider_id}"))?;
+    if provider.kind == ProviderKind::Subscription {
+        return Err("订阅模型目录只能从真实 CLI 同步；请通过勾选启用或停用模型".to_string());
+    }
+    Ok(())
+}
+
+fn validated_subscription_selection(
+    config: &AppConfig,
+    provider_id: &str,
+    submitted: &[ModelConfig],
+) -> Result<Vec<ModelConfig>, String> {
+    let official = config
+        .models
+        .iter()
+        .filter(|model| model.provider_id == provider_id)
+        .collect::<Vec<_>>();
+    if official.len() != submitted.len() {
+        return Err("订阅模型目录已变化，请重新同步后保存勾选".to_string());
+    }
+    let by_id = official
+        .iter()
+        .map(|model| (model.id.as_str(), *model))
+        .collect::<HashMap<_, _>>();
+    let mut enabled = HashMap::new();
+    for model in submitted {
+        let Some(known) = by_id.get(model.id.as_str()) else {
+            return Err("订阅模型目录只能从真实 CLI 同步，不能添加或改名模型".to_string());
+        };
+        let mut expected = (*known).clone();
+        expected.enabled = model.enabled;
+        if expected != *model || enabled.insert(model.id.as_str(), model.enabled).is_some() {
+            return Err("订阅模型只允许修改启用勾选，其他字段必须与官方目录一致".to_string());
+        }
+    }
+    Ok(official
+        .into_iter()
+        .map(|model| {
+            let mut selected = model.clone();
+            selected.enabled = enabled[model.id.as_str()];
+            selected
+        })
+        .collect())
+}
+
+fn apply_provider_model_bundle(
+    config: &mut AppConfig,
+    provider_id: &str,
+    models: Vec<ModelConfig>,
+    renames: &[(String, String)],
+) -> Result<(), String> {
+    let original = config
+        .models
+        .iter()
+        .filter(|model| model.provider_id == provider_id)
+        .map(|model| model.id.clone())
+        .collect::<HashSet<_>>();
+    let mut saved = Vec::with_capacity(models.len());
+    for model in models {
+        if model.provider_id != provider_id || model.id.trim().is_empty() {
+            return Err("模型必须属于当前服务商且 ID 不能为空".to_string());
+        }
+        saved.push(normalize_saved_model(model));
+    }
+    deduplicate_models(&mut saved);
+    let known = saved
+        .iter()
+        .map(|model| model.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut mapping = HashMap::new();
+    for (old, new) in renames {
+        if !original.contains(old)
+            || !known.contains(new.as_str())
+            || old == new
+            || mapping.insert(old.as_str(), new.as_str()).is_some()
+        {
+            return Err("模型改名来源或目标无效，请刷新目录后重试".to_string());
+        }
+    }
+    let enabled = saved
+        .iter()
+        .filter(|model| model.enabled)
+        .map(|model| model.id.clone())
+        .collect::<HashSet<_>>();
+    if enabled.is_empty()
+        && config
+            .bindings
+            .iter()
+            .any(|binding| binding.provider_id == provider_id)
+    {
+        return Err("该服务商仍被引擎绑定，至少保留一个启用模型".to_string());
+    }
+    let previous_bindings = config.bindings.clone();
+    for binding in config
+        .bindings
+        .iter_mut()
+        .filter(|binding| binding.provider_id == provider_id)
+    {
+        if let Some(target) = mapping.get(binding.primary_model.as_str()) {
+            binding.primary_model = (*target).to_string();
+        }
+        for selected in [&mut binding.fast_model, &mut binding.assistant_model_id] {
+            if let Some(target) = selected.as_deref().and_then(|model| mapping.get(model)) {
+                *selected = Some((*target).to_string());
+            }
+        }
+    }
+    config
+        .models
+        .retain(|model| model.provider_id != provider_id);
+    config.models.extend(saved);
+    retarget_orphaned_bindings(config, provider_id, Some(&enabled));
+    for binding in &mut config.bindings {
+        if let Some(previous) = previous_bindings
+            .iter()
+            .find(|previous| previous.engine_id == binding.engine_id)
+        {
+            if previous.primary_model != binding.primary_model
+                || previous.fast_model != binding.fast_model
+                || previous.assistant_model_id != binding.assistant_model_id
+            {
+                binding.revision = previous
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| "绑定修订号已达上限".to_string())?;
+            }
+        }
+    }
+    for binding in config
+        .bindings
+        .iter()
+        .filter(|binding| binding.provider_id == provider_id)
+    {
+        validate_binding(config, binding)?;
+    }
+    Ok(())
+}
+
+fn validate_engine_env_name(name: &str) -> Result<(), String> {
+    let valid = name
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_');
+    if !valid {
+        return Err("环境变量名只能包含英文字母、数字和下划线，且不能以数字开头".to_string());
+    }
+    let upper = name.to_ascii_uppercase();
+    let reserved = [
+        "HELM_",
+        "ANTHROPIC_",
+        "OPENAI_",
+        "CODEX_",
+        "GIT_CONFIG_",
+        "DYLD_",
+        "LD_",
+    ]
+    .iter()
+    .any(|prefix| upper.starts_with(prefix))
+        || ["PERMISSION", "SANDBOX", "APPROVAL"]
+            .iter()
+            .any(|word| upper.contains(word))
+        || [
+            "HOME",
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "PATH",
+            "PATHEXT",
+            "COMSPEC",
+            "SYSTEMROOT",
+            "WINDIR",
+            "SHELL",
+            "ENV",
+            "BASH_ENV",
+            "NODE_OPTIONS",
+            "PYTHONPATH",
+            "PYTHONSTARTUP",
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+        ]
+        .contains(&upper.as_str());
+    if reserved {
+        return Err(format!(
+            "{name} 属于受控配置，请通过服务商、引擎或权限入口设置"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_binding_model(
     config: &AppConfig,
     provider_id: &str,
     model_id: &str,
     label: &str,
 ) -> Result<(), String> {
-    // 方案 b：role: 前缀表示绑定到服务商角色，启动时解析为角色对应模型；
-    // 此处只校验角色已配置模型，不要求目录中存在具体模型条目。
+    resolve_model_reference(config, provider_id, model_id)
+        .map(|_| ())
+        .map_err(|error| format!("{label}不可用：{error}"))
+}
+
+pub fn resolve_model_reference(
+    config: &AppConfig,
+    provider_id: &str,
+    model_id: &str,
+) -> Result<String, String> {
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| format!("找不到服务商：{provider_id}"))?;
     if let Some(role_key) = model_id.strip_prefix("role:") {
-        let configured = config
-            .providers
-            .iter()
-            .find(|provider| provider.id == provider_id)
-            .and_then(|provider| provider.role_models.as_ref())
+        if provider.protocol != Protocol::Anthropic
+            || provider.kind == ProviderKind::Subscription
+            || !["default", "opus", "sonnet", "haiku"].contains(&role_key)
+        {
+            return Err(format!("该服务商不支持角色模型：{role_key}"));
+        }
+        let configured = provider
+            .role_models
+            .as_ref()
             .and_then(|role_models| role_models.get(role_key))
             .filter(|model| !model.trim().is_empty());
         if configured.is_none() {
@@ -1430,17 +2080,26 @@ fn validate_binding_model(
                 "角色 {role_key} 未配置对应模型，请在服务商详情中补全"
             ));
         }
-        return Ok(());
+        return Ok(configured.unwrap().trim().to_string());
+    }
+    if provider.protocol == Protocol::Anthropic
+        && provider.kind != ProviderKind::Subscription
+        && provider
+            .role_models
+            .as_ref()
+            .is_some_and(|roles| roles.values().any(|value| value.trim() == model_id))
+    {
+        return Ok(model_id.to_string());
     }
     let model = config
         .models
         .iter()
         .find(|model| model.provider_id == provider_id && model.id == model_id)
-        .ok_or_else(|| format!("找不到{label}：{model_id}"))?;
+        .ok_or_else(|| format!("找不到模型：{model_id}"))?;
     if !model.enabled {
-        return Err(format!("{label}未启用：{model_id}"));
+        return Err(format!("模型未启用：{model_id}"));
     }
-    Ok(())
+    Ok(model.id.clone())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1455,6 +2114,16 @@ fn env_for_config(
     secret_mode: SecretValueMode,
 ) -> Result<Vec<(String, String)>, String> {
     validate_binding(config, binding)?;
+    let mut resolved_binding = binding.clone();
+    resolved_binding.primary_model =
+        resolve_model_reference(config, &binding.provider_id, &binding.primary_model)?;
+    resolved_binding.fast_model = binding
+        .fast_model
+        .as_deref()
+        .filter(|model| !model.is_empty())
+        .map(|model| resolve_model_reference(config, &binding.provider_id, model))
+        .transpose()?;
+    let binding = &resolved_binding;
     let provider = config
         .providers
         .iter()
@@ -1601,82 +2270,6 @@ fn deduplicate_models(models: &mut Vec<ModelConfig>) {
 
 pub fn key_ref_for_provider(provider_id: &str) -> String {
     format!("helm:provider:{provider_id}:api-key")
-}
-
-pub fn engine_config_file_path(engine_id: &str) -> Result<PathBuf, String> {
-    let home = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-        .ok_or_else(|| "无法定位用户主目录".to_string())?;
-    match engine_id {
-        "claude-code" => Ok(home.join(".claude").join("settings.json")),
-        "codex" => Ok(home.join(".codex").join("config.toml")),
-        _ => Err(format!("未知引擎：{engine_id}")),
-    }
-}
-
-pub fn read_engine_config_file(engine_id: &str) -> Result<EngineConfigFile, String> {
-    let path = engine_config_file_path(engine_id)?;
-    read_engine_config_file_at(engine_id, &path)
-}
-
-pub fn read_engine_config_file_at(
-    engine_id: &str,
-    path: &Path,
-) -> Result<EngineConfigFile, String> {
-    validate_engine_id_for_config_file(engine_id)?;
-    let content = if path.exists() {
-        fs::read_to_string(path).map_err(|e| format!("读取引擎配置文件失败：{e}"))?
-    } else {
-        String::new()
-    };
-    Ok(EngineConfigFile {
-        path: path.to_path_buf(),
-        content,
-    })
-}
-
-pub fn write_engine_config_file(
-    engine_id: &str,
-    content: &str,
-) -> Result<EngineConfigFile, String> {
-    let path = engine_config_file_path(engine_id)?;
-    write_engine_config_file_at(engine_id, &path, content)
-}
-
-pub fn write_engine_config_file_at(
-    engine_id: &str,
-    path: &Path,
-    content: &str,
-) -> Result<EngineConfigFile, String> {
-    validate_engine_config_content(engine_id, content)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("创建引擎配置目录失败：{e}"))?;
-    }
-    fs::write(path, content).map_err(|e| format!("写入引擎配置文件失败：{e}"))?;
-    Ok(EngineConfigFile {
-        path: path.to_path_buf(),
-        content: content.to_string(),
-    })
-}
-
-fn validate_engine_id_for_config_file(engine_id: &str) -> Result<(), String> {
-    match engine_id {
-        "claude-code" | "codex" => Ok(()),
-        _ => Err(format!("未知引擎：{engine_id}")),
-    }
-}
-
-fn validate_engine_config_content(engine_id: &str, content: &str) -> Result<(), String> {
-    match engine_id {
-        "claude-code" => serde_json::from_str::<serde_json::Value>(content)
-            .map(|_| ())
-            .map_err(|e| format!("Claude Code 配置不是合法 JSON：{e}")),
-        "codex" => toml::from_str::<toml::Value>(content)
-            .map(|_| ())
-            .map_err(|e| format!("Codex 配置不是合法 TOML：{e}")),
-        _ => Err(format!("未知引擎：{engine_id}")),
-    }
 }
 
 pub fn provider_models_endpoint(provider_id: &str, base_url: &str) -> String {
@@ -1952,20 +2545,31 @@ fn retarget_orphaned_bindings(
     let fallback = enabled
         .first()
         .cloned()
-        .or_else(|| {
-            allowed.and_then(|set| {
-                catalog
-                    .iter()
-                    .find(|id| set.contains(*id))
-                    .cloned()
-            })
-        })
+        .or_else(|| allowed.and_then(|set| catalog.iter().find(|id| set.contains(*id)).cloned()))
         .or_else(|| catalog.first().cloned());
     let Some(fallback) = fallback else {
         return;
     };
+    let role_model_ids = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .filter(|provider| {
+            provider.protocol == Protocol::Anthropic && provider.kind != ProviderKind::Subscription
+        })
+        .and_then(|provider| provider.role_models.as_ref())
+        .map(|roles| {
+            roles
+                .values()
+                .map(|value| value.trim().to_string())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
     let is_valid = |model_id: &str| {
         if model_id.trim().is_empty() || model_id.starts_with("role:") {
+            return true;
+        }
+        if role_model_ids.contains(model_id) {
             return true;
         }
         if !catalog.iter().any(|id| id == model_id) {
@@ -1986,7 +2590,11 @@ fn retarget_orphaned_bindings(
             binding.primary_model = fallback.clone();
             changed = true;
         }
-        if let Some(fast) = binding.fast_model.as_deref().filter(|id| !id.trim().is_empty()) {
+        if let Some(fast) = binding
+            .fast_model
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+        {
             if !is_valid(fast) {
                 binding.fast_model = Some(fallback.clone());
                 changed = true;
@@ -2019,22 +2627,6 @@ fn normalize_saved_model(mut model: ModelConfig) -> ModelConfig {
         );
     }
     model
-}
-
-/// 同步入库的勾选裁决：绑定模型恒启用；reset 时其余不勾选；否则沿用旧值。
-fn sync_enabled_decision(
-    prev: Option<bool>,
-    id: &str,
-    bound: &HashSet<String>,
-    reset: bool,
-) -> bool {
-    if bound.contains(id) {
-        return true;
-    }
-    if reset {
-        return false;
-    }
-    prev.unwrap_or(false)
 }
 
 fn simple_pricing_profile(
@@ -2160,12 +2752,7 @@ pub async fn test_provider_connection<S: SecretStore>(
         .ok_or_else(|| format!("找不到服务商：{provider_id}"))?;
     // 订阅登录且未存令牌（P3-1）：凭证在 CLI 登录态里，Helm 拿不到，
     // 无法代表用户做 HTTP 探活——如实说明而不是拿空 Key 去撞 401。
-    if matches!(provider.auth_method, AuthMethod::OAuth)
-        && provider
-            .key_ref
-            .as_deref()
-            .is_none_or(|key_ref| key_ref.trim().is_empty())
-    {
+    if matches!(provider.kind, ProviderKind::Subscription) {
         return Ok(ConnectionResult {
             ok: false,
             verified: false,
@@ -2174,14 +2761,23 @@ pub async fn test_provider_connection<S: SecretStore>(
             latency_ms: started.elapsed().as_millis(),
         });
     }
-    let key_ref = provider
+    let api_key = match provider
         .key_ref
         .as_deref()
-        .ok_or_else(|| "请先保存 API 密钥".to_string())?;
-    let api_key = store
-        .secret(key_ref)?
-        .ok_or_else(|| "钥匙串中没有找到 API 密钥".to_string())?;
-
+        .filter(|reference| !reference.trim().is_empty())
+    {
+        Some(key_ref) => store
+            .secret(key_ref)?
+            .ok_or_else(|| "钥匙串中没有找到 API 密钥".to_string())?,
+        None if provider.kind == ProviderKind::Local => String::new(),
+        None => return Err("请先保存 API 密钥".to_string()),
+    };
+    if provider.kind != ProviderKind::Local && api_key.trim().is_empty() {
+        return Err("请先保存 API 密钥".to_string());
+    }
+    if provider.base_url.trim().is_empty() {
+        return Err("请先填写 Base URL".to_string());
+    }
     probe_provider_endpoint(&provider.protocol, &provider.base_url, &api_key).await
 }
 
@@ -2200,10 +2796,16 @@ async fn probe_provider_endpoint(
         .map_err(|e| format!("创建 HTTP 客户端失败：{e}"))?;
     let endpoint = provider_models_endpoint_for_protocol(protocol, base_url);
     let request = match protocol {
-        Protocol::Anthropic => client
-            .get(endpoint)
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01"),
+        Protocol::Anthropic => {
+            let request = client
+                .get(endpoint)
+                .header("anthropic-version", "2023-06-01");
+            if api_key.is_empty() {
+                request
+            } else {
+                request.header("x-api-key", api_key)
+            }
+        }
         Protocol::OpenAiResponses | Protocol::OpenAiChat | Protocol::Bedrock | Protocol::Vertex => {
             if api_key.is_empty() {
                 client.get(endpoint)
@@ -2288,6 +2890,9 @@ async fn fetch_provider_model_catalog_from<S: SecretStore>(
     existing_models: &[ModelConfig],
 ) -> Result<(ProviderConfig, Vec<ModelConfig>), String> {
     if matches!(provider.kind, ProviderKind::Subscription) {
+        if provider.protocol != Protocol::Anthropic {
+            return Err("该订阅模型目录必须从真实 CLI 同步".to_string());
+        }
         let models = subscription_models_for_provider(&provider);
         return Ok((provider, models));
     }
@@ -2383,9 +2988,12 @@ pub async fn list_provider_models<S: SecretStore>(
 pub async fn test_engine_connection(bin: &str) -> ConnectionResult {
     let started = Instant::now();
     let mut cmd = build_version_command(bin);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    match cmd.output().await {
-        Ok(output) if output.status.success() => {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    match tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output()).await {
+        Ok(Ok(output)) if output.status.success() => {
             let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
             ConnectionResult {
                 ok: true,
@@ -2398,16 +3006,22 @@ pub async fn test_engine_connection(bin: &str) -> ConnectionResult {
                 latency_ms: started.elapsed().as_millis(),
             }
         }
-        Ok(output) => ConnectionResult {
+        Ok(Ok(output)) => ConnectionResult {
             ok: false,
             verified: true,
             message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
             latency_ms: started.elapsed().as_millis(),
         },
-        Err(e) => ConnectionResult {
+        Ok(Err(error)) => ConnectionResult {
             ok: false,
             verified: true,
-            message: format!("无法执行引擎：{e}"),
+            message: format!("无法执行引擎：{error}"),
+            latency_ms: started.elapsed().as_millis(),
+        },
+        Err(_) => ConnectionResult {
+            ok: false,
+            verified: true,
+            message: "引擎连接检测超时".to_string(),
             latency_ms: started.elapsed().as_millis(),
         },
     }
@@ -2453,38 +3067,86 @@ mod tests {
     }
 
     #[test]
-    fn sync_enabled_decision_resets_except_bound() {
-        let bound: HashSet<String> = ["bound-main".to_string()].into();
-        assert!(!super::sync_enabled_decision(
-            Some(true),
-            "kept-old",
-            &bound,
-            true
-        ));
-        assert!(!super::sync_enabled_decision(
-            None,
-            "brand-new",
-            &bound,
-            true
-        ));
-        assert!(super::sync_enabled_decision(
-            None,
-            "bound-main",
-            &bound,
-            true
-        ));
-        assert!(super::sync_enabled_decision(
-            Some(true),
-            "plain",
-            &bound,
-            false
-        ));
-        assert!(!super::sync_enabled_decision(
-            Some(false),
-            "plain",
-            &bound,
-            false
-        ));
+    fn model_catalog_sync_resets_except_bound_and_preserves_previous_choices() {
+        for reset_enabled in [true, false] {
+            let directory = std::env::temp_dir().join(format!(
+                "helm-model-sync-{}-{}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            let path = directory.join("providers.json");
+            let store = ProviderStore::new(path.clone(), MemorySecretStore::default());
+            let provider = rename_test_provider();
+            let provider_id = provider.id.clone();
+            store.save_provider(provider, None).unwrap();
+            let previous = [
+                ("bound-main", true),
+                ("bound-fast", true),
+                ("bound-assistant", true),
+                ("kept-old", true),
+                ("disabled-old", false),
+            ];
+            store
+                .save_models_for_provider(
+                    &provider_id,
+                    previous
+                        .iter()
+                        .map(|(model_id, enabled)| {
+                            rename_test_model(model_id, &provider_id, *enabled)
+                        })
+                        .collect(),
+                )
+                .unwrap();
+            let mut binding = binding_for(&provider_id, "bound-main", Some("bound-fast"));
+            binding.assistant_model_id = Some("bound-assistant".into());
+            let configured = store.save_binding(binding).unwrap();
+            assert_eq!(configured.bindings[0].assistant_model_id, None);
+            let incoming = [
+                ("bound-main", false),
+                ("bound-fast", false),
+                ("bound-assistant", false),
+                ("kept-old", false),
+                ("disabled-old", true),
+                ("new-enabled", true),
+                ("new-disabled", false),
+            ];
+            let saved = store
+                .save_models_for_provider_sync(
+                    &provider_id,
+                    incoming
+                        .iter()
+                        .map(|(model_id, enabled)| {
+                            rename_test_model(model_id, &provider_id, *enabled)
+                        })
+                        .collect(),
+                    reset_enabled,
+                )
+                .unwrap();
+            let enabled = saved
+                .models
+                .iter()
+                .map(|model| (model.id.as_str(), model.enabled))
+                .collect::<HashMap<_, _>>();
+            for model_id in ["bound-main", "bound-fast"] {
+                assert!(enabled[model_id]);
+            }
+            assert_eq!(enabled["bound-assistant"], !reset_enabled);
+            assert_eq!(enabled["kept-old"], !reset_enabled);
+            assert!(!enabled["disabled-old"]);
+            assert_eq!(enabled["new-enabled"], !reset_enabled);
+            assert!(!enabled["new-disabled"]);
+            let reopened = ProviderStore::new(path, MemorySecretStore::default())
+                .load()
+                .unwrap();
+            assert_eq!(saved.models, reopened.models);
+            assert_eq!(reopened.bindings[0].primary_model, "bound-main");
+            assert_eq!(
+                reopened.bindings[0].fast_model.as_deref(),
+                Some("bound-fast")
+            );
+            assert_eq!(reopened.bindings[0].assistant_model_id, None);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]
@@ -2502,6 +3164,7 @@ mod tests {
             access_type: Some(ProviderAccessType::Relay),
             role_models: None,
             last_sync_at: None,
+            credential_revision: 0,
         };
         let json = serde_json::to_string(&provider).expect("serialize");
         assert!(json.contains("\"accessType\":\"relay\""));
@@ -2600,6 +3263,7 @@ mod tests {
             access_type: None,
             role_models: None,
             last_sync_at: None,
+            credential_revision: 0,
         }
     }
 
@@ -2616,6 +3280,62 @@ mod tests {
             context_window: None,
             capabilities: None,
         }
+    }
+
+    /// 角色模式（非订阅 Anthropic 兼容）保存服务商时清掉模型目录残留（2026-09-08）：
+    /// 模型只存 role_models，目录条目是历史同步遗留，不应继续出现在模型列表；
+    /// role: 前缀绑定走 role_models 解析，清理后仍然可用。
+    #[test]
+    fn save_provider_clears_catalog_leftovers_for_role_mode() {
+        let dir = std::env::temp_dir().join(format!("helm-role-clean-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("providers.json");
+        let store = ProviderStore::new(path.clone(), MemorySecretStore::default());
+        let mut provider = rename_test_provider();
+        provider.protocol = Protocol::Anthropic;
+        provider.role_models = Some(
+            [("opus".to_string(), "claude-sonnet-5".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let provider_id = provider.id.clone();
+        store.save_provider(provider.clone(), None).expect("seed provider");
+
+        // 模拟历史同步残留：目录里躺着两条该服务商的模型
+        store
+            .save_models_for_provider(
+                &provider_id,
+                vec![
+                    rename_test_model("claude-sonnet-5", &provider_id, true),
+                    rename_test_model("legacy-leftover", &provider_id, true),
+                ],
+            )
+            .expect("seed leftovers");
+
+        let binding = BindingConfig {
+            engine_id: "claude-code".into(),
+            provider_id: provider_id.clone(),
+            primary_model: "role:opus".into(),
+            fast_model: Some("role:opus".into()),
+            ..serde_json::from_str::<BindingConfig>(
+                "{\"engineId\":\"\",\"providerId\":\"\",\"primaryModel\":\"\"}",
+            )
+            .expect("minimal binding for remaining fields")
+        };
+        store.save_binding(binding).expect("save binding");
+
+        // 再次保存服务商（models=None，角色模式保存路径）→ 目录残留被清掉
+        let config = store.save_provider(provider, None).expect("save provider");
+        assert!(!config
+            .models
+            .iter()
+            .any(|model| model.provider_id == provider_id));
+
+        // role: 绑定仍可解析
+        let resolved = resolve_model_reference(&config, &provider_id, "role:opus")
+            .expect("role binding resolves");
+        assert_eq!(resolved, "claude-sonnet-5");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2643,7 +3363,9 @@ mod tests {
             )
             .expect("minimal binding for remaining fields")
         };
-        store.save_models_for_provider(&provider_id, models).expect("save models");
+        store
+            .save_models_for_provider(&provider_id, models)
+            .expect("save models");
         store.save_binding(binding).expect("save binding");
 
         // 改名到一个不存在的 ID：原地改名，三处 binding 引用一并替换
@@ -2654,16 +3376,13 @@ mod tests {
                 "DeepSeek-V4-Flash-0731-1M",
             )
             .expect("rename");
-        assert!(config
-            .models
-            .iter()
-            .any(|model| model.provider_id == provider_id
-                && model.id == "DeepSeek-V4-Flash-0731-1M"));
+        assert!(config.models.iter().any(
+            |model| model.provider_id == provider_id && model.id == "DeepSeek-V4-Flash-0731-1M"
+        ));
         assert!(!config
             .models
             .iter()
-            .any(|model| model.provider_id == provider_id
-                && model.id == "DeepSeek-V4-Flash-0731"));
+            .any(|model| model.provider_id == provider_id && model.id == "DeepSeek-V4-Flash-0731"));
         let binding = config
             .bindings
             .iter()
@@ -2683,16 +3402,19 @@ mod tests {
     /// 改名时也要一并替换。
     #[test]
     fn rename_provider_model_cascades_legacy_assistant_model_id() {
-        let dir =
-            std::env::temp_dir().join(format!("helm-rename-assist-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("helm-rename-assist-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("providers.json");
         let store = ProviderStore::new(path.clone(), MemorySecretStore::default());
         let provider = rename_test_provider();
         let provider_id = provider.id.clone();
-        store.save_provider(provider.clone(), None).expect("seed provider");
+        store
+            .save_provider(provider.clone(), None)
+            .expect("seed provider");
         let models = vec![rename_test_model("old-m", &provider_id, true)];
-        store.save_models_for_provider(&provider_id, models.clone()).expect("save models");
+        store
+            .save_models_for_provider(&provider_id, models.clone())
+            .expect("save models");
         // 直接把带 assistant_model_id 的旧格式 JSON 写进磁盘，绕过 save_binding 的清理逻辑
         store.load().expect("warm gate");
         let raw = serde_json::json!({
@@ -2740,7 +3462,9 @@ mod tests {
             rename_test_model("old-a", &provider_id, false),
             rename_test_model("target-b", &provider_id, true),
         ];
-        store.save_models_for_provider(&provider_id, models).expect("save models");
+        store
+            .save_models_for_provider(&provider_id, models)
+            .expect("save models");
 
         // 改名到已存在的 ID：合并——目标保留自身字段，enabled 取两者或（false || true = true），
         // 旧条目删除
@@ -2785,7 +3509,11 @@ mod tests {
         store
             .save_models_for_provider(
                 &provider_id,
-                vec![rename_test_model("DeepSeek-V4-Flash-0731", &provider_id, true)],
+                vec![rename_test_model(
+                    "DeepSeek-V4-Flash-0731",
+                    &provider_id,
+                    true,
+                )],
             )
             .expect("catalog");
         store
@@ -2836,7 +3564,11 @@ mod tests {
         store
             .save_models_for_provider(
                 &provider_id,
-                vec![rename_test_model("DeepSeek-V4-Flash-0731", &provider_id, true)],
+                vec![rename_test_model(
+                    "DeepSeek-V4-Flash-0731",
+                    &provider_id,
+                    true,
+                )],
             )
             .expect("catalog");
         store
@@ -2856,7 +3588,11 @@ mod tests {
         let config = store
             .save_models_for_provider(
                 &provider_id,
-                vec![rename_test_model("DeepSeek-V4-Flash-0731", &provider_id, true)],
+                vec![rename_test_model(
+                    "DeepSeek-V4-Flash-0731",
+                    &provider_id,
+                    true,
+                )],
             )
             .expect("save catalog");
         let binding = config

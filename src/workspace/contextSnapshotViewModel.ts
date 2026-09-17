@@ -4,7 +4,8 @@ import type { SessionContextRecord } from '../sessions/api';
 import type { AttributionEntry } from './attributionViewModel';
 import {
   billingSummary,
-  contextPanelData,
+  contextUsageSummary,
+  messageContextSummary,
   type ContextPanelCost,
   type ContextUsageSummary,
 } from './contextPanelViewModel';
@@ -55,9 +56,7 @@ export interface ContextSnapshotViewModel {
  */
 export function contextSnapshot(input: ContextSnapshotInput): ContextSnapshotViewModel {
   const { items, cost, mcpServers = [], disabledMcp = [], sessionContexts = [] } = input;
-  // 复用 contextPanelData 派生历史附件 / 消息数 / 上下文窗口 / 计费 token，
-  // 不在两处各写一遍。gitStatus/stagedFiles 与快照无关，这里不传。
-  const panel = contextPanelData(items, cost);
+  const messages = messageContextSummary(items);
   const disabledSet = new Set(disabledMcp);
 
   const connected = mcpServers.filter((server) => (server.toolCount ?? 0) > 0 && !server.lastError);
@@ -65,10 +64,10 @@ export function contextSnapshot(input: ContextSnapshotInput): ContextSnapshotVie
   const mcpDisabled = mcpServers.filter((server) => disabledSet.has(server.name));
 
   return {
-    usage: panel.contextUsage,
-    billing: panel.billing,
-    messageCount: panel.messageCount,
-    historicalAttachments: panel.historicalAttachments,
+    usage: contextUsageSummary(cost),
+    billing: billingSummary(cost),
+    messageCount: messages.messageCount,
+    historicalAttachments: messages.historicalAttachments,
     sessionContexts,
     mcpEnabled,
     mcpDisabled,

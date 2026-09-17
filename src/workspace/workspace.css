@@ -1046,6 +1046,10 @@
   gap: 8px;
   padding: 4px 0 2px;
 }
+/* 变更-37/38：折叠时隐藏全部过程条目。失败工具一律按真实时序留在过程区，
+   不再 sticky 常驻：失败/中断轮次 completed=false 由 TurnProcess 默认展开
+   （失败交代 = 「执行失败」胶囊 + terminalReason 原因行），成功轮次折叠、
+   点摘要头才展开看完整时序。 */
 .turn-process.is-collapsed .turn-process__body {
   display: none;
 }
@@ -1637,75 +1641,6 @@
   background: var(--accent);
 }
 
-/* checkpoint / rewind */
-.ckpt {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin: -4px 0;
-}
-.ckpt::before,
-.ckpt::after {
-  content: '';
-  height: 1px;
-  flex: 1;
-  background: var(--line);
-}
-.ckpt__chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 5px 4px 11px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  background: var(--surface);
-  font-size: 11.5px;
-  color: var(--fg-3);
-  white-space: nowrap;
-}
-.ckpt__chip > svg {
-  width: 13px;
-  height: 13px;
-  color: var(--accent-hi);
-}
-.ckpt__chip .t {
-  font-family: var(--font-mono);
-  color: var(--fg-4);
-}
-.ckpt__btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  height: 22px;
-  padding: 0 10px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: var(--surface-2);
-  color: var(--fg-2);
-  font: inherit;
-  font-size: 11.5px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: 0.13s;
-}
-.ckpt__btn svg {
-  width: 12px;
-  height: 12px;
-}
-.ckpt__btn:hover {
-  background: var(--hover);
-  color: var(--fg);
-  border-color: var(--border-2);
-}
-.ckpt.is-restored .ckpt__chip {
-  border-color: var(--accent-line);
-  color: var(--accent-hi);
-  background: var(--accent-soft);
-}
-.ckpt.is-restored .ckpt__chip > svg {
-  color: var(--accent);
-}
-
 /* 上下文压缩标记（原型 L550-554：分隔线夹住的安静提示行；批次①对齐形态，
    保留实现的展开明细与生命周期着色） */
 .compact {
@@ -1997,6 +1932,25 @@
   border-color: var(--accent-line);
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
+/* 变更-37 · 拖拽附加：落点高亮 + 提示层（.composer__box 已是 position:relative） */
+.composer__box.is-drop {
+  border-color: var(--accent-line);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.composer__drop {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 13px;
+  font-weight: 600;
+  pointer-events: none;
+}
 .composer textarea {
   width: 100%;
   min-height: 92px;
@@ -2057,6 +2011,9 @@
 }
 .composer__session-status {
   display: flex;
+  /* 底栏空间不足时不收缩：圆环是固定尺寸，容器被压扁后溢出内容会叠压到发送键上
+     （2026-09-11 用户实测：打开右栏对话列变窄时圆环与发送键重叠）；过窄由模型名收缩兜底。 */
+  flex: none;
   min-width: 0;
   align-items: center;
   gap: 5px;
@@ -2293,6 +2250,28 @@
   /* 关闭态列宽 0 + border-left 1px 会把边框盒撑出列外 1px，≥1280 视口横向越界
      （scrollWidth = clientWidth + 1，2026-09-04 视觉矩阵定位）；隐藏态无边框，勿回退。 */
   border-left-width: 0;
+}
+
+/* 右栏最大化（对齐原型 workspace.css L628-630）：.ctx fixed 覆盖线程区，
+   保留标题栏与主侧栏；线程与分隔线被盖住而非挤压。
+   旧实现用 --ctx-w: min(92vw,1440px) 撑宽三列网格，会把 1fr 线程列挤到越界、
+   还原按钮裁出视口（2026-09-10 用户实测左侧工作区错乱且无法还原），勿回退。
+   选择器带 .ws:not(.no-ctx) 抬优先级：压过 L3976 三列网格态的 position:relative
+   （2026-09-10 复测：低优先级 fixed 被 relative 覆盖，最大化只剩分隔线消失）。 */
+body.ws-ctx-max .ws:not(.no-ctx) .ctx {
+  position: fixed;
+  top: var(--titlebar-h);
+  right: 0;
+  bottom: 0;
+  left: var(--rail-w);
+  z-index: 55;
+  width: auto;
+  min-width: 0;
+  border-left: 0;
+  box-shadow: var(--shadow-pop);
+}
+body.ws-ctx-max .splitter--v {
+  display: none;
 }
 
 /* ---------- 右栏宽度拖拽（变更-34 · E1） ---------- */
@@ -2906,36 +2885,21 @@ body.is-splitting-v {
 }
 
 /* 文件预览（原型 L438-447 .filepreview）：批次②起占满右栏面板区，
-   与「修改记录/全部文件」同级切换，不再固定右栏底部。 */
+   与「修改记录/全部文件」同级切换。2026-09-10 用户裁决正文直出：
+   预览条整条去掉（tab 已带文件名/关闭），表格/文档类右上角留悬浮系统打开按钮。 */
 .filepreview {
+  position: relative;
   min-height: 0;
   flex: 1;
   display: flex;
   flex-direction: column;
   background: var(--bg);
 }
-.filepreview__bar {
-  min-height: 42px;
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  padding: 0 12px;
-  border-bottom: 1px solid var(--line);
-}
-.filepreview__bar > svg {
-  width: 15px;
-  height: 15px;
-  color: var(--fg-4);
-}
-.filepreview__path {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-family: var(--font-mono);
-  font-size: 11.5px;
-  color: var(--fg-2);
+.filepreview__open {
+  position: absolute;
+  top: 10px;
+  right: 14px;
+  z-index: 2;
 }
 .filepreview__body {
   flex: 1;
@@ -2982,6 +2946,68 @@ body.is-splitting-v {
   color: var(--fg-3);
   white-space: pre-wrap;
   word-break: break-word;
+}
+/* 文件 tab：MD 渲染态（复用 .md 排版，外层只管内边距与滚动） */
+.filepreview__md {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 18px 22px;
+}
+/* 文件 tab：xlsx/xls/csv 表格渲染态（SheetJS sheet_to_html 输出） */
+.filepreview__sheet {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.filepreview__sheet-select {
+  flex: none;
+  margin: 10px 14px 0;
+  align-self: flex-start;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  color: var(--fg-2);
+  font-size: 12px;
+}
+.filepreview__sheet-table {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px 14px 16px;
+}
+.filepreview__sheet-table table {
+  border-collapse: collapse;
+  font-size: 12px;
+  font-family: var(--font-mono);
+}
+.filepreview__sheet-table td {
+  border: 1px solid var(--line);
+  padding: 4px 10px;
+  min-width: 64px;
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg-2);
+}
+.filepreview__sheet-table tr:first-child td {
+  background: var(--surface-2);
+  font-weight: 600;
+  color: var(--fg);
+  position: sticky;
+  top: 0;
+}
+/* 文件 tab：docx 渲染态（复用 .md 排版；容器即 .md，只补内边距） */
+.filepreview__docx {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 18px 22px;
+  background: var(--bg);
 }
 .csec__t {
   font-size: 11px;
@@ -4473,9 +4499,13 @@ body.is-splitting-v {
   flex: none;
 }
 
-/* 原型 #modelBtn（workspace.css L649 + L82）：整钮 190px，mono 标签截断 */
+/* 原型 #modelBtn（workspace.css L649 + L82）：整钮 190px，mono 标签截断。
+   右栏打开挤窄对话列时模型名是唯一可收缩项（flex-shrink:1 + min-width:0），
+   优先吃掉空间紧张，避免溢出/叠压其他底栏控件。 */
 .composer__bar .cm-tool--model {
   max-width: 190px;
+  min-width: 0;
+  flex: 0 1 auto;
 }
 .composer__bar .cm-tool--model .mono {
   min-width: 0;

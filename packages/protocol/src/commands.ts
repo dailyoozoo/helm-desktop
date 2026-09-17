@@ -63,7 +63,6 @@ export type AgentCommand =
       decision: 'allow' | 'turn' | 'session' | 'project' | 'always' | 'deny';
     }
   | { type: 'interrupt'; sessionId: string }
-  | { type: 'restore_checkpoint'; sessionId: string; checkpointId: string }
   | {
       type: 'create_session';
       engine: EngineId;

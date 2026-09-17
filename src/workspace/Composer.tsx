@@ -27,6 +27,7 @@ import {
   resolveEnterAction,
 } from './slashCommands';
 import { CapCenterModal, type CapCenterKey } from './CapCenterModal';
+import { useFileDrop } from '../lib/fileDrop';
 import { ContextPill, contextPillLabel, type ContextPillItem } from './ContextPill';
 import { ContextRing, type ContextRingDetail, type SessionContextEditActions } from './ContextRing';
 import type { ContextSnapshotViewModel } from './contextSnapshotViewModel';
@@ -809,6 +810,13 @@ export function Composer({
     }
   };
 
+  // 拖拽附加（变更-37）：系统拖入的文件/目录走与「+」选择完全相同的药丸链路。
+  const dropRef = useRef<HTMLDivElement>(null);
+  const drop = useFileDrop(dropRef, (paths) => {
+    const dropped = paths.map((path) => path.trim()).filter(Boolean);
+    if (dropped.length) addAttachments(dropped);
+  });
+
   const removeAttachment = (path: string) => {
     setAttachments((current) => current.filter((item) => item.path !== path));
   };
@@ -816,7 +824,19 @@ export function Composer({
   return (
     <div className="composer">
       <div className="composer__inner">
-        <div className="composer__box">
+        <div
+          className={'composer__box' + (drop.dragging ? ' is-drop' : '')}
+          ref={dropRef}
+          onDragEnter={drop.onDragEnter}
+          onDragOver={drop.onDragOver}
+          onDragLeave={drop.onDragLeave}
+          onDrop={drop.onDrop}
+        >
+          {drop.dragging ? (
+            <div className="composer__drop" aria-hidden="true">
+              松开即可附加文件/目录
+            </div>
+          ) : null}
           {attachments.length ? (
             <div className="cpills" aria-label="已挂载上下文">
               {attachments.map((item) => (

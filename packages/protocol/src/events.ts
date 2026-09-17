@@ -128,16 +128,6 @@ export type AgentEvent =
     }
   | { type: 'plan_update'; sessionId: string; steps: PlanStep[] }
   | {
-      type: 'checkpoint';
-      sessionId: string;
-      id: string;
-      label: string;
-      ts: number;
-      restorable: boolean;
-      fileCount: number;
-      reason?: string;
-    }
-  | {
       type: 'token_usage';
       sessionId: string;
       inputTokens: number;
@@ -216,4 +206,13 @@ export interface AgentEventEnvelope {
   attemptNo?: number;
   runtimeGenerationId?: string;
   event: AgentEvent;
+}
+
+export interface TurnStreamFailure {
+  historyId: string;
+  turnId: string;
+  turnEpoch: number;
+  attemptNo: number;
+  runtimeGenerationId: string;
+  message: string;
 }

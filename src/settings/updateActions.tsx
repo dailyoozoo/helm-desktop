@@ -3,9 +3,25 @@ import { listen } from '@tauri-apps/api/event';
 import { Icon } from '../shell/icons';
 import { showResultToast } from '../components/toast';
 import { checkForUpdate, installUpdate, type UpdateCheckResult } from './api';
+import { openExternalUrl } from '../providers/api';
+
+/** GitHub 回退时引导到的发布页（与「查看发布」一致）。 */
+const RELEASES_URL = 'https://github.com/dailyoozoo/helm-desktop/releases/latest';
+
+/** 检查更新的行内状态条反馈（对齐原型 settings.html 的 cm-about-status-bar）。 */
+export interface UpdateFeedback {
+  kind: 'checking' | 'latest' | 'available' | 'error';
+  message: string;
+}
 
 /** 真实更新链路（P2-1）：检查 → 展示新版本 → 下载安装（进度来自 update-progress 事件）。 */
-export function UpdateActions({ feedConfigured }: { feedConfigured: boolean }) {
+export function UpdateActions({
+  feedConfigured,
+  onFeedback,
+}: {
+  feedConfigured: boolean;
+  onFeedback?: (feedback: UpdateFeedback | null) => void;
+}) {
   const [checking, setChecking] = useState(false);
   const [installing, setInstalling] = useState(false);
   const [available, setAvailable] = useState<UpdateCheckResult | null>(null);
@@ -43,18 +59,41 @@ export function UpdateActions({ feedConfigured }: { feedConfigured: boolean }) {
   const handleCheck = async () => {
     setChecking(true);
     setAvailable(null);
+    onFeedback?.({ kind: 'checking', message: '正在检查更新…' });
     try {
       const result = await checkForUpdate();
       if (result.available) {
         setAvailable(result);
-        showResultToast('发现新版本 v' + (result.version ?? ''));
+        // feed 源可应用内安装；GitHub 回退只提示版本并引导到发布页下载
+        const message =
+          result.source === 'github'
+            ? 'GitHub 上发现新版本 v' + (result.version ?? '')
+            : '发现新版本 v' + (result.version ?? '');
+        onFeedback?.({ kind: 'available', message });
+        showResultToast(message);
       } else {
-        showResultToast('当前已是最新版本（v' + result.currentVersion + '）');
+        onFeedback?.({
+          kind: 'latest',
+          message: '当前已是最新版本（v' + result.currentVersion + '）',
+        });
       }
     } catch (error) {
-      showResultToast('检查更新失败：' + (error instanceof Error ? error.message : String(error)));
+      const message = error instanceof Error ? error.message : String(error);
+      onFeedback?.({ kind: 'error', message: '检查更新失败：' + message });
+      showResultToast('检查更新失败：' + message);
     } finally {
       setChecking(false);
+    }
+  };
+
+  const handleOpenRelease = async () => {
+    if (!available) return;
+    try {
+      await openExternalUrl(available.releaseUrl || RELEASES_URL);
+    } catch (error) {
+      showResultToast(
+        '打开发布页失败：' + (error instanceof Error ? error.message : String(error)),
+      );
     }
   };
 
@@ -65,7 +104,9 @@ export function UpdateActions({ feedConfigured }: { feedConfigured: boolean }) {
       await installUpdate();
       // 成功路径应用会自动重启，走不到这里
     } catch (error) {
-      showResultToast('安装更新失败：' + (error instanceof Error ? error.message : String(error)));
+      const message = error instanceof Error ? error.message : String(error);
+      onFeedback?.({ kind: 'error', message: '安装更新失败：' + message });
+      showResultToast('安装更新失败：' + message);
       setInstalling(false);
       setProgress(null);
     }
@@ -81,21 +122,35 @@ export function UpdateActions({ feedConfigured }: { feedConfigured: boolean }) {
       <button
         className="btn btn--subtle btn--sm"
         type="button"
-        disabled={!feedConfigured || checking || installing}
-        title={feedConfigured ? undefined : '先填写更新发布源或价格目录镜像'}
+        disabled={checking || installing}
+        title={
+          feedConfigured
+            ? undefined
+            : '未配置发布源：通过 GitHub 检查并前往下载；配置签名发布源后可应用内安装'
+        }
         onClick={handleCheck}
       >
         <Icon name="refresh" /> {checking ? '检查中…' : '检查更新'}
       </button>
       {available?.available ? (
-        <button
-          className="btn btn--primary btn--sm"
-          type="button"
-          disabled={installing}
-          onClick={handleInstall}
-        >
-          <Icon name="down" /> {installing ? progressText : '下载并安装 v' + available.version}
-        </button>
+        available.source === 'github' ? (
+          <button
+            className="btn btn--primary btn--sm"
+            type="button"
+            onClick={() => void handleOpenRelease()}
+          >
+            <Icon name="gitbranch" /> 前往下载 v{available.version}
+          </button>
+        ) : (
+          <button
+            className="btn btn--primary btn--sm"
+            type="button"
+            disabled={installing}
+            onClick={handleInstall}
+          >
+            <Icon name="down" /> {installing ? progressText : '下载并安装 v' + available.version}
+          </button>
+        )
       ) : null}
       {available?.notes ? <span className="faint">{available.notes}</span> : null}
     </div>
