@@ -92,7 +92,9 @@ if ($args -contains '--version') { Write-Output 'codex-cli 9.9.9'; exit 0 }
 Write-Output 'Logged in using ChatGPT'
 `,
     });
-    const result = runRealMatrix(environment, 2);
+    // 5s：健康 shim 的探测上限。PS 5.1 冷启动本就可观，2s 在有负载的机器上会假性超时
+    //（挂起行为由下方 hung-status 测试单独验证，不受此值影响）。
+    const result = runRealMatrix(environment, 5);
     expect(result.error).toBeUndefined();
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout);
