@@ -38,3 +38,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           working-directory: src-tauri
+          # lopdf RUSTSEC-2026-0187（经 pdf-extract 间接引入，patched 需 pdf-extract 0.12，
+          # 仅影响本地解析用户自选 PDF 附件的 DoS）——audit-check@v2 不读取 .cargo/audit.toml，
+          # 忽略项必须在此传入；与 src-tauri/.cargo/audit.toml 保持同步。
+          ignore: RUSTSEC-2026-0187
