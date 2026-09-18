@@ -10,3 +10,4 @@ src-tauri/target/
 src-tauri/target-*/
 src-tauri/gen/
 vitest.config.ts.timestamp-*.mjs
+vitest.config.ts.timestamp-*.mjs
