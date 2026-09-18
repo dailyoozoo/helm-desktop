@@ -751,11 +751,15 @@ impl<S: SecretStore> ProviderStore<S> {
                 && item.kind != ProviderKind::Subscription
                 && item.protocol == Protocol::Anthropic
         }) {
-            // 角色模式（非订阅 Anthropic 兼容）：模型只存 role_models，不进模型目录；
-            // 目录里的条目是历史同步残留，保存服务商时一并清掉。
-            config
-                .models
-                .retain(|model| model.provider_id != provider_id);
+            // 角色模式（非订阅 Anthropic 兼容）：模型只存 role_models，目录里的历史同步残留
+            // 在保存服务商时清掉；但用户手动保存的模型（price_source == Manual）是用户明确
+            // 指定的直连模型，必须保留，否则重新保存服务商会让这些绑定在 launch/resolve 时
+            // 找不到模型。同步/遗留目录项（price_source 为 None/Builtin/Unknown）属于历史
+            // 残留，照常清理；role: 前缀绑定走 role_models 解析，不依赖目录，也不受此影响。
+            config.models.retain(|model| {
+                model.provider_id != provider_id
+                    || model.price_source == Some(PriceSource::Manual)
+            });
         }
         for binding in config
             .bindings
@@ -2620,7 +2624,10 @@ fn normalize_saved_model(mut model: ModelConfig) -> ModelConfig {
     if model.price_source.is_none() {
         model.price_source = Some(
             if model.input_price_per_mtok > 0.0 || model.output_price_per_mtok > 0.0 {
-                PriceSource::Manual
+                // 同步/发现所得的模型带有价格但来源未标注时，归入 Provider（厂商价目），
+                // 而非 Manual（用户手动录入）。两者定价口径一致，但只有 Manual 是用户明确
+                // 直存的模型——角色模式下重新保存服务商时依此区分：保留 Manual，清理 Provider 残留。
+                PriceSource::Provider
             } else {
                 PriceSource::Unknown
             },

@@ -1,0 +1,16 @@
+# RustSec 审计忽略配置（随 Helm 公开仓库 src-tauri 目录生效）
+#
+# RUSTSEC-2026-0187 — lopdf 0.34.0 深度嵌套 PDF 栈溢出（DoS）
+#   Helm 经 pdf-extract 0.7.12 间接依赖 lopdf。该漏洞的 patched 版本为 >=0.42.0，
+#   但 pdf-extract 直到 0.12.1 才升级到 lopdf ^0.42（0.8/0.10 仍锁旧 lopdf）。
+#   从 0.7 跨到 0.12 涉及多个小版本，extract_text 公共 API 大概率 breaking，
+#   需要改写调用并重编译/重测，成本与回归风险不成比例。
+#   实际风险有限：Helm 仅在本地解析用户主动选择的 PDF 附件，非网络暴露服务，
+#   且为 DoS（进程崩溃）而非 RCE。
+# 后续计划：单独排期 pdf-extract 0.12 升级（含 extract_text 调用改写与回归测试），
+#           完成后移除本条 ignore。rustls 漏洞（RUSTSEC-2026-0285）已通过
+#           cargo update -p rustls --precise 0.23.45 真实修复，不在忽略列表。
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0187",
+]

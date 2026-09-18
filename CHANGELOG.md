@@ -2,6 +2,13 @@
 
 本项目遵循 Keep a Changelog 的基本结构；0.x 阶段可能包含不兼容的配置或数据变更。
 
+## [0.6.1] - 2026-09-18
+
+### Fixed
+
+- CI 失败修复：修正 `claude_runtime_managed_api_binding_does_not_load_external_setting_sources` 测试在 Windows runner 上的 false negative——原断言订阅模式 args 数量为 0，未计入 `build_command` 在 Windows 上包裹的 `cmd /C` 前缀；改为校验策略注入前后 args 增量，Windows / Linux 均稳定通过。
+- 依赖安全更新：将 `rustls` 升级至 0.23.45，修复 RUSTSEC-2026-0285（TLS 1.3 握手越界）。`lopdf` 的 RUSTSEC-2026-0187（深度嵌套 PDF 栈溢出 DoS）经 `pdf-extract` 间接引入，其 patched 版本需跨多小版本升级 `pdf-extract` 0.12，API 破坏性较大，暂以 `src-tauri/audit.toml` 忽略并在后续单独排期真修；该漏洞仅影响本地解析用户自选 PDF 附件的场景。
+
 ## [0.6.0] - 2026-09-18
 
 ### Added

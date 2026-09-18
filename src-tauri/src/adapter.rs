@@ -6211,18 +6211,33 @@ mod tests {
 
     #[test]
     fn claude_runtime_managed_api_binding_does_not_load_external_setting_sources() {
+        // API Binding（use_user_setting_source=false）必须显式注入空的 --setting-sources，
+        // 屏蔽 ~/.claude 或项目设置对 Provider/Model 的覆盖（显式 --settings 仍加载审批 hook）。
         let mut api_command = super::build_command("claude");
+        let api_baseline = api_command.as_std().get_args().count();
         super::apply_claude_setting_source_policy(&mut api_command, false);
         let api_args = api_command
             .as_std()
             .get_args()
             .map(|value| value.to_string_lossy().to_string())
             .collect::<Vec<_>>();
+        assert!(
+            api_command.as_std().get_args().count() > api_baseline,
+            "API 模式必须追加 --setting-sources"
+        );
         assert!(api_args.ends_with(&["--setting-sources".to_string(), "".to_string()]));
 
+        // 订阅模式（use_user_setting_source=true）必须完全由 Helm 注入的 Provider/Model 决定，
+        // 不得追加任何 args。注意：Windows 上 build_command 会给命令包一层 `cmd /C <bin>`
+        // 前缀，这里只校验 apply 策略前后「没有新增」args，而非绝对数量。
         let mut subscription_command = super::build_command("claude");
+        let sub_baseline = subscription_command.as_std().get_args().count();
         super::apply_claude_setting_source_policy(&mut subscription_command, true);
-        assert_eq!(subscription_command.as_std().get_args().count(), 0);
+        assert_eq!(
+            subscription_command.as_std().get_args().count(),
+            sub_baseline,
+            "订阅模式不得追加任何 args（build_command 的平台前缀不计入增量）"
+        );
     }
 
     #[cfg(windows)]
