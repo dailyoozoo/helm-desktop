@@ -6,6 +6,7 @@
 
 ### Fixed
 
+- 角色模式（非订阅 Anthropic 兼容）模型目录语义修正：用户手动保存的模型（price_source = Manual）重新保存服务商时不再被清空，避免绑定在启动 / 解析时找不到模型；同步残留目录项照常清理。同步 / 发现所得的带价模型来源归入 Provider（厂商价目），与 Manual（用户手动录入）区分，定价口径不变。
 - CI 失败修复：修正 `claude_runtime_managed_api_binding_does_not_load_external_setting_sources` 测试在 Windows runner 上的 false negative——原断言订阅模式 args 数量为 0，未计入 `build_command` 在 Windows 上包裹的 `cmd /C` 前缀；改为校验策略注入前后 args 增量，Windows / Linux 均稳定通过。
 - 依赖安全更新：将 `rustls` 升级至 0.23.45，修复 RUSTSEC-2026-0285（TLS 1.3 握手越界）。`lopdf` 的 RUSTSEC-2026-0187（深度嵌套 PDF 栈溢出 DoS）经 `pdf-extract` 间接引入，其 patched 版本需跨多小版本升级 `pdf-extract` 0.12，API 破坏性较大，暂以 `src-tauri/audit.toml` 忽略并在后续单独排期真修；该漏洞仅影响本地解析用户自选 PDF 附件的场景。
 
