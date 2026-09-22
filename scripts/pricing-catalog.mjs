@@ -1,5 +1,18 @@
-import { readFile } from 'node:fs/promises';
+import { readFile, appendFile } from 'node:fs/promises';
 import process from 'node:process';
+
+/* 把对账结果写到 GitHub job summary（有环境变量时）；不写也不影响本地运行。
+   漂移/缺失只告警、不失败——失败邮件由 validateCatalog 的真实错误触发。 */
+async function writeSummary(text) {
+  const path = process.env.GITHUB_STEP_SUMMARY;
+  if (path) {
+    try {
+      await appendFile(path, text.endsWith('\n') ? text : `${text}\n`);
+    } catch {
+      /* summary 写不了就忽略，控制台已有同样输出 */
+    }
+  }
+}
 
 const catalogPath = new URL('../src-tauri/assets/pricing-catalog.json', import.meta.url);
 const catalog = JSON.parse(await readFile(catalogPath, 'utf8'));
@@ -96,12 +109,20 @@ const UPSTREAM_VENDORS = {
   moonshot: { provider: 'moonshot', idFilter: null },
 };
 async function checkUpstream() {
-  const response = await fetch('https://models.dev/api.json', {
-    headers: { accept: 'application/json', 'user-agent': 'helm-pricing-audit/1' },
-    signal: AbortSignal.timeout(30_000),
-  });
-  if (!response.ok) fail(`models.dev 返回 HTTP ${response.status}`);
-  const providers = await response.json();
+  let providers;
+  try {
+    const response = await fetch('https://models.dev/api.json', {
+      headers: { accept: 'application/json', 'user-agent': 'helm-pricing-audit/1' },
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    providers = await response.json();
+  } catch (error) {
+    const msg = `[pricing-catalog] 无法拉取上游 models.dev（${error.message}）；跳过本次对账，不视为失败`;
+    console.warn(msg);
+    await writeSummary(`> ⚠️ ${msg}\n`);
+    return;
+  }
   let missingTotal = 0;
   const drift = [];
   for (const [vendor, rule] of Object.entries(UPSTREAM_VENDORS)) {
@@ -150,7 +171,23 @@ async function checkUpstream() {
     console.log('[pricing-catalog] 上游价格差异（仅提示，必须回到官方来源审核）：');
     console.log(JSON.stringify(drift, null, 2));
   }
-  if (missingTotal || drift.length) process.exitCode = 2;
+  // 漂移/缺失只告警，不失败：避免上游（models.dev 社区库）频繁变动导致 workflow 天天失败刷邮件。
+  // 本地目录自身的结构校验（validateCatalog）仍会在出错时抛异常、令 workflow 失败。
+  if (missingTotal || drift.length) {
+    const lines = [
+      '## 定价目录上游对账（仅提示，非失败）',
+      '',
+      `- 上游新增未收录模型：**${missingTotal}** 个`,
+      `- 本地已有模型价格漂移：**${drift.length}** 个`,
+      '',
+      '以上差异以 models.dev 社区库为参照，**不代表本地一定错误**。需回到各厂商官方定价页逐条核对，',
+      '更新 sourceUrl/observedAt/sequence 后由 `npm run pricing:sign` 签名发布。',
+    ];
+    await writeSummary(lines.join('\n') + '\n');
+    console.log(
+      `[pricing-catalog] 共 ${missingTotal} 个未收录 + ${drift.length} 个价格漂移（仅提示，未令 workflow 失败）`,
+    );
+  }
 }
 
 validateCatalog(catalog);

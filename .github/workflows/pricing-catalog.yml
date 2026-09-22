@@ -21,9 +21,12 @@ jobs:
       - run: npm ci
       - run: npm run pricing:validate
       - name: Compare machine-readable discovery source
+        # 对账只把漂移/缺失写进 job summary，不再令 workflow 失败（避免上游社区库频繁变动刷失败邮件）。
+        # 即使本步骤异常也不影响整体结果；目录自身结构校验由上面的 pricing:validate 把关。
+        continue-on-error: true
         run: npm run pricing:check-upstream
-      - name: Explain next action
+      - name: Explain failure
         if: failure()
         run: |
-          echo "Upstream discovery changed. Verify every candidate against the vendor's official pricing page,"
-          echo "update sourceUrl/observedAt/sequence, then sign and publish to the domestic mirrors."
+          echo "定价目录自身结构校验失败（validateCatalog 抛错）。请检查 src-tauri/assets/pricing-catalog.json 的 schema/价格区间/去重。"
+          echo "漂移/缺失不再视为失败，详情见上方 'Compare machine-readable discovery source' 步骤的 job summary。"

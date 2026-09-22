@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "catalogVersion": "2026.08.24.1",
-  "sequence": 2026082302,
-  "publishedAt": "2026-08-24T00:00:00Z",
+  "catalogVersion": "2026.09.21.1",
+  "sequence": 2026092101,
+  "publishedAt": "2026-09-21T00:00:00Z",
   "models": [
     {
       "vendor": "openai",
@@ -13,23 +13,23 @@
       "currency": "USD",
       "unit": "per-million-tokens",
       "sourceUrl": "https://developers.openai.com/api/docs/pricing#latest-models",
-      "observedAt": "2026-07-17T00:00:00Z",
+      "observedAt": "2026-09-21T00:00:00Z",
       "tiers": {
         "standard": {
           "bands": [
             {
               "maxInputTokens": 272000,
-              "input": 5,
-              "cachedInput": 0.5,
-              "cacheWrite": 6.25,
-              "output": 30
+              "input": 4,
+              "cachedInput": 0.4,
+              "cacheWrite": 5,
+              "output": 20
             },
             {
               "minInputTokens": 272001,
-              "input": 10,
-              "cachedInput": 1,
-              "cacheWrite": 12.5,
-              "output": 45
+              "input": 8,
+              "cachedInput": 0.8,
+              "cacheWrite": 10,
+              "output": 40
             }
           ]
         },
@@ -37,17 +37,17 @@
           "bands": [
             {
               "maxInputTokens": 272000,
-              "input": 2.5,
-              "cachedInput": 0.25,
-              "cacheWrite": 3.125,
-              "output": 15
+              "input": 2,
+              "cachedInput": 0.2,
+              "cacheWrite": 2.5,
+              "output": 10
             },
             {
               "minInputTokens": 272001,
-              "input": 5,
-              "cachedInput": 0.5,
-              "cacheWrite": 6.25,
-              "output": 22.5
+              "input": 4,
+              "cachedInput": 0.4,
+              "cacheWrite": 5,
+              "output": 20
             }
           ]
         },
@@ -55,17 +55,17 @@
           "bands": [
             {
               "maxInputTokens": 272000,
-              "input": 2.5,
-              "cachedInput": 0.25,
-              "cacheWrite": 3.125,
-              "output": 15
+              "input": 2,
+              "cachedInput": 0.2,
+              "cacheWrite": 2.5,
+              "output": 10
             },
             {
               "minInputTokens": 272001,
-              "input": 5,
-              "cachedInput": 0.5,
-              "cacheWrite": 6.25,
-              "output": 22.5
+              "input": 4,
+              "cachedInput": 0.4,
+              "cacheWrite": 5,
+              "output": 20
             }
           ]
         },
@@ -73,17 +73,17 @@
           "bands": [
             {
               "maxInputTokens": 272000,
-              "input": 10,
-              "cachedInput": 1,
-              "cacheWrite": 12.5,
-              "output": 60
+              "input": 8,
+              "cachedInput": 0.8,
+              "cacheWrite": 10,
+              "output": 40
             },
             {
               "minInputTokens": 272001,
-              "input": 20,
-              "cachedInput": 2,
-              "cacheWrite": 25,
-              "output": 90
+              "input": 16,
+              "cachedInput": 1.6,
+              "cacheWrite": 20,
+              "output": 72
             }
           ]
         }
@@ -95,145 +95,9 @@
       "currency": "USD",
       "unit": "per-million-tokens",
       "sourceUrl": "https://developers.openai.com/api/docs/pricing#latest-models",
-      "observedAt": "2026-07-17T00:00:00Z",
+      "observedAt": "2026-09-21T00:00:00Z",
       "tiers": {
         "standard": {
-          "bands": [
-            {
-              "maxInputTokens": 272000,
-              "input": 2.5,
-              "cachedInput": 0.25,
-              "cacheWrite": 3.125,
-              "output": 15
-            },
-            {
-              "minInputTokens": 272001,
-              "input": 5,
-              "cachedInput": 0.5,
-              "cacheWrite": 6.25,
-              "output": 22.5
-            }
-          ]
-        },
-        "batch": {
-          "bands": [
-            {
-              "maxInputTokens": 272000,
-              "input": 1.25,
-              "cachedInput": 0.125,
-              "cacheWrite": 1.5625,
-              "output": 7.5
-            },
-            {
-              "minInputTokens": 272001,
-              "input": 2.5,
-              "cachedInput": 0.25,
-              "cacheWrite": 3.125,
-              "output": 11.25
-            }
-          ]
-        },
-        "flex": {
-          "bands": [
-            {
-              "maxInputTokens": 272000,
-              "input": 1.25,
-              "cachedInput": 0.125,
-              "cacheWrite": 1.5625,
-              "output": 7.5
-            },
-            {
-              "minInputTokens": 272001,
-              "input": 2.5,
-              "cachedInput": 0.25,
-              "cacheWrite": 3.125,
-              "output": 11.25
-            }
-          ]
-        },
-        "priority": {
-          "bands": [
-            {
-              "maxInputTokens": 272000,
-              "input": 5,
-              "cachedInput": 0.5,
-              "cacheWrite": 6.25,
-              "output": 30
-            },
-            {
-              "minInputTokens": 272001,
-              "input": 10,
-              "cachedInput": 1,
-              "cacheWrite": 12.5,
-              "output": 45
-            }
-          ]
-        }
-      }
-    },
-    {
-      "vendor": "openai",
-      "modelId": "gpt-5.6-luna",
-      "currency": "USD",
-      "unit": "per-million-tokens",
-      "sourceUrl": "https://developers.openai.com/api/docs/pricing#latest-models",
-      "observedAt": "2026-07-17T00:00:00Z",
-      "tiers": {
-        "standard": {
-          "bands": [
-            {
-              "maxInputTokens": 272000,
-              "input": 1,
-              "cachedInput": 0.1,
-              "cacheWrite": 1.25,
-              "output": 6
-            },
-            {
-              "minInputTokens": 272001,
-              "input": 2,
-              "cachedInput": 0.2,
-              "cacheWrite": 2.5,
-              "output": 9
-            }
-          ]
-        },
-        "batch": {
-          "bands": [
-            {
-              "maxInputTokens": 272000,
-              "input": 0.5,
-              "cachedInput": 0.05,
-              "cacheWrite": 0.625,
-              "output": 3
-            },
-            {
-              "minInputTokens": 272001,
-              "input": 1,
-              "cachedInput": 0.1,
-              "cacheWrite": 1.25,
-              "output": 4.5
-            }
-          ]
-        },
-        "flex": {
-          "bands": [
-            {
-              "maxInputTokens": 272000,
-              "input": 0.5,
-              "cachedInput": 0.05,
-              "cacheWrite": 0.625,
-              "output": 3
-            },
-            {
-              "minInputTokens": 272001,
-              "input": 1,
-              "cachedInput": 0.1,
-              "cacheWrite": 1.25,
-              "output": 4.5
-            }
-          ]
-        },
-        "priority": {
           "bands": [
             {
               "maxInputTokens": 272000,
@@ -247,7 +111,143 @@
               "input": 4,
               "cachedInput": 0.4,
               "cacheWrite": 5,
-              "output": 18
+              "output": 24
+            }
+          ]
+        },
+        "batch": {
+          "bands": [
+            {
+              "maxInputTokens": 272000,
+              "input": 1,
+              "cachedInput": 0.1,
+              "cacheWrite": 1.25,
+              "output": 6
+            },
+            {
+              "minInputTokens": 272001,
+              "input": 2,
+              "cachedInput": 0.2,
+              "cacheWrite": 2.5,
+              "output": 12
+            }
+          ]
+        },
+        "flex": {
+          "bands": [
+            {
+              "maxInputTokens": 272000,
+              "input": 1,
+              "cachedInput": 0.1,
+              "cacheWrite": 1.25,
+              "output": 6
+            },
+            {
+              "minInputTokens": 272001,
+              "input": 2,
+              "cachedInput": 0.2,
+              "cacheWrite": 2.5,
+              "output": 12
+            }
+          ]
+        },
+        "priority": {
+          "bands": [
+            {
+              "maxInputTokens": 272000,
+              "input": 4,
+              "cachedInput": 0.4,
+              "cacheWrite": 5,
+              "output": 24
+            },
+            {
+              "minInputTokens": 272001,
+              "input": 8,
+              "cachedInput": 0.8,
+              "cacheWrite": 10,
+              "output": 48
+            }
+          ]
+        }
+      }
+    },
+    {
+      "vendor": "openai",
+      "modelId": "gpt-5.6-luna",
+      "currency": "USD",
+      "unit": "per-million-tokens",
+      "sourceUrl": "https://developers.openai.com/api/docs/pricing#latest-models",
+      "observedAt": "2026-09-21T00:00:00Z",
+      "tiers": {
+        "standard": {
+          "bands": [
+            {
+              "maxInputTokens": 272000,
+              "input": 0.2,
+              "cachedInput": 0.02,
+              "cacheWrite": 0.25,
+              "output": 1.2
+            },
+            {
+              "minInputTokens": 272001,
+              "input": 0.4,
+              "cachedInput": 0.04,
+              "cacheWrite": 0.5,
+              "output": 2.4
+            }
+          ]
+        },
+        "batch": {
+          "bands": [
+            {
+              "maxInputTokens": 272000,
+              "input": 0.1,
+              "cachedInput": 0.01,
+              "cacheWrite": 0.125,
+              "output": 0.6
+            },
+            {
+              "minInputTokens": 272001,
+              "input": 0.2,
+              "cachedInput": 0.02,
+              "cacheWrite": 0.25,
+              "output": 1.2
+            }
+          ]
+        },
+        "flex": {
+          "bands": [
+            {
+              "maxInputTokens": 272000,
+              "input": 0.1,
+              "cachedInput": 0.01,
+              "cacheWrite": 0.125,
+              "output": 0.6
+            },
+            {
+              "minInputTokens": 272001,
+              "input": 0.2,
+              "cachedInput": 0.02,
+              "cacheWrite": 0.25,
+              "output": 1.2
+            }
+          ]
+        },
+        "priority": {
+          "bands": [
+            {
+              "maxInputTokens": 272000,
+              "input": 0.4,
+              "cachedInput": 0.04,
+              "cacheWrite": 0.5,
+              "output": 2.4
+            },
+            {
+              "minInputTokens": 272001,
+              "input": 0.8,
+              "cachedInput": 0.08,
+              "cacheWrite": 1,
+              "output": 4.8
             }
           ]
         }
@@ -330,14 +330,15 @@
       "currency": "USD",
       "unit": "per-million-tokens",
       "sourceUrl": "https://developers.openai.com/api/docs/pricing",
-      "observedAt": "2026-07-17T00:00:00Z",
+      "observedAt": "2026-09-21T00:00:00Z",
       "tiers": {
         "standard": {
           "bands": [
             {
-              "input": 1.25,
-              "cachedInput": 0.125,
-              "output": 10
+              "input": 1.75,
+              "cachedInput": 0.175,
+              "cacheWrite": 2.1875,
+              "output": 14
             }
           ]
         }
@@ -406,13 +407,15 @@
       "currency": "USD",
       "unit": "per-million-tokens",
       "sourceUrl": "https://docs.anthropic.com/en/docs/about-claude/pricing",
-      "observedAt": "2026-07-17T00:00:00Z",
+      "observedAt": "2026-09-21T00:00:00Z",
       "tiers": {
         "standard": {
           "bands": [
             {
               "input": 5,
-              "output": 25
+              "output": 25,
+              "cachedInput": 0.5,
+              "cacheWrite": 6.25
             }
           ]
         }
@@ -424,13 +427,15 @@
       "currency": "USD",
       "unit": "per-million-tokens",
       "sourceUrl": "https://docs.anthropic.com/en/docs/about-claude/pricing",
-      "observedAt": "2026-07-17T00:00:00Z",
+      "observedAt": "2026-09-21T00:00:00Z",
       "tiers": {
         "standard": {
           "bands": [
             {
               "input": 5,
-              "output": 25
+              "output": 25,
+              "cachedInput": 0.5,
+              "cacheWrite": 6.25
             }
           ]
         }
@@ -442,13 +447,15 @@
       "currency": "USD",
       "unit": "per-million-tokens",
       "sourceUrl": "https://docs.anthropic.com/en/docs/about-claude/pricing",
-      "observedAt": "2026-07-17T00:00:00Z",
+      "observedAt": "2026-09-21T00:00:00Z",
       "tiers": {
         "standard": {
           "bands": [
             {
               "input": 5,
-              "output": 25
+              "output": 25,
+              "cachedInput": 0.5,
+              "cacheWrite": 6.25
             }
           ]
         }
@@ -460,13 +467,15 @@
       "currency": "USD",
       "unit": "per-million-tokens",
       "sourceUrl": "https://docs.anthropic.com/en/docs/about-claude/pricing",
-      "observedAt": "2026-07-17T00:00:00Z",
+      "observedAt": "2026-09-21T00:00:00Z",
       "tiers": {
         "standard": {
           "bands": [
             {
               "input": 5,
-              "output": 25
+              "output": 25,
+              "cachedInput": 0.5,
+              "cacheWrite": 6.25
             }
           ]
         }
@@ -478,13 +487,15 @@
       "currency": "USD",
       "unit": "per-million-tokens",
       "sourceUrl": "https://docs.anthropic.com/en/docs/about-claude/pricing",
-      "observedAt": "2026-07-17T00:00:00Z",
+      "observedAt": "2026-09-21T00:00:00Z",
       "tiers": {
         "standard": {
           "bands": [
             {
               "input": 3,
-              "output": 15
+              "output": 15,
+              "cachedInput": 0.3,
+              "cacheWrite": 3.75
             }
           ]
         }
@@ -499,13 +510,15 @@
       "currency": "USD",
       "unit": "per-million-tokens",
       "sourceUrl": "https://docs.anthropic.com/en/docs/about-claude/pricing",
-      "observedAt": "2026-07-17T00:00:00Z",
+      "observedAt": "2026-09-21T00:00:00Z",
       "tiers": {
         "standard": {
           "bands": [
             {
-              "input": 0.8,
-              "output": 4
+              "input": 1,
+              "output": 5,
+              "cachedInput": 0.1,
+              "cacheWrite": 1.25
             }
           ]
         }
