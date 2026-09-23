@@ -1288,8 +1288,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(base.canonical_model_id, "gpt-5.6-sol");
-        assert_eq!(base.band.input, 5.0);
-        assert_eq!(base.band.cache_write, Some(6.25));
+        // GPT-5.6 Sol 于 2026-07-30 重新定价：标准档 5/30 → 4/20（缓存写入=1.25× 输入）
+        assert_eq!(base.band.input, 4.0);
+        assert_eq!(base.band.cache_write, Some(5.0));
 
         let long = catalog
             .resolve(
@@ -1299,8 +1300,8 @@ mod tests {
                 272_001,
             )
             .unwrap();
-        assert_eq!(long.band.input, 10.0);
-        assert_eq!(long.band.output, 45.0);
+        assert_eq!(long.band.input, 8.0);
+        assert_eq!(long.band.output, 40.0);
 
         let terra_batch_long = catalog
             .resolve(
@@ -1310,9 +1311,9 @@ mod tests {
                 272_001,
             )
             .unwrap();
-        assert_eq!(terra_batch_long.band.input, 2.5);
-        assert_eq!(terra_batch_long.band.cache_write, Some(3.125));
-        assert_eq!(terra_batch_long.band.output, 11.25);
+        assert_eq!(terra_batch_long.band.input, 2.0);
+        assert_eq!(terra_batch_long.band.cache_write, Some(2.5));
+        assert_eq!(terra_batch_long.band.output, 12.0);
     }
 
     #[test]
@@ -1337,7 +1338,8 @@ mod tests {
                 .unwrap()
                 .band
                 .output,
-            15.0
+            // GPT-5.6 Terra 于 2026-07-30 降价：标准档 2.5/15 → 2/12
+            12.0
         );
     }
 

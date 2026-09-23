@@ -1158,12 +1158,13 @@ fn parse_synced_models_prices_all_gpt_56_models_from_offline_catalog() {
             )
         })
         .collect::<Vec<_>>();
+    // GPT-5.6 系列于 2026-07-30 重新定价，此处跟随内置目录的官方价
     assert_eq!(
         prices,
         vec![
-            ("gpt-5.6-sol", 5.0, 30.0, Some(PriceSource::Builtin)),
-            ("gpt-5.6-terra", 2.5, 15.0, Some(PriceSource::Builtin)),
-            ("gpt-5.6-luna", 1.0, 6.0, Some(PriceSource::Builtin)),
+            ("gpt-5.6-sol", 4.0, 20.0, Some(PriceSource::Builtin)),
+            ("gpt-5.6-terra", 2.0, 12.0, Some(PriceSource::Builtin)),
+            ("gpt-5.6-luna", 0.2, 1.2, Some(PriceSource::Builtin)),
         ]
     );
 }
