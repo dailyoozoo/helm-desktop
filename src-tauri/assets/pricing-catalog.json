@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "catalogVersion": "2026.09.21.1",
-  "sequence": 2026092101,
-  "publishedAt": "2026-09-21T00:00:00Z",
+  "catalogVersion": "2026.09.25.1",
+  "sequence": 2026092501,
+  "publishedAt": "2026-09-25T00:00:00Z",
   "models": [
     {
       "vendor": "openai",
@@ -350,14 +350,14 @@
       "currency": "USD",
       "unit": "per-million-tokens",
       "sourceUrl": "https://developers.openai.com/api/docs/pricing",
-      "observedAt": "2026-07-17T00:00:00Z",
+      "observedAt": "2026-09-25T00:00:00Z",
       "tiers": {
         "standard": {
           "bands": [
             {
-              "input": 0.25,
-              "cachedInput": 0.025,
-              "output": 2
+              "input": 1.75,
+              "cachedInput": 0.175,
+              "output": 14
             }
           ]
         }

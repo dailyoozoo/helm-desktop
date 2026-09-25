@@ -1327,14 +1327,12 @@ export function AddProviderModal({
 }
 function EmptyProvidersPrompt({ onAdd }: { onAdd: () => void }) {
   return (
-    <section className="card card--pad providers-empty-card">
+    <section className="providers-empty-card">
       <span className="provider-detail__big">
         <Icon name="server" />
       </span>
-      <div>
-        <h2>还没有服务商</h2>
-        <p>添加 Claude / ChatGPT 订阅，或接入一个 API 服务商、本地模型服务。</p>
-      </div>
+      <h2>还没有服务商</h2>
+      <p>添加 Claude / ChatGPT 订阅，或接入一个 API 服务商、本地模型服务。</p>
       <button className="btn btn--primary" onClick={onAdd} type="button">
         <Icon name="plus" /> 添加服务商
       </button>
@@ -3563,7 +3561,9 @@ function ModelsPanel({
           })}
         </div>
       ) : (
-        <div className="providers-empty">暂无模型目录；先在服务商详情完成配置、探活与同步。</div>
+        <div className="providers-empty providers-empty--catalog">
+          暂无模型目录；先在服务商详情完成配置、探活与同步。
+        </div>
       )}
       {pricingOpen ? (
         <PricingCatalogModal

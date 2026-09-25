@@ -29,6 +29,16 @@
   padding: 28px 0;
 }
 
+/* 模型页空目录：对齐原型 .pv-empty（11.5px、居中、虚线框）；
+   不设字号时会继承全局 14px，比工具栏提示（11px）显大。 */
+.providers-empty--catalog {
+  padding: 16px 14px;
+  border: 1px dashed var(--border);
+  border-radius: var(--r-sm);
+  font-size: 11.5px;
+  text-align: center;
+}
+
 .providers-load-error {
   display: flex;
   flex-direction: column;
@@ -41,22 +51,41 @@
   color: var(--fg-3);
 }
 
+/* 服务商空状态：空列表时页头不渲染，这里是页面上唯一的添加入口，按钮必须保留。
+   虚线引导区对齐原型 .pv-empty 的空态语言。 */
 .providers-empty-card {
   display: flex;
+  flex-direction: column;
   align-items: center;
-  gap: 14px;
+  gap: 8px;
+  margin-top: 4px;
+  padding: 40px 24px;
+  border: 1px dashed var(--border);
+  border-radius: var(--r);
+  background: transparent;
+  text-align: center;
   color: var(--fg-3);
 }
 
+.providers-empty-card .btn {
+  margin-top: 10px;
+}
+
+.providers-empty-card .provider-detail__big {
+  margin-bottom: 4px;
+}
+
 .providers-empty-card h2 {
-  margin: 0 0 4px;
-  color: var(--fg);
-  font-size: 18px;
+  margin: 0;
+  color: var(--fg-2);
+  font-size: 14px;
+  font-weight: 600;
 }
 
 .providers-empty-card p {
   margin: 0;
-  font-size: 13px;
+  font-size: 12px;
+  color: var(--fg-4);
 }
 
 .providers-add-modal {
@@ -568,11 +597,20 @@
   align-items: center;
   gap: 10px;
   padding: 10px 14px;
+  margin-bottom: 12px;
   border: 1px solid var(--warn, var(--line));
   border-radius: var(--r);
   background: var(--warn-soft);
   font-size: 12px;
   color: var(--fg-2);
+}
+
+/* 原型限定 16px（providers.html §9）；Icon 组件输出裸 svg，必须在此约束尺寸 */
+.pv-bind-needed > svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  color: var(--warn, var(--line));
 }
 
 .cm-engine-detail__card {
