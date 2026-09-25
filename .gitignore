@@ -9,5 +9,6 @@ dist/
 src-tauri/target/
 src-tauri/target-*/
 src-tauri/gen/
-vitest.config.ts.timestamp-*.mjs
+
+# Vitest 配置瞬态缓存
 vitest.config.ts.timestamp-*.mjs

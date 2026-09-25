@@ -50,6 +50,7 @@ function ModelIdCombo(props: {
   const inputRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const measuredRef = useRef(0);
+  const hostRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     setText(props.value);
@@ -60,7 +61,10 @@ function ModelIdCombo(props: {
   }, [props.autoOpen]);
   // 挂载点：Radix 弹窗内必须挂进 dialog，否则既点不到也会触发 outside 关闭
   useEffect(() => {
-    setHost((inputRef.current?.closest('[role="dialog"]') as HTMLElement | null) ?? document.body);
+    const el =
+      (inputRef.current?.closest('[role="dialog"]') as HTMLElement | null) ?? document.body;
+    hostRef.current = el;
+    setHost(el);
   }, []);
 
   const place = useCallback(() => {
@@ -70,13 +74,21 @@ function ModelIdCombo(props: {
     const rendered = menuRef.current?.offsetHeight ?? 0;
     const menuH = rendered || measuredRef.current || 200;
     const gap = 4;
-    const spaceBelow = window.innerHeight - rect.bottom - gap - 8;
-    const spaceAbove = rect.top - gap - 8;
+    // .cm-modal 用 translate 居中，会成为内部 fixed 元素的包含块，视口坐标会整体偏移；
+    // 因此统一按「宿主内容坐标 + absolute」计算：先算视口坐标，再减宿主偏移、加宿主滚动量。
+    const hostEl = hostRef.current;
+    const hostRect = hostEl?.getBoundingClientRect();
+    const minTop = hostRect ? hostRect.top + 8 : 8;
+    const maxBottom = hostRect ? hostRect.bottom - 8 : window.innerHeight - 8;
+    const spaceBelow = maxBottom - rect.bottom - gap;
+    const spaceAbove = rect.top - minTop - gap;
     const flip = menuH > spaceBelow && spaceAbove > spaceBelow;
-    const top = flip ? Math.max(8, rect.top - menuH - gap) : rect.bottom + gap;
+    const topViewport = flip ? Math.max(minTop, rect.top - menuH - gap) : rect.bottom + gap;
     const maxHeight = Math.max(120, Math.min(300, flip ? spaceAbove : spaceBelow));
     const width = Math.min(Math.max(rect.width, 280), window.innerWidth - 16);
-    const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8));
+    const leftViewport = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8));
+    const top = topViewport - (hostRect?.top ?? 0) + (hostEl?.scrollTop ?? 0);
+    const left = leftViewport - (hostRect?.left ?? 0) + (hostEl?.scrollLeft ?? 0);
     setCoords({ top, left, width, maxHeight });
   }, []);
 
@@ -153,7 +165,7 @@ function ModelIdCombo(props: {
             ref={menuRef}
             className="pv-combo__menu"
             style={{
-              position: 'fixed',
+              position: 'absolute',
               top: coords.top,
               left: coords.left,
               width: coords.width,
