@@ -1625,6 +1625,7 @@ dependencies = [
  "base64 0.22.1",
  "dirs",
  "futures-util",
+ "indexmap 1.9.3",
  "keyring",
  "log",
  "minisign-verify",

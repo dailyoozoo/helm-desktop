@@ -12,6 +12,14 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# Force indexmap's `std` feature on in the *build-dependency* context.
+# schemars 0.8.22 (pulled in via tauri-build -> tauri) declares its optional
+# `indexmap` dep with only `features = ["serde-1"]`, assuming `std` is a default
+# feature. indexmap 1.9+ dropped `std` from defaults, so without this explicit
+# request schemars' `IndexMap<K, V>` alias fails to compile (missing `S` param).
+# Build deps unify separately from normal deps, so this must live here, not in
+# [dependencies].
+indexmap = { version = "1.9", features = ["std", "serde-1"] }
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
