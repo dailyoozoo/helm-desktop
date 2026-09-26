@@ -22,11 +22,20 @@ pub struct UpdateCheckResult {
     pub release_url: Option<String>,
 }
 
+/// 内置官方发布源：设置里没填自定义地址时走它，让一键更新开箱可用（2026-09-26）。
+/// 取不到（尚未发布 latest.json / 网络不可达）时回退 GitHub 版本比对，只提示不安装。
+/// 注意：不能用 `/releases/latest/download/latest.json`——本仓库所有版本都标了
+/// pre-release，GitHub 的 "latest" 别名（API 与下载路径同理）会 404。
+/// 因此固定指向滚动标签 `update-feed`，每次发版用 --clobber 覆盖上传 latest.json。
+const DEFAULT_UPDATE_FEED: &str =
+    "https://github.com/dailyoozoo/helm-desktop/releases/download/update-feed/latest.json";
+
 fn feed_url_from_settings(history_store: &SessionHistoryStore) -> Result<String, String> {
-    let settings = load_app_settings_from_store(history_store)?;
-    let feed = settings.general.update_feed_url.trim().to_string();
+    let feed = load_app_settings_from_store(history_store)
+        .map(|settings| settings.general.update_feed_url.trim().to_string())
+        .unwrap_or_default();
     if feed.is_empty() {
-        return Err("尚未配置更新发布源；请先在设置 → 通用里填写 latest.json 地址".to_string());
+        return Ok(DEFAULT_UPDATE_FEED.to_string());
     }
     Ok(feed)
 }
@@ -123,41 +132,61 @@ fn build_updater(app: &AppHandle, feed_url: &str) -> Result<tauri_plugin_updater
         .map_err(|e| format!("初始化更新器失败：{e}"))
 }
 
-/// 检查更新：配置了签名发布源时走带验签的应用内更新链路；
-/// 未配置时回退到 GitHub releases/latest 版本比对（只提示，不静默安装）。
+/// GitHub 版本比对回退：只比较版本号并引导到发布页，不做应用内静默安装
+/// （静默安装必须走带 minisign 验签的 latest.json，防止供应链投毒）。
+async fn github_fallback(current_version: &str) -> Result<UpdateCheckResult, String> {
+    let latest = fetch_github_latest().await?;
+    let available = version_gt(&latest.tag_name, current_version);
+    Ok(UpdateCheckResult {
+        current_version: current_version.to_string(),
+        available,
+        version: if available {
+            Some(latest.tag_name.trim_start_matches('v').to_string())
+        } else {
+            None
+        },
+        notes: if available { latest.body } else { None },
+        source: "github",
+        release_url: Some(latest.html_url),
+    })
+}
+
+/// 检查更新：优先走带验签的发布源（可应用内一键安装）；
+/// 取不到时回退 GitHub releases 版本比对（只提示，不静默安装）。
 #[tauri::command]
 pub async fn check_for_update(
     app: AppHandle,
     history_store: State<'_, SessionHistoryStore>,
 ) -> Result<UpdateCheckResult, String> {
     let current_version = env!("CARGO_PKG_VERSION").to_string();
-    let feed = load_app_settings_from_store(&history_store)
+    let configured = load_app_settings_from_store(&history_store)
         .map(|settings| settings.general.update_feed_url.trim().to_string())
         .unwrap_or_default();
+    let feed = if configured.is_empty() {
+        DEFAULT_UPDATE_FEED.to_string()
+    } else {
+        configured.clone()
+    };
 
-    if feed.is_empty() {
-        // 无发布源：GitHub 版本比对回退
-        let latest = fetch_github_latest().await?;
-        let available = version_gt(&latest.tag_name, &current_version);
-        return Ok(UpdateCheckResult {
-            current_version,
-            available,
-            version: if available {
-                Some(latest.tag_name.trim_start_matches('v').to_string())
-            } else {
-                None
-            },
-            notes: if available { latest.body } else { None },
-            source: "github",
-            release_url: Some(latest.html_url),
-        });
-    }
-
-    let updater = build_updater(&app, &feed)?;
-    let update = updater
-        .check()
-        .await
-        .map_err(|e| format!("检查更新失败：{e}"))?;
+    let updater = match build_updater(&app, &feed) {
+        Ok(updater) => updater,
+        Err(error) => {
+            log::warn!("[helm-update] 发布源不可用，回退 GitHub 版本比对：{error}");
+            return github_fallback(&current_version).await;
+        }
+    };
+    let update = match updater.check().await {
+        Ok(update) => update,
+        Err(error) => {
+            // 内置源取不到（未发布 latest.json / 网络不可达）时不要报错，回退版本比对；
+            // 用户自己填的源出错则要如实告知，便于排查。
+            if configured.is_empty() {
+                log::warn!("[helm-update] 内置发布源检查失败，回退 GitHub 版本比对：{error}");
+                return github_fallback(&current_version).await;
+            }
+            return Err(format!("检查更新失败：{error}"));
+        }
+    };
 
     Ok(match update {
         Some(update) => UpdateCheckResult {

@@ -2994,6 +2994,7 @@ pub async fn list_provider_models<S: SecretStore>(
 
 pub async fn test_engine_connection(bin: &str) -> ConnectionResult {
     let started = Instant::now();
+    log::info!("[helm-engine-test] start bin={bin}");
     let mut cmd = build_version_command(bin);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -3002,6 +3003,10 @@ pub async fn test_engine_connection(bin: &str) -> ConnectionResult {
     match tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output()).await {
         Ok(Ok(output)) if output.status.success() => {
             let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            log::info!(
+                "[helm-engine-test] ok bin={bin} version={text} elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
             ConnectionResult {
                 ok: true,
                 verified: true,
@@ -3013,24 +3018,75 @@ pub async fn test_engine_connection(bin: &str) -> ConnectionResult {
                 latency_ms: started.elapsed().as_millis(),
             }
         }
-        Ok(Ok(output)) => ConnectionResult {
-            ok: false,
-            verified: true,
-            message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            latency_ms: started.elapsed().as_millis(),
-        },
-        Ok(Err(error)) => ConnectionResult {
-            ok: false,
-            verified: true,
-            message: format!("无法执行引擎：{error}"),
-            latency_ms: started.elapsed().as_millis(),
-        },
-        Err(_) => ConnectionResult {
-            ok: false,
-            verified: true,
-            message: "引擎连接检测超时".to_string(),
-            latency_ms: started.elapsed().as_millis(),
-        },
+        Ok(Ok(output)) => {
+            // cmd 包装下管道输出是 OEM 代码页（中文系统 GBK），必须先正确解码再展示
+            let stderr = crate::adapter::decode_process_output(&output.stderr);
+            let stdout = crate::adapter::decode_process_output(&output.stdout);
+            let message = friendly_engine_failure(bin, &stderr, &stdout)
+                .unwrap_or_else(|| {
+                    [stderr.trim(), stdout.trim()]
+                        .into_iter()
+                        .find(|text| !text.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            format!(
+                                "引擎退出码 {}，未返回错误详情",
+                                output.status.code().unwrap_or(-1)
+                            )
+                        })
+                });
+            log::info!(
+                "[helm-engine-test] fail bin={bin} exit={:?} message={message} elapsed_ms={}",
+                output.status.code(),
+                started.elapsed().as_millis()
+            );
+            ConnectionResult {
+                ok: false,
+                verified: true,
+                message,
+                latency_ms: started.elapsed().as_millis(),
+            }
+        }
+        Ok(Err(error)) => {
+            log::warn!(
+                "[helm-engine-test] fail bin={bin} spawn_error={error} elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
+            ConnectionResult {
+                ok: false,
+                verified: true,
+                message: format!("无法执行引擎：{error}"),
+                latency_ms: started.elapsed().as_millis(),
+            }
+        }
+        Err(_) => {
+            log::warn!(
+                "[helm-engine-test] fail bin={bin} timeout elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
+            ConnectionResult {
+                ok: false,
+                verified: true,
+                message: "引擎连接检测超时".to_string(),
+                latency_ms: started.elapsed().as_millis(),
+            }
+        }
+    }
+}
+
+/// cmd 找不到命令时的原始报错（「'codex' 不是内部或外部命令…」/「is not recognized…」）
+/// 是系统黑话，用户看不懂；统一翻译成面向用户的安装引导提示。claude/codex 通用。
+fn friendly_engine_failure(bin: &str, stderr: &str, stdout: &str) -> Option<String> {
+    let combined = format!("{stderr}{stdout}");
+    let command_missing = combined.contains("不是内部或外部命令")
+        || combined.contains("is not recognized as an internal or external command");
+    if command_missing {
+        Some(format!(
+            "未检测到「{bin}」命令：引擎可能尚未安装，或安装后需要重启 Helm 让 PATH 生效。\
+             可在引导页一键安装，或从引擎页下方的官方发布链接下载。"
+        ))
+    } else {
+        None
     }
 }
 
@@ -3071,6 +3127,21 @@ mod tests {
         }"#;
         let provider: ProviderConfig = serde_json::from_str(legacy).expect("legacy config parses");
         assert_eq!(provider.access_type, None);
+    }
+
+    // 引擎检测失败文案：cmd「命令不存在」黑话必须翻译成用户能懂的安装引导。
+    #[test]
+    fn engine_missing_failure_is_translated_for_both_locales() {
+        let zh = "'codex' 不是内部或外部命令，也不是可运行的程序\n或批处理文件。";
+        let en = "'codex' is not recognized as an internal or external command,\r\noperable program or batch file.";
+        for raw in [zh, en] {
+            let message = friendly_engine_failure("codex", raw, "")
+                .expect("command-not-found must be translated");
+            assert!(message.contains("未检测到「codex」命令"));
+            assert!(!message.contains("不是内部或外部命令"));
+        }
+        // 其他真实 CLI 报错原样保留，不能被误翻译
+        assert!(friendly_engine_failure("codex", "error: config invalid", "").is_none());
     }
 
     #[test]

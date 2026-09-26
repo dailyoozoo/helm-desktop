@@ -87,6 +87,7 @@ describe('Tauri command contract', () => {
     const frontend = [
       'src/engine/transport.ts',
       'src/extensions/extensionsApi.ts',
+      'src/lib/uiLog.ts',
       'src/providers/api.ts',
       'src/sessions/api.ts',
       'src/settings/api.ts',

@@ -1,6 +1,6 @@
 [package]
 name = "helm"
-version = "0.6.3"
+version = "0.6.4"
 description = "Helm —— 驱动本地 CLI Agent 的桌面控制台"
 edition = "2021"
 rust-version = "1.77"
@@ -12,13 +12,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
-# Force indexmap's `std` feature on in the *build-dependency* context.
-# schemars 0.8.22 (pulled in via tauri-build -> tauri) declares its optional
-# `indexmap` dep with only `features = ["serde-1"]`, assuming `std` is a default
-# feature. indexmap 1.9+ dropped `std` from defaults, so without this explicit
-# request schemars' `IndexMap<K, V>` alias fails to compile (missing `S` param).
-# Build deps unify separately from normal deps, so this must live here, not in
-# [dependencies].
+# 强制打开 indexmap 的 std feature（仅构建依赖上下文）。
+# schemars 0.8.22（经 tauri-build -> tauri 引入）把可选依赖 indexmap 声明为
+# features = ["serde-1"]，假定 std 是默认 feature；indexmap 1.9+ 把 std 移出默认值，
+# 于是 schemars 的 IndexMap<K, V> 别名缺少 S 参数而编译失败（E0107）。
+# 构建依赖与常规依赖各自做 feature 统一，必须写在这里。
 indexmap = { version = "1.9", features = ["std", "serde-1"] }
 
 [dependencies]
@@ -60,6 +58,7 @@ tauri-plugin-window-state = "2"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
   "Win32_Foundation",
+  "Win32_Globalization",
   "Win32_Security",
   "Win32_Security_Authorization",
   "Win32_Security_Isolation",

@@ -104,6 +104,7 @@ pub struct WorkspaceDeps {
 
 /// 探测单个可执行文件的可用性与版本（真实 `--version`，失败一律视为缺失，不猜测）。
 async fn probe_version(program: &str, via_cmd: bool) -> WorkspaceDepStatus {
+    let started = std::time::Instant::now();
     let mut cmd = probe_command(program, via_cmd);
     cmd.arg("--version");
     match command_output_with_tree_timeout(cmd, Duration::from_secs(30), &format!("检测 {program}"))
@@ -116,15 +117,26 @@ async fn probe_version(program: &str, via_cmd: bool) -> WorkspaceDepStatus {
                 .find(|line| !line.is_empty())
                 .map(str::to_string)
                 .filter(|version| !version.is_empty());
+            log::info!(
+                "[helm-deps-probe] ok program={program} version={} elapsed_ms={}",
+                version.as_deref().unwrap_or("unknown"),
+                started.elapsed().as_millis()
+            );
             WorkspaceDepStatus {
                 available: true,
                 version,
             }
         }
-        _ => WorkspaceDepStatus {
-            available: false,
-            version: None,
-        },
+        _ => {
+            log::warn!(
+                "[helm-deps-probe] fail program={program} elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
+            WorkspaceDepStatus {
+                available: false,
+                version: None,
+            }
+        }
     }
 }
 
@@ -197,10 +209,11 @@ fn npm_command() -> Command {
 }
 
 fn output_tail(stdout: &[u8], stderr: &[u8]) -> String {
+    // npm 经 cmd /C 包装，失败输出是 OEM 代码页（中文系统 GBK），先正确解码
     let combined = format!(
         "{}{}",
-        String::from_utf8_lossy(stdout),
-        String::from_utf8_lossy(stderr)
+        crate::adapter::decode_process_output(stdout),
+        crate::adapter::decode_process_output(stderr)
     );
     combined
         .lines()
@@ -228,8 +241,10 @@ fn npm_install_attempts() -> Vec<(&'static str, Option<&'static str>)> {
 #[tauri::command]
 pub async fn install_cli_engine(engine: String) -> Result<CliInstallResult, String> {
     let package = npm_package_for_engine(&engine)?;
+    log::info!("[helm-engine-install] start engine={engine} package={package}");
 
     if !npm_available().await {
+        log::warn!("[helm-engine-install] fail engine={engine}: npm 不可用");
         return Err(
             "未检测到 npm（一键安装需要 Node.js 18+）。请在引导卡一键安装 Node.js，\
              或先从 https://nodejs.org 安装 Node.js 后重试。"
@@ -250,6 +265,7 @@ pub async fn install_cli_engine(engine: String) -> Result<CliInstallResult, Stri
         } else {
             INSTALL_TIMEOUT
         };
+        let npm_started = std::time::Instant::now();
         let output = match command_output_with_tree_timeout(
             cmd,
             timeout,
@@ -259,6 +275,10 @@ pub async fn install_cli_engine(engine: String) -> Result<CliInstallResult, Stri
         {
             Ok(output) => output,
             Err(error) => {
+                log::warn!(
+                    "[helm-engine-install] npm attempt {index} ({label}) error={error} elapsed_ms={}",
+                    npm_started.elapsed().as_millis()
+                );
                 if first_error.is_none() {
                     first_error = Some(error.clone());
                 }
@@ -266,6 +286,12 @@ pub async fn install_cli_engine(engine: String) -> Result<CliInstallResult, Stri
             }
         };
         let tail = output_tail(&output.stdout, &output.stderr);
+        log::info!(
+            "[helm-engine-install] npm attempt {index} ({label}) exit={:?} elapsed_ms={} tail={}",
+            output.status.code(),
+            npm_started.elapsed().as_millis(),
+            tail.lines().last().unwrap_or_default()
+        );
         if !output.status.success() {
             if first_error.is_none() {
                 first_error = Some(format!(
@@ -277,15 +303,40 @@ pub async fn install_cli_engine(engine: String) -> Result<CliInstallResult, Stri
             continue;
         }
 
-        // 安装成功后立即复检，拿真实路径与版本；复检失败说明 PATH 未刷新或安装目录不在 PATH
-        let detected = crate::settings::detect_engine_binary(&engine, engine_executable(&engine))
-            .await
-            .map_err(|e| {
-                format!(
-                    "安装命令已成功，但复检未找到 {}：{e}。可能需要重启 Helm 让 PATH 生效。",
-                    engine_executable(&engine)
-                )
-            })?;
+        // 安装成功后立即复检，拿真实路径与版本。刚写盘的 shim（claude.cmd /
+        // codex.cmd）在杀软实时扫描下可能短暂不可见，或 CLI 首次 --version 较慢，
+        // 立即复检会误报「复检未找到」；重试 3 次（间隔 1s/2s）避免安装成功却提示失败。
+        let mut detected = None;
+        let mut last_error = String::new();
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_secs(u64::from(attempt))).await;
+            }
+            log::info!("[helm-engine-install] recheck attempt {attempt} engine={engine}");
+            match crate::settings::detect_engine_binary(&engine, engine_executable(&engine)).await {
+                Ok(result) => {
+                    log::info!(
+                        "[helm-engine-install] recheck attempt {attempt} ok path={} version={}",
+                        result.path,
+                        result.version
+                    );
+                    detected = Some(result);
+                    break;
+                }
+                Err(error) => {
+                    log::warn!("[helm-engine-install] recheck attempt {attempt} fail: {error}");
+                    last_error = error;
+                }
+            }
+        }
+        let detected = detected.ok_or_else(|| {
+            log::warn!("[helm-engine-install] fail engine={engine}: 复检 3 次均未通过");
+            format!(
+                "安装命令已成功，但复检未找到 {}：{last_error}。\
+                 可能需要重启 Helm 让 PATH 生效，或稍后在引擎页手动重新检测。",
+                engine_executable(&engine)
+            )
+        })?;
         return Ok(CliInstallResult {
             path: detected.path,
             version: detected.version,
@@ -293,6 +344,10 @@ pub async fn install_cli_engine(engine: String) -> Result<CliInstallResult, Stri
         });
     }
 
+    log::warn!(
+        "[helm-engine-install] fail engine={engine}: 所有 npm 源均失败。{}",
+        first_error.as_deref().unwrap_or_default()
+    );
     Err(format!(
         "npm install -g {package} 失败（默认源与国内镜像均已尝试）。\
          常见原因：网络受限、全局目录无写权限。\n{}",

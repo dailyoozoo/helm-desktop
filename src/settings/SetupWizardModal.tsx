@@ -13,6 +13,7 @@ import {
   selectDirectory,
 } from './api';
 import { engineConfigWithDetection } from './settingsViewModel';
+import { logUi } from '../lib/uiLog';
 import { getProviderConfig, saveEngineConfig } from '../providers/api';
 import type { AppSettings } from './types';
 
@@ -35,7 +36,7 @@ export interface SetupWizardReadiness {
 /** 就绪度探测：与设置页向导同源（readiness report + 工作区依赖探测） */
 export async function probeSetupWizardReadiness(): Promise<SetupWizardReadiness> {
   const [report, deps] = await Promise.all([getReadinessReport(), detectWorkspaceDeps()]);
-  return {
+  const readiness: SetupWizardReadiness = {
     claudeInstalled: report.claudeCode.installed,
     claudeDetail: report.claudeCode.version
       ? report.claudeCode.version +
@@ -52,6 +53,16 @@ export async function probeSetupWizardReadiness(): Promise<SetupWizardReadiness>
     cwdOk: report.cwd.configured && report.cwd.exists,
     cwdPath: report.cwd.path,
   };
+  logUi('wizard readiness probe', {
+    claudeInstalled: readiness.claudeInstalled,
+    codexInstalled: readiness.codexInstalled,
+    gitReady: readiness.gitReady,
+    hasReadyProvider: readiness.hasReadyProvider,
+    cwdOk: readiness.cwdOk,
+    claudeDetail: readiness.claudeDetail,
+    codexDetail: readiness.codexDetail,
+  });
+  return readiness;
 }
 
 /**
@@ -127,10 +138,9 @@ export function SetupWizardModal({
       const readiness = await probeSetupWizardReadiness();
       setState({ kind: 'ready', readiness });
     } catch (error) {
-      setState({
-        kind: 'error',
-        message: error instanceof Error ? error.message : String(error),
-      });
+      const message = error instanceof Error ? error.message : String(error);
+      logUi('wizard refresh failed', message);
+      setState({ kind: 'error', message });
     }
   }, []);
 
@@ -166,14 +176,25 @@ export function SetupWizardModal({
 
   const installCli = async (engine: 'claude-code' | 'codex') => {
     setBusy(engine);
+    logUi('wizard installCli start', engine);
     try {
       const result = await installCliEngine(engine);
+      logUi('wizard installCli installed', {
+        engine,
+        path: result.path,
+        version: result.version,
+      });
       showResultToast(
         (engine === 'claude-code' ? 'Claude Code' : 'Codex') + ' 已安装（' + result.version + '）',
       );
       // 与引擎页一致：安装成功后同步检测结果进引擎配置
       try {
         const detection = await detectEngine(engine);
+        logUi('wizard installCli detection', {
+          engine,
+          path: detection.path,
+          version: detection.version,
+        });
         const config = await getProviderConfig();
         const engineConfig = config.engines.find((item) => item.id === engine);
         if (engineConfig) {
@@ -192,10 +213,18 @@ export function SetupWizardModal({
           },
         }));
       } catch (syncError) {
+        logUi('wizard installCli sync failed', {
+          engine,
+          error: syncError instanceof Error ? syncError.message : String(syncError),
+        });
         console.error('Failed to sync engine config', syncError);
       }
       await refresh();
     } catch (error) {
+      logUi('wizard installCli failed', {
+        engine,
+        error: error instanceof Error ? error.message : String(error),
+      });
       showResultToast('一键安装失败：' + (error instanceof Error ? error.message : String(error)));
     } finally {
       setBusy(null);

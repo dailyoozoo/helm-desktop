@@ -55,6 +55,57 @@ const CODEX_SEARCH_CATALOG_DIGEST_ENV: &str = "HELM_CODEX_MODEL_CATALOG_DIGEST";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// 把子进程管道输出解码成 UTF-8 字符串。
+///
+/// Windows 上经 `cmd /C` 包一层后，管道里的 stderr/stdout 是 OEM 代码页编码
+/// （中文系统为 GBK/936），例如「'claude' 不是内部或外部命令」。直接
+/// `from_utf8_lossy` 会变成乱码；这里先试 UTF-8，失败再按 OEM 代码页解码。
+pub(crate) fn decode_process_output(bytes: &[u8]) -> String {
+    if std::str::from_utf8(bytes).is_ok() {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Globalization::{GetOEMCP, MultiByteToWideChar};
+        let codepage = unsafe { GetOEMCP() };
+        if codepage == 0 {
+            return String::from_utf8_lossy(bytes).into_owned();
+        }
+        let length = unsafe {
+            MultiByteToWideChar(
+                codepage,
+                0,
+                bytes.as_ptr(),
+                bytes.len() as i32,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if length <= 0 {
+            return String::from_utf8_lossy(bytes).into_owned();
+        }
+        let mut wide = vec![0u16; length as usize];
+        let written = unsafe {
+            MultiByteToWideChar(
+                codepage,
+                0,
+                bytes.as_ptr(),
+                bytes.len() as i32,
+                wide.as_mut_ptr(),
+                length,
+            )
+        };
+        if written <= 0 {
+            return String::from_utf8_lossy(bytes).into_owned();
+        }
+        String::from_utf16_lossy(&wide[..written as usize])
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+
 /// 全局运行中 CLI 进程注册表：应用退出时必须整棵杀掉，否则 Windows 上经
 /// `cmd /C` 包装启动的 node 子进程会成为孤儿（kill_on_drop 只杀 cmd 层）。
 static RUNNING_PIDS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u32>>> =

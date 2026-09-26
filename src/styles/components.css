@@ -3279,8 +3279,11 @@ body[data-page='home'] .cm-pagebody {
 .cm-readiness__row:first-child {
   min-height: 76px;
 }
+/* 「未安装」是待办状态，不是故障：不用琥珀警告块，改为中性底。
+   2026-09-26 用户反馈：整块琥珀+警示图标让新装用户误读成「报错」，
+   与装完变绿连起来看就成了「先报错后成功」。琥珀/红只留给真失败。 */
 .cm-readiness__row.is-missing {
-  background: color-mix(in oklch, var(--warn-soft) 58%, transparent);
+  background: color-mix(in oklch, var(--surface-2) 42%, transparent);
 }
 .cm-readiness__row.is-installing {
   background: color-mix(in oklch, var(--accent-soft) 65%, transparent);
@@ -3328,8 +3331,9 @@ body[data-page='home'] .cm-pagebody {
 .cm-readiness__row.is-ready .cm-readiness__state {
   color: var(--success);
 }
+/* 待办态用中性灰，不用琥珀警告色（同 is-missing 背景的改动理由） */
 .cm-readiness__row.is-missing .cm-readiness__state {
-  color: var(--warn);
+  color: var(--fg-4);
 }
 .cm-readiness__row.is-installing .cm-readiness__state {
   color: var(--accent-hi);

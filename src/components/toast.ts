@@ -1,6 +1,8 @@
 // 全局通知层的数据通道（P2-2）：模块级单例，替代各页面自制的局部 toast。
 // 任何模块（含非 React 代码）都可以直接调用 showToast；ToastLayer 负责渲染。
 
+import { logUi } from '../lib/uiLog';
+
 export type ToastKind = 'info' | 'success' | 'error';
 
 export interface ToastEntry {
@@ -52,6 +54,8 @@ export function showToast(
   // 同文案的连续提示只保留一条，避免批量失败时刷屏
   toasts = toasts.filter((toast) => toast.message !== message || toast.kind !== kind);
   toasts = [...toasts, { id, message, kind, duration }];
+  // 每条 toast 落 helm.log（[helm-ui]），顺序问题可直接看日志还原
+  logUi(`toast ${kind}`, message);
   emit();
   return id;
 }

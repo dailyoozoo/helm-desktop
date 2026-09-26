@@ -1,6 +1,6 @@
 {
   "name": "helm",
-  "version": "0.6.3",
+  "version": "0.6.4",
   "private": true,
   "type": "module",
   "workspaces": [
@@ -24,6 +24,7 @@
     "pricing:check-upstream": "node scripts/pricing-catalog.mjs --check-upstream",
     "pricing:sign": "tauri signer sign src-tauri/assets/pricing-catalog.json",
     "release:audit": "node scripts/change-27l-release-audit.mjs",
+    "release:latest-json": "node scripts/release-latest-json.mjs",
     "agent:evidence": "node scripts/agent-evidence.mjs",
     "verify:27l": "node scripts/change-27l-release-audit.mjs --with-migrations",
     "verify": "npm run check && npm run check:version && npm run pricing:validate && cargo test --manifest-path src-tauri/Cargo.toml && npm run build && npm run release:audit",

@@ -55,19 +55,22 @@ export function deriveAgentReadiness(input: {
   cliInstalled: boolean;
   gitAvailable: boolean;
   installing: boolean;
+  /** 安装动作已结束、正在等复检结果：此时不得闪回「未安装」态 */
+  verifying?: boolean;
 }): { item: ReadinessItem; deps: ReadinessDep[] } {
   const name = engineDisplayName(input.engine);
   const ready = input.cliInstalled && input.gitAvailable;
+  const busy = input.installing || !!input.verifying;
   const deps: ReadinessDep[] = [
     {
       id: 'cli',
       label: 'Agent CLI',
-      state: input.cliInstalled ? 'ok' : input.installing ? 'installing' : 'missing',
+      state: input.cliInstalled ? 'ok' : busy ? 'installing' : 'missing',
     },
     {
       id: 'git',
       label: 'Git for Windows',
-      state: input.gitAvailable ? 'ok' : input.installing ? 'installing' : 'missing',
+      state: input.gitAvailable ? 'ok' : busy ? 'installing' : 'missing',
     },
   ];
   if (ready) {
@@ -83,6 +86,17 @@ export function deriveAgentReadiness(input: {
         state: 'installing',
         title: name,
         detail: '正在准备当前缺失项，完成后自动复检',
+      },
+      deps,
+    };
+  }
+  if (input.verifying) {
+    return {
+      item: {
+        key: 'agent',
+        state: 'installing',
+        title: name,
+        detail: '安装完成，正在复检…',
       },
       deps,
     };
@@ -167,6 +181,7 @@ export function buildReadinessItems(args: {
   engine: EngineId;
   directory: { path: string; exists: boolean };
   agentInstalling: boolean;
+  agentVerifying?: boolean;
 }): { items: ReadinessItem[]; agentDeps: ReadinessDep[] } {
   const cliInstalled = args.report ? engineReadiness(args.report, args.engine).installed : false;
   const gitAvailable = args.deps ? args.deps.git.available : false;
@@ -175,6 +190,7 @@ export function buildReadinessItems(args: {
     cliInstalled,
     gitAvailable,
     installing: args.agentInstalling,
+    verifying: args.agentVerifying,
   });
   const items: ReadinessItem[] = [
     agent.item,

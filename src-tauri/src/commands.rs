@@ -2129,6 +2129,13 @@ pub async fn test_engine_config(
     Ok(test_engine_connection(&bin).await)
 }
 
+/// 前端 UI 事件落日志（helm.log）：toast/引导等界面时序只能从前端取证，
+/// 用户报「先报错后成功」这类顺序问题时，日志即可还原完整顺序，无需截图。
+#[tauri::command]
+pub fn log_frontend_event(message: String) {
+    log::info!("[helm-ui] {message}");
+}
+
 /// 读取模型真实支持的推理档位。Claude 由本机 CLI help 与精确模型目录交叉判断；
 /// Codex 使用同一 Provider/CODEX_HOME 启动短生命周期 app-server 并调用 model/list。
 #[tauri::command]

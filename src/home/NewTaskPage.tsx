@@ -18,6 +18,7 @@ import { EngineBrand } from '../shell/EngineBrand';
 import { showToast } from '../components/toast';
 import { FullAccessConfirm } from '../components/FullAccessConfirm';
 import { useFileDrop } from '../lib/fileDrop';
+import { logUi } from '../lib/uiLog';
 import { ContextPill, contextPillLabel, type ContextPillItem } from '../workspace/ContextPill';
 import { defaultModelForEngine, workspaceEngineOptions } from '../workspace/workspaceViewModel';
 import { searchWorkspaceFiles } from '../workspace/workspaceApi';
@@ -113,6 +114,8 @@ export function NewTaskPage({
   }, [defaultDirectory]);
 
   const [agentInstalling, setAgentInstalling] = useState(false);
+  /** 安装动作已结束、正在等复检结果：此期间卡片保持「复检中」，不闪回「待安装」 */
+  const [agentVerifying, setAgentVerifying] = useState(false);
   const [installNote, setInstallNote] = useState<string | null>(null);
   const [readinessOpen, setReadinessOpen] = useState(false);
 
@@ -155,11 +158,20 @@ export function NewTaskPage({
         engine,
         directory: directory ?? { path: '', exists: false },
         agentInstalling,
+        agentVerifying,
       }),
-    [report, deps, engine, directory, agentInstalling],
+    [report, deps, engine, directory, agentInstalling, agentVerifying],
   );
   const items = readiness.items;
   const taskReady = isTaskReady(items);
+  // 行内状态变化也落日志：用户报「先看到红色再变绿色」时，红色文案只可能是
+  // 就绪项行内状态/提示（非 toast），这里配合 installNote 一起抓原文。
+  useEffect(() => {
+    logUi(
+      'gate items',
+      items.map((item) => ({ key: item.key, state: item.state, detail: item.detail })),
+    );
+  }, [items]);
 
   // Esc 自上而下关闭：浮层菜单 → 目录/中心/就绪弹层（原型同行为）。
   useEffect(() => {
@@ -305,9 +317,10 @@ export function NewTaskPage({
       return;
     }
     if (!taskReady) {
-      // 未就绪不能发送：打开就绪检查弹层（验收标准）
+      // 未就绪不能发送：打开就绪检查弹层（验收标准）。
+      // 弹层本身就是完整反馈，不再叠加红色 toast——2026-09-26 用户反馈：
+      // 「请先完成任务就绪检查」报错样式让新装用户误以为安装出了故障。
       setReadinessOpen(true);
-      showToast('请先完成任务就绪检查', 'error');
       return;
     }
     // 立即进入工作区；启动进度由 App 级 LaunchOverlay 监听真实后端事件驱动
@@ -422,6 +435,7 @@ export function NewTaskPage({
     const cliInstalled = engineReadiness(report, engine).installed;
     const gitAvailable = deps.git.available;
     const steps = planAgentInstall({ cliInstalled, gitAvailable });
+    logUi('gate install start', { engine, steps, cliInstalled, gitAvailable });
     let restartRequired = false;
     let failure: string | null = null;
     try {
@@ -441,18 +455,22 @@ export function NewTaskPage({
       }
     } catch (error) {
       failure = error instanceof Error ? error.message : String(error);
-    } finally {
-      setAgentInstalling(false);
     }
+    // 安装动作结束（无论成败）先切到「复检中」：此前这里先关安装态再等复检，
+    // 卡片会拿旧报告重算、瞬间闪回「待安装」，用户看到「装完先回到初始状态再成功」。
+    setAgentInstalling(false);
+    setAgentVerifying(true);
     // 安装后立即复检（验收标准），以复检结果为准更新三项状态
     try {
       const next = await refreshReadiness();
       if (failure) {
+        logUi('gate install failed', { engine, failure });
         setInstallNote(failure);
         showToast('安装未完成：' + failure, 'error');
       } else {
         const stillMissing =
           !engineReadiness(next.report, engine).installed || !next.deps.git.available;
+        logUi('gate recheck done', { engine, stillMissing, restartRequired });
         showToast(
           stillMissing && restartRequired
             ? '安装完成，但需要重启 Helm 刷新 PATH 后复检才会通过'
@@ -461,10 +479,17 @@ export function NewTaskPage({
               : '复检通过：Agent 与 Git 均已就绪',
           stillMissing ? 'info' : 'success',
         );
-        if (stillMissing) setInstallNote('复检未通过：请查看安装输出或重启 Helm 后重试。');
+        if (stillMissing) {
+          logUi('gate note', '复检未通过：请查看安装输出或重启 Helm 后重试。');
+          setInstallNote('复检未通过：请查看安装输出或重启 Helm 后重试。');
+        }
       }
     } catch {
+      logUi('gate recheck failed', engine);
+      logUi('gate note', '复检失败：无法读取本地环境报告');
       setInstallNote('复检失败：无法读取本地环境报告');
+    } finally {
+      setAgentVerifying(false);
     }
   };
 
@@ -1398,8 +1423,9 @@ function ReadinessRow({
       : item.state === 'installing'
         ? 'is-installing'
         : 'is-missing';
+  // 「未安装」是待办而非故障：用中性圆点，不用红色叉号（2026-09-26 用户反馈）
   const stateIcon =
-    item.state === 'ready' ? 'checkc' : item.state === 'installing' ? 'clock' : 'xc';
+    item.state === 'ready' ? 'checkc' : item.state === 'installing' ? 'clock' : 'dot';
   return (
     <div className={'cm-readiness__row ' + stateClass} data-readiness-key={item.key}>
       <span className="cm-readiness__state">

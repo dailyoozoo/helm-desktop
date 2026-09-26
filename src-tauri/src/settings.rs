@@ -5,7 +5,7 @@ use crate::subscription_profiles::SubscriptionProfileStore;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::State;
 
 const APP_SETTINGS_KEY: &str = "app_settings";
@@ -302,7 +302,15 @@ pub(crate) async fn detect_engine_binary(
     engine: &str,
     bin: &str,
 ) -> Result<EngineDetectionResult, String> {
-    let path = resolve_binary_path(bin)?;
+    let started = Instant::now();
+    let path = resolve_binary_path(bin).map_err(|error| {
+        log::warn!("[helm-engine-detect] fail engine={engine} bin={bin} {error}");
+        error
+    })?;
+    log::info!(
+        "[helm-engine-detect] start engine={engine} bin={bin} resolved={}",
+        path.display()
+    );
     let mut command = engine_command(engine, bin)?;
     command
         .arg("--version")
@@ -310,11 +318,34 @@ pub(crate) async fn detect_engine_binary(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+    // 冷启动实测：刚装完的 codex/claude 首次 --version 需要 11~12 秒（10s 会误判超时，
+    // 触发无谓重试让用户多等一轮），故放宽到 25s。
+    let output = tokio::time::timeout(Duration::from_secs(25), command.output())
         .await
-        .map_err(|_| "引擎版本检测超时".to_string())?
-        .map_err(|error| format!("无法执行配置的引擎：{error}"))?;
+        .map_err(|_| {
+            let error = "引擎版本检测超时".to_string();
+            log::warn!(
+                "[helm-engine-detect] fail engine={engine} bin={bin} timeout elapsed_ms={} (25s 上限，CLI 首次启动可能较慢)",
+                started.elapsed().as_millis()
+            );
+            error
+        })?
+        .map_err(|error| {
+            let error = format!("无法执行配置的引擎：{error}");
+            log::warn!(
+                "[helm-engine-detect] fail engine={engine} bin={bin} spawn_error={error} elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
+            error
+        })?;
     if !output.status.success() {
+        let stderr = crate::adapter::decode_process_output(&output.stderr);
+        log::warn!(
+            "[helm-engine-detect] fail engine={engine} bin={bin} exit={:?} stderr={} elapsed_ms={}",
+            output.status.code(),
+            stderr.trim(),
+            started.elapsed().as_millis()
+        );
         return Err("配置的引擎无法完成版本检测，请检查可执行文件".to_string());
     }
     let version = String::from_utf8_lossy(&output.stdout)
@@ -323,6 +354,10 @@ pub(crate) async fn detect_engine_binary(
         .unwrap_or("unknown")
         .trim()
         .to_string();
+    log::info!(
+        "[helm-engine-detect] ok engine={engine} bin={bin} version={version} elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
     Ok(EngineDetectionResult {
         path: path.to_string_lossy().to_string(),
         version,
@@ -499,10 +534,16 @@ async fn run_auth_status(
         "codex" => &["login", "status"],
         other => return Err(format!("未知引擎：{other}")),
     };
+    let started = Instant::now();
+    log::info!("[helm-auth-probe] start engine={engine} bin={bin}");
     let mut command = auth_command(profiles, engine, bin, args)?;
     let output = match tokio::time::timeout(Duration::from_secs(10), command.output()).await {
         Ok(Ok(output)) => output,
         Ok(Err(error)) => {
+            log::warn!(
+                "[helm-auth-probe] fail engine={engine} spawn_error={error} elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
             return Ok(login_state(
                 "unknown",
                 "unknown",
@@ -510,6 +551,10 @@ async fn run_auth_status(
             ));
         }
         Err(_) => {
+            log::warn!(
+                "[helm-auth-probe] fail engine={engine} timeout elapsed_ms={}（10s 上限，CLI 首次探测可能较慢）",
+                started.elapsed().as_millis()
+            );
             return Ok(login_state(
                 "unknown",
                 "unknown",
@@ -517,12 +562,19 @@ async fn run_auth_status(
             ));
         }
     };
-    Ok(parse_auth_status(
+    let state = parse_auth_status(
         engine,
         output.status.success(),
         &output.stdout,
         &output.stderr,
-    ))
+    );
+    log::info!(
+        "[helm-auth-probe] done engine={engine} state={} detail={} elapsed_ms={}",
+        state.state,
+        state.detail,
+        started.elapsed().as_millis()
+    );
+    Ok(state)
 }
 
 fn validate_subscription_login(state: &CliLoginState) -> Result<(), String> {

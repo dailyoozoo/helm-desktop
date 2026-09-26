@@ -126,7 +126,7 @@ export function UpdateActions({
         title={
           feedConfigured
             ? undefined
-            : '未配置发布源：通过 GitHub 检查并前往下载；配置签名发布源后可应用内安装'
+            : '使用内置官方发布源（GitHub latest.json），可在应用内一键下载安装；如需自定义，在设置 → 通用里填写发布源地址'
         }
         onClick={handleCheck}
       >
